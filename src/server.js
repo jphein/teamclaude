@@ -26,6 +26,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
   let requestCounter = 0;
+  let dashboardHtml = null;
 
   if (logDir) {
     mkdir(logDir, { recursive: true }).catch(() => {});
@@ -46,15 +47,18 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
+      // Parse pathname once for control-endpoint matching (ignores query string / fragment)
+      const pathname = new URL(req.url, 'http://localhost').pathname;
+
       // Status endpoint
-      if (req.method === 'GET' && req.url === '/teamclaude/status') {
+      if (req.method === 'GET' && pathname === '/teamclaude/status') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(accountManager.getStatus(), null, 2));
         return;
       }
 
       // POST /teamclaude/switch — manually pin the active account
-      if (req.method === 'POST' && req.url === '/teamclaude/switch') {
+      if (req.method === 'POST' && pathname === '/teamclaude/switch') {
         try {
           const { account } = JSON.parse((await readBody(req)) || '{}');
           if (!account) { json(res, 400, { error: 'Missing "account"' }); return; }
@@ -71,7 +75,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       }
 
       // POST /teamclaude/threshold — change the rotation threshold (0..1)
-      if (req.method === 'POST' && req.url === '/teamclaude/threshold') {
+      if (req.method === 'POST' && pathname === '/teamclaude/threshold') {
         try {
           const { value } = JSON.parse((await readBody(req)) || '{}');
           const v = Number(value);
@@ -89,12 +93,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
-      // GET /ui — serve the dashboard (single-page HTML)
-      if (req.method === 'GET' && (req.url === '/ui' || req.url === '/ui/' || req.url === '/ui/index.html')) {
+      // GET /ui — serve the dashboard (single-page HTML, cached after first read)
+      if (req.method === 'GET' && (pathname === '/ui' || pathname === '/ui/' || pathname === '/ui/index.html')) {
         try {
-          const html = await readFile(join(__dirname, 'web', 'index.html'), 'utf-8');
+          if (dashboardHtml === null) {
+            dashboardHtml = await readFile(join(__dirname, 'web', 'index.html'), 'utf-8');
+          }
           res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-          res.end(html);
+          res.end(dashboardHtml);
         } catch (err) {
           json(res, 500, { error: `Dashboard not found: ${err.message}` });
         }

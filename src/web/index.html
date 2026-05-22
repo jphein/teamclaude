@@ -43,90 +43,125 @@
     }
   }
   * { box-sizing: border-box; }
+  html, body { height: 100%; }
   body {
     margin: 0;
     font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
     background: var(--bg);
     color: var(--text);
-    min-height: 100vh;
-    padding: 2rem 1.5rem;
+    padding: clamp(0.5rem, 1.8vw, 1.75rem) clamp(0.5rem, 1.8vw, 1.5rem);
+    font-size: clamp(13px, 1.05vw, 15px);
   }
-  .wrap { max-width: 980px; margin: 0 auto; }
+  .wrap {
+    max-width: 1400px;
+    margin: 0 auto;
+  }
   header {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     justify-content: space-between;
     flex-wrap: wrap;
-    gap: 1rem;
-    margin-bottom: 1.5rem;
-    padding-bottom: 1rem;
+    gap: 0.5rem 1rem;
+    margin-bottom: clamp(0.75rem, 1.5vw, 1.5rem);
+    padding-bottom: 0.75rem;
     border-bottom: 1px solid var(--panel-border);
   }
   h1 {
     margin: 0;
-    font-size: 1.5rem;
+    font-size: clamp(1.05rem, 2.2vw, 1.5rem);
     font-weight: 600;
     letter-spacing: -0.01em;
+    line-height: 1.2;
+    min-width: 0;
   }
   h1 .sub {
     color: var(--text-dim);
     font-weight: 400;
-    font-size: 0.95rem;
-    margin-left: 0.5rem;
+    font-size: clamp(0.75rem, 1.4vw, 0.95rem);
+    margin-left: 0.4rem;
+    white-space: nowrap;
   }
   .threshold-row {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
-    font-size: 0.9rem;
+    gap: 0.5rem;
+    font-size: clamp(0.78rem, 1.2vw, 0.9rem);
+    flex: 1 1 auto;
+    min-width: 140px;
+    max-width: 360px;
+    justify-content: flex-end;
   }
-  .threshold-row label { color: var(--text-dim); }
+  .threshold-row label {
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
   .threshold-row input[type=range] {
-    width: 220px;
+    flex: 1 1 80px;
+    min-width: 70px;
+    max-width: 220px;
     accent-color: var(--accent);
   }
   .threshold-row .val {
     font-variant-numeric: tabular-nums;
     font-weight: 600;
     color: var(--accent);
-    min-width: 3rem;
+    min-width: 2.5rem;
     text-align: right;
   }
   .cards {
     display: grid;
-    gap: 0.875rem;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr));
+    gap: clamp(0.5rem, 1vw, 0.875rem);
   }
   .card {
     background: var(--panel);
     border: 1px solid var(--panel-border);
     border-radius: 8px;
-    padding: 1rem 1.125rem;
-    display: grid;
-    grid-template-columns: 1fr auto;
-    gap: 0.75rem 1rem;
-    align-items: center;
+    padding: clamp(0.625rem, 1.2vw, 1rem) clamp(0.75rem, 1.4vw, 1.125rem);
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
     transition: box-shadow 0.15s, border-color 0.15s;
+    container-type: inline-size;
+    min-width: 0;
   }
   .card.active {
     border-color: var(--accent);
     box-shadow: 0 0 0 1px var(--accent), 0 4px 18px var(--active-glow);
   }
-  .card .name {
-    font-size: 1.05rem;
-    font-weight: 600;
+  .card .top {
     display: flex;
     align-items: center;
     gap: 0.5rem;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .card .name {
+    font-size: clamp(0.92rem, 1.4vw, 1.05rem);
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .card .name .name-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
   }
   .card .name .badge {
-    font-size: 0.7rem;
+    font-size: 0.66rem;
     font-weight: 500;
-    padding: 0.15rem 0.5rem;
+    padding: 0.1rem 0.45rem;
     border-radius: 999px;
     background: var(--bar-bg);
     color: var(--text-dim);
     letter-spacing: 0.02em;
     text-transform: uppercase;
+    flex-shrink: 0;
   }
   .card.active .name .badge.active-badge {
     background: var(--accent);
@@ -134,18 +169,18 @@
   }
   .card .meta {
     color: var(--text-dim);
-    font-size: 0.85rem;
+    font-size: clamp(0.72rem, 1.05vw, 0.85rem);
     font-variant-numeric: tabular-nums;
-    grid-column: 1 / -1;
+    line-height: 1.4;
+    word-break: break-word;
   }
   .bars {
     display: grid;
-    grid-template-columns: max-content 1fr max-content;
-    column-gap: 0.625rem;
-    row-gap: 0.4rem;
+    grid-template-columns: 2ch 1fr 3.2rem;
+    column-gap: 0.55rem;
+    row-gap: 0.35rem;
     align-items: center;
-    grid-column: 1 / -1;
-    font-size: 0.8rem;
+    font-size: clamp(0.72rem, 1.05vw, 0.8rem);
     color: var(--text-dim);
   }
   .bars .lbl { letter-spacing: 0.02em; }
@@ -155,6 +190,7 @@
     border-radius: 4px;
     overflow: hidden;
     position: relative;
+    min-width: 0;
   }
   .bars .bar > span {
     display: block;
@@ -165,47 +201,51 @@
   }
   .bars .pct {
     font-variant-numeric: tabular-nums;
-    min-width: 3rem;
     text-align: right;
     color: var(--text);
   }
   .bars .bar.warn > span { background: var(--bar-warn); }
   .bars .bar.bad > span { background: var(--bar-bad); }
   button.switch {
-    align-self: start;
-    grid-row: 1;
-    grid-column: 2;
     background: transparent;
     color: var(--accent);
     border: 1px solid var(--accent);
     border-radius: 6px;
-    padding: 0.35rem 0.75rem;
-    font-size: 0.85rem;
+    padding: 0.3rem 0.7rem;
+    font-size: clamp(0.78rem, 1.15vw, 0.85rem);
     font-weight: 500;
     cursor: pointer;
     transition: background 0.12s, color 0.12s;
+    flex-shrink: 0;
+    white-space: nowrap;
   }
   button.switch:hover:not(:disabled) {
     background: var(--accent);
     color: #fff;
   }
-  button.switch:disabled {
-    opacity: 0.4;
-    cursor: default;
+  button.switch:disabled { display: none; }
+  /* Tighter card layout when the card itself is narrow */
+  @container (max-width: 300px) {
+    .card .name { font-size: 0.92rem; }
+    .bars { grid-template-columns: 2ch 1fr 2.6rem; column-gap: 0.4rem; }
+    button.switch { width: 100%; }
+    .card .meta { font-size: 0.7rem; }
   }
   footer {
-    margin-top: 1.5rem;
+    margin-top: clamp(0.75rem, 1.5vw, 1.5rem);
     color: var(--text-dim);
-    font-size: 0.8rem;
+    font-size: clamp(0.7rem, 1.05vw, 0.8rem);
     text-align: center;
+    word-break: break-word;
   }
   .err {
     background: var(--bad);
     color: #fff;
-    padding: 0.6rem 1rem;
+    padding: 0.55rem 0.9rem;
     border-radius: 6px;
-    margin-bottom: 1rem;
-    font-size: 0.9rem;
+    margin-bottom: 0.75rem;
+    font-size: 0.85rem;
+    word-break: break-word;
   }
   .status-dot {
     display: inline-block;
@@ -213,6 +253,7 @@
     height: 8px;
     border-radius: 50%;
     background: var(--good);
+    flex-shrink: 0;
   }
   .status-throttled { background: var(--warn); }
   .status-exhausted, .status-error { background: var(--bad); }
@@ -299,12 +340,14 @@
 
     const nameRow = el('div', { class: 'name' }, [
       el('span', { class: 'status-dot status-' + acct.status }),
-      acct.name,
+      el('span', { class: 'name-text', text: acct.name }),
       isActive ? el('span', { class: 'badge active-badge', text: 'active' }) : null,
       el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', text: acct.type }),
     ]);
 
     const btn = el('button', { class: 'switch', 'data-name': acct.name, disabled: isActive, text: 'Switch' });
+
+    const top = el('div', { class: 'top' }, [nameRow, btn]);
 
     const bars = el('div', { class: 'bars' }, [
       ...makeBar('5h', u5h, threshold),
@@ -316,7 +359,7 @@
       + (acct.rateLimitedUntil ? ' · throttled until ' + new Date(acct.rateLimitedUntil).toLocaleTimeString() : '');
     const meta = el('div', { class: 'meta', text: metaText });
 
-    const card = el('div', { class: 'card' + (isActive ? ' active' : '') }, [nameRow, btn, bars, meta]);
+    const card = el('div', { class: 'card' + (isActive ? ' active' : '') }, [top, bars, meta]);
     return card;
   }
 

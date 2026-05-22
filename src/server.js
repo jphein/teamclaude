@@ -26,7 +26,6 @@ export function createProxyServer(accountManager, config, hooks = {}) {
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
   let requestCounter = 0;
-  let dashboardHtml = null;
 
   if (logDir) {
     mkdir(logDir, { recursive: true }).catch(() => {});
@@ -93,14 +92,12 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
-      // GET /ui — serve the dashboard (single-page HTML, cached after first read)
+      // GET /ui — serve the dashboard (read from disk every request so edits are live)
       if (req.method === 'GET' && (pathname === '/ui' || pathname === '/ui/' || pathname === '/ui/index.html')) {
         try {
-          if (dashboardHtml === null) {
-            dashboardHtml = await readFile(join(__dirname, 'web', 'index.html'), 'utf-8');
-          }
+          const html = await readFile(join(__dirname, 'web', 'index.html'), 'utf-8');
           res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-          res.end(dashboardHtml);
+          res.end(html);
         } catch (err) {
           json(res, 500, { error: `Dashboard not found: ${err.message}` });
         }

@@ -202,14 +202,18 @@ async function serverCommand() {
   });
 
   if (!tui) {
-    process.on('SIGINT', () => {
+    const shutdown = () => {
       console.log('\n[TeamClaude] Shutting down...');
+      // Force-close in-flight connections (streaming responses, keep-alive)
+      // so systemd restarts and dev iteration don't wait minutes for the
+      // active Claude stream to drain. Clients reconnect on next request.
+      server.closeAllConnections?.();
       server.close(() => process.exit(0));
-    });
-    process.on('SIGTERM', () => {
-      console.log('\n[TeamClaude] Shutting down...');
-      server.close(() => process.exit(0));
-    });
+      // Safety net: hard exit if server.close() callback never fires
+      setTimeout(() => process.exit(0), 2000).unref();
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
   }
 }
 

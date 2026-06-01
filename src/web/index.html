@@ -176,7 +176,7 @@
   }
   .bars {
     display: grid;
-    grid-template-columns: 2ch 1fr 3.2rem;
+    grid-template-columns: 2ch 1fr 3.2rem 3.8rem;
     column-gap: 0.55rem;
     row-gap: 0.35rem;
     align-items: center;
@@ -184,6 +184,14 @@
     color: var(--text-dim);
   }
   .bars .lbl { letter-spacing: 0.02em; }
+  .bars .reset {
+    font-size: 0.78em;
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    white-space: nowrap;
+    opacity: 0.85;
+  }
   .bars .bar {
     height: 8px;
     background: var(--bar-bg);
@@ -227,7 +235,8 @@
   /* Tighter card layout when the card itself is narrow */
   @container (max-width: 300px) {
     .card .name { font-size: 0.92rem; }
-    .bars { grid-template-columns: 2ch 1fr 2.6rem; column-gap: 0.4rem; }
+    .bars { grid-template-columns: 2ch 1fr 2.6rem 3.2rem; column-gap: 0.4rem; }
+    .bars .reset { font-size: 0.72em; }
     button.switch { width: 100%; }
     .card .meta { font-size: 0.7rem; }
   }
@@ -307,6 +316,17 @@
 
   function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
   function fmtNum(n) { return n.toLocaleString(); }
+  function fmtReset(ms) {
+    if (!ms) return '';
+    const now = Date.now();
+    if (ms <= now) return '';
+    const d = new Date(ms);
+    const diff = ms - now;
+    const t = diff < 24 * 3600 * 1000
+      ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      : d.toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+    return '↺ ' + t;
+  }
   function fmtAgo(iso) {
     if (!iso) return 'never';
     const s = (Date.now() - new Date(iso).getTime()) / 1000;
@@ -322,12 +342,14 @@
     return 'bar';
   }
 
-  function makeBar(label, util, threshold) {
+  function makeBar(label, util, threshold, resetMs) {
     const inner = el('span', { style: 'width:' + (util == null ? 0 : Math.min(100, util * 100)) + '%' });
+    const titleAttr = resetMs && resetMs > Date.now() ? new Date(resetMs).toLocaleString() : null;
     return [
       el('span', { class: 'lbl', text: label }),
       el('div', { class: barClass(util, threshold) }, inner),
       el('span', { class: 'pct', text: fmtPct(util) }),
+      el('span', { class: 'reset', text: fmtReset(resetMs), title: titleAttr }),
     ];
   }
 
@@ -335,7 +357,11 @@
     const q = acct.quota;
     const u5h = q.unified5h != null ? q.unified5h
       : (q.tokensLimit ? 1 - q.tokensRemaining / q.tokensLimit : null);
+    const u5hReset = q.unified5h != null
+      ? q.unified5hReset
+      : (q.resetsAt ? new Date(q.resetsAt).getTime() : null);
     const u7d = q.unified7d;
+    const u7dReset = q.unified7dReset;
     const totalTok = acct.usage.totalInputTokens + acct.usage.totalOutputTokens;
 
     const nameRow = el('div', { class: 'name' }, [
@@ -350,8 +376,8 @@
     const top = el('div', { class: 'top' }, [nameRow, btn]);
 
     const bars = el('div', { class: 'bars' }, [
-      ...makeBar('5h', u5h, threshold),
-      ...makeBar('7d', u7d, threshold),
+      ...makeBar('5h', u5h, threshold, u5hReset),
+      ...makeBar('7d', u7d, threshold, u7dReset),
     ]);
 
     const metaText = fmtNum(acct.usage.totalRequests) + ' requests · '

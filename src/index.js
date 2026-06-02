@@ -2,6 +2,9 @@
 
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
@@ -53,6 +56,11 @@ switch (command) {
   case 'api':
     await apiCommand();
     process.exit(0);
+    break;
+  case 'version':
+  case '--version':
+  case '-v':
+    console.log(await getVersion());
     break;
   case 'help':
   case '--help':
@@ -849,4 +857,14 @@ async function resolveAccounts(config) {
 function argValue(flag) {
   const i = args.indexOf(flag);
   return (i >= 0 && args[i + 1]) ? args[i + 1] : null;
+}
+
+async function getVersion() {
+  try {
+    const dir = dirname(fileURLToPath(import.meta.url));
+    const pkg = JSON.parse(await readFile(join(dir, '..', 'package.json'), 'utf-8'));
+    return pkg.version;
+  } catch {
+    return 'unknown';
+  }
 }

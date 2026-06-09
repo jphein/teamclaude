@@ -216,6 +216,16 @@
     min-width: 3rem;
     text-align: right;
     color: var(--text);
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    line-height: 1.25;
+  }
+  .bars .pct .reset {
+    font-size: 0.66rem;
+    color: var(--text-dim);
+    white-space: nowrap;
+    cursor: help;
   }
   .bars .bar.warn > span { background: var(--bar-warn); }
   .bars .bar.bad > span { background: var(--bar-bad); }
@@ -502,6 +512,22 @@
     if (ms < 1000) return ms + 'ms';
     return (ms / 1000).toFixed(1) + 's';
   }
+  // Quota windows carry a reset timestamp (ms epoch for unified, ISO for standard).
+  // Returns { when, rel, full } or null when the window is already reset / absent.
+  function fmtReset(ts) {
+    if (ts == null) return null;
+    const t = typeof ts === 'number' ? ts : new Date(ts).getTime();
+    if (!t || isNaN(t) || t <= Date.now()) return null;
+    const d = new Date(t);
+    const diffMin = Math.round((t - Date.now()) / 60000);
+    const rel = diffMin < 60 ? diffMin + 'm'
+      : diffMin < 1440 ? Math.round(diffMin / 60) + 'h'
+      : Math.round(diffMin / 1440) + 'd';
+    const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    const sameDay = d.toDateString() === new Date().toDateString();
+    const when = sameDay ? time : d.toLocaleDateString([], { weekday: 'short' }) + ' ' + time;
+    return { when, rel, full: d.toLocaleString() };
+  }
   function shortPath(path) {
     return (path || '').replace(/^\/(v1|api)\//, '').split('?')[0] || path;
   }
@@ -513,12 +539,17 @@
   }
 
   // ── Account cards ────────────────────────────────────────────
-  function makeBar(label, util, threshold) {
+  function makeBar(label, util, threshold, resetTs) {
     const inner = el('span', { style: 'width:' + (util == null ? 0 : Math.min(100, util * 100)) + '%' });
+    const r = fmtReset(resetTs);
+    const pct = el('span', { class: 'pct' }, [
+      el('span', { text: fmtPct(util) }),
+      r ? el('span', { class: 'reset', title: 'resets ' + r.full + ' (in ' + r.rel + ')', text: '↺ ' + r.when }) : null,
+    ]);
     return [
       el('span', { class: 'lbl', text: label }),
       el('div', { class: barClass(util, threshold) }, inner),
-      el('span', { class: 'pct', text: fmtPct(util) }),
+      pct,
     ];
   }
 
@@ -537,8 +568,8 @@
     ]);
     const btn = el('button', { class: 'switch', 'data-name': acct.name, disabled: isActive, text: 'Switch' });
     const bars = el('div', { class: 'bars' }, [
-      ...makeBar('5h', u5h, threshold),
-      ...makeBar('7d', u7d, threshold),
+      ...makeBar('5h', u5h, threshold, q.unified5hReset ?? q.resetsAt),
+      ...makeBar('7d', u7d, threshold, q.unified7dReset),
     ]);
     const metaText = fmtNum(acct.usage.totalRequests) + ' requests · '
       + fmtNum(totalTok) + ' tokens · last used ' + fmtAgo(acct.usage.lastUsed)

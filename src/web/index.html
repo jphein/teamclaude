@@ -22,6 +22,7 @@
     --bar-warn: #d4a035;
     --bar-bad: #c45050;
     --active-glow: rgba(184, 106, 26, 0.15);
+    --log-bg: #f5f1ea;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -40,6 +41,7 @@
       --bar-warn: #c89534;
       --bar-bad: #b04040;
       --active-glow: rgba(232, 144, 48, 0.18);
+      --log-bg: #1e1810;
     }
   }
   * { box-sizing: border-box; }
@@ -51,13 +53,15 @@
     min-height: 100vh;
     padding: 2rem 1.5rem;
   }
-  .wrap { max-width: 980px; margin: 0 auto; }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+
+  /* ── Header ── */
   header {
     display: flex;
     align-items: baseline;
     justify-content: space-between;
     flex-wrap: wrap;
-    gap: 1rem;
+    gap: 0.75rem 1rem;
     margin-bottom: 1.5rem;
     padding-bottom: 1rem;
     border-bottom: 1px solid var(--panel-border);
@@ -74,15 +78,21 @@
     font-size: 0.95rem;
     margin-left: 0.5rem;
   }
-  .threshold-row {
+  .header-right {
     display: flex;
     align-items: center;
     gap: 0.75rem;
-    font-size: 0.9rem;
+    flex-wrap: wrap;
+  }
+  .threshold-row {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    font-size: 0.875rem;
   }
   .threshold-row label { color: var(--text-dim); }
   .threshold-row input[type=range] {
-    width: 220px;
+    width: 180px;
     accent-color: var(--accent);
   }
   .threshold-row .val {
@@ -92,10 +102,51 @@
     min-width: 3rem;
     text-align: right;
   }
-  .cards {
-    display: grid;
-    gap: 0.875rem;
+
+  /* ── Buttons ── */
+  button.switch, .btn-restart, .btn-ghost, .btn-danger {
+    border-radius: 6px;
+    font-size: 0.85rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
   }
+  button.switch {
+    align-self: start;
+    grid-row: 1;
+    grid-column: 2;
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    padding: 0.35rem 0.75rem;
+  }
+  button.switch:hover:not(:disabled) { background: var(--accent); color: #fff; }
+  button.switch:disabled { opacity: 0.4; cursor: default; }
+  .btn-restart {
+    background: transparent;
+    color: var(--bad);
+    border: 1px solid var(--bad);
+    padding: 0.32rem 0.7rem;
+    font-size: 0.82rem;
+  }
+  .btn-restart:hover:not(:disabled) { background: var(--bad); color: #fff; }
+  .btn-restart:disabled { opacity: 0.4; cursor: default; }
+  .restart-status {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
+  .btn-ghost {
+    background: transparent;
+    color: var(--text-dim);
+    border: 1px solid var(--panel-border);
+    padding: 0.18rem 0.5rem;
+    font-size: 0.75rem;
+  }
+  .btn-ghost:hover { color: var(--text); border-color: var(--text-dim); }
+
+  /* ── Account cards ── */
+  .cards { display: grid; gap: 0.875rem; }
   .card {
     background: var(--panel);
     border: 1px solid var(--panel-border);
@@ -128,10 +179,7 @@
     letter-spacing: 0.02em;
     text-transform: uppercase;
   }
-  .card.active .name .badge.active-badge {
-    background: var(--accent);
-    color: #fff;
-  }
+  .card.active .name .badge.active-badge { background: var(--accent); color: #fff; }
   .card .meta {
     color: var(--text-dim);
     font-size: 0.85rem;
@@ -171,42 +219,6 @@
   }
   .bars .bar.warn > span { background: var(--bar-warn); }
   .bars .bar.bad > span { background: var(--bar-bad); }
-  button.switch {
-    align-self: start;
-    grid-row: 1;
-    grid-column: 2;
-    background: transparent;
-    color: var(--accent);
-    border: 1px solid var(--accent);
-    border-radius: 6px;
-    padding: 0.35rem 0.75rem;
-    font-size: 0.85rem;
-    font-weight: 500;
-    cursor: pointer;
-    transition: background 0.12s, color 0.12s;
-  }
-  button.switch:hover:not(:disabled) {
-    background: var(--accent);
-    color: #fff;
-  }
-  button.switch:disabled {
-    opacity: 0.4;
-    cursor: default;
-  }
-  footer {
-    margin-top: 1.5rem;
-    color: var(--text-dim);
-    font-size: 0.8rem;
-    text-align: center;
-  }
-  .err {
-    background: var(--bad);
-    color: #fff;
-    padding: 0.6rem 1rem;
-    border-radius: 6px;
-    margin-bottom: 1rem;
-    font-size: 0.9rem;
-  }
   .status-dot {
     display: inline-block;
     width: 8px;
@@ -216,36 +228,246 @@
   }
   .status-throttled { background: var(--warn); }
   .status-exhausted, .status-error { background: var(--bad); }
+
+  /* ── Bottom panels ── */
+  .bottom-row {
+    display: grid;
+    grid-template-columns: 1fr 1.6fr;
+    gap: 0.875rem;
+    margin-top: 0.875rem;
+  }
+  @media (max-width: 740px) {
+    .bottom-row { grid-template-columns: 1fr; }
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    padding: 0.875rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+  .panel-hdr {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.625rem;
+    flex-shrink: 0;
+  }
+  .panel-title {
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+  }
+  .active-count {
+    font-size: 0.75rem;
+    color: var(--accent);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ── Activity feed ── */
+  #activeReqs { flex-shrink: 0; }
+  .activity-item {
+    display: flex;
+    align-items: baseline;
+    gap: 0.3rem;
+    padding: 0.22rem 0;
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+    min-width: 0;
+  }
+  .activity-item + .activity-item {
+    border-top: 1px solid var(--panel-border);
+  }
+  .activity-sys { color: var(--text-dim); font-style: italic; }
+  .act-dot {
+    flex-shrink: 0;
+    display: inline-block;
+    width: 1.1rem;
+    text-align: center;
+    font-style: normal;
+  }
+  .act-dot-active { color: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+  .act-dot-ok  { color: var(--good); }
+  .act-dot-warn { color: var(--warn); }
+  .act-dot-bad  { color: var(--bad); }
+  .act-dot-sys  { color: var(--text-dim); }
+  .act-method {
+    flex-shrink: 0;
+    font-size: 0.68rem;
+    font-weight: 700;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .act-path {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text);
+  }
+  .act-account {
+    color: var(--text-dim);
+    font-size: 0.73rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 14ch;
+    flex-shrink: 1;
+  }
+  .act-dur {
+    color: var(--text-dim);
+    font-size: 0.73rem;
+    margin-left: auto;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .act-status {
+    flex-shrink: 0;
+    font-size: 0.7rem;
+    font-weight: 700;
+    min-width: 2.2rem;
+  }
+  .act-ok   { color: var(--good); }
+  .act-warn { color: var(--warn); }
+  .act-bad  { color: var(--bad); }
+  .act-sep {
+    height: 1px;
+    background: var(--panel-border);
+    margin: 0.4rem 0;
+    flex-shrink: 0;
+  }
+  .completed-log {
+    height: 260px;
+    overflow-y: auto;
+    flex-shrink: 0;
+  }
+  .completed-log:empty::before {
+    content: 'No requests yet';
+    display: block;
+    text-align: center;
+    padding: 2rem 0;
+    color: var(--text-dim);
+    font-size: 0.8rem;
+  }
+
+  /* ── Logs panel ── */
+  .log-box {
+    height: 320px;
+    overflow-y: auto;
+    background: var(--log-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    padding: 0.5rem 0.625rem;
+    font-family: ui-monospace, 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
+    font-size: 0.69rem;
+    line-height: 1.6;
+  }
+  .log-box:empty::before {
+    content: 'Connecting to log stream…';
+    display: block;
+    text-align: center;
+    padding: 2rem 0;
+    color: var(--text-dim);
+    font-style: italic;
+  }
+  .log-line {
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: var(--text-dim);
+  }
+  .log-line.log-err  { color: var(--bad); }
+  .log-line.log-warn { color: var(--warn); }
+
+  /* ── Footer ── */
+  .err {
+    background: var(--bad);
+    color: #fff;
+    padding: 0.6rem 1rem;
+    border-radius: 6px;
+    margin-bottom: 1rem;
+    font-size: 0.9rem;
+  }
+  footer {
+    margin-top: 1.25rem;
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    text-align: center;
+  }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
     <h1>TeamClaude<span class="sub">multi-account proxy</span></h1>
-    <div class="threshold-row">
-      <label for="thr">Rotate at</label>
-      <input type="range" id="thr" min="50" max="100" step="1" value="98">
-      <span class="val" id="thrVal">98%</span>
+    <div class="header-right">
+      <div class="threshold-row">
+        <label for="thr">Rotate at</label>
+        <input type="range" id="thr" min="50" max="100" step="1" value="98">
+        <span class="val" id="thrVal">98%</span>
+      </div>
+      <button id="restartBtn" class="btn-restart">Restart service</button>
+      <span id="restartStatus" class="restart-status"></span>
     </div>
   </header>
+
   <div id="errBox"></div>
   <div class="cards" id="cards"></div>
+
+  <div class="bottom-row">
+    <!-- Activity panel -->
+    <div class="panel">
+      <div class="panel-hdr">
+        <span class="panel-title">Activity</span>
+        <span id="activeCount" class="active-count"></span>
+      </div>
+      <div id="activeReqs"></div>
+      <div class="act-sep" id="actSep" style="display:none"></div>
+      <div class="completed-log" id="completedLog"></div>
+    </div>
+
+    <!-- Logs panel -->
+    <div class="panel">
+      <div class="panel-hdr">
+        <span class="panel-title">Logs</span>
+        <button id="clearLogs" class="btn-ghost">clear</button>
+      </div>
+      <div class="log-box" id="logBox"></div>
+    </div>
+  </div>
+
   <footer>
     <span id="meta">Loading…</span>
   </footer>
 </div>
 <script>
-  // All DOM construction below uses createElement + textContent — never innerHTML
-  // with untrusted data. Account names come from Anthropic profile API via local
-  // config, so they're effectively trusted, but defense in depth.
-  const cardsEl = document.getElementById('cards');
-  const errEl = document.getElementById('errBox');
-  const metaEl = document.getElementById('meta');
-  const thr = document.getElementById('thr');
-  const thrVal = document.getElementById('thrVal');
+  // All DOM construction uses createElement + textContent — never innerHTML with untrusted data.
+
+  const cardsEl     = document.getElementById('cards');
+  const errEl       = document.getElementById('errBox');
+  const metaEl      = document.getElementById('meta');
+  const thr         = document.getElementById('thr');
+  const thrVal      = document.getElementById('thrVal');
+  const restartBtn  = document.getElementById('restartBtn');
+  const restartStatusEl = document.getElementById('restartStatus');
+  const activeReqsEl = document.getElementById('activeReqs');
+  const completedLogEl = document.getElementById('completedLog');
+  const activeCountEl  = document.getElementById('activeCount');
+  const actSepEl    = document.getElementById('actSep');
+  const logBoxEl    = document.getElementById('logBox');
+
   let lastThreshold = null;
   let saveTimer = null;
+  let restartPending = false;
+  let wasDisconnected = false;
 
+  // ── DOM builder ──────────────────────────────────────────────
   function el(tag, attrs = {}, children = []) {
     const node = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs)) {
@@ -264,6 +486,7 @@
     return node;
   }
 
+  // ── Formatters ───────────────────────────────────────────────
   function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
   function fmtNum(n) { return n.toLocaleString(); }
   function fmtAgo(iso) {
@@ -274,6 +497,14 @@
     if (s < 86400) return Math.round(s / 3600) + 'h ago';
     return Math.round(s / 86400) + 'd ago';
   }
+  function fmtMs(ms) {
+    if (ms == null) return '—';
+    if (ms < 1000) return ms + 'ms';
+    return (ms / 1000).toFixed(1) + 's';
+  }
+  function shortPath(path) {
+    return (path || '').replace(/^\/(v1|api)\//, '').split('?')[0] || path;
+  }
   function barClass(util, threshold) {
     if (util == null) return 'bar';
     if (util >= threshold) return 'bar bad';
@@ -281,6 +512,7 @@
     return 'bar';
   }
 
+  // ── Account cards ────────────────────────────────────────────
   function makeBar(label, util, threshold) {
     const inner = el('span', { style: 'width:' + (util == null ? 0 : Math.min(100, util * 100)) + '%' });
     return [
@@ -303,33 +535,38 @@
       isActive ? el('span', { class: 'badge active-badge', text: 'active' }) : null,
       el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', text: acct.type }),
     ]);
-
     const btn = el('button', { class: 'switch', 'data-name': acct.name, disabled: isActive, text: 'Switch' });
-
     const bars = el('div', { class: 'bars' }, [
       ...makeBar('5h', u5h, threshold),
       ...makeBar('7d', u7d, threshold),
     ]);
-
     const metaText = fmtNum(acct.usage.totalRequests) + ' requests · '
       + fmtNum(totalTok) + ' tokens · last used ' + fmtAgo(acct.usage.lastUsed)
       + (acct.rateLimitedUntil ? ' · throttled until ' + new Date(acct.rateLimitedUntil).toLocaleTimeString() : '');
     const meta = el('div', { class: 'meta', text: metaText });
-
-    const card = el('div', { class: 'card' + (isActive ? ' active' : '') }, [nameRow, btn, bars, meta]);
-    return card;
+    return el('div', { class: 'card' + (isActive ? ' active' : '') }, [nameRow, btn, bars, meta]);
   }
 
+  // ── Error display ────────────────────────────────────────────
   function showErr(msg) {
     errEl.textContent = '';
     if (msg) errEl.appendChild(el('div', { class: 'err', text: msg }));
   }
 
+  // ── Status poll ──────────────────────────────────────────────
   async function refresh() {
     try {
       const res = await fetch('/teamclaude/status', { cache: 'no-store' });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
+
+      if (restartPending && wasDisconnected) {
+        restartPending = false;
+        restartStatusEl.textContent = 'Restarted ✓';
+        restartBtn.disabled = false;
+        setTimeout(() => { restartStatusEl.textContent = ''; }, 4000);
+      }
+      wasDisconnected = false;
       showErr('');
 
       const serverPct = Math.round(data.switchThreshold * 100);
@@ -343,13 +580,20 @@
       for (const acct of data.accounts) {
         cardsEl.appendChild(renderAccount(acct, acct.name === data.currentAccount, data.switchThreshold));
       }
-      metaEl.textContent = 'Active: ' + data.currentAccount + ' · refreshes every 2s · ' + new Date().toLocaleTimeString();
+
+      const upDisplay = (data.upstream || 'api.anthropic.com').replace(/^https?:\/\//, '');
+      const portDisplay = data.port || 3456;
+      metaEl.textContent = `Active: ${data.currentAccount} · ${upDisplay}:${portDisplay} · ${new Date().toLocaleTimeString()}`;
     } catch (err) {
-      showErr('Cannot reach proxy: ' + err.message);
+      wasDisconnected = true;
+      if (!restartPending) {
+        showErr('Cannot reach proxy: ' + err.message);
+      }
       metaEl.textContent = 'Disconnected';
     }
   }
 
+  // ── Switch account ───────────────────────────────────────────
   cardsEl.addEventListener('click', async (e) => {
     const btn = e.target.closest('button.switch');
     if (!btn || btn.disabled) return;
@@ -372,6 +616,7 @@
     }
   });
 
+  // ── Threshold slider ─────────────────────────────────────────
   thr.addEventListener('input', () => { thrVal.textContent = thr.value + '%'; });
   thr.addEventListener('change', () => {
     clearTimeout(saveTimer);
@@ -394,6 +639,130 @@
     }, 100);
   });
 
+  // ── Service restart ──────────────────────────────────────────
+  restartBtn.addEventListener('click', async () => {
+    restartBtn.disabled = true;
+    restartStatusEl.textContent = 'Restarting…';
+    restartPending = true;
+    try {
+      await fetch('/teamclaude/restart', { method: 'POST' });
+    } catch {
+      // Expected — the service is going down
+    }
+  });
+
+  // ── Activity feed ────────────────────────────────────────────
+  const activityMap = new Map(); // id → { method, path, account, ts }
+
+  function renderActiveReqs() {
+    activeReqsEl.textContent = '';
+    const entries = [...activityMap.values()];
+    activeCountEl.textContent = entries.length > 0 ? entries.length + ' active' : '';
+    actSepEl.style.display = entries.length > 0 ? '' : 'none';
+
+    const now = Date.now();
+    for (const r of entries) {
+      const elapsed = ((now - r.ts) / 1000).toFixed(1);
+      activeReqsEl.appendChild(el('div', { class: 'activity-item' }, [
+        el('span', { class: 'act-dot act-dot-active', text: '●' }),
+        el('span', { class: 'act-method', text: r.method }),
+        el('span', { class: 'act-path', text: ' ' + shortPath(r.path) }),
+        r.account ? el('span', { class: 'act-account', text: ' → ' + r.account }) : null,
+        el('span', { class: 'act-dur', text: elapsed + 's' }),
+      ]));
+    }
+  }
+
+  function makeCompletedRow(evt) {
+    if (evt.type === 'req_end') {
+      const st = evt.status;
+      const cls = st >= 500 ? 'bad' : st >= 400 ? 'warn' : 'ok';
+      const icon = st >= 500 ? '✗' : st >= 400 ? '⚠' : '✓';
+      return el('div', { class: 'activity-item' }, [
+        el('span', { class: 'act-dot act-dot-' + cls, text: icon }),
+        el('span', { class: 'act-status act-' + cls, text: String(st || '?') }),
+        el('span', { class: 'act-method', text: ' ' + (evt.method || '') }),
+        el('span', { class: 'act-path', text: ' ' + shortPath(evt.path) }),
+        evt.account ? el('span', { class: 'act-account', text: ' → ' + evt.account }) : null,
+        el('span', { class: 'act-dur', text: fmtMs(evt.ms) }),
+      ]);
+    }
+    if (evt.type === 'switched') {
+      return el('div', { class: 'activity-item activity-sys' }, [
+        el('span', { class: 'act-dot act-dot-sys', text: '↩' }),
+        el('span', { text: 'Switched to ' + evt.account }),
+      ]);
+    }
+    if (evt.type === 'threshold') {
+      return el('div', { class: 'activity-item activity-sys' }, [
+        el('span', { class: 'act-dot act-dot-sys', text: '⚙' }),
+        el('span', { text: 'Threshold → ' + Math.round(evt.value * 100) + '%' }),
+      ]);
+    }
+    return el('div', { class: 'activity-item activity-sys' }, [el('span', { text: evt.type })]);
+  }
+
+  function prependCompleted(evt) {
+    completedLogEl.insertBefore(makeCompletedRow(evt), completedLogEl.firstChild || null);
+    while (completedLogEl.children.length > 150) completedLogEl.removeChild(completedLogEl.lastChild);
+  }
+
+  function connectActivity() {
+    const es = new EventSource('/teamclaude/activity');
+    es.onmessage = (e) => {
+      const evt = JSON.parse(e.data);
+      if (evt.type === 'req_start') {
+        activityMap.set(evt.id, { method: evt.method, path: evt.path, account: null, ts: evt.ts });
+      } else if (evt.type === 'req_routed') {
+        const r = activityMap.get(evt.id);
+        if (r) r.account = evt.account;
+      } else if (evt.type === 'req_end') {
+        activityMap.delete(evt.id);
+        prependCompleted(evt);
+      } else if (evt.type === 'switched' || evt.type === 'threshold') {
+        prependCompleted(evt);
+      }
+      renderActiveReqs();
+    };
+    // EventSource auto-reconnects on disconnect
+  }
+
+  setInterval(renderActiveReqs, 1000);
+  connectActivity();
+
+  // ── Logs panel ───────────────────────────────────────────────
+  let logAutoScroll = true;
+  logBoxEl.addEventListener('scroll', () => {
+    logAutoScroll = logBoxEl.scrollHeight - logBoxEl.scrollTop - logBoxEl.clientHeight < 30;
+  });
+
+  document.getElementById('clearLogs').addEventListener('click', () => {
+    logBoxEl.textContent = '';
+  });
+
+  function logLineClass(line) {
+    const l = line.toLowerCase();
+    if (l.includes('error') || l.includes('failed') || l.includes('exception') || l.includes('502') || l.includes('crash')) return 'log-err';
+    if (l.includes('warn') || l.includes('429') || l.includes('throttl') || l.includes('rate limit')) return 'log-warn';
+    return '';
+  }
+
+  function appendLog(line) {
+    const cls = logLineClass(line);
+    logBoxEl.appendChild(el('div', { class: 'log-line' + (cls ? ' ' + cls : ''), text: line }));
+    while (logBoxEl.children.length > 500) logBoxEl.removeChild(logBoxEl.firstChild);
+    if (logAutoScroll) logBoxEl.scrollTop = logBoxEl.scrollHeight;
+  }
+
+  function connectLogs() {
+    const es = new EventSource('/teamclaude/logs');
+    es.onmessage = (e) => appendLog(JSON.parse(e.data));
+    // EventSource auto-reconnects, so no manual reconnect needed
+  }
+
+  connectLogs();
+
+  // ── Boot ─────────────────────────────────────────────────────
   refresh();
   setInterval(refresh, 2000);
 </script>

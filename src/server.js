@@ -2,6 +2,7 @@ import http from 'node:http';
 import { writeFile, mkdir, readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { spawn } from 'node:child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -32,6 +33,42 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     mkdir(logDir, { recursive: true }).catch(() => {});
   }
 
+  // Activity feed: ring buffer + SSE subscribers
+  const activityBuf = [];
+  const activityClients = new Set();
+  const reqStartTimes = new Map();
+
+  function emitActivity(event) {
+    const e = { ...event, ts: Date.now() };
+    activityBuf.push(e);
+    if (activityBuf.length > 500) activityBuf.shift();
+    const msg = `data: ${JSON.stringify(e)}\n\n`;
+    for (const sub of activityClients) {
+      try { sub.write(msg); } catch { activityClients.delete(sub); }
+    }
+  }
+
+  // Wrap external hooks to also drive the activity feed
+  const _hooks = hooks;
+  hooks = {
+    persistThreshold: _hooks.persistThreshold,
+    onRequestStart(id, info) {
+      _hooks.onRequestStart?.(id, info);
+      reqStartTimes.set(id, Date.now());
+      emitActivity({ type: 'req_start', id, method: info.method, path: info.path });
+    },
+    onRequestRouted(id, info) {
+      _hooks.onRequestRouted?.(id, info);
+      emitActivity({ type: 'req_routed', id, account: info.account });
+    },
+    onRequestEnd(id, info) {
+      const ms = reqStartTimes.has(id) ? Date.now() - reqStartTimes.get(id) : null;
+      reqStartTimes.delete(id);
+      _hooks.onRequestEnd?.(id, info);
+      emitActivity({ type: 'req_end', id, method: info.method, path: info.path, account: info.account, status: info.status, ms });
+    },
+  };
+
   const server = http.createServer(async (req, res) => {
     try {
       // Auth check — skip for localhost connections
@@ -52,8 +89,11 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
       // Status endpoint
       if (req.method === 'GET' && pathname === '/teamclaude/status') {
+        const status = accountManager.getStatus();
+        status.upstream = upstream;
+        status.port = config.proxy?.port;
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(accountManager.getStatus(), null, 2));
+        res.end(JSON.stringify(status, null, 2));
         return;
       }
 
@@ -67,6 +107,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           accountManager.currentIndex = idx;
           console.log(`[TeamClaude] Manually switched to "${account}"`);
           hooks.onManualSwitch?.(account);
+          emitActivity({ type: 'switched', account });
           json(res, 200, { currentAccount: account });
         } catch (err) {
           json(res, 400, { error: err.message });
@@ -86,10 +127,61 @@ export function createProxyServer(accountManager, config, hooks = {}) {
           accountManager.switchThreshold = v;
           await hooks.persistThreshold?.(v);
           console.log(`[TeamClaude] Threshold set to ${(v * 100).toFixed(0)}%`);
+          emitActivity({ type: 'threshold', value: v });
           json(res, 200, { switchThreshold: v });
         } catch (err) {
           json(res, 400, { error: err.message });
         }
+        return;
+      }
+
+      // GET /teamclaude/activity — SSE stream of request lifecycle events
+      if (req.method === 'GET' && pathname === '/teamclaude/activity') {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+        });
+        // Replay recent terminal events (not in-flight req_start which may be stale)
+        const replayTypes = new Set(['req_end', 'switched', 'threshold']);
+        for (const e of activityBuf.filter(e => replayTypes.has(e.type)).slice(-100)) {
+          res.write(`data: ${JSON.stringify(e)}\n\n`);
+        }
+        activityClients.add(res);
+        req.on('close', () => activityClients.delete(res));
+        return;
+      }
+
+      // GET /teamclaude/logs — SSE stream of journald output
+      if (req.method === 'GET' && pathname === '/teamclaude/logs') {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+        });
+        const child = spawn('journalctl', [
+          '--user', '-u', 'teamclaude.service',
+          '-n', '100', '-f', '--no-pager', '--output=short-iso',
+        ]);
+        child.stdout.on('data', chunk => {
+          for (const line of chunk.toString().split('\n')) {
+            if (line.trim()) res.write(`data: ${JSON.stringify(line)}\n\n`);
+          }
+        });
+        req.on('close', () => child.kill());
+        child.on('exit', () => { if (!res.writableEnded) res.end(); });
+        return;
+      }
+
+      // POST /teamclaude/restart — fire-and-forget service restart
+      if (req.method === 'POST' && pathname === '/teamclaude/restart') {
+        json(res, 200, { restarting: true });
+        setImmediate(() => {
+          const child = spawn('systemctl', ['--user', 'restart', 'teamclaude.service'], {
+            detached: true, stdio: 'ignore',
+          });
+          child.unref();
+        });
         return;
       }
 

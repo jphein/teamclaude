@@ -11,6 +11,45 @@ const HOP_BY_HOP_HEADERS = new Set([
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
 
+/**
+ * Fast mode (Claude Code's /fast) sets `"speed": "fast"` in the request body and
+ * a `fast-mode-*` token in the anthropic-beta header. It routes through a separate
+ * priority-tier pool that, for subscription seats, bills as usage credits and is
+ * NOT covered by the subscription rate limits. A seat without credits gets a 429
+ * on EVERY fast request, regardless of account — which this proxy would otherwise
+ * misread as quota exhaustion and use to rate-limit every account in turn (one
+ * /fast keystroke takes the whole pool offline). We strip fast mode so the request
+ * runs as standard Opus and can never poison the account pool. Returns the body to
+ * forward (a new Buffer if modified, otherwise the original) and mutates `headers`.
+ */
+function stripFastMode(body, headers) {
+  if (!body || body.length === 0) return body;
+  let parsed;
+  try {
+    parsed = JSON.parse(body.toString());
+  } catch {
+    return body; // not JSON (shouldn't happen for /v1/messages) — leave untouched
+  }
+  if (parsed?.speed !== 'fast') return body;
+
+  delete parsed.speed;
+
+  // Drop the fast-mode-* beta token; harmless once speed is gone, but cleaner.
+  const beta = headers['anthropic-beta'];
+  if (typeof beta === 'string') {
+    const kept = beta.split(',').map(s => s.trim()).filter(s => s && !s.startsWith('fast-mode'));
+    if (kept.length) headers['anthropic-beta'] = kept.join(',');
+    else delete headers['anthropic-beta'];
+  }
+
+  console.log('[TeamClaude] Stripped fast mode (speed:"fast") — unavailable on subscription seats (usage-credit only); downgrading to standard Opus');
+  const newBody = Buffer.from(JSON.stringify(parsed));
+  // The body shrank — re-sync content-length or undici aborts the forwarded
+  // request with UND_ERR_REQ_CONTENT_LENGTH_MISMATCH.
+  if ('content-length' in headers) headers['content-length'] = String(newBody.length);
+  return newBody;
+}
+
 async function readBody(req) {
   const chunks = [];
   for await (const c of req) chunks.push(c);
@@ -216,7 +255,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
       for await (const chunk of req) {
         bodyChunks.push(chunk);
       }
-      const body = Buffer.concat(bodyChunks);
+      // Strip fast mode before forwarding — it always 429s on subscription seats
+      // and would otherwise rate-limit every account (see stripFastMode).
+      const body = stripFastMode(Buffer.concat(bodyChunks), req.headers);
 
       const ctx = { account: null, status: null };
       try {
@@ -409,14 +450,26 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // client's own timeout, which surfaces as an "API timeout" in Claude Code.
     if (upstreamRes.status === 429) {
       const retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10) || 60;
-      // Discard the 429 response body
-      await upstreamRes.body?.cancel();
+      // Read (don't discard) the 429 body so the *reason* is diagnosable. A
+      // priority-pool/fast 429 is byte-identical to a quota 429 at the status
+      // line; silently dropping the body is what made the fast-mode outage hard
+      // to debug. Reading also drains the stream and frees the connection.
+      let reason = '';
+      try {
+        const txt = await upstreamRes.text();
+        try {
+          const j = JSON.parse(txt);
+          reason = j?.error?.message || j?.error?.type || '';
+        } catch {
+          reason = txt.slice(0, 200);
+        }
+      } catch { /* body already aborted/consumed */ }
 
       if (logDir) {
-        logSections.push(`=== RESPONSE 429 — account "${account.name}" rate limited ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
+        logSections.push(`=== RESPONSE 429 — account "${account.name}" rate limited ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}${reason ? `\n${reason}` : ''}`);
         writeRequestLog(logDir, reqId, logSections);
       }
-      console.log(`[TeamClaude] 429 on "${account.name}" — rate limited ${retryAfter}s, rotating to next account`);
+      console.log(`[TeamClaude] 429 on "${account.name}" — rate limited ${retryAfter}s, rotating to next account${reason ? ` (${reason})` : ''}`);
       accountManager.markRateLimited(account.index, retryAfter);
 
       // Retry on the next available account. getActiveAccount() skips the account

@@ -40,6 +40,23 @@ function apiKeyManager() {
   return new AccountManager([{ name: 'test', type: 'apikey', apiKey: 'sk-test' }], 0.98);
 }
 
+// POST an arbitrary JSON body + headers to /v1/messages and resolve the response.
+function postJson(port, bodyObj, extraHeaders = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: '127.0.0.1', port, path: '/v1/messages', method: 'POST',
+        headers: { 'content-type': 'application/json', ...extraHeaders } },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString() }));
+      },
+    );
+    req.on('error', reject);
+    req.end(JSON.stringify(bodyObj));
+  });
+}
+
 test('transient upstream failure is retried, not dropped on the client', async (t) => {
   let hits = 0;
   const up = await listen((req, res) => {
@@ -129,4 +146,64 @@ test('429 on every account returns a clean 429 with retry-after, not a hang', { 
   assert.equal(result.status, 429, 'all accounts limited → 429 to client');
   assert.ok(result.headers['retry-after'], 'should tell the client how long to back off');
   assert.equal(JSON.parse(result.body).error.type, 'rate_limit_error');
+});
+
+// Fast mode (/fast) bills as usage credits, not subscription quota, so it 429s
+// on every account regardless of quota. Stripping it upstream stops one /fast
+// keystroke from rate-limiting the whole pool (see stripFastMode in server.js).
+test('fast mode (speed:"fast") is stripped before forwarding upstream', { timeout: 4000 }, async (t) => {
+  let received = null;
+  let receivedBeta;
+  const up = await listen((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      received = JSON.parse(Buffer.concat(chunks).toString());
+      receivedBeta = req.headers['anthropic-beta'];
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+  });
+
+  const proxy = createProxyServer(apiKeyManager(), { upstream: up.url, proxy: {} });
+  proxy.listen(0, '127.0.0.1');
+  await once(proxy, 'listening');
+  t.after(() => { proxy.close(); up.server.close(); });
+
+  const result = await postJson(
+    proxy.address().port,
+    { model: 'claude-opus-4-8', max_tokens: 1, messages: [], speed: 'fast' },
+    { 'anthropic-beta': 'oauth-2025-04-20,fast-mode-2026-02-01' },
+  );
+
+  assert.equal(result.status, 200, 'stripped request runs as standard Opus and succeeds');
+  assert.ok(received, 'upstream should have received the forwarded request');
+  assert.equal(received.speed, undefined, 'speed:"fast" must be stripped from the body');
+  assert.equal(received.model, 'claude-opus-4-8', 'the rest of the body is preserved');
+  assert.ok(!/fast-mode/.test(receivedBeta ?? ''), 'fast-mode beta token must be stripped');
+  assert.ok(/oauth-2025-04-20/.test(receivedBeta ?? ''), 'unrelated beta tokens must survive');
+});
+
+// A normal (non-fast) request must pass through completely untouched.
+test('non-fast requests are forwarded unchanged', { timeout: 4000 }, async (t) => {
+  let received = null;
+  const up = await listen((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      received = JSON.parse(Buffer.concat(chunks).toString());
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+  });
+
+  const proxy = createProxyServer(apiKeyManager(), { upstream: up.url, proxy: {} });
+  proxy.listen(0, '127.0.0.1');
+  await once(proxy, 'listening');
+  t.after(() => { proxy.close(); up.server.close(); });
+
+  const result = await postJson(proxy.address().port, { model: 'claude-opus-4-8', max_tokens: 1, messages: [] });
+
+  assert.equal(result.status, 200);
+  assert.deepEqual(received, { model: 'claude-opus-4-8', max_tokens: 1, messages: [] });
 });

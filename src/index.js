@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, buildEnvExports } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
@@ -346,8 +346,13 @@ async function loginOAuthCommand() {
 
 async function envCommand() {
   const config = await loadOrCreateConfig();
-  console.log(`export ANTHROPIC_BASE_URL=http://localhost:${config.proxy.port}`);
-  console.log(`export ANTHROPIC_API_KEY=${config.proxy.apiKey}`);
+  // --host lets you point a remote machine at this proxy's LAN/Tailscale IP
+  // instead of the localhost default (which only works on the proxy host).
+  const host = argValue('--host');
+  const port = argValue('--port');
+  for (const line of buildEnvExports(config, { host: host || undefined, port: port || undefined })) {
+    console.log(line);
+  }
 }
 
 // ── run ─────────────────────────────────────────────────────
@@ -678,7 +683,7 @@ Commands:
   import              Import credentials from Claude Code
   login               OAuth login via browser
   login --api         Add an API key account
-  env                 Print env vars to use with Claude
+  env [--host H]      Print env vars to use with Claude (--host for remote machines)
   run [-- args...]    Run Claude Code through the proxy
   status              Show proxy & account status (live)
   switch <name>       Manually pin the active account
@@ -697,6 +702,9 @@ Options:
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
+  --host HOST         Host/IP for env output (env, default: localhost; use this
+                      machine's LAN/Tailscale IP for other computers)
+  --port PORT         Port for env output (env, default: configured proxy port)
 
 Config: ${getConfigPath()}
 `);

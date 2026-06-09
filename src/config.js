@@ -41,6 +41,22 @@ export async function loadOrCreateConfig() {
   return config;
 }
 
+/**
+ * Build the `export ...` lines a Claude Code client needs to talk to this proxy.
+ *
+ * Defaults to `localhost`, which only works ON the proxy machine. Pass a `host`
+ * (this machine's LAN or Tailscale IP) to produce output usable from another
+ * computer on the network — remote clients hit the non-localhost auth gate in
+ * server.js, so the API key line is required there, not optional.
+ */
+export function buildEnvExports(config, { host = 'localhost', port } = {}) {
+  const p = port ?? config.proxy.port;
+  return [
+    `export ANTHROPIC_BASE_URL=http://${host}:${p}`,
+    `export ANTHROPIC_API_KEY=${config.proxy.apiKey}`,
+  ];
+}
+
 export async function saveConfig(config) {
   const path = getConfigPath();
   await mkdir(dirname(path), { recursive: true });

@@ -77,21 +77,31 @@ export class AccountManager {
     return true;
   }
 
-  _isNearQuota(account) {
+  /**
+   * Clear any quota counters whose reset time has passed. Cheap and safe to
+   * call frequently (e.g. from the TUI render loop) — once a counter is cleared
+   * it stays null until the next upstream response repopulates it, so the
+   * "reset" log fires at most once per window.
+   * @returns {boolean} true if anything was cleared.
+   */
+  _clearExpiredQuotas(account) {
     const q = account.quota;
     const now = Date.now();
+    let changed = false;
 
     // Clear expired unified quotas
     if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
       console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
       q.unified5h = null;
       q.unified5hReset = null;
+      changed = true;
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
       console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
       q.unified7d = null;
       q.unified7dReset = null;
       q.unifiedStatus = null;
+      changed = true;
     }
 
     // Clear expired standard quotas
@@ -101,7 +111,28 @@ export class AccountManager {
       q.requestsRemaining = null;
       q.requestsLimit = null;
       q.resetsAt = null;
+      changed = true;
     }
+
+    return changed;
+  }
+
+  /**
+   * Clear expired quotas across all accounts. Called by the display so a window
+   * expiry (e.g. the 5-hour session quota) resets the view instantly rather
+   * than waiting for the next request.
+   */
+  refreshExpiredQuotas() {
+    let changed = false;
+    for (const account of this.accounts) {
+      if (this._clearExpiredQuotas(account)) changed = true;
+    }
+    return changed;
+  }
+
+  _isNearQuota(account) {
+    const q = account.quota;
+    this._clearExpiredQuotas(account);
 
     // Unified quotas (Claude Max) — utilization is already 0-1
     if (q.unified5h != null && q.unified5h >= this.switchThreshold) return true;
@@ -132,6 +163,9 @@ export class AccountManager {
 
     for (let i = 0; i < this.accounts.length; i++) {
       const account = this.accounts[i];
+      // _isAvailable filters out accounts at/above the switch threshold, so the
+      // soonest-expiring pick only ever lands on an account whose 5-hour quota
+      // is still below 98%.
       if (!this._isAvailable(account)) continue;
 
       // Unknown weekly reset sorts first so we fill it in.

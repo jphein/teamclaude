@@ -373,6 +373,21 @@ export class TUI {
 
   render() {
     if (!this.running) return;
+    // Guard against re-entry: clearing an expired quota logs, and _addLog calls
+    // render() again — without this the nested call would render twice.
+    if (this._rendering) return;
+    this._rendering = true;
+    try {
+      this._render();
+    } finally {
+      this._rendering = false;
+    }
+  }
+
+  _render() {
+    // Reset the display the instant a quota window (e.g. 5-hour session) expires,
+    // instead of waiting for the next request to clear it.
+    this.am.refreshExpiredQuotas();
     const W = process.stdout.columns || 80;
     const H = process.stdout.rows || 24;
 

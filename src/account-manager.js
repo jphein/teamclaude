@@ -115,17 +115,31 @@ export class AccountManager {
   }
 
   _selectNext() {
-    const startIndex = this.currentIndex;
+    // Among all available accounts, prefer the one with no known weekly limit
+    // first — using it lets us discover its quota. Otherwise prefer the account
+    // whose weekly limit expires the soonest: that quota is closest to
+    // refreshing, so spending it first preserves accounts whose weekly window
+    // resets further out.
+    let best = null;
+    let bestReset = Infinity;
 
-    for (let i = 1; i <= this.accounts.length; i++) {
-      const idx = (startIndex + i) % this.accounts.length;
-      const account = this.accounts[idx];
+    for (let i = 0; i < this.accounts.length; i++) {
+      const account = this.accounts[i];
+      if (i === this.currentIndex) continue;
+      if (!this._isAvailable(account)) continue;
 
-      if (this._isAvailable(account)) {
-        this.currentIndex = idx;
-        console.log(`[TeamClaude] Switched to account "${account.name}"`);
-        return account;
+      // Unknown weekly reset sorts first so we fill it in.
+      const weeklyReset = account.quota.unified7dReset || -Infinity;
+      if (weeklyReset < bestReset) {
+        bestReset = weeklyReset;
+        best = account;
       }
+    }
+
+    if (best) {
+      this.currentIndex = best.index;
+      console.log(`[TeamClaude] Switched to account "${best.name}"`);
+      return best;
     }
 
     // All accounts unavailable — find the one that resets soonest

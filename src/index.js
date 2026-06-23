@@ -455,12 +455,22 @@ async function loginOAuthCommand() {
 
 async function envCommand() {
   const config = await loadOrCreateConfig();
-  // --host lets you point a remote machine at this proxy's LAN/Tailscale IP
-  // instead of the localhost default (which only works on the proxy host).
   const host = argValue('--host');
   const port = argValue('--port');
-  for (const line of buildEnvExports(config, { host: host || undefined, port: port || undefined })) {
-    console.log(line);
+
+  if (args.includes('--mitm')) {
+    const p = port ?? config.proxy.port;
+    const h = host || '127.0.0.1';
+    const upHost = upstreamHost(config);
+    const { caPath } = await ensureCerts(upHost);
+    console.log(`export HTTPS_PROXY=http://${h}:${p}`);
+    console.log(`export HTTP_PROXY=http://${h}:${p}`);
+    console.log(`export NODE_EXTRA_CA_CERTS=${caPath}`);
+    console.log('unset ANTHROPIC_BASE_URL 2>/dev/null');
+  } else {
+    for (const line of buildEnvExports(config, { host: host || undefined, port: port || undefined })) {
+      console.log(line);
+    }
   }
 }
 

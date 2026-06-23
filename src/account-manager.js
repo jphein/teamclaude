@@ -1,4 +1,14 @@
 import { refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { sameIdentity } from './identity.js';
+
+// Quota fields that survive a restart: utilization levels and their reset
+// windows, learned passively from upstream responses. Transient/derived state
+// (probing, requalify, rateLimitedUntil) is intentionally excluded.
+const PERSISTED_QUOTA_FIELDS = [
+  'unified5h', 'unified7d', 'unified7dSonnet',
+  'unified5hReset', 'unified7dReset', 'unified7dSonnetReset', 'unifiedStatus',
+  'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
+];
 
 function emptyQuota() {
   return {
@@ -8,11 +18,13 @@ function emptyQuota() {
     requestsLimit: null,
     requestsRemaining: null,
     // Unified rate limits (Claude Max accounts)
-    unified5h: null,       // utilization 0-1
-    unified7d: null,       // utilization 0-1
-    unified5hReset: null,  // ms timestamp
-    unified7dReset: null,  // ms timestamp
-    unifiedStatus: null,   // allowed | allowed_warning | rejected
+    unified5h: null,            // utilization 0-1
+    unified7d: null,            // utilization 0-1
+    unified7dSonnet: null,      // utilization 0-1 (Sonnet-specific weekly bucket)
+    unified5hReset: null,       // ms timestamp
+    unified7dReset: null,       // ms timestamp
+    unified7dSonnetReset: null, // ms timestamp
+    unifiedStatus: null,        // allowed | allowed_warning | rejected
     resetsAt: null,
   };
 }
@@ -24,10 +36,17 @@ export class AccountManager {
       name: acct.name,
       type: acct.type,
       accountUuid: acct.accountUuid || null,
+      orgUuid: acct.orgUuid || null,
+      orgName: acct.orgName || null,
+      priority: acct.priority || 0,
+      disabled: acct.disabled || false,
       credential: acct.accessToken || acct.apiKey,
       refreshToken: acct.refreshToken || null,
       expiresAt: acct.expiresAt || null,
       status: 'active',
+      // No quota is known at startup, so start probing: the first response for
+      // an account reveals its weekly limit and triggers re-evaluation.
+      probing: true,
       quota: emptyQuota(),
       usage: {
         totalInputTokens: 0,
@@ -46,15 +65,35 @@ export class AccountManager {
    * Returns null if all accounts are exhausted.
    */
   getActiveAccount() {
+    // Clear expired quotas across all accounts and switch proactively if a
+    // session reset made a sooner-expiring account the better choice. This runs
+    // on every request so the behaviour holds without the TUI render loop.
+    this.refreshExpiredQuotas();
     const current = this.accounts[this.currentIndex];
+    // We just learned a probed account's weekly quota — re-evaluate which
+    // account is best now that its limit is known.
+    if (current && current.requalify) {
+      current.requalify = false;
+      const next = this._selectNext();
+      if (next) return next;
+    }
     if (this._isAvailable(current)) {
-      return current;
+      // A strictly higher-priority (lower value) available account preempts a
+      // healthy current one. Within the same priority tier we stay put, so the
+      // common case (all accounts at the default priority 0) is unchanged and
+      // never thrashes — preemption only triggers when priorities differ.
+      const betterExists = this.accounts.some(a =>
+        this._isAvailable(a) && (a.priority || 0) < (current.priority || 0));
+      return betterExists ? this._selectNext() : current;
     }
     return this._selectNext();
   }
 
   _isAvailable(account) {
     if (!account) return false;
+
+    // Manually disabled accounts are skipped entirely until re-enabled.
+    if (account.disabled) return false;
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
@@ -70,21 +109,38 @@ export class AccountManager {
     return true;
   }
 
-  _isNearQuota(account) {
+  /**
+   * Clear any quota counters whose reset time has passed. Cheap and safe to
+   * call frequently (e.g. from the TUI render loop) — once a counter is cleared
+   * it stays null until the next upstream response repopulates it, so the
+   * "reset" log fires at most once per window.
+   * @returns {{changed: boolean, session: boolean}} what was cleared.
+   */
+  _clearExpiredQuotas(account) {
     const q = account.quota;
     const now = Date.now();
+    let changed = false;
+    let session = false;
 
     // Clear expired unified quotas
     if (q.unified5h != null && q.unified5hReset && now >= q.unified5hReset) {
       console.log(`[TeamClaude] Account "${account.name}" session quota reset`);
       q.unified5h = null;
       q.unified5hReset = null;
+      changed = true;
+      session = true;
     }
     if (q.unified7d != null && q.unified7dReset && now >= q.unified7dReset) {
       console.log(`[TeamClaude] Account "${account.name}" weekly quota reset`);
       q.unified7d = null;
       q.unified7dReset = null;
       q.unifiedStatus = null;
+      changed = true;
+    }
+    if (q.unified7dSonnet != null && q.unified7dSonnetReset && now >= q.unified7dSonnetReset) {
+      q.unified7dSonnet = null;
+      q.unified7dSonnetReset = null;
+      changed = true;
     }
 
     // Clear expired standard quotas
@@ -94,7 +150,69 @@ export class AccountManager {
       q.requestsRemaining = null;
       q.requestsLimit = null;
       q.resetsAt = null;
+      changed = true;
     }
+
+    return { changed, session };
+  }
+
+  /**
+   * Clear expired quotas across all accounts. Called from the display loop and
+   * the request path so a window expiry (e.g. the 5-hour session quota) resets
+   * the view instantly rather than waiting for the next request.
+   *
+   * When an account's session quota resets, it may have become the better
+   * choice — switch to it if its weekly limit expires sooner than the current
+   * account's (and it still has weekly quota), so we spend the quota closest to
+   * refreshing first.
+   */
+  refreshExpiredQuotas() {
+    let changed = false;
+    const sessionReset = [];
+    for (const account of this.accounts) {
+      const r = this._clearExpiredQuotas(account);
+      if (r.changed) changed = true;
+      if (r.session) sessionReset.push(account);
+    }
+    if (sessionReset.length) this._switchOnSessionReset(sessionReset);
+    return changed;
+  }
+
+  /**
+   * Given accounts whose session quota just reset, switch to the one whose
+   * weekly limit expires soonest — but only if that is sooner than the current
+   * account's weekly limit and the account still has weekly quota to spend.
+   */
+  _switchOnSessionReset(candidates) {
+    const current = this.accounts[this.currentIndex];
+    // Need a known weekly reset on the current account to compare against;
+    // if it is unknown we are still probing it, so leave it alone.
+    if (!current || current.quota.unified7dReset == null) return;
+
+    let best = null;
+    let bestWeekly = current.quota.unified7dReset;
+    for (const acc of candidates) {
+      if (acc.index === this.currentIndex) continue;
+      if (!this._isAvailable(acc)) continue; // enough session & weekly quota left
+      // Don't demote to a lower-priority (higher value) account on a reset.
+      if ((acc.priority || 0) > (current.priority || 0)) continue;
+      const weekly = acc.quota.unified7dReset;
+      if (weekly == null) continue; // need a known weekly to compare
+      if (weekly < bestWeekly) {
+        bestWeekly = weekly;
+        best = acc;
+      }
+    }
+
+    if (best) {
+      this.currentIndex = best.index;
+      console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
+    }
+  }
+
+  _isNearQuota(account) {
+    const q = account.quota;
+    this._clearExpiredQuotas(account);
 
     // Unified quotas (Claude Max) — utilization is already 0-1
     if (q.unified5h != null && q.unified5h >= this.switchThreshold) return true;
@@ -114,18 +232,74 @@ export class AccountManager {
     return false;
   }
 
-  _selectNext() {
-    const startIndex = this.currentIndex;
+  /**
+   * Pick the best available account by selection order, WITHOUT mutating state:
+   *   1. lowest `priority` value (operator-controlled; default 0, lower = preferred)
+   *   2. then the account with no known weekly limit — using it lets us
+   *      discover its quota
+   *   3. then the account whose weekly limit expires soonest: that quota is
+   *      closest to refreshing, so spending it first preserves accounts whose
+   *      weekly window resets further out.
+   * With all priorities at the default 0, this reduces to the weekly-reset
+   * heuristic. Returns the account or null if none are available.
+   */
+  _pickBestAvailable() {
+    let best = null;
+    let bestPriority = Infinity;
+    let bestReset = Infinity;
 
-    for (let i = 1; i <= this.accounts.length; i++) {
-      const idx = (startIndex + i) % this.accounts.length;
-      const account = this.accounts[idx];
+    for (let i = 0; i < this.accounts.length; i++) {
+      const account = this.accounts[i];
+      // _isAvailable filters out accounts at/above the switch threshold, so the
+      // soonest-expiring pick only ever lands on an account whose 5-hour quota
+      // is still below 98%.
+      if (!this._isAvailable(account)) continue;
 
-      if (this._isAvailable(account)) {
-        this.currentIndex = idx;
-        console.log(`[TeamClaude] Switched to account "${account.name}"`);
-        return account;
+      const priority = account.priority || 0;
+      // Unknown weekly reset sorts first so we fill it in.
+      const weeklyReset = account.quota.unified7dReset || -Infinity;
+      if (priority < bestPriority ||
+          (priority === bestPriority && weeklyReset < bestReset)) {
+        bestPriority = priority;
+        bestReset = weeklyReset;
+        best = account;
       }
+    }
+    return best;
+  }
+
+  /**
+   * Select the active account up front (e.g. on daemon launch, once persisted
+   * quota has been restored) so we start on the highest-priority / soonest-
+   * resetting account instead of blindly on index 0. Mirrors rotation order.
+   * Returns the chosen account, or the existing current one if none are
+   * available (the server still starts; requests 429 until a window resets).
+   */
+  selectActiveAccount() {
+    this.refreshExpiredQuotas(); // drop any restored windows that already expired
+    const best = this._pickBestAvailable();
+    if (!best) return this.accounts[this.currentIndex] || null;
+    this.currentIndex = best.index;
+    best.probing = best.quota.unified7dReset == null;
+    const wk = best.quota.unified7d != null
+      ? `${(best.quota.unified7d * 100).toFixed(1)}% weekly used`
+      : 'weekly quota unknown';
+    console.log(`[TeamClaude] Starting on account "${best.name}" (priority ${best.priority || 0}, ${wk})`);
+    return best;
+  }
+
+  _selectNext() {
+    const best = this._pickBestAvailable();
+    if (best) {
+      const switched = best.index !== this.currentIndex;
+      this.currentIndex = best.index;
+      // If we switched to an account whose weekly quota is still unknown, flag
+      // it so we re-evaluate once that quota is learned (see updateQuota).
+      best.probing = best.quota.unified7dReset == null;
+      if (switched) {
+        console.log(`[TeamClaude] Switched to account "${best.name}"`);
+      }
+      return best;
     }
 
     // All accounts unavailable — find the one that resets soonest
@@ -173,6 +347,14 @@ export class AccountManager {
     if (r5h) account.quota.unified5hReset = parseInt(r5h, 10) * 1000;
     if (r7d) account.quota.unified7dReset = parseInt(r7d, 10) * 1000;
 
+    // We switched to this account to discover its weekly quota; now that we
+    // know it, flag for re-evaluation so selection can pick the best account.
+    if (account.probing && account.quota.unified7dReset != null) {
+      account.probing = false;
+      account.requalify = true;
+      console.log(`[TeamClaude] Learned weekly quota for "${account.name}", re-evaluating selection`);
+    }
+
     const uStatus = headers['anthropic-ratelimit-unified-status'];
     if (uStatus) account.quota.unifiedStatus = uStatus;
 
@@ -214,6 +396,53 @@ export class AccountManager {
     if (!account) return;
     if (inputTokens) account.usage.totalInputTokens += inputTokens;
     if (outputTokens) account.usage.totalOutputTokens += outputTokens;
+  }
+
+  /**
+   * Enable or disable an account. A disabled account is skipped by rotation
+   * until re-enabled. Re-enabling also clears a stuck 'error' state (and any
+   * lingering rate-limit hold) so the account is retried immediately.
+   */
+  setDisabled(accountIndex, disabled) {
+    const account = this.accounts[accountIndex];
+    if (!account) return;
+    account.disabled = disabled;
+    if (!disabled && account.status === 'error') {
+      account.status = 'active';
+      account.rateLimitedUntil = null;
+      console.log(`[TeamClaude] Account "${account.name}" re-enabled — clearing error state`);
+    }
+  }
+
+  /**
+   * Apply quota learned from the OAuth usage endpoint (the background probe).
+   * Updates utilization/reset for the 5h, 7d, and Sonnet-7d buckets WITHOUT
+   * touching usage counters — a probe is not real client traffic.
+   */
+  applyUsageData(accountIndex, usage) {
+    const account = this.accounts[accountIndex];
+    if (!account || !usage) return;
+    const q = account.quota;
+
+    if (usage.fiveHour) {
+      if (usage.fiveHour.utilization != null) q.unified5h = usage.fiveHour.utilization;
+      if (usage.fiveHour.resetAt != null) q.unified5hReset = usage.fiveHour.resetAt;
+    }
+    if (usage.sevenDay) {
+      if (usage.sevenDay.utilization != null) q.unified7d = usage.sevenDay.utilization;
+      if (usage.sevenDay.resetAt != null) q.unified7dReset = usage.sevenDay.resetAt;
+    }
+    if (usage.sevenDaySonnet) {
+      if (usage.sevenDaySonnet.utilization != null) q.unified7dSonnet = usage.sevenDaySonnet.utilization;
+      if (usage.sevenDaySonnet.resetAt != null) q.unified7dSonnetReset = usage.sevenDaySonnet.resetAt;
+    }
+
+    // If we just learned this account's weekly window while probing, re-evaluate
+    // selection (same path as learning it from a live response).
+    if (account.probing && q.unified7dReset != null) {
+      account.probing = false;
+      account.requalify = true;
+    }
   }
 
   /**
@@ -301,10 +530,16 @@ export class AccountManager {
       name: acctData.name,
       type: acctData.type,
       accountUuid: acctData.accountUuid || null,
+      orgUuid: acctData.orgUuid || null,
+      orgName: acctData.orgName || null,
+      priority: acctData.priority || 0,
+      disabled: acctData.disabled || false,
       credential: acctData.accessToken || acctData.apiKey,
       refreshToken: acctData.refreshToken || null,
       expiresAt: acctData.expiresAt || null,
       status: 'active',
+      // Unknown quota until the first response — probe it like startup accounts.
+      probing: true,
       quota: emptyQuota(),
       usage: { totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastUsed: null },
       rateLimitedUntil: null,
@@ -327,6 +562,36 @@ export class AccountManager {
   }
 
   /**
+   * Serialize persistable quota state for all accounts (no credentials), keyed
+   * by account identity so it can be matched back after a restart.
+   */
+  exportQuotaState() {
+    return this.accounts.map(a => {
+      const quota = {};
+      for (const f of PERSISTED_QUOTA_FIELDS) quota[f] = a.quota[f];
+      return { accountUuid: a.accountUuid, orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, quota };
+    });
+  }
+
+  /**
+   * Restore quota learned in a previous run. Matches saved entries to accounts
+   * by identity. Stale windows are not special-cased here — _clearExpiredQuotas
+   * wipes any restored window whose reset time has already passed on first use.
+   */
+  restoreQuotaState(saved) {
+    if (!Array.isArray(saved)) return;
+    for (const account of this.accounts) {
+      const match = saved.find(s => sameIdentity(s, account));
+      if (!match || !match.quota) continue;
+      for (const f of PERSISTED_QUOTA_FIELDS) {
+        if (match.quota[f] != null) account.quota[f] = match.quota[f];
+      }
+      // We already know this account's weekly window, so it isn't "probing".
+      if (account.quota.unified7dReset != null) account.probing = false;
+    }
+  }
+
+  /**
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
   getStatus() {
@@ -336,6 +601,9 @@ export class AccountManager {
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,
+        orgName: a.orgName || null,
+        priority: a.priority || 0,
+        disabled: a.disabled || false,
         status: a.status,
         quota: { ...a.quota },
         usage: { ...a.usage },

@@ -9,6 +9,32 @@ export function getConfigPath() {
   return join(configDir, 'teamclaude.json');
 }
 
+/**
+ * Path to the runtime state file (a sibling of the config). This holds volatile
+ * data learned at runtime — e.g. quota utilization observed passively from
+ * traffic — kept out of the hand-editable config so config stays clean and
+ * isn't rewritten on every state save.
+ */
+export function getStatePath() {
+  const cfg = getConfigPath();
+  return cfg.endsWith('.json') ? cfg.replace(/\.json$/, '.state.json') : cfg + '.state';
+}
+
+export async function loadState() {
+  try {
+    return JSON.parse(await readFile(getStatePath(), 'utf-8'));
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+export async function saveState(state) {
+  const path = getStatePath();
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 });
+}
+
 export function createDefaultConfig() {
   return {
     proxy: {

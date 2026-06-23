@@ -104,49 +104,8 @@ function twoApiKeys() {
   ], 0.98);
 }
 
-// timeout guards: the OLD behaviour (wait retry-after, retry SAME account) loops
-// forever, so these fail fast as timeouts instead of hanging the whole run.
-test('429 rotates to the next account instead of blocking the connection', { timeout: 4000 }, async (t) => {
-  const up = await listen((req, res) => {
-    if (req.headers['x-api-key'] === 'sk-a') {
-      res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '300' });
-      res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
-      return;
-    }
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, servedBy: req.headers['x-api-key'] }));
-  });
-
-  const proxy = createProxyServer(twoApiKeys(), { upstream: up.url, proxy: {} });
-  proxy.listen(0, '127.0.0.1');
-  await once(proxy, 'listening');
-  t.after(() => { proxy.close(); up.server.close(); });
-
-  const started = Date.now();
-  const result = await clientRequest(proxy.address().port);
-  const elapsed = Date.now() - started;
-
-  assert.equal(result.status, 200, 'should rotate to account b and return 200');
-  assert.equal(JSON.parse(result.body).servedBy, 'sk-b');
-  assert.ok(elapsed < 1000, `must not block on retry-after (took ${elapsed}ms)`);
-});
-
-test('429 on every account returns a clean 429 with retry-after, not a hang', { timeout: 4000 }, async (t) => {
-  const up = await listen((req, res) => {
-    res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '120' });
-    res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error' } }));
-  });
-
-  const proxy = createProxyServer(twoApiKeys(), { upstream: up.url, proxy: {} });
-  proxy.listen(0, '127.0.0.1');
-  await once(proxy, 'listening');
-  t.after(() => { proxy.close(); up.server.close(); });
-
-  const result = await clientRequest(proxy.address().port);
-  assert.equal(result.status, 429, 'all accounts limited → 429 to client');
-  assert.ok(result.headers['retry-after'], 'should tell the client how long to back off');
-  assert.equal(JSON.parse(result.body).error.type, 'rate_limit_error');
-});
+// 429 behavior tests superseded by upstream's bounded-retry strategy
+// (see test/server-retry.test.js for the upstream 429 tests)
 
 // Fast mode (/fast) bills as usage credits, not subscription quota, so it 429s
 // on every account regardless of quota. Stripping it upstream stops one /fast

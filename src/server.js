@@ -1,8 +1,13 @@
 import http from 'node:http';
-import { writeFile, mkdir, readFile } from 'node:fs/promises';
+import { createWriteStream } from 'node:fs';
+import { mkdir, readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
+import { ensureCerts, createConnectHandler } from './mitm.js';
+import { patchAccountUuid } from './account-uuid-rewrite.js';
+import { BodyWriter } from './request-log.js';
+import { upstreamFetch } from './upstream-fetch.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -61,7 +66,7 @@ function json(res, status, payload) {
   res.end(JSON.stringify(payload));
 }
 
-export function createProxyServer(accountManager, config, hooks = {}) {
+export function createProxyServer(accountManager, config, hooks = {}, sx = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
@@ -87,10 +92,12 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     }
   }
 
-  // Wrap external hooks to also drive the activity feed
+  // Wrap external hooks to also drive the activity feed. Spread the originals
+  // first so non-instrumented hooks (persistThreshold, onManualSwitch, reload)
+  // pass straight through; only the three request-lifecycle hooks are overridden.
   const _hooks = hooks;
   hooks = {
-    persistThreshold: _hooks.persistThreshold,
+    ..._hooks,
     onRequestStart(id, info) {
       _hooks.onRequestStart?.(id, info);
       reqStartTimes.set(id, Date.now());
@@ -108,9 +115,9 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     },
   };
 
-  const server = http.createServer(async (req, res) => {
+  const requestHandler = async (req, res) => {
     try {
-      // Auth check — skip for localhost connections
+      // Auth check — skip for localhost connections.
       const clientKey = req.headers['x-api-key'];
       const remoteAddr = req.socket.remoteAddress;
       const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
@@ -238,11 +245,31 @@ export function createProxyServer(accountManager, config, hooks = {}) {
         return;
       }
 
+      // Reload endpoint — re-sync accounts from config without a restart. This
+      // is the headless equivalent of pressing 'R' in the TUI. Local control
+      // only (no upstream calls); the auth gate above already applies.
+      if (req.method === 'POST' && req.url === '/teamclaude/reload') {
+        if (!hooks.reload) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'reload not supported' }));
+          return;
+        }
+        try {
+          const added = await hooks.reload();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, added: added || 0 }));
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+        return;
+      }
+
       // Let client token refresh requests pass through to upstream untouched.
       // The proxy manages its own tokens via ensureTokenFresh(); intercepting
       // or rewriting client refreshes would cause token rotation conflicts.
       if (req.method === 'POST' && req.url === '/v1/oauth/token') {
-        await relayRaw(req, res, upstream);
+        await relayRaw(req, res, upstream, sx);
         return;
       }
 
@@ -261,7 +288,7 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
       const ctx = { account: null, status: null };
       try {
-        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir);
+        await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
         ctx.status = ctx.status || 502;
         console.error('[TeamClaude] Unhandled error:', err);
@@ -281,6 +308,36 @@ export function createProxyServer(accountManager, config, hooks = {}) {
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
     }
+  };
+
+  const server = http.createServer(requestHandler);
+
+  // Forward-proxy support (always on, so multiple claude instances can use
+  // either ANTHROPIC_BASE_URL or HTTPS_PROXY against the same server). A CONNECT
+  // to the upstream host is a transparent MITM relay (rewrite only auth); the
+  // test host is answered locally; anything else is blind-tunneled. Certs are
+  // minted lazily on the first intercepted CONNECT.
+  const mitmHost = (() => { try { return new URL(upstream).hostname; } catch { return 'api.anthropic.com'; } })();
+  let certsPromise = null;
+  const ensureLeaf = async () => {
+    certsPromise ||= ensureCerts(mitmHost);
+    const c = await certsPromise;
+    return { key: c.leafKeyPem, cert: c.leafCertPem };
+  };
+  const connectHandler = createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx });
+  server.on('connect', (req, clientSocket, head) => {
+    const ra = clientSocket.remoteAddress;
+    const isLocal = ra === '127.0.0.1' || ra === '::1' || ra === '::ffff:127.0.0.1';
+    if (proxyApiKey && !isLocal) {
+      const m = /^Basic\s+(.+)$/i.exec(req.headers['proxy-authorization'] || '');
+      const provided = m ? Buffer.from(m[1], 'base64').toString().split(':').pop() : null;
+      if (provided !== proxyApiKey) {
+        clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="teamclaude"\r\n\r\n');
+        clientSocket.destroy();
+        return;
+      }
+    }
+    connectHandler(req, clientSocket, head);
   });
 
   return server;
@@ -289,13 +346,13 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 /**
  * Relay a request to upstream with no header rewriting — pure passthrough.
  */
-async function relayRaw(req, res, upstream) {
+async function relayRaw(req, res, upstream, sx) {
   const bodyChunks = [];
   for await (const chunk of req) bodyChunks.push(chunk);
   const body = Buffer.concat(bodyChunks);
 
   try {
-    const upstreamRes = await fetch(`${upstream}${req.url}`, {
+    const upstreamRes = await upstreamFetch(`${upstream}${req.url}`, {
       method: req.method,
       headers: {
         'content-type': req.headers['content-type'] || 'application/json',
@@ -303,7 +360,7 @@ async function relayRaw(req, res, upstream) {
         'user-agent': req.headers['user-agent'] || 'node',
       },
       body: body.length > 0 ? body : undefined,
-    });
+    }, sx, sx?.useByDefault());
 
     const responseBody = await upstreamRes.text();
     const responseHeaders = {};
@@ -329,15 +386,28 @@ function logTimestamp() {
   return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
 }
 
-async function writeRequestLog(logDir, reqId, sections) {
-  if (!logDir) return;
-  const ts = logTimestamp();
-  const filename = `${ts}_${String(reqId).padStart(5, '0')}.log`;
-  try {
-    await writeFile(join(logDir, filename), sections.join('\n\n'), 'utf-8');
-  } catch (err) {
-    console.error(`[TeamClaude] Failed to write log: ${err.message}`);
-  }
+// A per-request log that streams to disk as the request/response flow, instead
+// of buffering the whole body in memory and writing once at the end. The file
+// is opened on first write; header sections are written verbatim and bodies are
+// streamed through BodyWriter (JSON pretty-printed on the fly, SSE/other raw),
+// so even a ~1M-token response costs only the current chunk.
+function openRequestLog(logDir, reqId) {
+  const filename = `${logTimestamp()}_${String(reqId).padStart(5, '0')}.log`;
+  const ws = createWriteStream(join(logDir, filename), { flags: 'a' });
+  ws.on('error', (err) => console.error(`[TeamClaude] Failed to write log: ${err.message}`));
+  let ended = false;
+  const write = (s) => { if (!ended && s) ws.write(Buffer.from(String(s), 'latin1')); };
+  return {
+    write,
+    // Stream a complete body buffer under a section header.
+    body(label, buf, contentType) {
+      if (!buf || !buf.length) { write(`\n\n=== ${label} ===\n(empty)`); return; }
+      new BodyWriter(write, label, contentType || '').chunk(buf);
+    },
+    // A BodyWriter to append chunks incrementally (e.g. an SSE response).
+    bodyWriter(label, contentType) { return new BodyWriter(write, label, contentType || ''); },
+    end() { if (!ended) { ended = true; ws.end('\n'); } },
+  };
 }
 
 function formatHeaders(headers) {
@@ -347,8 +417,11 @@ function formatHeaders(headers) {
   return Object.entries(headers).map(([k, v]) => `  ${k}: ${v}`).join('\n');
 }
 
-async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir) {
+async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
+  // Whether THIS attempt dials via sx.org. Undefined on the first call → derive
+  // from the default policy ('always' routes; 'off'/'429' start direct).
+  const route = useSx === undefined ? !!(sx?.useByDefault()) : useSx;
 
   // Select account
   const account = accountManager.getActiveAccount();
@@ -378,7 +451,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   // Refresh OAuth token if needed
   await accountManager.ensureTokenFresh(account.index);
   if (account.status === 'error' && retryCount < maxRetries) {
-    return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+    return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
   }
 
   // Build upstream request headers
@@ -403,36 +476,34 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
   const upstreamUrl = `${upstream}${req.url}`;
   const method = req.method;
 
-  // Build log sections
-  const logSections = [];
-  if (logDir) {
+  // Align the body's account_uuid (in metadata.user_id) with the account whose
+  // token we're injecting (same-length patch; no-op if absent).
+  const sendBody = account.accountUuid ? patchAccountUuid(body, account.accountUuid) : body;
+
+  // Streaming request log, opened lazily on the first terminal outcome (a
+  // pure-429-then-retry attempt writes no file, matching prior behavior). The
+  // request head+body are written once, just before the response is logged.
+  let log = null;
+  let reqLogged = false;
+  const getLog = () => (logDir ? (log ||= openRequestLog(logDir, reqId)) : null);
+  const logRequestHead = () => {
+    const l = getLog();
+    if (!l || reqLogged) return;
+    reqLogged = true;
     const safeHeaders = { ...headers };
-    // Mask credentials in logs
-    if (safeHeaders['x-api-key']) {
-      safeHeaders['x-api-key'] = safeHeaders['x-api-key'].slice(0, 15) + '...';
-    }
-    if (safeHeaders['authorization']) {
-      safeHeaders['authorization'] = safeHeaders['authorization'].slice(0, 20) + '...';
-    }
-    logSections.push(
-      `=== REQUEST (account: ${account.name}, retry: ${retryCount}) ===\n${method} ${upstreamUrl}\n${formatHeaders(safeHeaders)}`,
-    );
-    if (body.length > 0) {
-      try {
-        logSections.push(`=== REQUEST BODY ===\n${JSON.stringify(JSON.parse(body.toString()), null, 2)}`);
-      } catch {
-        logSections.push(`=== REQUEST BODY (${body.length} bytes) ===\n${body.toString().slice(0, 4096)}`);
-      }
-    }
-  }
+    if (safeHeaders['x-api-key']) safeHeaders['x-api-key'] = safeHeaders['x-api-key'].slice(0, 15) + '...';
+    if (safeHeaders['authorization']) safeHeaders['authorization'] = safeHeaders['authorization'].slice(0, 20) + '...';
+    l.write(`=== REQUEST (account: ${account.name}, retry: ${retryCount}) ===\n${method} ${upstreamUrl}\n${formatHeaders(safeHeaders)}`);
+    if (body.length > 0) l.body('REQUEST BODY', body, req.headers['content-type']);
+  };
 
   try {
-    const upstreamRes = await fetch(upstreamUrl, {
+    const upstreamRes = await upstreamFetch(upstreamUrl, {
       method,
       headers,
-      body: ['GET', 'HEAD'].includes(method) ? undefined : body,
+      body: ['GET', 'HEAD'].includes(method) ? undefined : sendBody,
       redirect: 'manual',
-    });
+    }, sx, route);
 
     // Extract rate limit headers
     const rateLimitHeaders = {};
@@ -443,58 +514,52 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
 
-    // On 429 this account is rate limited. Mark it so rotation skips it until it
-    // resets, then retry on the NEXT account — that's the entire point of a
-    // multi-account proxy. We must NOT block the client's open connection waiting
-    // for retry-after: those windows can be minutes-to-hours, far past the
-    // client's own timeout, which surfaces as an "API timeout" in Claude Code.
+    // On 429, wait the retry-after duration and retry on the same account
+    // (this is a transient rate limit, not quota exhaustion).
     if (upstreamRes.status === 429) {
-      const retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10) || 60;
-      // Read (don't discard) the 429 body so the *reason* is diagnosable. A
-      // priority-pool/fast 429 is byte-identical to a quota 429 at the status
-      // line; silently dropping the body is what made the fast-mode outage hard
-      // to debug. Reading also drains the stream and frees the connection.
-      let reason = '';
-      try {
-        const txt = await upstreamRes.text();
-        try {
-          const j = JSON.parse(txt);
-          reason = j?.error?.message || j?.error?.type || '';
-        } catch {
-          reason = txt.slice(0, 200);
-        }
-      } catch { /* body already aborted/consumed */ }
+      // Clamp Retry-After to a sane window: missing/invalid falls back to 60s,
+      // and out-of-range values are bounded to [1, 300]. A negative value would
+      // otherwise bypass the retry cap — setTimeout returns immediately and
+      // markRateLimited would set rateLimitedUntil in the past.
+      let retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10);
+      if (Number.isNaN(retryAfter)) retryAfter = 60;
+      retryAfter = Math.min(Math.max(retryAfter, 1), 300);
+      // Discard the 429 response body
+      await upstreamRes.body?.cancel();
 
-      if (logDir) {
-        logSections.push(`=== RESPONSE 429 — account "${account.name}" rate limited ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}${reason ? `\n${reason}` : ''}`);
-        writeRequestLog(logDir, reqId, logSections);
-      }
-      console.log(`[TeamClaude] 429 on "${account.name}" — rate limited ${retryAfter}s, rotating to next account${reason ? ` (${reason})` : ''}`);
-      accountManager.markRateLimited(account.index, retryAfter);
+      // sx.org failover: 429s are IP-based, so retry via the proxy's egress IP.
+      // 'always' is already on sx; '429' switches direct→sx now and skips the
+      // wait (a fresh IP isn't throttled). Also arm the sticky window for MITM.
+      const nextUseSx = !!(sx?.useOn429());
+      const switchingToSx = nextUseSx && !route;
+      sx?.noteRateLimited(retryAfter);
 
-      // Retry on the next available account. getActiveAccount() skips the account
-      // we just throttled; if every account is limited it returns null and the
-      // top-of-function guard responds with a 429 + retry-after for the client.
-      if (retryCount < maxRetries && !res.headersSent && !res.destroyed) {
-        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      // Bound the retries: a persistently-throttled upstream must not loop
+      // forever (that would tie up the client connection indefinitely).
+      // Once retries are exhausted, throttle this account and re-dispatch —
+      // getActiveAccount then picks another account, or returns 429 to the
+      // client if every account is throttled.
+      if (retryCount >= maxRetries) {
+        console.log(`[TeamClaude] Persistent 429 on "${account.name}" — throttling ${retryAfter}s and re-dispatching`);
+        accountManager.markRateLimited(account.index, retryAfter);
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
 
-      // Retries exhausted with everything limited — tell the client how long to wait.
-      ctx.status = 429;
-      if (!res.headersSent) {
-        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: { type: 'rate_limit_error', message: `All accounts rate limited. Retry in ${retryAfter}s.` },
-        }));
+      if (switchingToSx) {
+        console.log(`[TeamClaude] 429 on "${account.name}" — retrying via sx.org (fresh egress IP)`);
+      } else {
+        console.log(`[TeamClaude] 429 on "${account.name}" — waiting ${retryAfter}s before retry`);
+        await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
       }
-      return;
+      // Client may have disconnected during the wait
+      if (res.destroyed) return;
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
     }
 
-    // Log response headers
-    if (logDir) {
-      logSections.push(`=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers)}`);
-    }
+    // Log the request head (once) followed by the response headers, streaming
+    // to disk from here on.
+    logRequestHead();
+    getLog()?.write(`\n\n=== RESPONSE ${upstreamRes.status} ===\n${formatHeaders(upstreamRes.headers)}`);
 
     ctx.status = upstreamRes.status;
 
@@ -510,34 +575,27 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     res.writeHead(upstreamRes.status, responseHeaders);
 
     if (!upstreamRes.body) {
-      if (logDir) {
-        logSections.push(`=== RESPONSE BODY ===\n(empty)`);
-        writeRequestLog(logDir, reqId, logSections);
-      }
+      const l = getLog();
+      if (l) { l.write('\n\n=== RESPONSE BODY ===\n(empty)'); l.end(); }
       res.end();
       return;
     }
 
-    const isStreaming = (upstreamRes.headers.get('content-type') || '').includes('text/event-stream');
+    const contentType = upstreamRes.headers.get('content-type') || '';
+    const isStreaming = contentType.includes('text/event-stream');
 
     if (isStreaming) {
-      const streamLog = logDir ? [] : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, streamLog);
-      if (logDir) {
-        logSections.push(`=== RESPONSE BODY (streamed) ===\n${streamLog.join('')}`);
-        writeRequestLog(logDir, reqId, logSections);
-      }
+      // Stream each chunk straight to the log as it is relayed — never hold the
+      // whole (potentially ~1M-token) SSE body in memory.
+      const l = getLog();
+      const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
+      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw);
+      l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
       extractUsageFromBody(buf, account.index, accountManager);
-      if (logDir) {
-        try {
-          logSections.push(`=== RESPONSE BODY ===\n${JSON.stringify(JSON.parse(buf.toString()), null, 2)}`);
-        } catch {
-          logSections.push(`=== RESPONSE BODY (${buf.length} bytes) ===\n${buf.toString().slice(0, 8192)}`);
-        }
-        writeRequestLog(logDir, reqId, logSections);
-      }
+      const l = getLog();
+      if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
     }
   } catch (err) {
@@ -547,11 +605,9 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const causeStr = cause ? (cause.code || cause.message || String(cause)) : '';
     console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, err.message, causeStr ? `(${causeStr})` : '');
 
-    if (logDir) {
-      const detail = cause ? `\nCause: ${cause.stack || causeStr}` : '';
-      logSections.push(`=== ERROR ===\n${err.stack || err.message}${detail}`);
-      writeRequestLog(logDir, reqId, logSections);
-    }
+    logRequestHead();
+    const l = getLog();
+    if (l) { l.write(`\n\n=== ERROR ===\n${err.stack || err.message}`); l.end(); }
 
     // The network-level error code lives on err.cause.code for fetch() failures,
     // not on err.code — check both.
@@ -587,7 +643,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // the next account.
     if (!isTransient && retryCount < maxRetries) {
       account.status = 'error';
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
     // Retries exhausted — return a clean, retryable error. Never destroy the
@@ -604,7 +660,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, streamLog) {
+async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter) {
   const reader = webStream.getReader();
   const decoder = new TextDecoder();
   let sseBuffer = '';
@@ -620,10 +676,10 @@ async function streamResponse(webStream, res, accountIndex, accountManager, stre
       // Forward chunk immediately
       const ok = res.write(value);
 
-      const text = decoder.decode(value, { stream: true });
+      // Append to the log as it streams (no whole-body buffering)
+      if (bodyWriter) bodyWriter.chunk(Buffer.from(value));
 
-      // Capture for logging
-      if (streamLog) streamLog.push(text);
+      const text = decoder.decode(value, { stream: true });
 
       // Parse SSE events for usage tracking
       sseBuffer += text;

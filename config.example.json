@@ -5,6 +5,7 @@
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
+  "quotaProbeSeconds": 0,
   "accounts": [
     {
       "name": "primary-max",
@@ -12,14 +13,20 @@
       "importFrom": "~/.claude/.credentials.json"
     },
     {
-      "name": "secondary-max",
+      "name": "user@example.com (Acme)",
       "type": "oauth",
+      "accountUuid": "optional-account-uuid",
+      "orgUuid": "optional-organization-uuid",
+      "orgName": "Acme",
+      "priority": 0,
       "accessToken": "sk-ant-oat01-your-access-token",
       "refreshToken": "sk-ant-ort01-your-refresh-token"
     },
     {
       "name": "api-fallback",
       "type": "apikey",
+      "priority": 10,
+      "disabled": false,
       "apiKey": "sk-ant-api03-your-api-key"
     }
   ]

@@ -24,6 +24,8 @@ export async function importCredentials(filePath) {
 }
 
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+const OAUTH_USAGE_BETA = 'oauth-2025-04-20';
 const DEFAULT_TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
 const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 
@@ -129,6 +131,7 @@ export async function fetchProfile(accessToken) {
       accountUuid: data.account?.uuid,
       email: data.account?.email,
       name: data.account?.display_name,
+      orgUuid: data.organization?.uuid,
       orgName: data.organization?.name,
       orgType: data.organization?.organization_type,
       hasClaudeMax: data.account?.has_claude_max,
@@ -136,6 +139,73 @@ export async function fetchProfile(accessToken) {
     };
   } catch (err) {
     return { error: err.message || String(err) };
+  }
+}
+
+// Normalize one usage bucket from the /api/oauth/usage payload into
+// { utilization: 0-1, resetAt: ms-epoch }. Tolerant of field-name and
+// percentage/fraction and seconds/ms variations across payload versions.
+export function normalizeUsageBucket(bucket) {
+  if (!bucket || typeof bucket !== 'object') return null;
+
+  const rawPct = bucket.used_percentage ?? bucket.utilization ?? bucket.usedPercentage;
+  const parsedPct = typeof rawPct === 'number' ? rawPct : parseFloat(rawPct);
+  const utilization = Number.isFinite(parsedPct)
+    ? (parsedPct > 1 ? parsedPct / 100 : parsedPct)
+    : null;
+
+  const rawReset = bucket.resets_at ?? bucket.resetsAt ?? bucket.reset_at ?? bucket.resetAt;
+  let resetAt = null;
+  if (typeof rawReset === 'number') {
+    resetAt = rawReset < 1e12 ? rawReset * 1000 : rawReset;
+  } else if (typeof rawReset === 'string') {
+    const asNum = Number(rawReset);
+    if (Number.isFinite(asNum) && rawReset.trim() !== '') {
+      resetAt = asNum < 1e12 ? asNum * 1000 : asNum;
+    } else {
+      const parsed = Date.parse(rawReset);
+      if (Number.isFinite(parsed)) resetAt = parsed;
+    }
+  }
+
+  return { utilization, resetAt };
+}
+
+/**
+ * Fetch OAuth subscription usage from the usage endpoint. This reports quota
+ * utilization WITHOUT spending message quota, which is what makes it safe to
+ * poll. Returns normalized { fiveHour, sevenDay, sevenDaySonnet } buckets, or
+ * { error, status } on failure.
+ */
+export async function fetchUsage(accessToken) {
+  try {
+    const res = await fetch(USAGE_URL, {
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'anthropic-beta': OAUTH_USAGE_BETA,
+        'Accept': 'application/json',
+      },
+    });
+
+    if (!res.ok) {
+      let detail = '';
+      try {
+        const body = await res.json();
+        detail = body?.error?.message || JSON.stringify(body).slice(0, 200);
+      } catch {
+        detail = await res.text().catch(() => '');
+      }
+      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status };
+    }
+
+    const data = await res.json();
+    return {
+      fiveHour: normalizeUsageBucket(data?.five_hour),
+      sevenDay: normalizeUsageBucket(data?.seven_day),
+      sevenDaySonnet: normalizeUsageBucket(data?.seven_day_sonnet),
+    };
+  } catch (err) {
+    return { error: err.message || String(err), status: null };
   }
 }
 

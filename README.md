@@ -1,8 +1,7 @@
-# TeamClaude
+# TeamClaude (fork)
 
-[![CI](https://github.com/KarpelesLab/teamclaude/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/teamclaude/actions/workflows/ci.yml)
-[![npm version](https://img.shields.io/npm/v/@karpeleslab/teamclaude.svg)](https://www.npmjs.com/package/@karpeleslab/teamclaude)
-[![node](https://img.shields.io/node/v/@karpeleslab/teamclaude.svg)](https://nodejs.org)
+> **Fork of [`KarpelesLab/teamclaude`](https://github.com/KarpelesLab/teamclaude)** with additional features: web dashboard with live activity feed, fast-mode stripping, `env --mitm` / `env --host` for flexible deployment, and resilient upstream error handling. Upstream changes are merged periodically.
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Multi-account Claude proxy with automatic quota-based rotation for [Claude Code](https://claude.ai/claude-code).
@@ -26,7 +25,10 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Optional quota probe** — off by default; when enabled, periodically refreshes idle accounts' quota from the usage endpoint (no message spend), and surfaces the Sonnet weekly bucket
 - **Optional MITM proxy mode** — `teamclaude run --mitm` routes claude via an HTTPS forward proxy with a local CA so even hardcoded `api.anthropic.com` endpoints (e.g. the Claude Design MCP) get the real token injected
 - **Optional sx.org proxy mode** — off by default; set an [sx.org](https://sx.org) API key in the TUI settings screen (`g`) and TeamClaude auto-provisions a residential proxy to change the egress IP and work around IP-based `429`s. Three modes (`m` to cycle): **always** (route all upstream traffic), **on 429 only** (stay direct, fail over to the proxy after a 429), or **off** (keep the key but don't use it). TLS stays end-to-end with Anthropic (the proxy only relays ciphertext)
+- **Web dashboard** — browser UI at `/ui` with quota bars, account switching, live activity feed, log viewer, and a restart button
+- **Fast-mode stripping** — silently removes Claude Code's `/fast` mode (`speed:"fast"`) before forwarding, since fast mode bills as usage credits (not covered by subscription) and would otherwise 429 every account in the pool
 - **Request logging** — optional full request/response logging for debugging
+- **Remote env generation** — `teamclaude env --host <ip> --port <port>` generates exports usable from other machines (with API-key auth for non-localhost)
 - **Zero dependencies** — uses only Node.js built-in modules
 
 ## Quick Start
@@ -34,8 +36,10 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 Requires Node.js 18+.
 
 ```bash
-# Install
+# Install globally (from npm or locally via npm link)
 npm install -g @karpeleslab/teamclaude
+# or from this fork:
+cd ~/Projects/teamclaude && npm link
 
 # Add your first account (opens browser for OAuth)
 teamclaude login
@@ -126,7 +130,19 @@ You usually don't need to call it directly: `teamclaude login`, `import`, `enabl
 | `r` | Remove an account |
 | `d` | Enable/disable an account |
 | `R` | Reload accounts from config |
+| `g` | Settings screen (threshold, probe interval, sx.org) |
 | `q` | Quit |
+
+**Settings screen** (`g`):
+
+| Key | Action |
+|-----|--------|
+| `t` | Edit rotation threshold |
+| `p` | Edit quota-probe interval |
+| `k` | Set sx.org API key |
+| `m` | Cycle sx.org mode (always / 429-only / off) |
+| `x` | Clear sx.org key |
+| `Esc` | Back to main screen |
 
 In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
 
@@ -141,8 +157,16 @@ teamclaude run
 Or manually set the environment:
 
 ```bash
-eval $(teamclaude env)
+eval $(teamclaude env)          # reverse-proxy mode (ANTHROPIC_BASE_URL)
+eval $(teamclaude env --mitm)   # MITM forward-proxy mode (HTTPS_PROXY + CA cert)
 claude
+```
+
+Generate env vars for a remote machine (non-localhost clients authenticate via the proxy API key):
+
+```bash
+teamclaude env --host 10.0.6.5 --port 3456         # reverse-proxy
+teamclaude env --host 10.0.6.5 --port 3456 --mitm   # MITM
 ```
 
 ### Routing plain `claude` automatically (alias)
@@ -162,6 +186,8 @@ This is an interactive-shell alias — it affects `claude` typed at a prompt, no
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude accounts -v       # Also show token expiry times
 teamclaude status            # Show live proxy status (requires running server)
+teamclaude switch <name>     # Manually pin the active account (live, hits running server)
+teamclaude threshold <val>   # Set rotation threshold (accepts 85, 85%, or 0.85; live)
 teamclaude remove <name>     # Remove an account (by name or email)
 teamclaude disable <name>    # Temporarily exclude an account from rotation
 teamclaude enable <name>     # Re-enable it (also clears a stuck error state)
@@ -177,6 +203,34 @@ When the same email belongs to multiple organizations, accounts are named
 bare email, e.g. `teamclaude remove user@example.com --org Acme`. Use
 `teamclaude priority <name> --first` / `--last` to move an account to the front
 or back of the rotation order.
+
+### Web dashboard
+
+The proxy serves a single-page dashboard at `http://localhost:3456/ui` with:
+
+- Per-account quota bars (session + weekly) with reset countdowns
+- Live activity feed (request lifecycle events via SSE)
+- Log viewer (streams `journalctl --user -u teamclaude.service`)
+- Account switching buttons
+- Editable rotation threshold
+- Restart service button
+
+Useful for at-a-glance monitoring without the TUI, or when accessing the proxy remotely.
+
+### HTTP endpoints
+
+All endpoints are on the proxy port (default 3456). Localhost connections skip auth; non-localhost requires the proxy API key via `x-api-key` header (reverse proxy) or `proxy-authorization: Basic` (CONNECT/MITM).
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/teamclaude/status` | JSON status (accounts, quota, active account) |
+| `POST` | `/teamclaude/switch` | Pin active account (`{"name": "..."}`) |
+| `POST` | `/teamclaude/threshold` | Set rotation threshold (`{"threshold": 0.85}`) |
+| `POST` | `/teamclaude/reload` | Hot-reload accounts from config |
+| `POST` | `/teamclaude/restart` | Restart the systemd user service |
+| `GET` | `/teamclaude/activity` | SSE stream of request lifecycle events (replays last 100) |
+| `GET` | `/teamclaude/logs` | SSE stream of journalctl output |
+| `GET` | `/ui` | Web dashboard |
 
 ### Request logging
 
@@ -303,6 +357,45 @@ TLS is established **end-to-end with `api.anthropic.com` over the tunnel**, so t
 
 > **Cost:** in **always** mode *all* Claude traffic flows through the residential proxy, which sx.org meters by bandwidth — expect real per-GB cost. **on 429 only** uses the proxy just when you're actually being throttled, so it's the cheaper way to ride out rate limits.
 
+## Deployment as a systemd service
+
+Run the proxy as a persistent user service (no root required):
+
+```bash
+# Create the service unit
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/teamclaude.service << 'EOF'
+[Unit]
+Description=TeamClaude — Multi-account Claude proxy with quota-based rotation
+Documentation=https://github.com/jphein/teamclaude
+
+[Service]
+Type=simple
+ExecStart=%h/.npm-global/bin/teamclaude server --headless
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+
+# Enable and start
+systemctl --user daemon-reload
+systemctl --user enable --now teamclaude
+
+# Check status / logs
+systemctl --user status teamclaude
+journalctl --user -u teamclaude -f
+```
+
+The web dashboard's restart button and `/teamclaude/restart` endpoint call `systemctl --user restart teamclaude.service`.
+
+### Fast-mode stripping
+
+Claude Code's `/fast` mode sets `"speed": "fast"` in the request body and a `fast-mode-*` token in the `anthropic-beta` header. Fast mode routes through a separate billing path that charges **usage credits**, not the subscription's included quota. On accounts without credits, every fast-mode request immediately 429s — and the proxy would misinterpret that as quota exhaustion, rotating through every account in the pool from a single keystroke.
+
+TeamClaude silently strips fast mode from all forwarded requests, downgrading to standard Opus. If `/fast` doesn't seem to work behind the proxy, this is why — and it's intentional.
+
 ## How It Works
 
 1. Claude Code connects to the local proxy instead of `api.anthropic.com`
@@ -317,12 +410,7 @@ TLS is established **end-to-end with `api.anthropic.com` over the tunnel**, so t
 
 ## Security
 
-The only canonical sources for TeamClaude are this repository
-(https://github.com/KarpelesLab/teamclaude) and the
-[`@karpeleslab/teamclaude`](https://www.npmjs.com/package/@karpeleslab/teamclaude)
-npm package. TeamClaude is **never** distributed as a downloadable binary
-archive — be wary of soft-forks that bundle a `.zip` and tell you to extract and
-run it. See [SECURITY.md](SECURITY.md) for details and how to report issues.
+This is a **fork** of [`KarpelesLab/teamclaude`](https://github.com/KarpelesLab/teamclaude). The upstream project and the [`@karpeleslab/teamclaude`](https://www.npmjs.com/package/@karpeleslab/teamclaude) npm package are the canonical sources. This fork is for personal use and is not published to npm. See upstream's [SECURITY.md](https://github.com/KarpelesLab/teamclaude/blob/master/SECURITY.md) for reporting vulnerabilities.
 
 ## License
 

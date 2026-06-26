@@ -465,6 +465,7 @@ async function envCommand() {
     const { caPath } = await ensureCerts(upHost);
     console.log(`export HTTPS_PROXY=http://${h}:${p}`);
     console.log(`export HTTP_PROXY=http://${h}:${p}`);
+    console.log(`export NO_PROXY=localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local`);
     console.log(`export NODE_EXTRA_CA_CERTS=${caPath}`);
     console.log('unset ANTHROPIC_BASE_URL 2>/dev/null');
   } else {
@@ -501,7 +502,7 @@ async function runCommand() {
       const { caPath } = await ensureCerts(host);
       const proxyUrl = `http://127.0.0.1:${port}`;
       env.HTTPS_PROXY = env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxyUrl;
-      env.NO_PROXY = env.no_proxy = ''; // ensure nothing (esp. the upstream host) bypasses us
+      env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local';
       env.NODE_EXTRA_CA_CERTS = caPath;
       delete env.ANTHROPIC_BASE_URL;
     } else {

@@ -265,6 +265,25 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         return;
       }
 
+      // Reject plain-HTTP proxy requests to non-upstream hosts. When HTTP_PROXY
+      // is set, clients may send absolute-URL requests (e.g. GET http://familiar:8085/...)
+      // for hosts that should have been excluded via NO_PROXY. Rather than forwarding
+      // these to the upstream API (which fails with ENOTFOUND or auth errors), return
+      // 502 with a clear message so the caller can fix NO_PROXY.
+      if (req.url.startsWith('http://') || req.url.startsWith('https://')) {
+        const target = new URL(req.url);
+        const upHost = new URL(upstream).hostname;
+        if (target.hostname !== upHost) {
+          console.error(`[TeamClaude] Rejected non-upstream proxy request: ${req.method} ${req.url} (add "${target.hostname}" to NO_PROXY)`);
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            type: 'error',
+            error: { type: 'proxy_error', message: `Not an upstream request — add "${target.hostname}" to NO_PROXY` },
+          }));
+          return;
+        }
+      }
+
       // Let client token refresh requests pass through to upstream untouched.
       // The proxy manages its own tokens via ensureTokenFresh(); intercepting
       // or rewriting client refreshes would cause token rotation conflicts.
@@ -636,7 +655,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       const delay = Math.min(200 * 2 ** retryCount, 2000);
       await new Promise(resolve => setTimeout(resolve, delay));
       if (res.destroyed) return;
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
     // Non-transient error: this account/credential may be bad — mark it and try

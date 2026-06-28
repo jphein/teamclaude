@@ -265,21 +265,29 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         return;
       }
 
-      // Reject plain-HTTP proxy requests to non-upstream hosts. When HTTP_PROXY
-      // is set, clients may send absolute-URL requests (e.g. GET http://familiar:8085/...)
-      // for hosts that should have been excluded via NO_PROXY. Rather than forwarding
-      // these to the upstream API (which fails with ENOTFOUND or auth errors), return
-      // 502 with a clear message so the caller can fix NO_PROXY.
+      // Plain-HTTP proxy requests to non-upstream hosts (e.g. GET http://familiar:8085/...).
+      // Subprocesses that inherit HTTP_PROXY may not respect NO_PROXY, so rather than
+      // rejecting these, forward them directly as a standard HTTP proxy would.
       if (req.url.startsWith('http://') || req.url.startsWith('https://')) {
         const target = new URL(req.url);
         const upHost = new URL(upstream).hostname;
         if (target.hostname !== upHost) {
-          console.error(`[TeamClaude] Rejected non-upstream proxy request: ${req.method} ${req.url} (add "${target.hostname}" to NO_PROXY)`);
-          res.writeHead(502, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            type: 'error',
-            error: { type: 'proxy_error', message: `Not an upstream request — add "${target.hostname}" to NO_PROXY` },
-          }));
+          const fwdHeaders = { ...req.headers };
+          delete fwdHeaders['proxy-authorization'];
+          delete fwdHeaders['proxy-connection'];
+          fwdHeaders.host = target.host;
+          const fwd = http.request(req.url, { method: req.method, headers: fwdHeaders }, (fwdRes) => {
+            res.writeHead(fwdRes.statusCode, fwdRes.headers);
+            fwdRes.pipe(res);
+          });
+          fwd.on('error', (err) => {
+            console.error(`[TeamClaude] Proxy passthrough failed: ${req.method} ${req.url}: ${err.message}`);
+            if (!res.headersSent) {
+              res.writeHead(502, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: err.message } }));
+            }
+          });
+          req.pipe(fwd);
           return;
         }
       }

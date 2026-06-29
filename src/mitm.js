@@ -205,11 +205,13 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
   // traffic — not just on disk.
   const tap = combineTaps(makeMitmTap(logDir, account.name), makeActivityTap(hooks, account.name));
 
+  const teardown = () => { claudeTls.destroy(); upstreamSock.destroy(); };
+
   if (alpn === 'h2') {
     h2Relay(claudeTls, upstreamSock, {
       rewriteRequest: makeRewriteRequest(account),
       makeBodyPatcher,
-      onResponseHeaders: makeQuotaObserver(accountManager, account, sx),
+      onResponseHeaders: makeQuotaObserver(accountManager, account, sx, teardown),
       tap,
       log,
     });
@@ -220,7 +222,7 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
     h1Relay(claudeTls, upstreamSock, {
       rewriteHead: (h) => rewriteH1Auth(h, auth),
       makeBodyPatcher,
-      onResponseHeaders: makeQuotaObserver(accountManager, account, sx),
+      onResponseHeaders: makeQuotaObserver(accountManager, account, sx, teardown),
       tap,
     });
   }
@@ -347,7 +349,7 @@ function makeRewriteRequest(account) {
   };
 }
 
-function makeQuotaObserver(accountManager, account, sx = null) {
+function makeQuotaObserver(accountManager, account, sx = null, teardown = null) {
   return (fields) => {
     const m = {};
     for (const f of fields) m[f.name.toString().toLowerCase()] = f.value.toString();
@@ -363,6 +365,9 @@ function makeQuotaObserver(accountManager, account, sx = null) {
       // Arm sx.org sticky routing so the next MITM tunnel uses the proxy (in
       // '429' mode); no-op in 'off'/'always'.
       sx?.noteRateLimited(ra);
+      // Tear down the MITM tunnel so the client reconnects and gets a fresh
+      // account — otherwise this tunnel stays pinned to the throttled account.
+      if (teardown) setTimeout(teardown, 500);
     }
   };
 }

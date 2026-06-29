@@ -350,6 +350,12 @@ function makeRewriteRequest(account) {
 }
 
 function makeQuotaObserver(accountManager, account, sx = null, teardown = null) {
+  let tornDown = false;
+  const scheduleTeardown = () => {
+    if (tornDown || !teardown) return;
+    tornDown = true;
+    setTimeout(teardown, 500);
+  };
   return (fields) => {
     const m = {};
     for (const f of fields) m[f.name.toString().toLowerCase()] = f.value.toString();
@@ -362,12 +368,19 @@ function makeQuotaObserver(accountManager, account, sx = null, teardown = null) 
       if (Number.isNaN(ra)) ra = 60;
       ra = Math.min(Math.max(ra, 1), 300);
       accountManager.markRateLimited(account.index, ra);
-      // Arm sx.org sticky routing so the next MITM tunnel uses the proxy (in
-      // '429' mode); no-op in 'off'/'always'.
       sx?.noteRateLimited(ra);
-      // Tear down the MITM tunnel so the client reconnects and gets a fresh
-      // account — otherwise this tunnel stays pinned to the throttled account.
-      if (teardown) setTimeout(teardown, 500);
+      scheduleTeardown();
+      return;
+    }
+    // Proactively tear down the tunnel when a better account is available —
+    // don't wait for a 429.  Only tear down if rotation would actually pick
+    // a DIFFERENT account (if all are exhausted, churning tunnels is pointless).
+    if (teardown && accountManager._isAvailable && !accountManager._isAvailable(account)) {
+      const better = accountManager._pickBestAvailable?.();
+      if (better && better.index !== account.index) {
+        console.log(`[TeamClaude] MITM tunnel for "${account.name}" is no longer the best account — tearing down`);
+        scheduleTeardown();
+      }
     }
   };
 }

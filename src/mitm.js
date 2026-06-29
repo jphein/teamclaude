@@ -111,6 +111,11 @@ export function hostMode(host, config) {
  * @param ensureLeaf async () => { key, cert }   // current leaf PEMs
  */
 export function createConnectHandler({ config, accountManager, ensureLeaf, upstreamTlsOptions = {}, logDir = null, hooks = {}, log = () => {}, sx = null }) {
+  // Registry of active MITM tunnels keyed by account index.  When any tunnel
+  // discovers its account is no longer the best, ALL tunnels for that account
+  // are torn down — not just the one that observed the quota change.
+  const tunnels = new Map(); // accountIndex → Set<teardownFn>
+
   return (req, clientSocket, head) => {
     clientSocket.on('error', () => {});
     const [host, portStr] = (req.url || '').split(':');
@@ -127,12 +132,12 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, upstr
       return;
     }
 
-    intercept({ host, port, mode, clientSocket, head, accountManager, ensureLeaf, upstreamTlsOptions, logDir, hooks, log, sx })
+    intercept({ host, port, mode, clientSocket, head, accountManager, ensureLeaf, upstreamTlsOptions, logDir, hooks, log, sx, tunnels })
       .catch((err) => { log(`[TeamClaude] MITM ${host}: ${err.message}`); clientSocket.destroy(); });
   };
 }
 
-async function intercept({ host, port, mode, clientSocket, head, accountManager, ensureLeaf, upstreamTlsOptions, logDir, hooks = {}, log, sx }) {
+async function intercept({ host, port, mode, clientSocket, head, accountManager, ensureLeaf, upstreamTlsOptions, logDir, hooks = {}, log, sx, tunnels }) {
   const { key, cert } = await ensureLeaf();
 
   if (mode === 'test') {
@@ -207,11 +212,31 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
 
   const teardown = () => { claudeTls.destroy(); upstreamSock.destroy(); };
 
+  // Register this tunnel so it can be torn down when the account goes bad.
+  if (tunnels) {
+    if (!tunnels.has(account.index)) tunnels.set(account.index, new Set());
+    const bucket = tunnels.get(account.index);
+    bucket.add(teardown);
+    const cleanup = () => bucket.delete(teardown);
+    claudeTls.once('close', cleanup);
+    upstreamSock.once('close', cleanup);
+  }
+
+  // Tear down ALL tunnels for an account, not just the one that observed it.
+  const teardownAll = () => {
+    if (!tunnels) return teardown();
+    const bucket = tunnels.get(account.index);
+    if (!bucket || bucket.size === 0) return;
+    const count = bucket.size;
+    for (const fn of bucket) fn();
+    console.log(`[TeamClaude] Tore down ${count} MITM tunnel(s) for "${account.name}"`);
+  };
+
   if (alpn === 'h2') {
     h2Relay(claudeTls, upstreamSock, {
       rewriteRequest: makeRewriteRequest(account),
       makeBodyPatcher,
-      onResponseHeaders: makeQuotaObserver(accountManager, account, sx, teardown),
+      onResponseHeaders: makeQuotaObserver(accountManager, account, sx, teardownAll),
       tap,
       log,
     });
@@ -222,7 +247,7 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
     h1Relay(claudeTls, upstreamSock, {
       rewriteHead: (h) => rewriteH1Auth(h, auth),
       makeBodyPatcher,
-      onResponseHeaders: makeQuotaObserver(accountManager, account, sx, teardown),
+      onResponseHeaders: makeQuotaObserver(accountManager, account, sx, teardownAll),
       tap,
     });
   }

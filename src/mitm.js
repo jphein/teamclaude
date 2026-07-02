@@ -18,6 +18,7 @@ import tls from 'node:tls';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
 import { h2Relay, h1Relay, rewriteH1Auth } from './h2/relay.js';
+import { cachedLookup } from './dns-cache.js';
 import { AccountUuidPatcher } from './account-uuid-rewrite.js';
 import { makeMitmTap, makeActivityTap, combineTaps } from './request-log.js';
 import { tunnelTls } from './sx.js';
@@ -175,7 +176,7 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
     });
   } else {
     upstreamSock = tls.connect({
-      host, port, servername: host, autoSelectFamily: true,
+      host, port, servername: host, autoSelectFamily: true, lookup: cachedLookup,
       ...(offered ? { ALPNProtocols: offered } : {}),
       ...upstreamTlsOptions,
     });
@@ -210,7 +211,17 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
   // traffic — not just on disk.
   const tap = combineTaps(makeMitmTap(logDir, account.name), makeActivityTap(hooks, account.name));
 
-  const teardown = () => { claudeTls.destroy(); upstreamSock.destroy(); };
+  // Graceful teardown: hand off to the relay's drain() — finish in-flight
+  // requests, signal the client to migrate (h2 GOAWAY / h1 connection close) so
+  // its NEXT request opens a fresh tunnel pinned to the new account, then close —
+  // instead of destroying the sockets mid-request (which surfaced to Claude Code
+  // as intermittent "API errors"). Falls back to a hard destroy only if teardown
+  // races tunnel setup before the relay handle exists.
+  let relayHandle = null;
+  const teardown = () => {
+    if (relayHandle) relayHandle.drain();
+    else { claudeTls.destroy(); upstreamSock.destroy(); }
+  };
 
   // Register this tunnel so it can be torn down when the account goes bad.
   if (tunnels) {
@@ -229,11 +240,11 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
     if (!bucket || bucket.size === 0) return;
     const count = bucket.size;
     for (const fn of bucket) fn();
-    console.log(`[TeamClaude] Tore down ${count} MITM tunnel(s) for "${account.name}"`);
+    console.log(`[TeamClaude] Draining ${count} MITM tunnel(s) for "${account.name}" (finishing in-flight requests)`);
   };
 
   if (alpn === 'h2') {
-    h2Relay(claudeTls, upstreamSock, {
+    relayHandle = h2Relay(claudeTls, upstreamSock, {
       rewriteRequest: makeRewriteRequest(account),
       makeBodyPatcher,
       onResponseHeaders: makeQuotaObserver(accountManager, account, sx, teardownAll),
@@ -244,7 +255,7 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
     const auth = account.type === 'oauth'
       ? { authorization: `Bearer ${account.credential}` }
       : { apiKey: account.credential };
-    h1Relay(claudeTls, upstreamSock, {
+    relayHandle = h1Relay(claudeTls, upstreamSock, {
       rewriteHead: (h) => rewriteH1Auth(h, auth),
       makeBodyPatcher,
       onResponseHeaders: makeQuotaObserver(accountManager, account, sx, teardownAll),
@@ -403,7 +414,7 @@ function makeQuotaObserver(accountManager, account, sx = null, teardown = null) 
     if (teardown && accountManager._isAvailable && !accountManager._isAvailable(account)) {
       const better = accountManager._pickBestAvailable?.();
       if (better && better.index !== account.index) {
-        console.log(`[TeamClaude] MITM tunnel for "${account.name}" is no longer the best account — tearing down`);
+        console.log(`[TeamClaude] MITM tunnel for "${account.name}" is no longer the best account — draining`);
         scheduleTeardown();
       }
     }

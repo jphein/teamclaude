@@ -19,6 +19,11 @@ import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
 import { h2Relay, h1Relay, rewriteH1Auth } from './h2/relay.js';
 import { cachedLookup } from './dns-cache.js';
+import { makeLogThrottle } from './log-throttle.js';
+
+// Normalize an error to a stable class for log-throttling: drop the per-call
+// OpenSSL context id and digits so a client's identical retries share one key.
+const errClass = (err) => (err?.code || err?.message || 'error').replace(/[0-9a-fA-F]{6,}/g, '#').replace(/\d+/g, '#');
 import { AccountUuidPatcher } from './account-uuid-rewrite.js';
 import { makeMitmTap, makeActivityTap, combineTaps } from './request-log.js';
 import { tunnelTls } from './sx.js';
@@ -116,6 +121,9 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, upstr
   // discovers its account is no longer the best, ALL tunnels for that account
   // are torn down — not just the one that observed the quota change.
   const tunnels = new Map(); // accountIndex → Set<teardownFn>
+  // Throttle repeated per-client handshake errors (e.g. a browser that doesn't
+  // trust our CA retrying forever) so one misconfigured client can't flood the log.
+  const errLog = makeLogThrottle();
 
   return (req, clientSocket, head) => {
     clientSocket.on('error', () => {});
@@ -134,7 +142,13 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, upstr
     }
 
     intercept({ host, port, mode, clientSocket, head, accountManager, ensureLeaf, upstreamTlsOptions, logDir, hooks, log, sx, tunnels })
-      .catch((err) => { log(`[TeamClaude] MITM ${host}: ${err.message}`); clientSocket.destroy(); });
+      .catch((err) => {
+        // A client that rejects our forged cert (no CA imported) retries endlessly;
+        // coalesce identical repeats per client to one log line per window.
+        const d = errLog(`${clientSocket.remoteAddress || '?'} ${host} ${errClass(err)}`);
+        if (d.log) log(`[TeamClaude] MITM ${host}: ${err.message}${d.suppressed ? ` (${d.suppressed} repeats suppressed)` : ''}`);
+        clientSocket.destroy();
+      });
   };
 }
 

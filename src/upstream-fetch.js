@@ -9,36 +9,11 @@
 // `status`, `headers.get()/.entries()`, `text()`, `arrayBuffer()`, and `body`
 // (a web ReadableStream, so streamResponse()'s getReader()/cancel() is untouched).
 
-import dns from 'node:dns';
 import http from 'node:http';
 import https from 'node:https';
 import { Readable } from 'node:stream';
 import { tunnelTls } from './sx.js';
-
-// In-process DNS cache using dns.resolve4 (c-ares) which bypasses getaddrinfo,
-// nsswitch, and crucially the search-domain list. Long-running processes doing
-// high-volume fetch() through getaddrinfo can flood the stub resolver and trip
-// search-domain fallback (api.anthropic.com.lan → NXDOMAIN → ENOTFOUND).
-const dnsCache = new Map();
-const DNS_TTL = 300_000; // 300s — well above the 32s record TTL for resilience
-
-function cachedLookup(hostname, opts, cb) {
-  const now = Date.now();
-  const entry = dnsCache.get(hostname);
-  const serve = (ips) => {
-    if (opts?.all) return cb(null, ips.map(a => ({ address: a, family: 4 })));
-    cb(null, ips[0], 4);
-  };
-  if (entry && entry.expires > now) return serve(entry.ips);
-  dns.resolve4(hostname, (err, ips) => {
-    if (err) {
-      if (entry) return serve(entry.ips); // serve stale on failure
-      return cb(err);
-    }
-    dnsCache.set(hostname, { ips, expires: now + DNS_TTL });
-    serve(ips);
-  });
-}
+import { cachedLookup } from './dns-cache.js';
 
 const directAgent = new https.Agent({ keepAlive: true });
 
@@ -106,7 +81,9 @@ function proxiedFetch(url, opts, sx) {
 // Wrap a Node IncomingMessage as the subset of a fetch Response that server.js uses.
 function makeResponse(res) {
   const web = Readable.toWeb(res); // single web stream — one consumer either way
+  let collected = null;            // memoized so text()/json() can be called after each other
   const collect = async () => {
+    if (collected) return collected;
     const chunks = [];
     const reader = web.getReader();
     for (;;) {
@@ -114,13 +91,16 @@ function makeResponse(res) {
       if (done) break;
       chunks.push(Buffer.from(value));
     }
-    return Buffer.concat(chunks);
+    collected = Buffer.concat(chunks);
+    return collected;
   };
   return {
     status: res.statusCode,
+    ok: res.statusCode >= 200 && res.statusCode < 300,
     headers: makeHeaders(res.headers),
     body: web,
     async text() { return (await collect()).toString('utf8'); },
+    async json() { return JSON.parse((await collect()).toString('utf8')); },
     async arrayBuffer() { const b = await collect(); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); },
   };
 }

@@ -4,6 +4,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { exec } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import http from 'node:http';
+import { upstreamFetch } from './upstream-fetch.js';
 
 /**
  * Import OAuth credentials from a Claude Code credentials file.
@@ -44,7 +45,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
         await new Promise(resolve => setTimeout(resolve, delay));
       }
 
-      const res = await fetch(endpoint, {
+      const res = await upstreamFetch(endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -76,8 +77,9 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
     } catch (err) {
       const isNetworkError = err instanceof Error &&
         (err.message.includes('fetch failed') ||
-          (err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
-           err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT'));
+          err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' ||
+          err.code === 'ETIMEDOUT' || err.code === 'UND_ERR_CONNECT_TIMEOUT' ||
+          err.code === 'ENOTFOUND' || err.code === 'EAI_AGAIN');
 
       if (attempt < maxRetries && isNetworkError) {
         continue;
@@ -113,7 +115,7 @@ export function isTokenExpiringSoon(expiresAt, thresholdMs = 5 * 60 * 1000) {
  */
 export async function fetchProfile(accessToken) {
   try {
-    const res = await fetch(PROFILE_URL, {
+    const res = await upstreamFetch(PROFILE_URL, {
       headers: { 'Authorization': `Bearer ${accessToken}` },
     });
     if (!res.ok) {
@@ -179,7 +181,7 @@ export function normalizeUsageBucket(bucket) {
  */
 export async function fetchUsage(accessToken) {
   try {
-    const res = await fetch(USAGE_URL, {
+    const res = await upstreamFetch(USAGE_URL, {
       headers: {
         'Authorization': `Bearer ${accessToken}`,
         'anthropic-beta': OAUTH_USAGE_BETA,

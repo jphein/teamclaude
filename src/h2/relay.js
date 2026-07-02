@@ -13,6 +13,11 @@ import { HpackDecoder, HpackEncoder } from './hpack.js';
 
 const SETTINGS_HEADER_TABLE_SIZE = 0x1;
 
+// How long to wait for in-flight requests to finish after an account is rotated
+// away, before force-closing the tunnel. A healthy stream drains on its own well
+// under this; the cap is only a leak-guard against a half-open / stuck socket.
+const DRAIN_TIMEOUT_MS = 10 * 60_000; // 10 minutes
+
 // Wire src→dst with backpressure; `onClose` fires once when either side ends.
 function link(src, dst, onData, onClose) {
   let closed = false;
@@ -48,12 +53,26 @@ export function h2Relay(claude, upstream, opts = {}) {
   const bodyPatchers = makeBodyPatcher ? new Map() : null; // streamId -> patcher
   const tap = opts.tap || null; // optional request-logging tap (per streamId)
   const log = opts.log || (() => {});
+  const drainTimeoutMs = opts.drainTimeoutMs ?? DRAIN_TIMEOUT_MS;
 
   // Streams that have started (request headers seen) but not yet completed, so a
   // mid-flight connection teardown can close their tap records instead of
   // leaking them (e.g. a stuck "in-flight" entry in the TUI activity feed).
   const openStreams = new Set();
-  const closeStream = (id) => { if (bodyPatchers) bodyPatchers.delete(id); tap?.end(id); openStreams.delete(id); };
+
+  // Graceful-drain state. drain() runs when this account is being rotated away
+  // from (429 or a better account appeared). Instead of destroying the sockets
+  // mid-stream — which aborts requests Claude Code has in flight and surfaces as
+  // an "API error" — we send the client a GOAWAY (so it opens a fresh CONNECT
+  // tunnel for NEW requests, which the proxy pins to the new account), stop
+  // relaying new streams to the doomed upstream, and close only once the
+  // in-flight streams have finished.
+  let draining = false;
+  let destroyed = false;
+  let drainTimer = null;
+  let lastClientStreamId = 0; // highest client stream we've relayed → GOAWAY last-stream-id
+  let pendingGoaway = false;  // a GOAWAY waiting to be injected at the next client frame boundary
+  let respAtBoundary = true;  // true when everything written to the client ends on a frame boundary
 
   const reqDec = new HpackDecoder();         // decodes claude's request blocks
   const reqEnc = new HpackEncoder();         // re-encodes to upstream
@@ -61,9 +80,39 @@ export function h2Relay(claude, upstream, opts = {}) {
   const respDec = new HpackDecoder();        // read-only, decodes upstream responses
 
   const destroyBoth = () => {
+    if (destroyed) return;
+    destroyed = true;
+    if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
     for (const id of openStreams) tap?.end(id);
     openStreams.clear();
     claude.destroy(); upstream.destroy();
+  };
+
+  const closeStream = (id) => {
+    if (bodyPatchers) bodyPatchers.delete(id);
+    tap?.end(id);
+    openStreams.delete(id);
+    if (draining && openStreams.size === 0) destroyBoth(); // last in-flight stream drained
+  };
+
+  // Inject a GOAWAY(NO_ERROR) toward the client. The response direction is
+  // written verbatim (not frame-aligned), so this is only ever called when the
+  // bytes written so far end on a frame boundary — otherwise we'd splice our
+  // frame into the middle of a half-written response frame and corrupt it.
+  const sendGoaway = () => {
+    const payload = Buffer.alloc(8);
+    payload.writeUInt32BE(lastClientStreamId & 0x7fffffff, 0); // last stream we processed
+    payload.writeUInt32BE(0, 4);                               // NO_ERROR
+    try { claude.write(buildFrame({ type: FRAME.GOAWAY, flags: 0, streamId: 0, payload })); } catch { /* client already gone */ }
+  };
+
+  const drain = () => {
+    if (draining || destroyed) return;
+    draining = true;
+    if (openStreams.size === 0) { destroyBoth(); return; }      // nothing in flight → close now
+    if (respAtBoundary) sendGoaway(); else pendingGoaway = true; // else inject at next boundary
+    drainTimer = setTimeout(destroyBoth, drainTimeoutMs);
+    drainTimer.unref?.();
   };
 
   // ── request direction: claude → upstream (rewrite HEADERS) ──
@@ -102,6 +151,14 @@ export function h2Relay(claude, upstream, opts = {}) {
       if (fr.flags & FLAG.END_HEADERS) finishReqBlock();
       return;
     }
+    // While draining, drop frames for streams we're not keeping alive (new
+    // streams the client opened after GOAWAY). Forwarding them to the doomed
+    // upstream connection could make it reset and abort the legit in-flight
+    // streams that share it. Connection-level frames (stream 0) still pass.
+    if (draining && fr.streamId !== 0 && !openStreams.has(fr.streamId)) {
+      if (fr.type === FRAME.RST_STREAM) closeStream(fr.streamId);
+      return;
+    }
     if (fr.type === FRAME.DATA && (bodyPatchers || tap)) {
       // Same-length in-place body patch (account_uuid) via a per-stream streaming
       // JSON state machine; re-emit the DATA frame unchanged in length/flags so
@@ -127,10 +184,14 @@ export function h2Relay(claude, upstream, opts = {}) {
   function finishReqBlock() {
     const { streamId, frags, priority, endStream } = asm;
     asm = null;
-    const fields = reqDec.decode(Buffer.concat(frags)); // keep decoder dynamic table in sync
+    const fields = reqDec.decode(Buffer.concat(frags)); // keep decoder dynamic table in sync (always decode)
+    // Post-GOAWAY: don't open NEW streams to the doomed upstream. Trailers on an
+    // already-open stream (streamId in openStreams) still pass through.
+    if (draining && !openStreams.has(streamId)) return;
     const rewritten = rewriteRequest(fields);
     if (tap) tap.req(streamId, rewritten);
     openStreams.add(streamId);
+    if (streamId > lastClientStreamId) lastClientStreamId = streamId;
     const newBlock = reqEnc.encode(rewritten);
     writeBackpressured(upstream, buildHeaderBlock(streamId, newBlock, { endStream, priority }), reqCtl);
   }
@@ -148,6 +209,10 @@ export function h2Relay(claude, upstream, opts = {}) {
     const { frames, rest } = readFrames(sbuf);
     sbuf = rest;
     for (const fr of frames) observeRespFrame(fr);
+    // Everything written to the client ends on a frame boundary iff the parser
+    // consumed the whole buffer — the only safe moment to splice in our GOAWAY.
+    respAtBoundary = rest.length === 0;
+    if (pendingGoaway && respAtBoundary) { pendingGoaway = false; sendGoaway(); }
   };
 
   function observeRespFrame(fr) {
@@ -184,6 +249,8 @@ export function h2Relay(claude, upstream, opts = {}) {
   }
 
   respCtl = link(upstream, claude, onRespData, destroyBoth);
+
+  return { drain, inflight: () => openStreams.size, isIdle: () => openStreams.size === 0 };
 }
 
 const MAX_HEAD = 65536; // runaway-head guard for a single request/response head
@@ -270,7 +337,21 @@ export function h1Relay(claude, upstream, opts = {}) {
   const makeBodyPatcher = opts.makeBodyPatcher || null;
   const onResponseHeaders = opts.onResponseHeaders || (() => {});
   const tap = opts.tap || null;
-  const destroyBoth = () => { claude.destroy(); upstream.destroy(); };
+  const drainTimeoutMs = opts.drainTimeoutMs ?? DRAIN_TIMEOUT_MS;
+
+  // Graceful-drain state — see the h2Relay note. HTTP/1.1 has no GOAWAY: we stop
+  // forwarding NEW request heads (the client's next request errors with a bare
+  // connection close and undici retries it on a fresh CONNECT tunnel, which the
+  // proxy pins to the new account) and close once the in-flight exchange drains.
+  let draining = false;
+  let destroyed = false;
+  let drainTimer = null;
+  const destroyBoth = () => {
+    if (destroyed) return;
+    destroyed = true;
+    if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+    claude.destroy(); upstream.destroy();
+  };
   claude.on('error', destroyBoth);
   upstream.on('error', destroyBoth);
 
@@ -288,6 +369,7 @@ export function h1Relay(claude, upstream, opts = {}) {
   const pumpReq = () => {
     while (reqBuf.length) {
       if (reqPhase === 'head') {
+        if (draining) return; // stop accepting new requests; the in-flight one finishes, then we close
         const idx = reqBuf.indexOf('\r\n\r\n');
         if (idx < 0) { if (reqBuf.length > MAX_HEAD) destroyBoth(); return; }
         const head = rewriteHead(reqBuf.subarray(0, idx + 4).toString('latin1'));
@@ -348,7 +430,11 @@ export function h1Relay(claude, upstream, opts = {}) {
       } else {
         const { consumed, done } = resTrack(resBuf);
         if (consumed > 0) { if (tap) tap.resData(resId, Buffer.from(resBuf.subarray(0, consumed))); resBuf = resBuf.subarray(consumed); }
-        if (done) { if (tap) tap.end(resId); resId = null; resPhase = 'head'; resTrack = null; }
+        if (done) {
+          if (tap) tap.end(resId);
+          resId = null; resPhase = 'head'; resTrack = null;
+          if (draining && pending.length === 0) destroyBoth(); // last in-flight response drained
+        }
         else if (consumed === 0) return;
       }
     }
@@ -360,6 +446,15 @@ export function h1Relay(claude, upstream, opts = {}) {
   });
   upstream.on('end', () => { endOpen(); claude.end(); });
   upstream.on('close', () => { endOpen(); claude.destroy(); });
+
+  const drain = () => {
+    if (draining || destroyed) return;
+    draining = true;
+    if (pending.length === 0 && resId === null) { destroyBoth(); return; } // idle → close now
+    drainTimer = setTimeout(destroyBoth, drainTimeoutMs);
+    drainTimer.unref?.();
+  };
+  return { drain, inflight: () => pending.length + (resId !== null ? 1 : 0), isIdle: () => pending.length === 0 && resId === null };
 }
 
 // Parse an HTTP/1.1 head into an h2-style [{name,value}] list (lowercased names),

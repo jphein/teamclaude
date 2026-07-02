@@ -323,7 +323,13 @@ async function serverCommand() {
       prober?.stop();
       clearInterval(quotaSaveInterval);
       await persistQuotaState();
+      // Force live tunnels closed so server.close() can actually complete, and
+      // guarantee the process exits within a bound — otherwise a lingering
+      // keep-alive/MITM connection leaves server.close() hanging until systemd's
+      // TimeoutStopSec fires and SIGKILLs us (logged as "Failed: timeout").
+      server.closeAllConnections?.();
       server.close(() => process.exit(0));
+      setTimeout(() => process.exit(0), 2000).unref();
     };
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);

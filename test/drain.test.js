@@ -105,6 +105,47 @@ test('h1Relay.drain() closes immediately when the tunnel is idle', T, async () =
   }
 });
 
+test('h1Relay.drain() flushes the full response to a slow client instead of truncating the tail', T, async () => {
+  // A large response fully buffered toward a NOT-yet-reading client, then drained.
+  // A .destroy()-based close drops the buffered tail → the client sees a truncated
+  // ("connection closed mid-response") body. A flush-then-close must deliver it all.
+  const BIG = 'Z'.repeat(20_000_000); // far exceeds socket buffers → sits in the userland write queue
+  const head = `HTTP/1.1 200 OK\r\nContent-Length: ${BIG.length}\r\n\r\n`;
+  const upstream = net.createServer((s) => {
+    s.on('error', () => {});
+    s.once('data', () => { s.write(head); s.write(BIG); });
+  });
+  const upPort = await listen(upstream);
+  const conns = [];
+  let resolveHandle;
+  const handleReady = new Promise((r) => (resolveHandle = r));
+  const front = net.createServer((c) => {
+    c.on('error', () => {});
+    conns.push(c);
+    const u = net.connect(upPort, '127.0.0.1', () => { const h = h1Relay(c, u, {}); conns.push(u); resolveHandle(h); });
+    u.on('error', () => {});
+  });
+  const frontPort = await listen(front);
+  const client = net.connect(frontPort, '127.0.0.1');
+  client.on('error', () => {});
+  let received = 0;
+  client.on('data', (d) => { received += d.length; });
+  client.pause(); // slow client: force the relay to buffer the whole response
+  try {
+    await once(client, 'connect');
+    client.write('GET /big HTTP/1.1\r\nHost: x\r\n\r\n');
+    const h = await handleReady;
+    await until(() => h.isIdle(), 4000);  // relay has parsed the full response (buffered to the paused client)
+    h.drain();                             // drain-close must NOT drop the buffered body
+    client.resume();
+    await until(() => received >= BIG.length + head.length, 6000);
+    assert.ok(received >= BIG.length + head.length,
+      `client received ${received} of ${BIG.length + head.length} bytes — response was truncated on drain-close`);
+  } finally {
+    teardown({ client, conns, servers: [front, upstream] });
+  }
+});
+
 // ─────────────────────────── HTTP/2 ───────────────────────────
 
 test('h2Relay.drain() lets an in-flight stream finish, sends GOAWAY, then closes', T, async () => {

@@ -87,12 +87,24 @@ export function h2Relay(claude, upstream, opts = {}) {
     openStreams.clear();
     claude.destroy(); upstream.destroy();
   };
+  // Graceful close for the DRAIN path: end() flushes the client's buffered frames
+  // before the FIN; destroy() would discard them and truncate the tail of a large
+  // response ("connection closed mid-response"). Hard timeout / errors still destroy.
+  const gracefulClose = () => {
+    if (destroyed) return;
+    destroyed = true;
+    if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+    for (const id of openStreams) tap?.end(id);
+    openStreams.clear();
+    try { upstream.destroy(); } catch { /* */ }
+    try { claude.end(); } catch { /* */ }
+  };
 
   const closeStream = (id) => {
     if (bodyPatchers) bodyPatchers.delete(id);
     tap?.end(id);
     openStreams.delete(id);
-    if (draining && openStreams.size === 0) destroyBoth(); // last in-flight stream drained
+    if (draining && openStreams.size === 0) gracefulClose(); // last in-flight stream done — flush, then close
   };
 
   // Inject a GOAWAY(NO_ERROR) toward the client. The response direction is
@@ -109,7 +121,7 @@ export function h2Relay(claude, upstream, opts = {}) {
   const drain = () => {
     if (draining || destroyed) return;
     draining = true;
-    if (openStreams.size === 0) { destroyBoth(); return; }      // nothing in flight → close now
+    if (openStreams.size === 0) { gracefulClose(); return; }    // nothing in flight → flush + close
     if (respAtBoundary) sendGoaway(); else pendingGoaway = true; // else inject at next boundary
     drainTimer = setTimeout(destroyBoth, drainTimeoutMs);
     drainTimer.unref?.();
@@ -352,6 +364,17 @@ export function h1Relay(claude, upstream, opts = {}) {
     if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
     claude.destroy(); upstream.destroy();
   };
+  // Graceful close for the DRAIN path: end() flushes the client's buffered write
+  // queue before the FIN, whereas destroy() discards it — which truncates the tail
+  // of a large response and surfaces as "connection closed mid-response". Only the
+  // hard drain-timeout and socket-error paths use destroyBoth().
+  const gracefulClose = () => {
+    if (destroyed) return;
+    destroyed = true;
+    if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
+    try { upstream.destroy(); } catch { /* */ }
+    try { claude.end(); } catch { /* */ }
+  };
   claude.on('error', destroyBoth);
   upstream.on('error', destroyBoth);
 
@@ -433,7 +456,7 @@ export function h1Relay(claude, upstream, opts = {}) {
         if (done) {
           if (tap) tap.end(resId);
           resId = null; resPhase = 'head'; resTrack = null;
-          if (draining && pending.length === 0) destroyBoth(); // last in-flight response drained
+          if (draining && pending.length === 0) gracefulClose(); // last in-flight response done — flush, then close
         }
         else if (consumed === 0) return;
       }
@@ -445,12 +468,15 @@ export function h1Relay(claude, upstream, opts = {}) {
     try { pumpRes(); } catch { resBuf = Buffer.alloc(0); } // never let a parse bug break the relay
   });
   upstream.on('end', () => { endOpen(); claude.end(); });
-  upstream.on('close', () => { endOpen(); claude.destroy(); });
+  // During a gracefulClose() we deliberately release upstream while claude is still
+  // flushing its buffered tail — don't let that upstream teardown destroy claude
+  // (which would truncate the very response we're trying to deliver).
+  upstream.on('close', () => { if (destroyed) return; endOpen(); claude.destroy(); });
 
   const drain = () => {
     if (draining || destroyed) return;
     draining = true;
-    if (pending.length === 0 && resId === null) { destroyBoth(); return; } // idle → close now
+    if (pending.length === 0 && resId === null) { gracefulClose(); return; } // idle → flush any buffered tail, then close
     drainTimer = setTimeout(destroyBoth, drainTimeoutMs);
     drainTimer.unref?.();
   };

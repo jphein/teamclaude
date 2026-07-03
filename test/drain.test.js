@@ -181,6 +181,42 @@ test('h1Relay.drain() releases its client socket even if the client keeps its ha
   }
 });
 
+test('h1Relay reaps its upstream socket when upstream half-closes but the client stays open (no CLOSE_WAIT leak)', T, async () => {
+  // Anthropic FINs an idle keep-alive after sending a full response; the client
+  // keeps its pooled connection open. The relay must close its upstream socket,
+  // not leave it stuck in CLOSE_WAIT holding an FD.
+  const upstream = net.createServer((s) => {
+    s.on('error', () => {});
+    s.once('data', () => s.end('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok')); // response + FIN
+  });
+  const upPort = await listen(upstream);
+  const conns = [];
+  let resolveHandle;
+  const handleReady = new Promise((r) => (resolveHandle = r));
+  const front = net.createServer((c) => {
+    c.on('error', () => {});
+    conns.push(c);
+    // allowHalfOpen mirrors the real TLS upstream: it does NOT auto-close its write
+    // side when the peer FINs, so the relay must close it explicitly.
+    const u = net.connect({ port: upPort, host: '127.0.0.1', allowHalfOpen: true }, () => { const h = h1Relay(c, u, {}); conns.push(u); resolveHandle(h); });
+    u.on('error', () => {});
+  });
+  const frontPort = await listen(front);
+  const client = net.connect({ port: frontPort, host: '127.0.0.1', allowHalfOpen: true });
+  client.on('error', () => {});
+  client.on('data', () => {});
+  client.on('end', () => { /* keep our writable half open — pooled keep-alive */ });
+  try {
+    await once(client, 'connect');
+    client.write('GET / HTTP/1.1\r\nHost: x\r\n\r\n');
+    await handleReady;
+    await until(() => conns[1].destroyed, 3000);
+    assert.equal(conns[1].destroyed, true, 'relay left the upstream socket in CLOSE_WAIT (leaked) after upstream half-closed');
+  } finally {
+    teardown({ client, conns, servers: [front, upstream] });
+  }
+});
+
 // ─────────────────────────── HTTP/2 ───────────────────────────
 
 test('h2Relay.drain() lets an in-flight stream finish, sends GOAWAY, then closes', T, async () => {

@@ -369,6 +369,7 @@ export function h1Relay(claude, upstream, opts = {}) {
   let draining = false;
   let destroyed = false;
   let drainTimer = null;
+  let upstreamEnded = false; // upstream half-closed gracefully (its 'end' fired) vs an abrupt reset
   const destroyBoth = () => {
     if (destroyed) return;
     destroyed = true;
@@ -478,11 +479,26 @@ export function h1Relay(claude, upstream, opts = {}) {
     resBuf = Buffer.concat([resBuf, c]);
     try { pumpRes(); } catch { resBuf = Buffer.alloc(0); } // never let a parse bug break the relay
   });
-  upstream.on('end', () => { endOpen(); claude.end(); });
+  upstream.on('end', () => {
+    if (destroyed) return;
+    upstreamEnded = true;
+    endOpen();
+    claude.end();                                  // propagate FIN to the client (flushes buffered bytes)
+    // Close OUR side of the upstream socket too, so it doesn't sit in CLOSE_WAIT
+    // holding an FD until the (pooled, maybe never-closing) client disconnects.
+    try { upstream.end(); reapAfterFlush(upstream, drainTimeoutMs); } catch { /* */ }
+  });
   // During a gracefulClose() we deliberately release upstream while claude is still
   // flushing its buffered tail — don't let that upstream teardown destroy claude
   // (which would truncate the very response we're trying to deliver).
-  upstream.on('close', () => { if (destroyed) return; endOpen(); claude.destroy(); });
+  upstream.on('close', () => {
+    if (destroyed) return;
+    endOpen();
+    // A graceful upstream close (after 'end') was already propagated via claude.end();
+    // destroying the client here would truncate that flush. Only an ABRUPT upstream
+    // close (reset, with no preceding 'end') should tear the client down.
+    if (upstreamEnded) claude.end(); else claude.destroy();
+  });
 
   const drain = () => {
     if (draining || destroyed) return;

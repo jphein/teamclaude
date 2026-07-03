@@ -18,6 +18,17 @@ const SETTINGS_HEADER_TABLE_SIZE = 0x1;
 // under this; the cap is only a leak-guard against a half-open / stuck socket.
 const DRAIN_TIMEOUT_MS = 10 * 60_000; // 10 minutes
 
+// After end() flushes a socket, fully close it so the FD is released. end() alone
+// half-closes (FIN) but keeps the FD open until the PEER also closes — and a
+// keep-alive client (undici pool) often doesn't, so under heavy draining the
+// half-open sockets pile up as leaked FDs. Destroy once the flush lands ('finish')
+// or after a bound if the peer never drains our buffer.
+function reapAfterFlush(sock, timeoutMs) {
+  const reap = setTimeout(() => { try { sock.destroy(); } catch { /* */ } }, timeoutMs);
+  reap.unref?.();
+  sock.once('finish', () => { clearTimeout(reap); try { sock.destroy(); } catch { /* */ } });
+}
+
 // Wire src→dst with backpressure; `onClose` fires once when either side ends.
 function link(src, dst, onData, onClose) {
   let closed = false;
@@ -97,7 +108,7 @@ export function h2Relay(claude, upstream, opts = {}) {
     for (const id of openStreams) tap?.end(id);
     openStreams.clear();
     try { upstream.destroy(); } catch { /* */ }
-    try { claude.end(); } catch { /* */ }
+    try { claude.end(); reapAfterFlush(claude, drainTimeoutMs); } catch { /* */ }
   };
 
   const closeStream = (id) => {
@@ -373,7 +384,7 @@ export function h1Relay(claude, upstream, opts = {}) {
     destroyed = true;
     if (drainTimer) { clearTimeout(drainTimer); drainTimer = null; }
     try { upstream.destroy(); } catch { /* */ }
-    try { claude.end(); } catch { /* */ }
+    try { claude.end(); reapAfterFlush(claude, drainTimeoutMs); } catch { /* */ }
   };
   claude.on('error', destroyBoth);
   upstream.on('error', destroyBoth);

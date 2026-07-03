@@ -146,6 +146,41 @@ test('h1Relay.drain() flushes the full response to a slow client instead of trun
   }
 });
 
+test('h1Relay.drain() releases its client socket even if the client keeps its half open (no FD leak)', T, async () => {
+  // undici pools keep-alive connections and may not close their side promptly when
+  // we FIN. end() alone would then leave our socket half-open forever → FD leak.
+  const upstream = net.createServer((s) => {
+    s.on('error', () => {});
+    s.once('data', () => s.write('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'));
+  });
+  const upPort = await listen(upstream);
+  const conns = [];
+  let resolveHandle;
+  const handleReady = new Promise((r) => (resolveHandle = r));
+  const front = net.createServer((c) => {
+    c.on('error', () => {});
+    conns.push(c);
+    const u = net.connect(upPort, '127.0.0.1', () => { const h = h1Relay(c, u, {}); conns.push(u); resolveHandle(h); });
+    u.on('error', () => {});
+  });
+  const frontPort = await listen(front);
+  const client = net.connect({ port: frontPort, host: '127.0.0.1', allowHalfOpen: true });
+  client.on('error', () => {});
+  client.on('data', () => {});
+  client.on('end', () => { /* deliberately keep our writable half OPEN — never close */ });
+  try {
+    await once(client, 'connect');
+    client.write('GET / HTTP/1.1\r\nHost: x\r\n\r\n');
+    const h = await handleReady;
+    await until(() => h.isIdle(), 3000);      // response fully relayed
+    h.drain();                                 // gracefulClose flushes then must RELEASE the socket
+    await until(() => conns[0].destroyed, 3000);
+    assert.equal(conns[0].destroyed, true, 'relay leaked its client socket — end() without a follow-up close');
+  } finally {
+    teardown({ client, conns, servers: [front, upstream] });
+  }
+});
+
 // ─────────────────────────── HTTP/2 ───────────────────────────
 
 test('h2Relay.drain() lets an in-flight stream finish, sends GOAWAY, then closes', T, async () => {

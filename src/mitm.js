@@ -171,6 +171,14 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
   // an h2 client both negotiate end-to-end exactly as they would directly.
   const account = accountManager.getActiveAccount();
   if (!account) { clientSocket.destroy(); return; }
+  // Count this tunnel against its account for least-in-flight balancing, and
+  // release when the client connection closes (covers graceful drain and hard
+  // destroy alike). Acquire at selection time so concurrent CONNECTs see the
+  // incrementing count and don't all stampede the same "least loaded" account.
+  // Optional-chained to match the rest of this path's loose coupling to the
+  // account manager (a partial manager just opts out of in-flight tracking).
+  const releaseSlot = accountManager.acquire?.(account.index) ?? (() => {});
+  clientSocket.once('close', releaseSlot);
   await accountManager.ensureTokenFresh(account.index);
 
   reply200Raw(clientSocket);

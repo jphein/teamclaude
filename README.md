@@ -13,6 +13,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 ## Features
 
 - **Automatic account rotation** — switches to the next account when session (5h) or weekly (7d) quota reaches the configured threshold (default 98%)
+- **Least-in-flight load balancing** (opt-in) — spread each request across all available accounts by fewest concurrent requests instead of pinning one account, keeping every account under Anthropic's short-term burst limit under heavy concurrency. Toggle live (TUI `g` → `b`); the dashboards surface per-account in-flight load and inferred burst-429 counts
 - **Auto-retry on 429** — waits the `retry-after` duration and retries the same account; switches to the next on persistent errors
 - **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls; a settings screen (`g`) edits the rotation threshold, quota-probe interval, and sx.org proxy live
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
@@ -138,6 +139,7 @@ You usually don't need to call it directly: `teamclaude login`, `import`, `enabl
 | Key | Action |
 |-----|--------|
 | `t` | Edit rotation threshold |
+| `b` | Toggle least-in-flight load balancing |
 | `p` | Edit quota-probe interval |
 | `k` | Set sx.org API key |
 | `m` | Cycle sx.org mode (always / 429-only / off) |
@@ -226,6 +228,7 @@ All endpoints are on the proxy port (default 3456). Localhost connections skip a
 | `GET` | `/teamclaude/status` | JSON status (accounts, quota, active account) |
 | `POST` | `/teamclaude/switch` | Pin active account (`{"name": "..."}`) |
 | `POST` | `/teamclaude/threshold` | Set rotation threshold (`{"threshold": 0.85}`) |
+| `POST` | `/teamclaude/loadbalance` | Toggle least-in-flight load balancing (`{"enabled": true}`) |
 | `POST` | `/teamclaude/reload` | Hot-reload accounts from config |
 | `POST` | `/teamclaude/restart` | Restart the systemd user service |
 | `GET` | `/teamclaude/activity` | SSE stream of request lifecycle events (replays last 100) |
@@ -262,6 +265,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
+  "loadBalance": false,
   "sx": { "apiKey": "your-sx-org-api-key", "mode": "always" },
   "accounts": [
     {
@@ -285,6 +289,7 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | `proxy.apiKey` | API key clients use to authenticate with the proxy |
 | `upstream` | Upstream API base URL |
 | `switchThreshold` | Quota utilization (0–1) at which to switch accounts (TUI: `g` → `t`) |
+| `loadBalance` | If `true`, spread each request across all available accounts by fewest in-flight requests instead of pinning one sticky account — keeps any single account under Anthropic's short-term burst limit under concurrency. Opt-in; default `false` (TUI: `g` → `b`, or `POST /teamclaude/loadbalance`) |
 | `quotaProbeSeconds` | Background quota-probe interval in seconds (`0` = off, the default; CLI `probe` or TUI `g` → `p`) |
 | `sx.apiKey` | [sx.org](https://sx.org) API key. When set, TeamClaude auto-provisions a residential proxy (egress-IP 429 workaround). Absent/empty = off |
 | `sx.mode` | `always` (route all upstream traffic), `429` (direct, fail over to the proxy after a 429), or `off` (keep the key but don't use it). Defaults to `always` when a key is set |

@@ -129,7 +129,9 @@ async function serverCommand() {
   }
 
   const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold);
+  const accountManager = new AccountManager(accounts, threshold, {
+    loadBalance: config.loadBalance || false,
+  });
 
   // Restore quota observed in a previous run so a restart doesn't lose rotation
   // state (passive — we never call the API to re-learn it). Stale windows are
@@ -230,6 +232,10 @@ async function serverCommand() {
     diskConfig.switchThreshold = value;
   });
 
+  hooks.persistLoadBalance = (enabled) => atomicConfigUpdate(diskConfig => {
+    diskConfig.loadBalance = enabled;
+  });
+
   if (useTUI) {
     tui = new TUI({
       accountManager, config, sx,
@@ -296,6 +302,7 @@ async function serverCommand() {
       console.log(`  Port:       ${port}`);
       console.log(`  Accounts:   ${accounts.length}`);
       console.log(`  Threshold:  ${(threshold * 100).toFixed(0)}%`);
+      console.log(`  Balancing:  ${accountManager.loadBalance ? 'on (least in-flight)' : 'off (single account)'}`);
       console.log(`  Upstream:   ${config.upstream || 'https://api.anthropic.com'}`);
       console.log('');
       accounts.forEach((a, i) => {
@@ -551,7 +558,8 @@ async function statusCommand() {
     const data = await res.json();
 
     console.log(`Active account: ${data.currentAccount}`);
-    console.log(`Switch at:      ${(data.switchThreshold * 100).toFixed(0)}% usage\n`);
+    console.log(`Switch at:      ${(data.switchThreshold * 100).toFixed(0)}% usage`);
+    console.log(`Load balancing: ${data.loadBalance ? 'on (least in-flight)' : 'off'}\n`);
 
     for (const acct of data.accounts) {
       const q = acct.quota;
@@ -573,6 +581,11 @@ async function statusCommand() {
       }
 
       console.log(`    Total:    ${acct.usage.totalInputTokens + acct.usage.totalOutputTokens} tokens, ${acct.usage.totalRequests} requests`);
+      const inFlight = acct.inFlight || 0;
+      const burst = (acct.stats && acct.stats.burstHits) || 0;
+      if (inFlight > 0 || burst > 0) {
+        console.log(`    Load:     ${inFlight} in-flight, ${burst} burst-429s`);
+      }
       if (acct.rateLimitedUntil) console.log(`    Throttled until: ${acct.rateLimitedUntil}`);
       console.log('');
     }

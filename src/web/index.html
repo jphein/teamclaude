@@ -422,6 +422,10 @@
         <input type="range" id="thr" min="50" max="100" step="1" value="98">
         <span class="val" id="thrVal">98%</span>
       </div>
+      <div class="threshold-row" title="Spread requests across all available accounts (least in-flight) instead of one sticky account">
+        <label for="lb">Balance</label>
+        <input type="checkbox" id="lb">
+      </div>
       <button id="restartBtn" class="btn-restart">Restart service</button>
       <span id="restartStatus" class="restart-status"></span>
     </div>
@@ -464,6 +468,7 @@
   const metaEl      = document.getElementById('meta');
   const thr         = document.getElementById('thr');
   const thrVal      = document.getElementById('thrVal');
+  const lbToggle    = document.getElementById('lb');
   const restartBtn  = document.getElementById('restartBtn');
   const restartStatusEl = document.getElementById('restartStatus');
   const activeReqsEl = document.getElementById('activeReqs');
@@ -560,10 +565,13 @@
     const u7d = q.unified7d;
     const totalTok = acct.usage.totalInputTokens + acct.usage.totalOutputTokens;
 
+    const inFlight = acct.inFlight || 0;
+    const burstHits = (acct.stats && acct.stats.burstHits) || 0;
     const nameRow = el('div', { class: 'name' }, [
       el('span', { class: 'status-dot status-' + acct.status }),
       acct.name,
       isActive ? el('span', { class: 'badge active-badge', text: 'active' }) : null,
+      inFlight > 0 ? el('span', { class: 'badge', style: 'background:transparent;color:var(--accent,#4a9eff);', text: inFlight + ' live' }) : null,
       el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', text: acct.type }),
     ]);
     const btn = el('button', { class: 'switch', 'data-name': acct.name, disabled: isActive, text: 'Switch' });
@@ -573,6 +581,7 @@
     ]);
     const metaText = fmtNum(acct.usage.totalRequests) + ' requests · '
       + fmtNum(totalTok) + ' tokens · last used ' + fmtAgo(acct.usage.lastUsed)
+      + (burstHits > 0 ? ' · ' + burstHits + ' burst-429' + (burstHits === 1 ? '' : 's') : '')
       + (acct.rateLimitedUntil ? ' · throttled until ' + new Date(acct.rateLimitedUntil).toLocaleTimeString() : '');
     const meta = el('div', { class: 'meta', text: metaText });
     return el('div', { class: 'card' + (isActive ? ' active' : '') }, [nameRow, btn, bars, meta]);
@@ -606,6 +615,8 @@
         thrVal.textContent = serverPct + '%';
         lastThreshold = serverPct;
       }
+
+      if (document.activeElement !== lbToggle) lbToggle.checked = !!data.loadBalance;
 
       cardsEl.textContent = '';
       for (const acct of data.accounts) {
@@ -668,6 +679,25 @@
         showErr('Threshold update failed: ' + err.message);
       }
     }, 100);
+  });
+
+  // ── Load-balance toggle ──────────────────────────────────────
+  lbToggle.addEventListener('change', async () => {
+    const enabled = lbToggle.checked;
+    try {
+      const res = await fetch('/teamclaude/loadbalance', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || 'HTTP ' + res.status);
+      }
+    } catch (err) {
+      lbToggle.checked = !enabled; // revert on failure
+      showErr('Load-balance toggle failed: ' + err.message);
+    }
   });
 
   // ── Service restart ──────────────────────────────────────────

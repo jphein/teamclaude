@@ -265,7 +265,19 @@ export class TUI {
     }
     else if (k === 'm') { this._doCycleSxMode(); }
     else if (k === 'x') { this._doClearSxKey(); }
+    else if (k === 'b') { this._doToggleLoadBalance(); }
     else if (k === 'esc' || k === 'q') { this.mode = 'normal'; }
+  }
+
+  async _doToggleLoadBalance() {
+    const on = !this.am.loadBalance;
+    this.config.loadBalance = on;
+    this.am.loadBalance = on; // apply to the running rotation immediately
+    try { await this.saveConfig(this.config); }
+    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    this._addLog(`Load balancing ${on ? 'enabled' : 'disabled'}`);
+    this.mode = 'settings';
+    if (this.running) this.render();
   }
 
   async _doSetThreshold(input) {
@@ -668,6 +680,11 @@ export class TUI {
         line += `  S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset)}`;
       }
     }
+    // Live load (concurrent requests in flight) and observed burst-429s — the
+    // latter is Anthropic's short-term rate ceiling, inferred from 429s that hit
+    // while the account still had quota. Only shown when non-zero.
+    if (a.inFlight > 0) line += cyan(`  L:${a.inFlight}`);
+    if (a.stats && a.stats.burstHits > 0) line += yellow(`  B:${a.stats.burstHits}`);
     return line;
   }
 
@@ -677,6 +694,11 @@ export class TUI {
     const thr = this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98;
     lines.push(bold('  Rotation') + dim('  — switch accounts when quota crosses the threshold'));
     lines.push(`  Switch at:  ${green(`${Math.round(thr * 100)}%`)}  ${dim('utilization')}`);
+    lines.push('');
+    // ── Load balancing
+    const lb = this.am.loadBalance;
+    lines.push(bold('  Load balancing') + dim('  — spread requests across accounts (least in-flight)'));
+    lines.push(`  Status:     ${lb ? green('on') : gray('off (single account)')}`);
     lines.push('');
     // ── Quota probe
     const probe = this.config.quotaProbeSeconds || 0;
@@ -716,7 +738,7 @@ export class TUI {
       case 'normal':
         return ` ${bold('s')}witch  ${bold('a')}dd  ${bold('r')}emove  ${bold('d')}isable  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
       case 'settings':
-        return ` ${bold('t')} threshold  ${bold('p')} probe  ${bold('m')} sx-mode  ${bold('k')} sx-key  ${bold('x')} clear-key  ${bold('Esc')} back`;
+        return ` ${bold('t')} threshold  ${bold('b')} balance  ${bold('p')} probe  ${bold('m')} sx-mode  ${bold('k')} sx-key  ${bold('x')} clear-key  ${bold('Esc')} back`;
       case 'select': {
         const act = this.selAction === 'switch' ? 'switch'
           : this.selAction === 'toggle' ? 'enable/disable'

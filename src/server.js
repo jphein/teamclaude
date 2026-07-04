@@ -181,6 +181,22 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         return;
       }
 
+      // POST /teamclaude/loadbalance — toggle least-in-flight load balancing
+      if (req.method === 'POST' && pathname === '/teamclaude/loadbalance') {
+        try {
+          const { enabled } = JSON.parse((await readBody(req)) || '{}');
+          const on = !!enabled;
+          accountManager.loadBalance = on;
+          await hooks.persistLoadBalance?.(on);
+          console.log(`[TeamClaude] Load balancing ${on ? 'enabled' : 'disabled'}`);
+          emitActivity({ type: 'loadbalance', value: on });
+          json(res, 200, { loadBalance: on });
+        } catch (err) {
+          json(res, 400, { error: err.message });
+        }
+        return;
+      }
+
       // GET /teamclaude/activity — SSE stream of request lifecycle events
       if (req.method === 'GET' && pathname === '/teamclaude/activity') {
         res.writeHead(200, {
@@ -524,6 +540,11 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (body.length > 0) l.body('REQUEST BODY', body, req.headers['content-type']);
   };
 
+  // Count this request against the account for the duration of the upstream
+  // exchange (drives least-in-flight balancing). Released in `finally`, and
+  // early before any retry-recursion so a retry on another account doesn't
+  // double-count. The release fn is idempotent, so the finally is a safety net.
+  const releaseSlot = accountManager.acquire(account.index);
   try {
     const upstreamRes = await upstreamFetch(upstreamUrl, {
       method,
@@ -569,6 +590,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       if (retryCount >= maxRetries) {
         console.log(`[TeamClaude] Persistent 429 on "${account.name}" — throttling ${retryAfter}s and re-dispatching`);
         accountManager.markRateLimited(account.index, retryAfter);
+        releaseSlot();
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
 
@@ -579,6 +601,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
         await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
       }
       // Client may have disconnected during the wait
+      releaseSlot();
       if (res.destroyed) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
     }
@@ -662,6 +685,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     if (isTransient && retryCount < maxRetries) {
       const delay = Math.min(200 * 2 ** retryCount, 2000);
       await new Promise(resolve => setTimeout(resolve, delay));
+      releaseSlot();
       if (res.destroyed) return;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
@@ -670,6 +694,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     // the next account.
     if (!isTransient && retryCount < maxRetries) {
       account.status = 'error';
+      releaseSlot();
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -681,6 +706,8 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       type: 'error',
       error: { type: 'proxy_error', message: `Upstream error after ${retryCount + 1} attempt(s): ${err.message}` },
     }));
+  } finally {
+    releaseSlot();
   }
 }
 

@@ -30,7 +30,7 @@ function emptyQuota() {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98) {
+  constructor(accounts, switchThreshold = 0.98, { loadBalance = false } = {}) {
     this.accounts = accounts.map((acct, index) => ({
       index,
       name: acct.name,
@@ -54,10 +54,70 @@ export class AccountManager {
         totalRequests: 0,
         lastUsed: null,
       },
+      // Concurrent requests currently dispatched to this account. Drives
+      // least-in-flight load balancing and the dashboard's live-load display.
+      inFlight: 0,
+      // Observed throttling. `burstHits` counts 429s received while the account
+      // was NOT near its quota — Anthropic's short-term burst/concurrency
+      // ceiling, which no header reports directly, so we infer it here.
+      stats: {
+        rateLimitHits: 0,
+        burstHits: 0,
+        lastRateLimitedAt: null,
+        lastRetryAfter: null,
+      },
       rateLimitedUntil: null,
     }));
     this.currentIndex = 0;
     this.switchThreshold = switchThreshold;
+    // When true, getActiveAccount spreads concurrent requests across all
+    // available accounts (least in-flight) instead of pinning one sticky
+    // account. Opt-in; default preserves the original single-account behavior.
+    this.loadBalance = loadBalance;
+  }
+
+  /**
+   * Mark one request as dispatched to an account. Returns a release callback
+   * (idempotent) to call when the request completes. Used to keep an accurate
+   * concurrent-request count for least-in-flight selection.
+   */
+  acquire(index) {
+    const account = this.accounts[index];
+    if (!account) return () => {};
+    account.inFlight++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.release(index);
+    };
+  }
+
+  release(index) {
+    const account = this.accounts[index];
+    if (!account) return;
+    account.inFlight = Math.max(0, account.inFlight - 1);
+  }
+
+  /**
+   * Pick the available account with the fewest in-flight requests. Ties break
+   * toward the higher-priority (lower value) account, then the one with the most
+   * remaining 5-hour budget. Returns null if no account is available.
+   */
+  _pickLeastLoaded() {
+    let best = null;
+    for (const account of this.accounts) {
+      if (!this._isAvailable(account)) continue;
+      if (best === null) { best = account; continue; }
+      if (account.inFlight < best.inFlight) { best = account; continue; }
+      if (account.inFlight > best.inFlight) continue;
+      const ap = account.priority || 0;
+      const bp = best.priority || 0;
+      if (ap < bp) { best = account; continue; }
+      if (ap > bp) continue;
+      if ((account.quota.unified5h ?? 0) < (best.quota.unified5h ?? 0)) best = account;
+    }
+    return best;
   }
 
   /**
@@ -69,6 +129,18 @@ export class AccountManager {
     // session reset made a sooner-expiring account the better choice. This runs
     // on every request so the behaviour holds without the TUI render loop.
     this.refreshExpiredQuotas();
+    // Load-balancing mode: spread each request across all available accounts by
+    // least in-flight, rather than pinning one sticky account. This keeps any
+    // single account under Anthropic's short-term burst ceiling under
+    // concurrency. Falls through to the soonest-reset logic when all are capped.
+    if (this.loadBalance) {
+      const balanced = this._pickLeastLoaded();
+      if (balanced) {
+        this.currentIndex = balanced.index;
+        return balanced;
+      }
+      return this._selectNext();
+    }
     const current = this.accounts[this.currentIndex];
     // We just learned a probed account's weekly quota — re-evaluate which
     // account is best now that its limit is known.
@@ -453,7 +525,22 @@ export class AccountManager {
     if (!account) return;
     account.status = 'throttled';
     account.rateLimitedUntil = Date.now() + (retryAfterSeconds * 1000);
-    console.log(`[TeamClaude] Account "${account.name}" rate limited for ${retryAfterSeconds}s`);
+
+    // Classify the 429: if the account was not near its quota when throttled,
+    // this is Anthropic's short-term burst/concurrency limit rather than genuine
+    // quota exhaustion. Unknown utilization counts as burst — we got a 429 with
+    // no evidence the budget is spent.
+    const q = account.quota;
+    const nearQuota =
+      (q.unified5h != null && q.unified5h >= this.switchThreshold) ||
+      (q.unified7d != null && q.unified7d >= this.switchThreshold);
+    account.stats.rateLimitHits++;
+    if (!nearQuota) account.stats.burstHits++;
+    account.stats.lastRateLimitedAt = new Date().toISOString();
+    account.stats.lastRetryAfter = retryAfterSeconds;
+
+    const kind = nearQuota ? 'quota' : 'burst';
+    console.log(`[TeamClaude] Account "${account.name}" rate limited for ${retryAfterSeconds}s (${kind})`);
   }
 
   /**
@@ -598,6 +685,7 @@ export class AccountManager {
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       switchThreshold: this.switchThreshold,
+      loadBalance: this.loadBalance,
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,
@@ -607,6 +695,8 @@ export class AccountManager {
         status: a.status,
         quota: { ...a.quota },
         usage: { ...a.usage },
+        inFlight: a.inFlight,
+        stats: { ...a.stats },
         rateLimitedUntil: a.rateLimitedUntil
           ? new Date(a.rateLimitedUntil).toISOString()
           : null,

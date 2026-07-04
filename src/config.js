@@ -43,6 +43,7 @@ export function createDefaultConfig() {
     },
     upstream: 'https://api.anthropic.com',
     switchThreshold: 0.98,
+    loadBalance: false,
     accounts: [],
   };
 }

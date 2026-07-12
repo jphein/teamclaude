@@ -306,6 +306,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
           req.pipe(fwd);
           return;
         }
+        // Absolute-form request for the upstream itself: rewrite to origin-form
+        // so the `${upstream}${req.url}` concatenation downstream builds a valid
+        // URL instead of fusing the two into a mangled host (api.anthropic.comhttps
+        // → ENOTFOUND → the account wrongly marked errored).
+        req.url = target.pathname + target.search;
       }
 
       // Let client token refresh requests pass through to upstream untouched.

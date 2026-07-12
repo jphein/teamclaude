@@ -66,7 +66,7 @@ function json(res, status, payload) {
   res.end(JSON.stringify(payload));
 }
 
-export function createProxyServer(accountManager, config, hooks = {}, sx = null) {
+export function createProxyServer(accountManager, config, hooks = {}, sx = null, serverInfo = {}) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
@@ -138,6 +138,12 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         const status = accountManager.getStatus();
         status.upstream = upstream;
         status.port = config.proxy?.port;
+        status.server = {
+          version: serverInfo.version || null,
+          uptimeSeconds: Math.floor(process.uptime()),
+          pid: process.pid,
+          rssBytes: process.memoryUsage().rss,
+        };
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(status, null, 2));
         return;
@@ -191,6 +197,51 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
           console.log(`[TeamClaude] Load balancing ${on ? 'enabled' : 'disabled'}`);
           emitActivity({ type: 'loadbalance', value: on });
           json(res, 200, { loadBalance: on });
+        } catch (err) {
+          json(res, 400, { error: err.message });
+        }
+        return;
+      }
+
+      // POST /teamclaude/probe — refresh every account's quota from the
+      // zero-spend usage endpoint NOW (e.g. after a plan upgrade), instead of
+      // waiting for rotation traffic or the opt-in background probe.
+      if (req.method === 'POST' && pathname === '/teamclaude/probe') {
+        if (!hooks.probeNow) {
+          json(res, 501, { ok: false, error: 'probe not supported' });
+          return;
+        }
+        try {
+          const probed = await hooks.probeNow();
+          console.log(`[TeamClaude] On-demand quota probe (${probed} account(s))`);
+          emitActivity({ type: 'probe', value: probed });
+          json(res, 200, { ok: true, probed });
+        } catch (err) {
+          json(res, 500, { ok: false, error: err.message });
+        }
+        return;
+      }
+
+      // POST /teamclaude/account — enable/disable an account from the UI.
+      // Applies live (setDisabled also clears a stuck error on re-enable) and
+      // persists to config through the hook so a restart doesn't undo it.
+      if (req.method === 'POST' && pathname === '/teamclaude/account') {
+        try {
+          const { name, disabled } = JSON.parse((await readBody(req)) || '{}');
+          const idx = accountManager.accounts.findIndex(a => a.name === name);
+          if (idx < 0) {
+            json(res, 404, { error: `account "${name}" not found` });
+            return;
+          }
+          if (!hooks.persistAccountDisabled) {
+            json(res, 501, { error: 'account toggle not supported' });
+            return;
+          }
+          accountManager.setDisabled(idx, !!disabled);
+          await hooks.persistAccountDisabled(name, !!disabled);
+          console.log(`[TeamClaude] Account "${name}" ${disabled ? 'disabled' : 'enabled'} via UI`);
+          emitActivity({ type: 'account', name, disabled: !!disabled });
+          json(res, 200, { name, disabled: !!disabled });
         } catch (err) {
           json(res, 400, { error: err.message });
         }

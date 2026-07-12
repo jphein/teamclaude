@@ -144,6 +144,44 @@
     font-size: 0.75rem;
   }
   .btn-ghost:hover { color: var(--text); border-color: var(--text-dim); }
+  .btn-svc {
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    padding: 0.32rem 0.7rem;
+    font-size: 0.82rem;
+    border-radius: 6px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+  }
+  .btn-svc:hover:not(:disabled) { background: var(--accent); color: #fff; }
+  .btn-svc:disabled { opacity: 0.4; cursor: default; }
+
+  /* ── Service bar ── */
+  .svc {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    padding: 0.6rem 1.125rem;
+    margin-bottom: 0.875rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.5rem 1rem;
+  }
+  .svc-stats {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 0.25rem 1.1rem;
+    font-size: 0.82rem;
+    color: var(--text-dim);
+  }
+  .svc-stats .svc-title { font-weight: 600; font-size: 0.9rem; color: var(--text); }
+  .svc-stats b { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
+  .svc-actions { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
 
   /* ── Account cards ── */
   .cards { display: grid; gap: 0.875rem; }
@@ -162,6 +200,16 @@
     border-color: var(--accent);
     box-shadow: 0 0 0 1px var(--accent), 0 4px 18px var(--active-glow);
   }
+  .card.off { opacity: 0.55; }
+  .card-actions {
+    grid-row: 1;
+    grid-column: 2;
+    align-self: start;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .card-actions .btn-ghost { padding: 0.3rem 0.6rem; font-size: 0.8rem; }
   .card .name {
     font-size: 1.05rem;
     font-weight: 600;
@@ -426,12 +474,23 @@
         <label for="lb">Balance</label>
         <input type="checkbox" id="lb">
       </div>
-      <button id="restartBtn" class="btn-restart">Restart service</button>
-      <span id="restartStatus" class="restart-status"></span>
     </div>
   </header>
 
   <div id="errBox"></div>
+
+  <!-- Service manager -->
+  <div class="svc">
+    <div class="svc-stats" id="svcStats"><span class="svc-title">Service</span></div>
+    <div class="svc-actions">
+      <span id="svcMsg" class="restart-status"></span>
+      <button id="probeBtn" class="btn-svc" title="Re-read every account's quota from the zero-spend usage endpoint — use after a plan change or upgrade">↻ Refresh quotas</button>
+      <button id="reloadBtn" class="btn-svc" title="Re-sync accounts from the config file without a restart (picks up new accounts, tokens, priorities)">⟲ Reload config</button>
+      <button id="restartBtn" class="btn-restart" title="systemctl --user restart teamclaude">Restart</button>
+      <span id="restartStatus" class="restart-status"></span>
+    </div>
+  </div>
+
   <div class="cards" id="cards"></div>
 
   <div class="bottom-row">
@@ -471,6 +530,10 @@
   const lbToggle    = document.getElementById('lb');
   const restartBtn  = document.getElementById('restartBtn');
   const restartStatusEl = document.getElementById('restartStatus');
+  const svcStatsEl  = document.getElementById('svcStats');
+  const svcMsgEl    = document.getElementById('svcMsg');
+  const probeBtn    = document.getElementById('probeBtn');
+  const reloadBtn   = document.getElementById('reloadBtn');
   const activeReqsEl = document.getElementById('activeReqs');
   const completedLogEl = document.getElementById('completedLog');
   const activeCountEl  = document.getElementById('activeCount');
@@ -517,6 +580,13 @@
     if (ms < 1000) return ms + 'ms';
     return (ms / 1000).toFixed(1) + 's';
   }
+  function fmtUptime(s) {
+    if (s == null) return '—';
+    if (s < 3600) return Math.floor(s / 60) + 'm';
+    if (s < 86400) return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
+    return Math.floor(s / 86400) + 'd ' + Math.floor((s % 86400) / 3600) + 'h';
+  }
+  function fmtMB(bytes) { return bytes == null ? '—' : Math.round(bytes / 1048576) + ' MB'; }
   // Quota windows carry a reset timestamp (ms epoch for unified, ISO for standard).
   // Returns { when, rel, full } or null when the window is already reset / absent.
   function fmtReset(ts) {
@@ -571,10 +641,18 @@
       el('span', { class: 'status-dot status-' + acct.status }),
       acct.name,
       isActive ? el('span', { class: 'badge active-badge', text: 'active' }) : null,
+      acct.disabled ? el('span', { class: 'badge', style: 'background:transparent;color:var(--bad);border:1px solid var(--bad);', text: 'disabled' }) : null,
       inFlight > 0 ? el('span', { class: 'badge', style: 'background:transparent;color:var(--accent,#4a9eff);', text: inFlight + ' live' }) : null,
       el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', text: acct.type }),
     ]);
-    const btn = el('button', { class: 'switch', 'data-name': acct.name, disabled: isActive, text: 'Switch' });
+    const actions = el('div', { class: 'card-actions' }, [
+      el('button', { class: 'switch', 'data-name': acct.name, disabled: isActive || acct.disabled, text: 'Switch' }),
+      el('button', {
+        class: 'btn-ghost toggle-acct', 'data-name': acct.name, 'data-disabled': acct.disabled ? '1' : '',
+        title: acct.disabled ? 'Bring this account back into rotation (also clears a stuck error)' : 'Exclude this account from rotation',
+        text: acct.disabled ? 'Enable' : 'Disable',
+      }),
+    ]);
     const bars = el('div', { class: 'bars' }, [
       ...makeBar('5h', u5h, threshold, q.unified5hReset ?? q.resetsAt),
       ...makeBar('7d', u7d, threshold, q.unified7dReset),
@@ -584,7 +662,7 @@
       + (burstHits > 0 ? ' · ' + burstHits + ' burst-429' + (burstHits === 1 ? '' : 's') : '')
       + (acct.rateLimitedUntil ? ' · throttled until ' + new Date(acct.rateLimitedUntil).toLocaleTimeString() : '');
     const meta = el('div', { class: 'meta', text: metaText });
-    return el('div', { class: 'card' + (isActive ? ' active' : '') }, [nameRow, btn, bars, meta]);
+    return el('div', { class: 'card' + (isActive ? ' active' : '') + (acct.disabled ? ' off' : '') }, [nameRow, actions, bars, meta]);
   }
 
   // ── Error display ────────────────────────────────────────────
@@ -623,6 +701,20 @@
         cardsEl.appendChild(renderAccount(acct, acct.name === data.currentAccount, data.switchThreshold));
       }
 
+      const sv = data.server || {};
+      svcStatsEl.textContent = '';
+      svcStatsEl.appendChild(el('span', { class: 'svc-title', text: 'Service' }));
+      for (const [label, value] of [
+        ['version', sv.version ? 'v' + sv.version : '—'],
+        ['uptime', fmtUptime(sv.uptimeSeconds)],
+        ['memory', fmtMB(sv.rssBytes)],
+        ['pid', sv.pid != null ? String(sv.pid) : '—'],
+        ['port', String(data.port || 3456)],
+        ['accounts', data.accounts.filter(a => !a.disabled).length + '/' + data.accounts.length + ' in rotation'],
+      ]) {
+        svcStatsEl.appendChild(el('span', {}, [label + ' ', el('b', { text: value })]));
+      }
+
       const upDisplay = (data.upstream || 'api.anthropic.com').replace(/^https?:\/\//, '');
       const portDisplay = data.port || 3456;
       metaEl.textContent = `Active: ${data.currentAccount} · ${upDisplay}:${portDisplay} · ${new Date().toLocaleTimeString()}`;
@@ -635,28 +727,59 @@
     }
   }
 
-  // ── Switch account ───────────────────────────────────────────
+  // ── Account actions (switch / enable / disable) ──────────────
   cardsEl.addEventListener('click', async (e) => {
-    const btn = e.target.closest('button.switch');
+    const btn = e.target.closest('button.switch, button.toggle-acct');
     if (!btn || btn.disabled) return;
     const name = btn.getAttribute('data-name');
+    const isToggle = btn.classList.contains('toggle-acct');
     btn.disabled = true;
     try {
-      const res = await fetch('/teamclaude/switch', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ account: name }),
-      });
+      const res = isToggle
+        ? await fetch('/teamclaude/account', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ name, disabled: !btn.getAttribute('data-disabled') }),
+          })
+        : await fetch('/teamclaude/switch', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ account: name }),
+          });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.error || 'HTTP ' + res.status);
       }
       await refresh();
     } catch (err) {
-      showErr('Switch failed: ' + err.message);
+      showErr((isToggle ? 'Account toggle' : 'Switch') + ' failed: ' + err.message);
       btn.disabled = false;
     }
   });
+
+  // ── Service actions: refresh quotas / reload config ──────────
+  function flashSvcMsg(text) {
+    svcMsgEl.textContent = text;
+    setTimeout(() => { if (svcMsgEl.textContent === text) svcMsgEl.textContent = ''; }, 4000);
+  }
+  async function svcAction(btn, url, describe) {
+    btn.disabled = true;
+    try {
+      const res = await fetch(url, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
+      await refresh();
+      flashSvcMsg(describe(data));
+    } catch (err) {
+      showErr('Service action failed: ' + err.message);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+  probeBtn.addEventListener('click', () =>
+    svcAction(probeBtn, '/teamclaude/probe', d => '✓ probed ' + d.probed + ' account' + (d.probed === 1 ? '' : 's')));
+  reloadBtn.addEventListener('click', () =>
+    svcAction(reloadBtn, '/teamclaude/reload', d => d.added ? '✓ +' + d.added + ' account' + (d.added === 1 ? '' : 's') : '✓ config re-synced'));
 
   // ── Threshold slider ─────────────────────────────────────────
   thr.addEventListener('input', () => { thrVal.textContent = thr.value + '%'; });

@@ -89,6 +89,10 @@ switch (command) {
     await probeCommand();
     process.exit(0);
     break;
+  case 'refresh':
+    await refreshCommand();
+    process.exit(0);
+    break;
   case 'help':
   case '--help':
   case '-h':
@@ -237,6 +241,19 @@ async function serverCommand() {
     diskConfig.loadBalance = enabled;
   });
 
+  // On-demand quota refresh (POST /teamclaude/probe, `teamclaude refresh`).
+  // `prober` is assigned later in startup; read it at call time.
+  hooks.probeNow = () => (prober ? prober.probeAll() : 0);
+
+  hooks.persistAccountDisabled = (name, disabled) => atomicConfigUpdate(diskConfig => {
+    for (const cfg of [diskConfig, config]) {
+      const acct = cfg.accounts.find(a => a.name === name);
+      if (!acct) continue;
+      if (disabled) acct.disabled = true;
+      else delete acct.disabled;
+    }
+  });
+
   if (useTUI) {
     tui = new TUI({
       accountManager, config, sx,
@@ -279,7 +296,7 @@ async function serverCommand() {
   // Expose reload to the proxy's control endpoint (works with or without TUI).
   hooks.reload = reloadAccounts;
 
-  const server = createProxyServer(accountManager, config, hooks, sx);
+  const server = createProxyServer(accountManager, config, hooks, sx, { version: await getVersion() });
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
   // remove this handler so a later runtime 'error' isn't misreported as a
   // listen failure and exit the whole proxy.
@@ -549,6 +566,30 @@ async function runCommand() {
 }
 
 // ── status ──────────────────────────────────────────────────
+
+// ── refresh ─────────────────────────────────────────────────
+
+// Force a zero-spend quota probe on the running server, then show the result.
+// The proxy otherwise only learns quota from live response headers, so an idle
+// account's display goes stale — e.g. still "exhausted" after a plan upgrade.
+async function refreshCommand() {
+  const config = await loadOrCreateConfig();
+  const url = `http://localhost:${config.proxy.port}/teamclaude/probe`;
+  try {
+    const res = await fetch(url, { method: 'POST', headers: { 'x-api-key': config.proxy.apiKey } });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) {
+      console.error(`Refresh failed: ${data.error || `HTTP ${res.status}`}`);
+      process.exit(1);
+    }
+    console.log(`Probed ${data.probed} account(s) — fresh quota:\n`);
+  } catch {
+    console.error('Proxy is not running — quota lives in the server, nothing to refresh.');
+    console.error('Start it with: teamclaude server');
+    process.exit(1);
+  }
+  await statusCommand();
+}
 
 async function statusCommand() {
   const config = await loadOrCreateConfig();
@@ -1024,6 +1065,8 @@ Commands:
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
+  refresh             Probe all accounts' quota NOW and show status (use after
+                      a plan change/upgrade so the display isn't stale)
   api <path>          Call an API endpoint with account credentials
   help                Show this help
 

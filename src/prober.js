@@ -44,13 +44,15 @@ export class Prober {
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
   }
 
-  /** Probe every OAuth account once. Overlapping cycles are skipped. */
+  /** Probe every OAuth account once; returns how many were probed.
+   *  Overlapping cycles are skipped (returns 0). */
   async probeAll() {
-    if (this._running) return;
+    if (this._running) return 0;
     this._running = true;
     try {
       const accounts = this.am.accounts.filter(a => a.type === 'oauth' && a.credential);
       await Promise.all(accounts.map(a => this.probeOne(a)));
+      return accounts.length;
     } finally {
       this._running = false;
     }

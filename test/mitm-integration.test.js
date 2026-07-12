@@ -51,8 +51,8 @@ function connectThroughProxy(proxyPort, target, caCertPem, alpn) {
 
 const ACCOUNT_UUID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 
-function makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, onQuota, logDir = null, hooks = {}, sx = null) {
-  const account = { index: 0, type: 'oauth', credential: 'REAL-TOKEN', accountUuid: ACCOUNT_UUID, name: 'acct@x' };
+function makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, onQuota, logDir = null, hooks = {}, sx = null, account = null) {
+  account ||= { index: 0, type: 'oauth', credential: 'REAL-TOKEN', accountUuid: ACCOUNT_UUID, name: 'acct@x' };
   const accountManager = {
     getActiveAccount: () => account,
     ensureTokenFresh: async () => {},
@@ -390,6 +390,100 @@ test('MITM h1 keep-alive: every request is reframed, rewritten, masked, and quot
     assert.ok(all.every((c) => /"auth"/.test(c)), 'response JSON body is logged (pretty)');
   } finally {
     tlsSock.destroy(); closeHard(proxy); closeHard(upstream); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A token refresh must reach ALREADY-OPEN tunnels. The h1 relay used to bake the
+// Bearer string into a closure at tunnel setup, so after ensureTokenFresh()
+// rotated the credential, every request on a live keep-alive tunnel kept sending
+// the expiring token — a client-visible 401 spray a few minutes after each
+// refresh (client fetch is http/1.1, so this was the common path).
+test('MITM h1: a token refresh mid-tunnel is used by the next request', T, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+  const upstream = tls.createServer({ key: leafKeyPem, cert: leafCertPem, ALPNProtocols: ['http/1.1'] }, (s) => {
+    let buf = '';
+    s.on('data', (d) => {
+      buf += d;
+      let idx;
+      while ((idx = buf.indexOf('\r\n\r\n')) >= 0) {
+        const head = buf.slice(0, idx);
+        const need = parseInt((head.match(/content-length: (\d+)/i) || [])[1] || '0', 10);
+        if (buf.length < idx + 4 + need) break;
+        buf = buf.slice(idx + 4 + need);
+        const auth = (head.match(/authorization: (.*)/i) || [])[1]?.trim() || 'none';
+        const body = JSON.stringify({ auth });
+        s.write(`HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(body)}\r\nconnection: keep-alive\r\n\r\n${body}`);
+      }
+    });
+  });
+  const upPort = await listen(upstream);
+
+  const account = { index: 0, type: 'oauth', credential: 'REAL-TOKEN', accountUuid: ACCOUNT_UUID, name: 'acct@x' };
+  const proxy = makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, () => {}, null, {}, null, account);
+  const proxyPort = await listen(proxy);
+
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['http/1.1']);
+  const readJson = () => new Promise((resolve) => {
+    let buf = '';
+    const onData = (d) => {
+      buf += d;
+      const i = buf.indexOf('\r\n\r\n');
+      if (i < 0) return;
+      const need = parseInt((buf.match(/content-length: (\d+)/i) || [])[1], 10);
+      if (buf.length < i + 4 + need) return;
+      tlsSock.removeListener('data', onData);
+      resolve(JSON.parse(buf.slice(i + 4, i + 4 + need)));
+    };
+    tlsSock.on('data', onData);
+  });
+  try {
+    tlsSock.setEncoding('utf8');
+    const p1 = readJson();
+    tlsSock.write('POST /v1/messages HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer FAKE\r\ncontent-type: application/json\r\ncontent-length: 9\r\n\r\n{"q":"x"}');
+    const r1 = await p1;
+    assert.equal(r1.auth, 'Bearer REAL-TOKEN', 'pre-refresh token injected');
+
+    account.credential = 'ROTATED-TOKEN'; // ensureTokenFresh() rotated mid-tunnel
+
+    const p2 = readJson();
+    tlsSock.write('POST /v1/messages HTTP/1.1\r\nhost: localhost\r\nauthorization: Bearer FAKE\r\ncontent-type: application/json\r\ncontent-length: 9\r\n\r\n{"q":"y"}');
+    const r2 = await p2;
+    assert.equal(r2.auth, 'Bearer ROTATED-TOKEN', 'refreshed token used on the live tunnel (was baked at setup)');
+  } finally {
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
+  }
+});
+
+// Same rotation scenario on the h2 path — pins the (already correct) live
+// per-request read in makeRewriteRequest so it can't regress to setup-time capture.
+test('MITM h2: a token refresh mid-tunnel is used by the next request', T, async () => {
+  const { caCertPem, leafCertPem, leafKeyPem } = generateCertChain('localhost');
+  const upstream = http2.createSecureServer({ key: leafKeyPem, cert: leafCertPem });
+  upstream.on('stream', (s, h) => {
+    s.respond({ ':status': 200, 'x-saw-auth': h.authorization || 'none' });
+    s.end();
+  });
+  const upPort = await listen(upstream);
+
+  const account = { index: 0, type: 'oauth', credential: 'REAL-TOKEN', accountUuid: ACCOUNT_UUID, name: 'acct@x' };
+  const proxy = makeProxy(upPort, caCertPem, leafCertPem, leafKeyPem, () => {}, null, {}, null, account);
+  const proxyPort = await listen(proxy);
+
+  const tlsSock = await connectThroughProxy(proxyPort, `127.0.0.1:${upPort}`, caCertPem, ['h2', 'http/1.1']);
+  try {
+    const client = http2.connect('https://localhost', { createConnection: () => tlsSock });
+    const ask = () => new Promise((resolve, reject) => {
+      const req = client.request({ ':method': 'POST', ':path': '/v1/messages', authorization: 'Bearer FAKE' });
+      req.on('response', (h) => resolve(h['x-saw-auth']));
+      req.on('error', reject);
+      req.end('{}');
+    });
+    assert.equal(await ask(), 'Bearer REAL-TOKEN');
+    account.credential = 'ROTATED-TOKEN';
+    assert.equal(await ask(), 'Bearer ROTATED-TOKEN', 'h2 rewrite reads the live credential');
+    client.close();
+  } finally {
+    tlsSock.destroy(); closeHard(proxy); closeHard(upstream);
   }
 });
 

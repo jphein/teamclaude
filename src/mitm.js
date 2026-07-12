@@ -274,11 +274,14 @@ async function intercept({ host, port, mode, clientSocket, head, accountManager,
       log,
     });
   } else {
-    const auth = account.type === 'oauth'
-      ? { authorization: `Bearer ${account.credential}` }
-      : { apiKey: account.credential };
+    // Resolve the credential per request, NOT at tunnel setup: keep-alive
+    // tunnels outlive token refreshes, and a baked Bearer string keeps sending
+    // the expiring token (401 spray minutes after every refresh). The h2 path
+    // already reads live via makeRewriteRequest.
     relayHandle = h1Relay(claudeTls, upstreamSock, {
-      rewriteHead: (h) => rewriteH1Auth(h, auth),
+      rewriteHead: (h) => rewriteH1Auth(h, account.type === 'oauth'
+        ? { authorization: `Bearer ${account.credential}` }
+        : { apiKey: account.credential }),
       makeBodyPatcher,
       onResponseHeaders: makeQuotaObserver(accountManager, account, sx, teardownAll),
       tap,

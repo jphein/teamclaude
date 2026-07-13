@@ -26,7 +26,7 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 - **Optional quota probe** — off by default; when enabled, periodically refreshes idle accounts' quota from the usage endpoint (no message spend), and surfaces the Sonnet weekly bucket
 - **Optional MITM proxy mode** — `teamclaude run --mitm` routes claude via an HTTPS forward proxy with a local CA so even hardcoded `api.anthropic.com` endpoints (e.g. the Claude Design MCP) get the real token injected
 - **Optional sx.org proxy mode** — off by default; set an [sx.org](https://sx.org) API key in the TUI settings screen (`g`) and TeamClaude auto-provisions a residential proxy to change the egress IP and work around IP-based `429`s. Three modes (`m` to cycle): **always** (route all upstream traffic), **on 429 only** (stay direct, fail over to the proxy after a 429), or **off** (keep the key but don't use it). TLS stays end-to-end with Anthropic (the proxy only relays ciphertext)
-- **Web dashboard** — browser UI at `/ui` with quota bars, account switching, live activity feed, log viewer, and a restart button
+- **Web dashboard** — browser UI at `/ui` with quota bars, account switching, live activity feed, log viewer, and a service manager (version/uptime/memory, on-demand quota refresh, config reload, restart, per-account enable/disable)
 - **Fast-mode stripping** — silently removes Claude Code's `/fast` mode (`speed:"fast"`) before forwarding, since fast mode bills as usage credits (not covered by subscription) and would otherwise 429 every account in the pool
 - **Request logging** — optional full request/response logging for debugging
 - **Remote env generation** — `teamclaude env --host <ip> --port <port>` generates exports usable from other machines (with API-key auth for non-localhost)
@@ -195,6 +195,7 @@ teamclaude disable <name>    # Temporarily exclude an account from rotation
 teamclaude enable <name>     # Re-enable it (also clears a stuck error state)
 teamclaude priority <name> 1 # Set rotation priority (lower = preferred)
 teamclaude probe 300         # Enable background quota refresh (off by default)
+teamclaude refresh           # Probe all accounts' quota NOW (zero-spend; use after a plan change)
 teamclaude alias             # Print/install a `claude` alias that routes via the proxy
 teamclaude api <path>        # Call an API endpoint with account credentials
 teamclaude help              # Show all commands

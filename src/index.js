@@ -296,10 +296,14 @@ async function serverCommand() {
 
   // Expose reload to the proxy's control endpoint (works with or without TUI).
   hooks.reload = reloadAccounts;
+  const buildVersion = currentVersion();
   hooks.getStatusExtra = () => ({
     server: {
+      version: buildVersion,
       startedAt: new Date(serverStartedAt).toISOString(),
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
+      pid: process.pid,
+      rssBytes: process.memoryUsage().rss,
       port,
       upstream: config.upstream || 'https://api.anthropic.com',
     },
@@ -330,6 +334,26 @@ async function serverCommand() {
       })),
     },
   });
+
+  // Web-dashboard control hooks — consumed by the /teamclaude/* endpoints in
+  // server.js. They work with or without the TUI, so the browser dashboard can
+  // drive the daemon (which, being TTY-less, can't host the interactive TUI).
+  hooks.probeNow = async () => {
+    // Same fleet-wide refresh the TUI 'p' key runs; returns how many OAuth
+    // accounts were eligible so the UI can report "probed N account(s)".
+    const n = accountManager.accounts.filter(a => a.type === 'oauth' && a.credential).length;
+    await prober?.probeAll();
+    return n;
+  };
+  hooks.persistThreshold = (value) => {
+    config.switchThreshold = value; // keep in-memory config in sync with the live rotation
+    return atomicConfigUpdate(async diskConfig => { diskConfig.switchThreshold = value; });
+  };
+  hooks.persistAccountDisabled = (name, disabled) =>
+    atomicConfigUpdate(async diskConfig => {
+      const acct = diskConfig.accounts?.find(a => a.name === name);
+      if (acct) acct.disabled = disabled;
+    });
 
   const server = createProxyServer(accountManager, config, hooks, sx);
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we

@@ -1,8 +1,10 @@
 import http from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
-import { mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, readFile } from 'node:fs/promises';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
 import { ensureCerts, createConnectHandler } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
@@ -47,6 +49,30 @@ export function isLoopbackAddr(addr) {
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
 }
 
+// Directory of this module — used to locate the bundled web dashboard.
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// Collect a request body into a string (control endpoints send small JSON).
+async function readBody(req) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  return Buffer.concat(chunks).toString('utf-8');
+}
+
+// Terse JSON responder for the /teamclaude/* control endpoints.
+function json(res, status, payload) {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(payload));
+}
+
+// State-changing dashboard endpoints that require the CSRF header (see the guard
+// in the request handler). Read-only endpoints (status/ui/activity/logs) and
+// upstream's own /teamclaude/reload are intentionally NOT here.
+const MUTATING_CONTROL = new Set([
+  '/teamclaude/switch', '/teamclaude/threshold', '/teamclaude/account',
+  '/teamclaude/probe', '/teamclaude/restart',
+]);
+
 export function createProxyServer(accountManager, config, hooks = {}, sx = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
@@ -54,6 +80,62 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
 
   if (logDir) {
     mkdir(logDir, { recursive: true }).catch(() => {});
+  }
+
+  let dashboardHtml = null;
+  let journalctlBroken = false; // set once journalctl is found missing (stops the EventSource respawn spin)
+  let logStreams = 0;           // concurrent /teamclaude/logs subprocesses, capped below
+
+  // Activity feed: a ring buffer of recent lifecycle/control events plus the set
+  // of SSE subscribers. Lives here (not in the TUI) so the browser dashboard
+  // shows live traffic even when the process is a TTY-less daemon.
+  const activityBuf = [];
+  const activityClients = new Set();
+  const reqStartTimes = new Map();
+  function emitActivity(event) {
+    const e = { ...event, ts: Date.now() };
+    activityBuf.push(e);
+    if (activityBuf.length > 500) activityBuf.shift();
+    const msg = `data: ${JSON.stringify(e)}\n\n`;
+    for (const sub of activityClients) {
+      try { sub.write(msg); } catch { activityClients.delete(sub); }
+    }
+  }
+
+  // Feed the activity stream from the request lifecycle, on top of whatever the
+  // TUI registered. The base HTTP forwarder and the MITM CONNECT forwarder each
+  // mint their OWN reqId sequence (1,2,3,…), so we namespace the activity id per
+  // channel ('h'/'m') to keep the shared buffer's ids collision-free. This is the
+  // one injection point that reaches the lifecycle without touching forwardRequest.
+  function channelHooks(tag) {
+    const key = (id) => tag + id;
+    return {
+      ...hooks,
+      onRequestStart: (id, info) => {
+        const k = key(id);
+        reqStartTimes.set(k, Date.now());
+        // onRequestEnd (which deletes the entry) runs in a finally, but only once
+        // a request reaches the forward try-block; a client that drops mid-body
+        // aborts earlier, so cap the map to bound that slow leak.
+        if (reqStartTimes.size > 1024) reqStartTimes.delete(reqStartTimes.keys().next().value);
+        emitActivity({ type: 'req_start', id: k, method: info?.method, path: info?.path });
+        hooks.onRequestStart?.(id, info);
+      },
+      onRequestRouted: (id, info) => {
+        emitActivity({ type: 'req_routed', id: key(id), account: info?.account });
+        hooks.onRequestRouted?.(id, info);
+      },
+      onRequestEnd: (id, info) => {
+        const k = key(id);
+        const started = reqStartTimes.get(k);
+        reqStartTimes.delete(k);
+        emitActivity({
+          type: 'req_end', id: k, method: info?.method, path: info?.path,
+          account: info?.account, status: info?.status, ms: started ? Date.now() - started : null,
+        });
+        hooks.onRequestEnd?.(id, info);
+      },
+    };
   }
 
   const requestHandler = async (req, res) => {
@@ -99,13 +181,150 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         return;
       }
 
+      // ── Web dashboard (served over HTTP so it works on a TTY-less daemon,
+      //    which the in-process TUI cannot) ──────────────────────────────
+
+      // CSRF guard for the state-changing control endpoints. The proxy-key gate
+      // above exempts loopback, and these are reachable from a browser, so a page
+      // on any site the user visits could POST to them cross-site (a CORS "simple
+      // request" whose side effect fires even though the response is blocked).
+      // Requiring a non-safelisted header defeats that: a cross-site fetch that
+      // sets it triggers a CORS preflight we never approve, while the same-origin
+      // dashboard sends it freely. GETs (status/ui/activity/logs) can't mutate and
+      // are additionally protected by same-origin read rules, so they're exempt.
+      if (req.method === 'POST' && MUTATING_CONTROL.has(req.url) && !req.headers['x-teamclaude-control']) {
+        json(res, 403, { error: 'missing X-TeamClaude-Control header (CSRF guard)' });
+        return;
+      }
+
+      // GET /ui — the single-page dashboard, cached after first read.
+      if (req.method === 'GET' && (req.url === '/ui' || req.url === '/ui/' || req.url === '/ui/index.html')) {
+        try {
+          if (dashboardHtml === null) dashboardHtml = await readFile(join(__dirname, 'web', 'index.html'), 'utf-8');
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+          res.end(dashboardHtml);
+        } catch (err) {
+          json(res, 500, { error: `Dashboard not found: ${err.message}` });
+        }
+        return;
+      }
+
+      // POST /teamclaude/switch — soft-pin the active account (mirrors the TUI's
+      // manual switch: sets currentIndex; normal selection may re-pick on a miss).
+      if (req.method === 'POST' && req.url === '/teamclaude/switch') {
+        try {
+          const { account } = JSON.parse((await readBody(req)) || '{}');
+          if (!account) { json(res, 400, { error: 'Missing "account"' }); return; }
+          const idx = accountManager.accounts.findIndex(a => a.name === account);
+          if (idx < 0) { json(res, 404, { error: `Account "${account}" not found` }); return; }
+          accountManager.currentIndex = idx;
+          console.log(`[TeamClaude] Manually switched to "${account}" via UI`);
+          emitActivity({ type: 'switched', account });
+          json(res, 200, { currentAccount: account });
+        } catch (err) { json(res, 400, { error: err.message }); }
+        return;
+      }
+
+      // POST /teamclaude/threshold — change the rotation threshold (0..1), live.
+      if (req.method === 'POST' && req.url === '/teamclaude/threshold') {
+        try {
+          const { value } = JSON.parse((await readBody(req)) || '{}');
+          const v = Number(value);
+          if (Number.isNaN(v) || v < 0 || v > 1) { json(res, 400, { error: 'value must be a number between 0 and 1' }); return; }
+          accountManager.switchThreshold = v;
+          await hooks.persistThreshold?.(v);
+          console.log(`[TeamClaude] Threshold set to ${(v * 100).toFixed(0)}% via UI`);
+          emitActivity({ type: 'threshold', value: v });
+          json(res, 200, { switchThreshold: v });
+        } catch (err) { json(res, 400, { error: err.message }); }
+        return;
+      }
+
+      // POST /teamclaude/account — enable/disable an account (live + persisted,
+      // so a restart doesn't undo it; re-enable also clears a stuck error state).
+      if (req.method === 'POST' && req.url === '/teamclaude/account') {
+        try {
+          const { name, disabled } = JSON.parse((await readBody(req)) || '{}');
+          const idx = accountManager.accounts.findIndex(a => a.name === name);
+          if (idx < 0) { json(res, 404, { error: `account "${name}" not found` }); return; }
+          accountManager.setDisabled(idx, !!disabled);
+          await hooks.persistAccountDisabled?.(name, !!disabled);
+          console.log(`[TeamClaude] Account "${name}" ${disabled ? 'disabled' : 'enabled'} via UI`);
+          emitActivity({ type: 'account', name, disabled: !!disabled });
+          json(res, 200, { name, disabled: !!disabled });
+        } catch (err) { json(res, 400, { error: err.message }); }
+        return;
+      }
+
+      // POST /teamclaude/probe — refresh every OAuth account's quota now (the
+      // HTTP twin of the TUI 'p' key), instead of waiting for rotation traffic.
+      if (req.method === 'POST' && req.url === '/teamclaude/probe') {
+        if (!hooks.probeNow) { json(res, 501, { ok: false, error: 'probe not supported' }); return; }
+        try {
+          const probed = await hooks.probeNow();
+          emitActivity({ type: 'probe', value: probed });
+          json(res, 200, { ok: true, probed });
+        } catch (err) { json(res, 500, { ok: false, error: err.message }); }
+        return;
+      }
+
+      // GET /teamclaude/activity — SSE stream of request lifecycle + control
+      // events. Replays recent terminal events so a fresh page isn't blank.
+      if (req.method === 'GET' && req.url === '/teamclaude/activity') {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+        const replay = new Set(['req_end', 'switched', 'threshold']);
+        for (const e of activityBuf.filter(ev => replay.has(ev.type)).slice(-100)) {
+          res.write(`data: ${JSON.stringify(e)}\n\n`);
+        }
+        activityClients.add(res);
+        req.on('close', () => activityClients.delete(res));
+        return;
+      }
+
+      // GET /teamclaude/logs — SSE tail of this service's journald output.
+      if (req.method === 'GET' && req.url === '/teamclaude/logs') {
+        // 501 is NOT an event-stream, so EventSource stops reconnecting instead
+        // of respawning journalctl every few seconds on a host that lacks it.
+        if (journalctlBroken) { json(res, 501, { error: 'journalctl unavailable' }); return; }
+        if (logStreams >= 4) { json(res, 503, { error: 'too many concurrent log streams' }); return; }
+        logStreams++;
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+        // stderr ignored so a chatty journalctl can't block on an unread pipe.
+        const child = spawn('journalctl',
+          ['--user', '-u', 'teamclaude.service', '-n', '100', '-f', '--no-pager', '--output=short-iso'],
+          { stdio: ['ignore', 'pipe', 'ignore'] });
+        child.stdout.on('data', chunk => {
+          for (const line of chunk.toString().split('\n')) {
+            // Honor backpressure: if the socket buffer is full, pause the tail
+            // until it drains so a slow/stalled reader can't balloon RSS.
+            if (line.trim() && !res.write(`data: ${JSON.stringify(line)}\n\n`)) child.stdout.pause();
+          }
+        });
+        res.on('drain', () => child.stdout.resume());
+        child.on('error', () => { journalctlBroken = true; if (!res.writableEnded) res.end(); });
+        child.on('exit', () => { if (!res.writableEnded) res.end(); });
+        let closed = false;
+        req.on('close', () => { if (closed) return; closed = true; logStreams--; child.kill(); });
+        return;
+      }
+
+      // POST /teamclaude/restart — fire-and-forget systemd restart of this unit.
+      if (req.method === 'POST' && req.url === '/teamclaude/restart') {
+        json(res, 200, { restarting: true });
+        setImmediate(() => {
+          const child = spawn('systemctl', ['--user', 'restart', 'teamclaude.service'], { detached: true, stdio: 'ignore' });
+          child.unref();
+        });
+        return;
+      }
+
       return forward(req, res);
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
     }
   };
 
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx });
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks: channelHooks('h'), sx });
   const server = http.createServer(requestHandler);
 
   // Forward-proxy support (always on, so multiple claude instances can use
@@ -122,7 +341,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks: channelHooks('m'), log: console.error, sx }));
 
   return server;
 }

@@ -1192,6 +1192,7 @@ export class AccountManager {
         priority: a.priority || 0,
         disabled: a.disabled || false,
         status: a.status,
+        inFlight: a.inFlight || 0,
         quota: { ...a.quota },
         usage: { ...a.usage },
         rateLimitedUntil: a.rateLimitedUntil

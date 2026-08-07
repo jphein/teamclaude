@@ -254,10 +254,12 @@ const OAUTH_AUTHORIZE = 'https://claude.ai/oauth/authorize';
 const OAUTH_SCOPES = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
 
 /**
- * Perform OAuth login via browser with PKCE flow.
- * Opens the user's browser, waits for the callback, exchanges the code for tokens.
+ * Create a PKCE authorization session: a fresh verifier/state pair, a local
+ * callback listener, and an exchange function bound to them. Shared by the CLI
+ * login (which races the callback against stdin) and the dashboard reauth flow
+ * (which races it against a pasted code from the browser).
  */
-export async function loginOAuth() {
+export async function createOAuthSession({ tokenEndpoint = DEFAULT_TOKEN_ENDPOINT } = {}) {
   // Generate PKCE
   const codeVerifier = randomBytes(32).toString('base64url');
   const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
@@ -278,45 +280,94 @@ export async function loginOAuth() {
   authUrl.searchParams.set('code_challenge_method', 'S256');
   authUrl.searchParams.set('state', state);
 
+  return {
+    authUrl: authUrl.toString(),
+    state,
+    codePromise,
+    async exchange(code) {
+      const tokenRes = await fetch(tokenEndpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          code,
+          state,
+          grant_type: 'authorization_code',
+          client_id: DEFAULT_CLIENT_ID,
+          redirect_uri: redirectUri,
+          code_verifier: codeVerifier,
+        }),
+      });
+
+      if (!tokenRes.ok) {
+        const text = await tokenRes.text();
+        throw new Error(`Token exchange failed (${tokenRes.status}): ${text}`);
+      }
+
+      const tokens = await tokenRes.json();
+      return {
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token,
+        expiresAt: normalizeExpiresAt(tokens.expires_at) || (Date.now() + (tokens.expires_in || 3600) * 1000),
+      };
+    },
+    close() {
+      server.close();
+    },
+  };
+}
+
+/**
+ * Parse pasted authorization-code input: either a raw code or a full callback
+ * URL. Returns the code, or null for empty input. Throws when the pasted URL
+ * carries a state that doesn't match this session (the code belongs to some
+ * other login attempt).
+ */
+export function parseAuthCodeInput(text, expectedState) {
+  const trimmed = (text || '').trim();
+  if (!trimmed) return null;
+
+  // Try to parse as a URL with ?code= parameter
+  try {
+    const url = new URL(trimmed);
+    const code = url.searchParams.get('code');
+    const state = url.searchParams.get('state');
+    if (code) {
+      if (expectedState && state && state !== expectedState) {
+        throw new Error('OAuth state mismatch');
+      }
+      return code;
+    }
+  } catch (err) {
+    if (err.message === 'OAuth state mismatch') throw err;
+  }
+
+  // Treat raw input as the authorization code
+  return trimmed;
+}
+
+/**
+ * Perform OAuth login via browser with PKCE flow.
+ * Opens the user's browser, waits for the callback, exchanges the code for tokens.
+ */
+export async function loginOAuth() {
+  const session = await createOAuthSession();
+
   // Open browser
   console.log('Opening browser for authentication...');
-  console.log(`If it doesn't open, visit:\n  ${authUrl.toString()}\n`);
-  openBrowser(authUrl.toString());
+  console.log(`If it doesn't open, visit:\n  ${session.authUrl}\n`);
+  openBrowser(session.authUrl);
 
   // Wait for either the callback server or manual paste from stdin
   let code;
   try {
-    code = await raceWithStdinCode(codePromise, state);
+    code = await raceWithStdinCode(session.codePromise, session.state);
   } finally {
-    server.close();
+    session.close();
   }
 
   // Exchange code for tokens
   console.log('Exchanging authorization code for tokens...');
-  const tokenRes = await fetch(DEFAULT_TOKEN_ENDPOINT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      code,
-      state,
-      grant_type: 'authorization_code',
-      client_id: DEFAULT_CLIENT_ID,
-      redirect_uri: redirectUri,
-      code_verifier: codeVerifier,
-    }),
-  });
-
-  if (!tokenRes.ok) {
-    const text = await tokenRes.text();
-    throw new Error(`Token exchange failed (${tokenRes.status}): ${text}`);
-  }
-
-  const tokens = await tokenRes.json();
-  return {
-    accessToken: tokens.access_token,
-    refreshToken: tokens.refresh_token,
-    expiresAt: normalizeExpiresAt(tokens.expires_at) || (Date.now() + (tokens.expires_in || 3600) * 1000),
-  };
+  return session.exchange(code);
 }
 
 /**
@@ -338,26 +389,15 @@ function raceWithStdinCode(callbackPromise, expectedState) {
     };
 
     rl.question('Paste authorization code here (or wait for browser callback): ', answer => {
-      const trimmed = answer.trim();
-      if (!trimmed) return; // empty input, keep waiting for callback
-
-      // Try to parse as a URL with ?code= parameter
+      let code;
       try {
-        const url = new URL(trimmed);
-        const code = url.searchParams.get('code');
-        const state = url.searchParams.get('state');
-        if (code) {
-          if (expectedState && state && state !== expectedState) {
-            settle(reject, new Error('OAuth state mismatch'));
-          } else {
-            settle(resolve, code);
-          }
-          return;
-        }
-      } catch {}
-
-      // Treat raw input as the authorization code
-      settle(resolve, trimmed);
+        code = parseAuthCodeInput(answer, expectedState);
+      } catch (err) {
+        settle(reject, err);
+        return;
+      }
+      if (!code) return; // empty input, keep waiting for callback
+      settle(resolve, code);
     });
 
     callbackPromise.then(

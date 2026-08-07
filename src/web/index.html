@@ -210,6 +210,36 @@
     gap: 0.5rem;
   }
   .card-actions .btn-ghost { padding: 0.3rem 0.6rem; font-size: 0.8rem; }
+
+  /* ── Reauth panel (shown inside a card while a reauth session is pending) ── */
+  .reauth-panel {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-top: 0.6rem;
+    padding-top: 0.6rem;
+    border-top: 1px dashed var(--panel-border);
+  }
+  .reauth-panel .reauth-msg {
+    flex-basis: 100%;
+    color: var(--text-dim);
+    font-size: 0.8rem;
+  }
+  .reauth-panel .reauth-msg a { color: var(--accent); }
+  .reauth-panel input {
+    flex: 1;
+    min-width: 9rem;
+    padding: 0.3rem 0.5rem;
+    font: inherit;
+    font-size: 0.8rem;
+    color: var(--text);
+    background: var(--log-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 5px;
+  }
+  .reauth-panel input:focus { outline: none; border-color: var(--accent); }
+  .reauth-panel .btn-ghost { padding: 0.3rem 0.6rem; font-size: 0.8rem; }
   .card .name {
     font-size: 1.05rem;
     font-weight: 600;
@@ -646,6 +676,11 @@
         title: acct.disabled ? 'Bring this account back into rotation (also clears a stuck error)' : 'Exclude this account from rotation',
         text: acct.disabled ? 'Enable' : 'Disable',
       }),
+      acct.type === 'oauth' ? el('button', {
+        class: 'btn-ghost reauth-acct', 'data-name': acct.name,
+        title: 'Re-run the browser OAuth login for this account (fixes a revoked refresh token). Log into claude.ai as this account before approving.',
+        text: 'Reauth',
+      }) : null,
     ]);
     const bars = el('div', { class: 'bars' }, [
       ...makeBar('5h', u5h, threshold, q.unified5hReset ?? q.resetsAt),
@@ -655,7 +690,7 @@
       + fmtNum(totalTok) + ' tokens · last used ' + fmtAgo(acct.usage.lastUsed)
       + (acct.rateLimitedUntil ? ' · throttled until ' + new Date(acct.rateLimitedUntil).toLocaleTimeString() : '');
     const meta = el('div', { class: 'meta', text: metaText });
-    return el('div', { class: 'card' + (isActive ? ' active' : '') + (acct.disabled ? ' off' : '') }, [nameRow, actions, bars, meta]);
+    return el('div', { class: 'card' + (isActive ? ' active' : '') + (acct.disabled ? ' off' : ''), 'data-name': acct.name }, [nameRow, actions, bars, meta]);
   }
 
   // ── Error display ────────────────────────────────────────────
@@ -687,10 +722,14 @@
         lastThreshold = serverPct;
       }
 
+      // Cards are rebuilt every poll; the reauth panel is a singleton element
+      // re-attached afterwards so a half-typed code (and focus) survives.
+      const reauthHadFocus = document.activeElement === reauthCodeEl;
       cardsEl.textContent = '';
       for (const acct of data.accounts) {
         cardsEl.appendChild(renderAccount(acct, acct.name === data.currentAccount, data.switchThreshold));
       }
+      attachReauthPanel(reauthHadFocus);
 
       const sv = data.server || {};
       svcStatsEl.textContent = '';
@@ -746,6 +785,127 @@
       showErr((isToggle ? 'Account toggle' : 'Switch') + ' failed: ' + err.message);
       btn.disabled = false;
     }
+  });
+
+  // ── Reauth flow (per-account browser OAuth re-login) ─────────
+  // One session at a time, mirroring the server. The panel lives inside the
+  // pending account's card: a status line with a fallback link to the authorize
+  // page, plus a paste-code input for when the localhost callback can't reach
+  // the proxy host (e.g. dashboard opened from another machine).
+  const reauthCtl = { account: null, timer: null };
+  const reauthMsgEl = el('span', { class: 'reauth-msg' });
+  const reauthCodeEl = el('input', { type: 'text', placeholder: 'paste code or callback URL', spellcheck: 'false' });
+  const reauthSubmitEl = el('button', { class: 'btn-ghost', text: 'Submit' });
+  const reauthCancelEl = el('button', { class: 'btn-ghost', text: 'Cancel' });
+  const reauthPanel = el('div', { class: 'reauth-panel' }, [reauthMsgEl, reauthCodeEl, reauthSubmitEl, reauthCancelEl]);
+
+  function attachReauthPanel(hadFocus) {
+    if (!reauthCtl.account) return;
+    for (const card of cardsEl.children) {
+      if (card.getAttribute('data-name') === reauthCtl.account) {
+        card.appendChild(reauthPanel);
+        if (hadFocus) reauthCodeEl.focus();
+        return;
+      }
+    }
+  }
+
+  function stopReauth() {
+    reauthCtl.account = null;
+    if (reauthCtl.timer) { clearInterval(reauthCtl.timer); reauthCtl.timer = null; }
+    reauthPanel.remove();
+    reauthCodeEl.value = '';
+  }
+
+  function handleReauthStatus(st) {
+    if (!reauthCtl.account) return;
+    if (st.state === 'done') {
+      flashSvcMsg('✓ reauthed ' + (st.email || st.account));
+      stopReauth();
+      refresh();
+    } else if (st.state === 'error') {
+      showErr('Reauth failed: ' + (st.error || 'unknown error'));
+      stopReauth();
+    } else if (st.state === 'idle') {
+      stopReauth(); // cancelled elsewhere, or the service restarted
+    }
+    // 'pending' → keep waiting
+  }
+
+  async function pollReauth() {
+    if (!reauthCtl.account) return;
+    try {
+      const res = await fetch('/teamclaude/reauth', { cache: 'no-store' });
+      if (res.ok) handleReauthStatus(await res.json());
+    } catch { /* transient — keep polling */ }
+  }
+
+  async function startReauth(btn, name) {
+    // Open the tab synchronously (inside the click's user activation) so popup
+    // blockers allow it; point it at the authorize URL once the server answers.
+    const tab = window.open('about:blank', '_blank');
+    btn.disabled = true;
+    try {
+      const res = await fetch('/teamclaude/reauth', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-teamclaude-control': '1' },
+        body: JSON.stringify({ name }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
+      if (tab) tab.location = data.authUrl;
+      showErr('');
+      reauthCtl.account = name;
+      reauthCodeEl.value = '';
+      reauthMsgEl.textContent = '';
+      reauthMsgEl.append(
+        'Approve in the ',
+        el('a', { href: data.authUrl, target: '_blank', text: 'login page' }),
+        ' while logged into claude.ai as ' + name + ' — or paste the code it shows:',
+      );
+      attachReauthPanel(false);
+      if (!reauthCtl.timer) reauthCtl.timer = setInterval(pollReauth, 2000);
+    } catch (err) {
+      if (tab) tab.close();
+      showErr('Reauth failed: ' + err.message);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function submitReauthCode() {
+    const code = reauthCodeEl.value.trim();
+    if (!code) return;
+    reauthSubmitEl.disabled = true;
+    try {
+      const res = await fetch('/teamclaude/reauth/code', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-teamclaude-control': '1' },
+        body: JSON.stringify({ code }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
+      handleReauthStatus(data);
+    } catch (err) {
+      showErr('Reauth code submit failed: ' + err.message);
+    } finally {
+      reauthSubmitEl.disabled = false;
+    }
+  }
+
+  reauthSubmitEl.addEventListener('click', submitReauthCode);
+  reauthCodeEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitReauthCode(); });
+  reauthCancelEl.addEventListener('click', async () => {
+    try {
+      await fetch('/teamclaude/reauth/cancel', { method: 'POST', headers: { 'x-teamclaude-control': '1' } });
+    } catch { /* the server may be gone; reset the UI regardless */ }
+    stopReauth();
+  });
+
+  cardsEl.addEventListener('click', (e) => {
+    const btn = e.target.closest('button.reauth-acct');
+    if (!btn || btn.disabled) return;
+    startReauth(btn, btn.getAttribute('data-name'));
   });
 
   // ── Service actions: refresh quotas / reload config ──────────
@@ -859,6 +1019,12 @@
         el('span', { text: 'Threshold → ' + Math.round(evt.value * 100) + '%' }),
       ]);
     }
+    if (evt.type === 'reauth') {
+      return el('div', { class: 'activity-item activity-sys' }, [
+        el('span', { class: 'act-dot act-dot-sys', text: '⟳' }),
+        el('span', { text: 'Reauth started for ' + evt.name }),
+      ]);
+    }
     return el('div', { class: 'activity-item activity-sys' }, [el('span', { text: evt.type })]);
   }
 
@@ -883,7 +1049,7 @@
       } else if (evt.type === 'req_end') {
         activityMap.delete(evt.id);
         prependCompleted(evt);
-      } else if (evt.type === 'switched' || evt.type === 'threshold') {
+      } else if (evt.type === 'switched' || evt.type === 'threshold' || evt.type === 'reauth') {
         prependCompleted(evt);
       }
       renderActiveReqs();

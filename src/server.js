@@ -71,6 +71,7 @@ function json(res, status, payload) {
 const MUTATING_CONTROL = new Set([
   '/teamclaude/switch', '/teamclaude/threshold', '/teamclaude/account',
   '/teamclaude/probe', '/teamclaude/restart',
+  '/teamclaude/reauth', '/teamclaude/reauth/code', '/teamclaude/reauth/cancel',
 ]);
 
 export function createProxyServer(accountManager, config, hooks = {}, sx = null) {
@@ -265,6 +266,41 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
           emitActivity({ type: 'probe', value: probed });
           json(res, 200, { ok: true, probed });
         } catch (err) { json(res, 500, { ok: false, error: err.message }); }
+        return;
+      }
+
+      // ── Reauth: browser-driven OAuth re-login for an existing account.
+      //    POST /teamclaude/reauth starts a PKCE session; completion races the
+      //    localhost callback against a pasted code (…/code); GET polls. ──
+      if (req.url === '/teamclaude/reauth' && req.method === 'GET') {
+        if (!hooks.reauth) { json(res, 501, { error: 'reauth not supported' }); return; }
+        json(res, 200, hooks.reauth.status());
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/teamclaude/reauth') {
+        if (!hooks.reauth) { json(res, 501, { error: 'reauth not supported' }); return; }
+        try {
+          const { name } = JSON.parse((await readBody(req)) || '{}');
+          if (!name) { json(res, 400, { error: 'Missing "name"' }); return; }
+          const { authUrl } = await hooks.reauth.start(name);
+          console.log(`[TeamClaude] Reauth started for "${name}" via UI`);
+          emitActivity({ type: 'reauth', name });
+          json(res, 200, { ok: true, authUrl });
+        } catch (err) { json(res, err.status || 500, { error: err.message }); }
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/teamclaude/reauth/code') {
+        if (!hooks.reauth) { json(res, 501, { error: 'reauth not supported' }); return; }
+        try {
+          const { code } = JSON.parse((await readBody(req)) || '{}');
+          json(res, 200, await hooks.reauth.submitCode(code));
+        } catch (err) { json(res, err.status || 500, { error: err.message }); }
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/teamclaude/reauth/cancel') {
+        if (!hooks.reauth) { json(res, 501, { error: 'reauth not supported' }); return; }
+        hooks.reauth.cancel();
+        json(res, 200, hooks.reauth.status());
         return;
       }
 

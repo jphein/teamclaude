@@ -7,6 +7,7 @@ import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConf
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { createReauthManager } from './reauth.js';
 import { sameIdentity, orgKey, matchAccounts } from './identity.js';
 import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
@@ -354,6 +355,30 @@ async function serverCommand() {
       const acct = diskConfig.accounts?.find(a => a.name === name);
       if (acct) acct.disabled = disabled;
     });
+  // Browser-driven OAuth re-login (the dashboard's per-account Reauth button).
+  // Fresh tokens are written to disk, then the normal reload path propagates
+  // them into the running account — which also clears a stuck 'error' status.
+  hooks.reauth = createReauthManager({
+    accountManager,
+    persistTokens: (name, creds, profile) => atomicConfigUpdate(async diskConfig => {
+      const acct = diskConfig.accounts?.find(a => a.name === name);
+      if (!acct) throw new Error(`account "${name}" no longer in config`);
+      acct.accessToken = creds.accessToken;
+      acct.refreshToken = creds.refreshToken;
+      acct.expiresAt = creds.expiresAt;
+      if (profile.accountUuid && !acct.accountUuid) acct.accountUuid = profile.accountUuid;
+      if (profile.orgUuid && !acct.orgUuid) acct.orgUuid = profile.orgUuid;
+      if (profile.orgName && !acct.orgName) acct.orgName = profile.orgName;
+      // A reauthed account owns a fresh token family: stop re-importing stale
+      // credentials from a Claude Code file (which would also shadow these
+      // tokens on every reload).
+      if (acct.importFrom) {
+        delete acct.importFrom;
+        acct.source = 'login';
+      }
+    }),
+    reload: reloadAccounts,
+  });
 
   const server = createProxyServer(accountManager, config, hooks, sx);
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we

@@ -1,5 +1,7 @@
+import { createWriteStream } from 'node:fs';
 import { importCredentials, fetchProfile } from './oauth.js';
-import { sameIdentity } from './identity.js';
+import { sameIdentity, findUpsertTarget } from './identity.js';
+import { parseProxyUrl, proxyToUrl, describeProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
@@ -34,6 +36,21 @@ const routeColorFn = name => {
   const code = NAMED_FG[String(name || '').toLowerCase()];
   return code ? (s => fg(code, s)) : cyan;
 };
+
+// Per-session coloring for the activity log: a stable color derived from the
+// session id lets you tell concurrent sessions apart at a glance. Palette avoids
+// red (error) and gray (timestamps); includes bright variants for separation.
+const SESSION_FG = [36, 35, 34, 33, 94, 95, 96, 93, 92];
+const SESSION_ID_LEN = 6; // first 6 hex chars — plenty to distinguish a handful
+function sessionColorCode(sid) {
+  let h = 0;
+  for (let i = 0; i < sid.length; i++) h = (h * 31 + sid.charCodeAt(i)) >>> 0;
+  return SESSION_FG[h % SESSION_FG.length];
+}
+// Fixed-width colored short id (blank-padded when there's no session, e.g. a
+// telemetry request), so the activity column stays aligned.
+const sessionTag = sid =>
+  sid ? fg(sessionColorCode(sid), sid.slice(0, SESSION_ID_LEN)) : ' '.repeat(SESSION_ID_LEN);
 
 // Which quota-family bar (F7/S7) a route binds to, or null for a general route.
 // Auto routes are named 'fable'/'sonnet'; a configured route is classified by its
@@ -154,7 +171,10 @@ function timestamp() {
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null, activityLogPath = null,
+    // Injectable so the import path can be exercised without a real credentials
+    // file or a live profile call.
+    readCredentials = importCredentials, readProfile = fetchProfile }) {
     this.am = accountManager;
     this.config = config;
     this.saveConfig = saveConfig;
@@ -163,15 +183,22 @@ export class TUI {
     this.sx = sx;            // sx.org proxy manager (may be null)
     this.sxBalance = null;   // last fetched sx.org balance, for the settings screen
     this.probeQuota = probeQuota; // on-demand fleet-wide quota refresh (may be null)
+    this.activityLogPath = activityLogPath;
+    this._readCredentials = readCredentials;
+    this._readProfile = readProfile;
+    this._activityStream = null;
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
-    this.mode = 'normal';    // normal | select | add | input | settings
+    this.mode = 'normal';    // normal | select | add | input | settings | pick
+    this.pick = null;        // active list picker (routes editor accounts/bucket/color)
+    this.pickReturn = 'routes'; // mode to fall back to when the picker closes
     this.selAction = null;   // switch | remove | toggle
     this.selIdx = 0;
     this.selRoute = null;    // in switch mode: null = global default, else a getRoutes() entry to pin
     this.selReturn = 'normal'; // mode to fall back to when select mode closes
     this.setIdx = 0;         // cursor row on the settings screen (BIOS-style nav)
+    this.blockIdx = 0;       // cursor row on the blocked-models editor
     this.inputPrompt = '';
     this.inputBuf = '';
     this.inputCb = null;
@@ -187,6 +214,14 @@ export class TUI {
 
   start() {
     this.running = true;
+    if (this.activityLogPath) {
+      this._activityStream = createWriteStream(this.activityLogPath, { flags: 'a' });
+      this._activityStream.on('error', err => {
+        // Swallow write errors — can't log them to the TUI without recursion
+        this._activityStream = null;
+        process.stderr.write(`[TeamClaude] activity log error: ${err.message}\n`);
+      });
+    }
     process.stdout.write(`${ESC}?1049h${ESC}?25l`);
     process.stdin.setRawMode(true);
     process.stdin.resume();
@@ -213,6 +248,7 @@ export class TUI {
     this.running = false;
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
     if (this._origLog) { console.log = this._origLog; console.error = this._origErr; }
+    if (this._activityStream) { this._activityStream.end(); this._activityStream = null; }
     process.stdin.removeListener('data', this._dataHandler);
     process.stdout.removeListener('resize', this._resizeHandler);
     process.stdout.write(`${ESC}?25h${ESC}?1049l`);
@@ -243,13 +279,17 @@ export class TUI {
     const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
     const acct = info.account || r?.account || '?';
     const model = info.model ? ` (${info.model})` : ''; // shown when the request named a model
-    this._addLog(`${info.method} ${info.path}${model} → ${acct} (${info.status}, ${dur}s)`);
+    const sid = info.sessionId || r?.sessionId || null;
+    const pin = (info.pinned || r?.pinned) ? dim(' [pin]') : '';
+    this._addLog(`${sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
   }
 
   _addLog(msg) {
     msg = msg.replace(/^\[TeamClaude\]\s*/, '');
-    this.log.unshift({ t: timestamp(), msg });
+    const t = timestamp();
+    this.log.unshift({ t, msg });
     if (this.log.length > 200) this.log.length = 200;
+    if (this._activityStream) this._activityStream.write(`${t}  ${strip(msg)}\n`);
     if (this.running) this.render();
   }
 
@@ -278,6 +318,8 @@ export class TUI {
       case 'input':  this._keyInput(k); break;
       case 'settings': this._keySettings(k); break;
       case 'routes': this._keyRoutes(k); break;
+      case 'pick': this._keyPick(k); break;
+      case 'blocklist': this._keyBlocklist(k); break;
     }
     this.render();
   }
@@ -329,6 +371,21 @@ export class TUI {
     });
 
     fields.push({
+      id: 'eventlog',
+      label: 'Event logging',
+      hint: '←→ cycle',
+      value: () => {
+        const m = this.config.eventLogging || 'hide';
+        return m === 'show' ? green('show')
+          : m === 'block' ? red('block')
+          : gray('hide');
+      },
+      left: () => this._cycleEventLogging(-1),
+      right: () => this._cycleEventLogging(+1),
+      enter: () => this._cycleEventLogging(+1),
+    });
+
+    fields.push({
       id: 'routes',
       label: 'Manage routing',
       hint: 'Enter to open',
@@ -337,6 +394,17 @@ export class TUI {
         return n ? green(`${n} route${n === 1 ? '' : 's'}`) : gray('none');
       },
       enter: () => { this.mode = 'routes'; this.routeIdx = 0; },
+    });
+
+    fields.push({
+      id: 'blocklist',
+      label: 'Blocked models',
+      hint: 'Enter to edit',
+      value: () => {
+        const n = (this.config.blockedModels || []).length;
+        return n ? red(`${n} blocked`) : gray('none');
+      },
+      enter: () => { this.mode = 'blocklist'; this.blockIdx = 0; },
     });
 
     fields.push({
@@ -359,6 +427,22 @@ export class TUI {
         enter: () => { this.mode = 'select'; this.selAction = 'remove'; this.selIdx = 0; this.selReturn = 'settings'; },
       });
     }
+
+    fields.push({
+      id: 'upstreamProxy',
+      label: 'Upstream proxy',
+      hint: 'Enter to set',
+      value: () => {
+        const { proxy, source } = getUpstreamProxy();
+        if (!proxy) return dim('(direct)');
+        // Name the environment when that is where it came from: a value the
+        // operator did not put in the config, silently in force, is exactly the
+        // thing that is hard to account for later.
+        const via = source.startsWith('env:') ? gray(` (${source.slice(4)})`) : '';
+        return green(describeProxy(proxy)) + via;
+      },
+      enter: () => this._promptInput('Upstream proxy (host:port, or blank for direct)', v => this._doSetUpstreamProxy(v.trim())),
+    });
 
     if (this.sx) {
       fields.push({
@@ -472,14 +556,11 @@ export class TUI {
     const len = this.am.accounts.length;
     if (k === 'up' || k === 'k') this.selIdx = Math.max(0, this.selIdx - 1);
     else if (k === 'down' || k === 'j') this.selIdx = Math.min(len - 1, this.selIdx + 1);
-    // Tab (switch only): cycle which route the pick applies to. null = the global
-    // default account; each getRoutes() entry = a per-route manual pin.
-    else if (k === 'tab' && this.selAction === 'switch') {
-      const routes = this.am.getRoutes();
-      const cycle = [null, ...routes];
-      const at = this.selRoute ? routes.findIndex(r => r.name === this.selRoute.name) + 1 : 0;
-      this.selRoute = cycle[(at + 1) % cycle.length];
-    }
+    // Tab / ←→ (switch only): cycle which route the pick applies to. null = the
+    // global default account; each getRoutes() entry = a per-route manual pin.
+    // ↑↓ move within the account list, so ←→ are free to move across targets.
+    else if ((k === 'tab' || k === 'right') && this.selAction === 'switch') this._cycleSelRoute(+1);
+    else if (k === 'left' && this.selAction === 'switch') this._cycleSelRoute(-1);
     else if (k === 'enter') {
       if (this.selAction === 'switch') {
         this._doSwitchSelection();
@@ -491,6 +572,18 @@ export class TUI {
       if (this.mode === 'select') this.mode = this.selReturn;
     }
     else if (k === 'esc' || k === 'q') { this.mode = this.selReturn; }
+  }
+
+  // Step the switch-mode pin target by `dir` through [default, ...routes],
+  // wrapping at both ends. A route that vanished between renders (an autocreated
+  // family route whose quota expired) leaves us at the default rather than
+  // stranding the cursor.
+  _cycleSelRoute(dir) {
+    const routes = this.am.getRoutes();
+    const cycle = [null, ...routes];
+    const at = this.selRoute ? routes.findIndex(r => r.name === this.selRoute.name) + 1 : 0;
+    const from = at < 1 ? 0 : at; // findIndex -1 → 0 → treat as the default entry
+    this.selRoute = cycle[(from + dir + cycle.length) % cycle.length];
   }
 
   // Apply an Enter in switch mode: with no route selected this sets the global
@@ -582,6 +675,39 @@ export class TUI {
     }
   }
 
+  // ── Network settings ───────────────────────────────
+
+  /**
+   * Set (or clear) the egress proxy live.
+   *
+   * Applied to the running process as well as saved, so the next request uses it
+   * without a restart — the operator is usually here BECAUSE requests are
+   * failing, and "set it, then restart to find out" is a poor loop to be in.
+   * An empty value clears it back to a direct connection; an explicit `false`
+   * survives in the config as "ignore the environment too".
+   */
+  async _doSetUpstreamProxy(value) {
+    let parsed;
+    try {
+      parsed = parseProxyUrl(value);
+    } catch (e) {
+      this._addLog(`Invalid proxy: ${e.message}`);
+      this.mode = 'settings';
+      return;
+    }
+
+    if (parsed) this.config.upstreamProxy = proxyToUrl(parsed);
+    else delete this.config.upstreamProxy;
+
+    try { await this.saveConfig(this.config); }
+    catch (e) { this._addLog(`Failed to save proxy setting: ${e.message}`); }
+
+    const resolved = setUpstreamProxy(resolveUpstreamProxy(this.config));
+    if (resolved.proxy) this._addLog(`Upstream proxy set to ${describeProxy(resolved.proxy)}`);
+    else this._addLog('Upstream proxy cleared — connecting directly');
+    this.mode = 'settings';
+  }
+
   // ── sx.org settings ────────────────────────────────
 
   _loadSxBalance() {
@@ -623,6 +749,18 @@ export class TUI {
     if (this.running) this.render();
   }
 
+  async _cycleEventLogging(dir = 1) {
+    // Claude Code telemetry display/handling: show → hide → block → show.
+    const order = ['show', 'hide', 'block'];
+    const cur = this.config.eventLogging || 'hide';
+    const next = order[(order.indexOf(cur) + dir + order.length) % order.length];
+    this.config.eventLogging = next; // shared config object; the server reads it live
+    try { await this.saveConfig(this.config); }
+    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    this._addLog(`Event logging: ${next}`);
+    if (this.running) this.render();
+  }
+
   async _doClearSxKey() {
     this.config.sx = null;
     try { await this.saveConfig(this.config); }
@@ -636,8 +774,8 @@ export class TUI {
   async _doImport() {
     try {
       this._addLog('Importing credentials...');
-      const creds = await importCredentials('~/.claude/.credentials.json');
-      const profile = await fetchProfile(creds.accessToken);
+      const creds = await this._readCredentials('~/.claude/.credentials.json');
+      const profile = await this._readProfile(creds.accessToken);
       const profileOk = profile && !profile.error;
 
       if (!profileOk) {
@@ -664,10 +802,11 @@ export class TUI {
         expiresAt: creds.expiresAt,
       };
 
-      // Deduplicate by account+org identity (same email in a different org is a
-      // distinct account), then by name.
-      let idx = this.config.accounts.findIndex(a => sameIdentity(a, entry));
-      if (idx < 0) idx = this.config.accounts.findIndex(a => a.name === name);
+      // Same rule as the login path: a name match counts only where it is not
+      // standing in for a different account+org. Both organizations of one person
+      // carry the same email-derived name, and overwriting on that match drops an
+      // account here AND rewrites the running one's identity below.
+      const idx = findUpsertTarget(this.config.accounts, entry);
 
       if (idx >= 0) {
         const prev = this.config.accounts[idx];
@@ -772,7 +911,11 @@ export class TUI {
     // ── Header
     const left = bold(' TeamClaude');
     const port = this.config.proxy?.port || 3456;
-    const right = `Port ${port} ${green('▲')} `;
+    const sess = this.am.sessionStats();
+    const sessStr = (sess.active || sess.known)
+      ? `${sess.active} sess${this.am.distributeSessions ? green(' dist') : ''}  `
+      : '';
+    const right = `${sessStr}Port ${port} ${green('▲')} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
 
@@ -790,6 +933,10 @@ export class TUI {
       this._renderSettings(lines);
     } else if (view === 'routes') {
       this._renderRoutes(lines);
+    } else if (view === 'pick') {
+      this._renderPick(lines);
+    } else if (view === 'blocklist') {
+      this._renderBlocklist(lines);
     } else {
     // ── Accounts
     if (this.am.accounts.length === 0) {
@@ -837,8 +984,9 @@ export class TUI {
       const el = ((now - r.started) / 1000).toFixed(1);
       const sp = cyan(SPINNER[this.frame]);
       const m = r.model ? dim(` (${r.model})`) : ''; // filled in as soon as the model is peeked from the stream
-      const a = r.account ? ` → ${r.account}` : '';
-      lines.push(` ${sp} ${gray(r.t)}  ${r.method} ${r.path}${m}${a} ${dim(`(${el}s...)`)}`);
+      const pin = r.pinned ? dim(' [pin]') : '';
+      const a = r.account ? ` → ${r.account}${pin}` : '';
+      lines.push(` ${sp} ${gray(r.t)}  ${sessionTag(r.sessionId)} ${r.method} ${r.path}${m}${a} ${dim(`(${el}s...)`)}`);
     }
 
     // Completed log
@@ -995,14 +1143,28 @@ export class TUI {
     lines.push(bold('  Quota probe') + dim('  — refresh idle accounts from the usage endpoint'));
     lines.push(row(byId('probe')));
     lines.push('');
+    // ── Activity log
+    lines.push(bold('  Activity log') + dim('  — what to do with Claude Code\'s telemetry'));
+    lines.push(row(byId('eventlog')));
+    lines.push('');
     // ── Routing
-    lines.push(bold('  Routing') + dim('  — pin model families to specific accounts'));
+    lines.push(bold('  Routing') + dim('  — pin model families to specific accounts, or block them outright'));
     lines.push(row(byId('routes')));
+    lines.push(row(byId('blocklist')));
     lines.push('');
     // ── Accounts
     lines.push(bold('  Accounts') + dim('  — add (import / API key) or remove an account'));
     lines.push(row(byId('addAccount')));
     if (byId('removeAccount')) lines.push(row(byId('removeAccount')));
+    lines.push('');
+    // ── Network
+    // Drawn before the sx.org block, which returns early when sx is unavailable:
+    // this setting is the one a host behind a corporate proxy needs, and it must
+    // not disappear along with an unrelated integration.
+    lines.push(bold('  Network') + dim('  — how this machine reaches Anthropic'));
+    lines.push(row(byId('upstreamProxy')));
+    lines.push(dim('  Set when the machine has no direct route out (HTTPS_PROXY is'));
+    lines.push(dim('  picked up automatically). Applies to requests, login and refresh.'));
     lines.push('');
     // ── sx.org
     lines.push(bold('  sx.org proxy') + dim('  — route upstream via a residential IP (429 workaround)'));
@@ -1054,6 +1216,107 @@ export class TUI {
     this.inputCb = v => cb((v || '').trim());
   }
 
+  // A modal list picker used by the routes editor so fixed-choice fields are
+  // selected rather than typed. `multi` gives a checkbox multi-select (Space
+  // toggles, Enter confirms the set); otherwise it's single-select (Enter picks
+  // the highlighted row). `cb` receives the chosen value(s). Esc/q cancels
+  // without calling cb — which, like the text prompts, abandons the whole edit.
+  _openPicker({ title, hint, items, multi, selected, cb }) {
+    this.mode = 'pick';
+    this.pickReturn = 'routes';
+    this.pick = {
+      title, hint, items, multi, cb,
+      idx: multi ? 0 : Math.max(0, items.findIndex(it => it.value === (selected || ''))),
+      sel: new Set(multi ? (selected || []) : []),
+    };
+  }
+
+  // Checklist of the loaded accounts. Preselects the route's current members;
+  // selecting none means "all accounts" (route.accounts is then omitted).
+  _pickAccounts(preselected, cb) {
+    this._openPicker({
+      title: 'Route accounts',
+      hint: 'Space toggles — none selected = all accounts',
+      multi: true,
+      selected: preselected,
+      items: this.am.accounts.map(a => ({ label: a.name, value: a.name })),
+      cb,
+    });
+  }
+
+  // Which weekly quota bucket meters the route (auto = pick by model family).
+  _pickBucket(current, cb) {
+    this._openPicker({
+      title: 'Quota bucket',
+      hint: 'weekly bucket this route is metered against',
+      multi: false,
+      selected: current,
+      items: [
+        { label: 'auto (by model family)', value: '' },
+        { label: 'unified7d (shared weekly)', value: 'unified7d' },
+        { label: 'unified7dFable', value: 'unified7dFable' },
+        { label: 'unified7dSonnet', value: 'unified7dSonnet' },
+      ],
+      cb,
+    });
+  }
+
+  // The dashboard marker color for the route (default = plain cyan).
+  _pickColor(current, cb) {
+    this._openPicker({
+      title: 'Marker color',
+      hint: 'highlights this route on the dashboard',
+      multi: false,
+      selected: current,
+      items: [
+        { label: 'default', value: '' },
+        ...ROUTE_COLOR_NAMES.map(c => ({ label: c, value: c, paint: routeColorFn(c) })),
+      ],
+      cb,
+    });
+  }
+
+  _keyPick(k) {
+    const p = this.pick;
+    if (!p) { this.mode = this.pickReturn; return; }
+    const len = p.items.length;
+    if (k === 'up' || k === 'k') p.idx = Math.max(0, p.idx - 1);
+    else if (k === 'down' || k === 'j') p.idx = Math.min(len - 1, p.idx + 1);
+    else if (p.multi && (k === ' ' || k === 'x')) {
+      const v = p.items[p.idx]?.value;
+      if (v != null) { p.sel.has(v) ? p.sel.delete(v) : p.sel.add(v); }
+    }
+    else if (k === 'enter') {
+      const cb = p.cb;
+      this.pick = null;
+      this.mode = this.pickReturn;
+      if (p.multi) cb?.(p.items.filter(it => p.sel.has(it.value)).map(it => it.value));
+      else cb?.(p.items[p.idx]?.value ?? '');
+    }
+    else if (k === 'esc' || k === 'q') { this.pick = null; this.mode = this.pickReturn; }
+  }
+
+  _renderPick(lines) {
+    const p = this.pick;
+    if (!p) return;
+    lines.push('');
+    lines.push(bold('  ' + p.title) + (p.hint ? dim('  — ' + p.hint) : ''));
+    lines.push('');
+    if (!p.items.length) {
+      lines.push(gray('    (no accounts loaded — a route with none set serves all)'));
+      return;
+    }
+    p.items.forEach((it, i) => {
+      const cur = i === p.idx;
+      const cursor = cur ? cyan('▸') : ' ';
+      const mark = p.multi
+        ? (p.sel.has(it.value) ? green('[x]') : dim('[ ]'))
+        : (cur ? cyan('◉') : dim('◯'));
+      const paint = it.paint || (s => s);
+      lines.push(`   ${cursor} ${mark} ${paint(cur ? bold(it.label) : it.label)}`);
+    });
+  }
+
   // Guided add/edit: name → glob(s) → accounts → bucket → save. `orig` is the
   // existing route being edited, or null when adding.
   _routeEdit(orig) {
@@ -1069,12 +1332,15 @@ export class TUI {
       this._routePrompt('Model glob(s), comma-separated (e.g. *fable*)', draft.match, match => {
         if (!match) { this._addLog('At least one glob required — cancelled'); this.mode = 'routes'; return; }
         draft.match = match;
-        const names = this.am.accounts.map(a => a.name).join(', ');
-        this._routePrompt(`Accounts (comma; blank = all) [${names}]`, draft.accounts, accts => {
-          draft.accounts = accts;
-          this._routePrompt('Quota bucket override (blank = auto)', draft.bucket, bucket => {
+        // Accounts, bucket and color are all fixed-choice, so they're pickers
+        // rather than typed fields — no free text, and no giant account-name hint
+        // that used to spill off the footer (issue #130). Only name and glob stay
+        // typed, since those are arbitrary strings.
+        this._pickAccounts(splitCsv(draft.accounts), accts => {
+          draft.accounts = accts.join(', ');
+          this._pickBucket(draft.bucket, bucket => {
             draft.bucket = bucket;
-            this._routePrompt(`Marker color (${ROUTE_COLOR_NAMES.join('/')}, blank = default)`, draft.color, color => {
+            this._pickColor(draft.color, color => {
               draft.color = color;
               this._routeSave(draft, orig);
             });
@@ -1119,6 +1385,64 @@ export class TUI {
     if (this.running) this.render();
   }
 
+  _keyBlocklist(k) {
+    const list = this.config.blockedModels || [];
+    const n = list.length;
+    if (this.blockIdx >= n) this.blockIdx = Math.max(0, n - 1);
+    if ((k === 'up' || k === 'k') && n) this.blockIdx = (this.blockIdx - 1 + n) % n;
+    else if ((k === 'down' || k === 'j') && n) this.blockIdx = (this.blockIdx + 1) % n;
+    else if (k === 'a') this._blocklistAdd();
+    else if (k === 'd' && n) this._blocklistDelete(this.blockIdx);
+    else if (k === 'esc' || k === 'q') { this.mode = 'settings'; this.setIdx = 0; }
+  }
+
+  // Prompt for a model glob and add it to the blocklist, staying on the editor.
+  _blocklistAdd() {
+    this.mode = 'input';
+    this.inputReturn = 'blocklist';
+    this.inputPrompt = 'Block model glob (e.g. *fable*)';
+    this.inputBuf = '';
+    this.inputCb = v => this._doBlocklistAdd((v || '').trim());
+  }
+
+  async _doBlocklistAdd(pat) {
+    if (!pat) { this._addLog('Blocklist add cancelled'); return; }
+    this.config.blockedModels = this.config.blockedModels || [];
+    if (this.config.blockedModels.includes(pat)) { this._addLog(`"${pat}" already blocked`); return; }
+    this.config.blockedModels.push(pat);
+    this.blockIdx = this.config.blockedModels.length - 1;
+    try { await this.saveConfig(this.config); this._addLog(`Blocked model "${pat}"`); }
+    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (this.running) this.render();
+  }
+
+  async _blocklistDelete(idx) {
+    const list = this.config.blockedModels || [];
+    const pat = list[idx];
+    if (pat == null) return;
+    list.splice(idx, 1);
+    this.blockIdx = Math.max(0, Math.min(idx, list.length - 1));
+    try { await this.saveConfig(this.config); this._addLog(`Unblocked "${pat}"`); }
+    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    if (this.running) this.render();
+  }
+
+  _renderBlocklist(lines) {
+    const list = this.config.blockedModels || [];
+    lines.push('');
+    lines.push(bold('  Blocked models') + dim('  — requests whose model matches a glob are rejected, not forwarded'));
+    lines.push('');
+    if (!list.length) {
+      lines.push(gray('    Nothing blocked. Press [a] to add a glob (e.g. *fable*).'));
+    } else {
+      list.forEach((pat, i) => {
+        const sel = i === this.blockIdx;
+        const cursor = sel ? cyan('▸') : ' ';
+        lines.push(`   ${cursor} ${red('✗')} ${sel ? bold(pat) : pat}`);
+      });
+    }
+  }
+
   _renderRoutes(lines) {
     const routes = this.config.routes || [];
     lines.push('');
@@ -1157,12 +1481,18 @@ export class TUI {
         return ` ${dim('↑↓')} navigate  ${dim('←→')} change  ${bold('Enter')} edit  ${bold('Esc')} back`;
       case 'routes':
         return ` ${dim('↑↓')} select  ${bold('a')}dd  ${bold('e')}dit  ${bold('d')}elete  ${bold('Esc')} back`;
+      case 'pick':
+        return this.pick?.multi
+          ? ` ${dim('↑↓')} move  ${bold('Space')} toggle  ${bold('Enter')} confirm  ${bold('Esc')} cancel`
+          : ` ${dim('↑↓')} move  ${bold('Enter')} select  ${bold('Esc')} cancel`;
+      case 'blocklist':
+        return ` ${dim('↑↓')} select  ${bold('a')}dd  ${bold('d')}elete  ${bold('Esc')} back`;
       case 'select': {
         if (this.selAction === 'switch') {
           const target = this.selRoute
             ? routeColorFn(this.selRoute.color)(`route ${this.selRoute.name}`)
             : 'default';
-          return ` ${dim('↑↓')} select  ${bold('Tab')} target: ${target}  ${bold('Enter')} pin  ${bold('Esc')} cancel`;
+          return ` ${dim('↑↓')} select  ${dim('←→')} target: ${target}  ${bold('Enter')} pin  ${bold('Esc')} cancel`;
         }
         const act = this.selAction === 'toggle' ? 'enable/disable' : 'remove';
         return ` ${dim('↑↓')} select  ${bold('Enter')} ${act}  ${bold('Esc')} cancel`;

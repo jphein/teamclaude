@@ -4,6 +4,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { exec } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import http from 'node:http';
+import { proxyFetch } from './upstream-fetch.js';
 
 /**
  * Import OAuth credentials from a Claude Code credentials file.
@@ -49,7 +50,7 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
         await new Promise(resolve => setTimeout(resolve, delay));
       }
 
-      const res = await fetch(endpoint, {
+      const res = await proxyFetch(endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -137,7 +138,7 @@ export function isTokenExpired(expiresAt) {
  */
 export async function fetchProfile(accessToken) {
   try {
-    const res = await fetch(PROFILE_URL, {
+    const res = await proxyFetch(PROFILE_URL, {
       headers: { 'Authorization': `Bearer ${accessToken}` },
     });
     if (!res.ok) {
@@ -217,7 +218,7 @@ export function normalizeUsageBucket(bucket) {
  */
 export async function fetchUsage(accessToken) {
   try {
-    const res = await fetch(USAGE_URL, {
+    const res = await proxyFetch(USAGE_URL, {
       headers: {
         'Authorization': `Bearer ${accessToken}`,
         'anthropic-beta': OAUTH_USAGE_BETA,
@@ -285,7 +286,7 @@ export async function createOAuthSession({ tokenEndpoint = DEFAULT_TOKEN_ENDPOIN
     state,
     codePromise,
     async exchange(code) {
-      const tokenRes = await fetch(tokenEndpoint, {
+      const tokenRes = await proxyFetch(tokenEndpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

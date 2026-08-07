@@ -1,7 +1,8 @@
-# TeamClaude (fork)
+# TeamClaude
 
-> **Fork of [`KarpelesLab/teamclaude`](https://github.com/KarpelesLab/teamclaude)** with additional features: web dashboard with live activity feed, fast-mode stripping, `env --mitm` / `env --host` for flexible deployment, and resilient upstream error handling. Upstream changes are merged periodically.
-
+[![CI](https://github.com/KarpelesLab/teamclaude/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/teamclaude/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/@karpeleslab/teamclaude.svg)](https://www.npmjs.com/package/@karpeleslab/teamclaude)
+[![node](https://img.shields.io/node/v/@karpeleslab/teamclaude.svg)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Multi-account Claude proxy with automatic quota-based rotation for [Claude Code](https://claude.ai/claude-code).
@@ -13,23 +14,24 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 ## Features
 
 - **Automatic account rotation** — switches to the next account when session (5h) or weekly (7d) quota reaches the configured threshold (default 98%)
-- **Least-in-flight load balancing** (opt-in) — spread each request across all available accounts by fewest concurrent requests instead of pinning one account, keeping every account under Anthropic's short-term burst limit under heavy concurrency. Toggle live (TUI `g` → `b`); the dashboards surface per-account in-flight load and inferred burst-429 counts
-- **Auto-retry on 429** — waits the `retry-after` duration and retries the same account; switches to the next on persistent errors
-- **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls; a settings screen (`g`) edits the rotation threshold, quota-probe interval, and sx.org proxy live
+- **Model-aware routing** — the per-model weekly cap (e.g. Fable) is tracked separately, so an account whose Fable quota is spent is skipped **only** for Fable requests and still serves Opus/Sonnet. Requests are routed by their `model` (read exactly from the request body, in both base-URL and MITM modes). Optional **[model routes](#model-routes)** pin model patterns to a specific set of accounts (config, `teamclaude route`, or the TUI settings screen → Manage routing). Advisor requests (Claude Code's `/advisor`) carry a **second** model nested in the tools array; routing sees it too, so the request lands on an account eligible for both the main model and the advisor (falling back to main-model-only routing when no account can serve both)
+- **Auto-retry on 429** — distinguishes the two kinds of 429: a **quota rejection** (a spent 5h/weekly bucket, `unified-…-status: rejected`) switches accounts immediately; a **rate-limit 429** (the per-minute throttle) does **not** switch — it [pauses the account](#storm-control-switchover-ramp-up) so concurrent requests wait instead of flooding, retries the same account (absorbing short `retry-after`s inline), and only surfaces a 429 to the client for longer waits. Rotating on a rate-limit 429 would just move the burst to the next account and throw away the first account's cache
+- **Storm control** — when many agents fail over to a fresh account at once, requests are [paced onto it](#storm-control-switchover-ramp-up) with a short ramp-up so the herd doesn't instantly throttle it and cascade down the fleet
+- **Interactive TUI** — real-time dashboard with color-coded quota bars, reset countdowns, activity log, and keyboard controls; a settings screen (`g`) edits the rotation threshold, quota-probe interval, routing, accounts (add/remove), and sx.org proxy live, and `p` refreshes every account's quota on demand
 - **OAuth token management** — automatically refreshes tokens nearing expiry and persists them to config; client token refreshes pass through untouched
 - **Hot-reload accounts** — add or change accounts while the server is running; press **R** in the TUI, or run headless and CLI changes auto-reload via a local control endpoint
 - **Headless mode** — run the proxy without the TUI (`--headless`) for backgrounding/services
 - **Org-aware accounts** — one email can hold multiple accounts across different organizations (e.g. corp + personal); dedup is keyed on account + org, and names disambiguate as `email (Org)`
+- **Third-party backend accounts** — route requests to any Anthropic-compatible API (e.g. DeepSeek, GLM) as a fallback when Claude accounts are exhausted; a per-account `upstream` URL and `modelMap` translate model names transparently. Accounts with a `models` list are reserved for requests that explicitly name those models, enabling per-session backend selection without touching other sessions
 - **Rotation priority** — pin a preferred account order with `teamclaude priority`
 - **Enable/disable accounts** — temporarily pause an account without removing it (`teamclaude disable`/`enable`, or `d` in the TUI); re-enabling also clears a stuck error state
 - **Quota persistence** — observed quota survives restarts (saved to a sibling state file), so rotation state isn't lost on restart; stale windows are discarded automatically
-- **Optional quota probe** — off by default; when enabled, periodically refreshes idle accounts' quota from the usage endpoint (no message spend), and surfaces the Sonnet weekly bucket
-- **Optional MITM proxy mode** — `teamclaude run --mitm` routes claude via an HTTPS forward proxy with a local CA so even hardcoded `api.anthropic.com` endpoints (e.g. the Claude Design MCP) get the real token injected
+- **Optional quota probe** — off by default; when enabled, periodically refreshes idle accounts' quota from the usage endpoint (no message spend), and surfaces the Sonnet and Fable weekly buckets
+- **Optional keep-warm** — off by default; when enabled, periodically starts idle accounts' 5h session timers with a minimal request (`teamclaude warmup`) so the next account isn't cold when rotation reaches it (spends a little quota, unlike the probe)
+- **Account pinning** — force a request onto one account via an `ANTHROPIC_BASE_URL=.../tc-acct/<name>` prefix, bypassing rotation
+- **MITM proxy mode (default)** — `teamclaude run` routes claude via an HTTPS forward proxy with a local CA so even hardcoded `api.anthropic.com` endpoints (e.g. the Claude Design MCP) get the real token injected; pass `--no-mitm` for base-URL routing only
 - **Optional sx.org proxy mode** — off by default; set an [sx.org](https://sx.org) API key in the TUI settings screen (`g`) and TeamClaude auto-provisions a residential proxy to change the egress IP and work around IP-based `429`s. Three modes (`m` to cycle): **always** (route all upstream traffic), **on 429 only** (stay direct, fail over to the proxy after a 429), or **off** (keep the key but don't use it). TLS stays end-to-end with Anthropic (the proxy only relays ciphertext)
-- **Web dashboard** — browser UI at `/ui` with quota bars, account switching, live activity feed, log viewer, and a service manager (version/uptime/memory, on-demand quota refresh, config reload, restart, per-account enable/disable)
-- **Fast-mode stripping** — silently removes Claude Code's `/fast` mode (`speed:"fast"`) before forwarding, since fast mode bills as usage credits (not covered by subscription) and would otherwise 429 every account in the pool
 - **Request logging** — optional full request/response logging for debugging
-- **Remote env generation** — `teamclaude env --host <ip> --port <port>` generates exports usable from other machines (with API-key auth for non-localhost)
 - **Zero dependencies** — uses only Node.js built-in modules
 
 ## Quick Start
@@ -37,10 +39,8 @@ Sits transparently between Claude Code and the Anthropic API, managing multiple 
 Requires Node.js 18+.
 
 ```bash
-# Install globally (from npm or locally via npm link)
+# Install
 npm install -g @karpeleslab/teamclaude
-# or from this fork:
-cd ~/Projects/teamclaude && npm link
 
 # Add your first account (opens browser for OAuth)
 teamclaude login
@@ -127,26 +127,13 @@ You usually don't need to call it directly: `teamclaude login`, `import`, `enabl
 | Key | Action |
 |-----|--------|
 | `s` | Switch active account |
-| `a` | Add account (import or API key) |
-| `r` | Remove an account |
 | `d` | Enable/disable an account |
+| `p` | Refresh quota on all accounts (one-shot probe of the zero-spend usage endpoint) |
 | `R` | Reload accounts from config |
-| `g` | Settings screen (threshold, probe interval, sx.org) |
+| `g` | Settings (threshold, quota probe, routing, **add/remove accounts**, sx.org) |
 | `q` | Quit |
 
-**Settings screen** (`g`):
-
-| Key | Action |
-|-----|--------|
-| `t` | Edit rotation threshold |
-| `b` | Toggle least-in-flight load balancing |
-| `p` | Edit quota-probe interval |
-| `k` | Set sx.org API key |
-| `m` | Cycle sx.org mode (always / 429-only / off) |
-| `x` | Clear sx.org key |
-| `Esc` | Back to main screen |
-
-In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `Esc` to cancel.
+In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `Esc` to cancel. Adding and removing accounts lives on the settings screen: `g` → **Add account** (import from Claude Code or paste an API key) / **Remove account**.
 
 ### Run Claude Code through the proxy
 
@@ -154,26 +141,28 @@ In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `E
 teamclaude run
 ```
 
-`run` probes the proxy first: if it's up, Claude Code is routed through it; if it's **not** running, `claude` is launched directly so nothing breaks.
+`run` probes the proxy first: if it's up, Claude Code is routed through it; if it's **not** running, `run` errors out rather than silently bypassing the proxy (which would spend your own quota with no rotation). Pass `--auto-fallback` to launch `claude` directly when the proxy is down instead:
+
+```bash
+teamclaude run --auto-fallback
+```
+
+Since **1.1.0**, `run` defaults to [MITM forward-proxy mode](#mitm-proxy-mode-default) so even hardcoded `api.anthropic.com` endpoints (e.g. the Claude Design MCP) are intercepted. To keep the previous base-URL-only behavior, pass `--no-mitm`:
+
+```bash
+teamclaude run --no-mitm
+```
 
 Or manually set the environment:
 
 ```bash
-eval $(teamclaude env)          # reverse-proxy mode (ANTHROPIC_BASE_URL)
-eval $(teamclaude env --mitm)   # MITM forward-proxy mode (HTTPS_PROXY + CA cert)
+eval $(teamclaude env)
 claude
-```
-
-Generate env vars for a remote machine (non-localhost clients authenticate via the proxy API key):
-
-```bash
-teamclaude env --host 10.0.6.5 --port 3456         # reverse-proxy
-teamclaude env --host 10.0.6.5 --port 3456 --mitm   # MITM
 ```
 
 ### Routing plain `claude` automatically (alias)
 
-So you don't have to type `teamclaude run` every time, add a shell alias that makes plain `claude` go through the proxy (and fall back to direct when it's down):
+So you don't have to type `teamclaude run` every time, add a shell alias that makes plain `claude` go through the proxy (it errors if the proxy is down rather than silently bypassing it — add `--auto-fallback` to launch claude directly instead):
 
 ```bash
 teamclaude alias              # print the alias for your shell
@@ -188,53 +177,36 @@ This is an interactive-shell alias — it affects `claude` typed at a prompt, no
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude accounts -v       # Also show token expiry times
 teamclaude status            # Show live proxy status (requires running server)
-teamclaude switch <name>     # Manually pin the active account (live, hits running server)
-teamclaude threshold <val>   # Set rotation threshold (accepts 85, 85%, or 0.85; live)
 teamclaude remove <name>     # Remove an account (by name or email)
 teamclaude disable <name>    # Temporarily exclude an account from rotation
 teamclaude enable <name>     # Re-enable it (also clears a stuck error state)
 teamclaude priority <name> 1 # Set rotation priority (lower = preferred)
+teamclaude route list        # Manage per-model routes (add/rm); see Model routes
 teamclaude probe 300         # Enable background quota refresh (off by default)
-teamclaude refresh           # Probe all accounts' quota NOW (zero-spend; use after a plan change)
 teamclaude alias             # Print/install a `claude` alias that routes via the proxy
 teamclaude api <path>        # Call an API endpoint with account credentials
+teamclaude update            # Check npm for a newer teamclaude and install it
+teamclaude version           # Print the installed version
 teamclaude help              # Show all commands
 ```
+
+### Auto-update
+
+When teamclaude is installed globally via npm, it self-updates in the
+background: it checks the npm registry at most once a day, and when a newer
+version is published it runs `npm install -g @karpeleslab/teamclaude@latest` and
+applies it on the next launch. The check runs after a `teamclaude run` session
+ends and when a headless server starts; a git checkout is never touched (update
+it with `git pull`). Run `teamclaude update` to update on demand.
+
+Disable auto-update with `TEAMCLAUDE_DISABLE_AUTOUPDATE=1` or `"autoUpdate": false`
+in the config.
 
 When the same email belongs to multiple organizations, accounts are named
 `email (Org)` to keep them distinct. Pass `--org <name|uuid>` to disambiguate a
 bare email, e.g. `teamclaude remove user@example.com --org Acme`. Use
 `teamclaude priority <name> --first` / `--last` to move an account to the front
 or back of the rotation order.
-
-### Web dashboard
-
-The proxy serves a single-page dashboard at `http://localhost:3456/ui` with:
-
-- Per-account quota bars (session + weekly) with reset countdowns
-- Live activity feed (request lifecycle events via SSE)
-- Log viewer (streams `journalctl --user -u teamclaude.service`)
-- Account switching buttons
-- Editable rotation threshold
-- Restart service button
-
-Useful for at-a-glance monitoring without the TUI, or when accessing the proxy remotely.
-
-### HTTP endpoints
-
-All endpoints are on the proxy port (default 3456). Localhost connections skip auth; non-localhost requires the proxy API key via `x-api-key` header (reverse proxy) or `proxy-authorization: Basic` (CONNECT/MITM).
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/teamclaude/status` | JSON status (accounts, quota, active account) |
-| `POST` | `/teamclaude/switch` | Pin active account (`{"name": "..."}`) |
-| `POST` | `/teamclaude/threshold` | Set rotation threshold (`{"threshold": 0.85}`) |
-| `POST` | `/teamclaude/loadbalance` | Toggle least-in-flight load balancing (`{"enabled": true}`) |
-| `POST` | `/teamclaude/reload` | Hot-reload accounts from config |
-| `POST` | `/teamclaude/restart` | Restart the systemd user service |
-| `GET` | `/teamclaude/activity` | SSE stream of request lifecycle events (replays last 100) |
-| `GET` | `/teamclaude/logs` | SSE stream of journalctl output |
-| `GET` | `/ui` | Web dashboard |
 
 ### Request logging
 
@@ -256,6 +228,35 @@ Override the config path with `TEAMCLAUDE_CONFIG`:
 TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 ```
 
+### Network resilience
+
+After a host network drop and reconnect, Node's shared connection pool can hold dead keep-alive sockets. Because a request has no default time limit, a retry can land on a dead socket and hang forever — every account and every retry keeps hitting the same poison, so the proxy appears wedged until you restart it. teamclaude bounds each stage so a stuck request fails fast instead: the failure lets Node evict the dead socket, the client retries, and the next request connects fresh — no restart needed. Recovery is per-socket, so after a flap it can take a few failed-then-retried requests to fully drain, but it always converges.
+
+| Variable | Default | Description |
+|---|---|---|
+| `TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS` | `120000` | Max wait for upstream **response headers** (time-to-first-byte). Cleared the instant headers arrive, so a long streaming body is never cut. Streamed completions deliver first byte in seconds; a non-streaming (`stream:false`) request that legitimately generates for longer than this could trip it — raise it for such callers. |
+| `TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS` | `120000` | Max **idle** gap between response-body chunks. Resets on every chunk, so a slow-but-healthy stream is fine; it fires only when the socket goes silent mid-stream (a drop after headers), turning a hang into a fast, retryable failure. |
+| `TEAMCLAUDE_REFRESH_TIMEOUT_MS` | `30000` | Max wait for an OAuth token refresh. A hung refresh is coalesced across all callers, so it would otherwise wedge every request for that account. |
+
+### Storm control (switchover ramp-up)
+
+When you run many agents at once and the active account runs out, every in-flight request fails over to the next account **at the same instant** — a thundering herd that can spend a big chunk of the fresh account's quota (large contexts) and instantly throttle it, cascading down the fleet ([#84](https://github.com/KarpelesLab/teamclaude/issues/84)).
+
+To prevent this, requests onto a **just-switched-to account** are paced: concurrency starts at 1 and the cap ramps up over a few seconds, then lifts. The first request or two reveal whether the new account is also near-exhausted **before** the whole herd commits to it, so a cascade is broken up hop by hop. The gate is **fail-open** — a request never blocks longer than the ramp window, and a client that disconnects while waiting just drops out — and the slot is held only until response headers arrive, so streaming replies don't tie up concurrency.
+
+On by default. Tune or disable via `stormRamp` in the config:
+
+```json
+"stormRamp": { "enabled": true, "startConc": 1, "stepConc": 1, "stepMs": 250, "windowMs": 30000 }
+```
+
+- **`startConc`** — concurrent requests allowed the instant a switch happens (default 1).
+- **`stepConc` / `stepMs`** — the cap grows by `stepConc` every `stepMs` (default +1 every 250ms ≈ 4 req/s).
+- **`windowMs`** — after this long, pacing stops entirely (default 30s).
+- **`enabled: false`** — turn storm control off (send the full burst immediately, pre-#84 behavior).
+
+The same gate handles **rate-limit 429s** (the per-minute throttle, not quota exhaustion): teamclaude pauses the account for the `retry-after` window so new queries wait instead of piling on, then releases the held queries through a fresh ramp (staggered, not all at once). It **never rotates** on a rate-limit 429 — that would just move the burst to the next account and drop the first account's cache. Short waits are absorbed inline on the same account (default ≤ 60s, `TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS`); longer ones return a 429 + `retry-after` so the client backs off. Only a **quota rejection** (`unified-…-status: rejected`) rotates.
+
 ### Config format
 
 ```json
@@ -266,7 +267,6 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
   },
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
-  "loadBalance": false,
   "sx": { "apiKey": "your-sx-org-api-key", "mode": "always" },
   "accounts": [
     {
@@ -287,17 +287,56 @@ TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 | Field | Description |
 |-------|-------------|
 | `proxy.port` | Local port the proxy listens on |
-| `proxy.apiKey` | API key clients use to authenticate with the proxy |
+| `proxy.host` | Interface to bind. Defaults to `127.0.0.1` (localhost only). Set to `0.0.0.0` (or override with env `TEAMCLAUDE_HOST`) to accept off-box clients — in which case **set `proxy.apiKey`**, since remote clients must present it (via `x-api-key`, or `Proxy-Authorization` for CONNECT/HTTPS-proxy usage); loopback is always exempt |
+| `proxy.apiKey` | API key clients use to authenticate with the proxy (required for any non-loopback client; the proxy injects real account tokens, so an unauthenticated open port would leak them) |
 | `upstream` | Upstream API base URL |
 | `switchThreshold` | Quota utilization (0–1) at which to switch accounts (TUI: `g` → `t`) |
-| `loadBalance` | If `true`, spread each request across all available accounts by fewest in-flight requests instead of pinning one sticky account — keeps any single account under Anthropic's short-term burst limit under concurrency. Opt-in; default `false` (TUI: `g` → `b`, or `POST /teamclaude/loadbalance`) |
 | `quotaProbeSeconds` | Background quota-probe interval in seconds (`0` = off, the default; CLI `probe` or TUI `g` → `p`) |
+| `warmupSeconds` | Keep-warm interval in seconds (`0` = off, the default; CLI `warmup`). Spawns a minimal `claude` per idle account to start its 5h timer — **spends a little quota**, unlike the probe |
+| `stormRamp` | Optional storm-control tuning (on by default) — see [Storm control](#storm-control-switchover-ramp-up). Object: `{ enabled, startConc, stepConc, stepMs, windowMs }` |
 | `sx.apiKey` | [sx.org](https://sx.org) API key. When set, TeamClaude auto-provisions a residential proxy (egress-IP 429 workaround). Absent/empty = off |
 | `sx.mode` | `always` (route all upstream traffic), `429` (direct, fail over to the proxy after a 429), or `off` (keep the key but don't use it). Defaults to `always` when a key is set |
 | `accounts[].accountUuid` | Anthropic account (person) id; set automatically from the OAuth profile |
 | `accounts[].orgUuid` / `orgName` | Organization the account is scoped to — lets one email hold multiple org accounts |
 | `accounts[].priority` | Rotation preference, lower = preferred (default 0) |
 | `accounts[].disabled` | If `true`, the account is excluded from rotation until re-enabled |
+| `accounts[].upstream` | Alternative upstream base URL for this account (e.g. `https://api.deepseek.com/anthropic`). Overrides the global `upstream` for this account only |
+| `accounts[].modelMap` | Object mapping Anthropic model names to this backend's model names (e.g. `{"claude-sonnet-4-6": "deepseek-v4-pro[1m]"}`). Applied automatically when requests are routed to this account |
+| `accounts[].models` | Array of model names this account exclusively handles. When any account declares a `models` list, requests for those models are routed only to accounts that list them — use this to reserve a third-party account for sessions that pass `--model <name>` explicitly |
+| `routes` | Optional list of routing rules that pin model patterns to specific accounts — see [Model routes](#model-routes) |
+
+### Model routes
+
+By default every request routes through the same pool, and per-model quota is respected automatically: a family with its own weekly bucket (Fable, Sonnet) only blocks that family, so an account whose Fable quota is spent still serves Opus/Sonnet. `teamclaude status` shows this per account (a `Models` line) and any families it detects appear as **auto** routes.
+
+To go further you can pin model patterns to an **exclusive** set of accounts with a `routes` table. Each route matches the request's `model` id against shell-style globs (`*` is the only wildcard) and, on the **first matching** route, restricts the request to the listed accounts:
+
+```json
+"routes": [
+  { "name": "fable", "match": ["*fable*"], "accounts": ["personal-max"], "color": "magenta" },
+  { "name": "bulk",  "match": ["*opus*", "*sonnet*"], "accounts": ["corp-1", "corp-2"], "color": "blue" }
+]
+```
+
+- **`match`** — one or more model globs; the first route whose globs match wins.
+- **`accounts`** — account names (or indices) that may serve matching models. **Exclusive**: only these are used (and they 429/rotate among themselves when spent). Omit to route to all accounts — e.g. to only set a `bucket` override.
+- **`bucket`** — optional: force which quota bucket governs eligibility (`unified7dFable`, `unified7dSonnet`, `unified7d`), for the rare case the family can't be inferred from the model id.
+- **`color`** — optional: `red`/`green`/`yellow`/`blue`/`magenta`/`cyan`, tinting this route's inline marker in the TUI (see below). Display only.
+
+Manage routes from the shell (changes apply to a running server immediately):
+
+```bash
+teamclaude route list
+teamclaude route add fable --match '*fable*' --accounts personal-max --color magenta
+teamclaude route add bulk  --match '*opus*,*sonnet*' --accounts corp-1,corp-2
+teamclaude route rm fable
+```
+
+…or interactively in the TUI: open settings (**`g`**) → **Manage routing**, then `a` add / `e` edit / `d` delete (the editor prompts for a marker color too).
+
+**Inline markers (TUI).** Instead of a separate list, each route surfaces on the account rows as a colored `►`: next to the **`F7`/`S7`** bar for a Fable/Sonnet route, or at the **start of the row** for a general route (one fixed column per route so its position is stable). The marker is bold on the account a route is pinned to, dim when that account is currently ineligible. `teamclaude status` (the CLI text dump) still prints the routes as a list, now colored and annotated with any pin.
+
+**Manual per-route switching (TUI).** Press **`s`** to switch accounts, then **`Tab`** to choose *what* you're switching: the global **default** account, or a specific **route**. Pick an account with `↑/↓` and **`Enter`** to pin that route to it; `Enter` again on the current pin clears it. Pins are a **runtime preference** — not saved to config — and routing **falls back** to normal best-available selection whenever the pinned account is throttled or over quota, so a pin never stalls requests.
 
 ### Quota probe (optional, off by default)
 
@@ -313,25 +352,97 @@ teamclaude probe        # show current setting
 
 You can also set the interval live from the TUI settings screen (`g` → `p`), alongside the rotation threshold (`t`).
 
-It reads each OAuth account's utilization from Anthropic's usage endpoint (`/api/oauth/usage`), which reports quota **without consuming any message quota**. Minimum interval is 30s. Changing it takes effect on a running server immediately (no restart). When enabled, it also surfaces the **Sonnet 7-day** bucket as an extra bar in the TUI / `status` (when your plan exposes it).
+It reads each OAuth account's utilization from Anthropic's usage endpoint (`/api/oauth/usage`), which reports quota **without consuming any message quota**. Minimum interval is 30s. Changing it takes effect on a running server immediately (no restart). When enabled, it also surfaces the **Sonnet 7-day** and **Fable 7-day** buckets as extra bars in the TUI / `status` (when your plan exposes them).
 
-### MITM proxy mode (optional, off by default)
+### Keep-warm: start idle accounts' 5h timers (optional, off by default)
 
-The normal reverse-proxy only intercepts what `ANTHROPIC_BASE_URL` covers. Some Claude Code features (e.g. the **Claude Design MCP**) use a **hardcoded** `https://api.anthropic.com` URL that ignores that variable, so they bypass the proxy. MITM proxy mode captures those too.
-
-Run claude with the `--mitm` flag:
+The rolling **5-hour session window** only starts once an account sends a real message. So when your active account runs out and rotation moves to a cold account, that account's 5h window starts *then* — right when you need its full headroom. Keep-warm ([#76](https://github.com/KarpelesLab/teamclaude/issues/76)) starts the timer on idle accounts ahead of time, so the next account is already partway (or fully) through a fresh window when it's needed.
 
 ```bash
-teamclaude run --mitm -- <claude args...>
+teamclaude warmup 600    # warm idle accounts every 600s
+teamclaude warmup off    # disabled (default)
+teamclaude warmup        # show current setting
 ```
 
-That launches claude pointed at teamclaude as an **HTTPS forward proxy** (`HTTPS_PROXY`) and trusts a locally-generated CA (`NODE_EXTRA_CA_CERTS`). For an intercepted host, teamclaude **dials the real upstream first, mirrors its negotiated ALPN** (HTTP/2 or HTTP/1.1), then terminates TLS toward claude with the same protocol and relays the traffic **as transparently as possible** — rewriting only what it must:
+> ⚠️ **This spends a little quota — unlike the passive quota probe.** The 5h timer can't be started by a read-only call, so keep-warm sends a real (minimal) message: for each eligible idle account it spawns a one-shot `claude -p --bare --model haiku "hi"` pointed at this proxy, pinned to that account (see below). It only warms accounts whose 5h window is **not already running**, skips disabled/throttled/errored and third-party-backend accounts, and uses the cheapest model — but it does consume a few tokens and a slice of the 5h/weekly buckets per account per window. Requires the `claude` CLI on `PATH`. Minimum interval 60s; changes apply live (no restart). Status shows under `warm` in `teamclaude status --json`.
 
-- the **`authorization`** header → the active account's real token (dropping any client `x-api-key`);
-- the **`account_uuid`** inside `metadata.user_id` → the active account's UUID (so the body agrees with the injected token);
-- and it reads `anthropic-ratelimit-*` from responses for quota.
+### Prompt caching across rotation
 
-Everything else is copied byte-for-byte (HTTP/2 is handled with a built-in HPACK codec so the only header changed is the auth one). Any host other than the upstream is blind-tunnelled. The server accepts *both* base-URL and proxy clients at once, so instances launched with and without `--mitm` can share one server.
+Rotation is transparent to your Claude Code session, but it's worth knowing how it interacts with Anthropic's [prompt cache](https://docs.claude.com/en/docs/build-with-claude/prompt-caching).
+
+- **Your context is never lost.** Claude Code resends the full transcript every turn, and TeamClaude rewrites the request's `account_uuid` to match the injected token, so whichever account serves a turn sees the complete history — a mid-session switch is invisible to the client.
+- **The cache doesn't carry across accounts.** The prompt cache is scoped to the account/organization that created it and expires after a few minutes, so the first turn after a switch is a cache **miss** — that turn is processed without the cache discount, after which the new account warms its own cache. No proxy can share a cache across organizations.
+
+In practice this rarely bites, because **TeamClaude prefers to keep you on one account**: it stays on the current account and only rotates when that account nears the switch threshold (default `98%`); when it does pick, it prefers the account whose weekly quota resets soonest — so a single account tends to serve a whole session and switches are infrequent. Pin an explicit order with `teamclaude priority` to lean on one account even harder.
+
+> Keep-warm (above) is unrelated to this — it starts an idle account's **5h session timer**, not its prompt cache. A freshly-rotated account still takes a one-turn cache miss regardless.
+
+### Pin a request to a specific account
+
+`ANTHROPIC_BASE_URL` with a `/tc-acct/<name-or-index>` prefix forces every request onto **one** account, bypassing rotation (and never failing over to another). This is what keep-warm uses internally, and it doubles as a manual way to exercise a specific account:
+
+```bash
+# Route this whole claude session to the account named "work (Acme)" (index also works)
+ANTHROPIC_BASE_URL='http://127.0.0.1:3456/tc-acct/1' \
+ANTHROPIC_API_KEY='<your teamclaude proxy key>' \
+  claude -p --bare 'say hi'
+```
+
+The `<name>` matches an account's display name exactly (URL-encode spaces/parens), or a numeric rotation index. An unknown pin returns `404`. The prefix is stripped before the request is forwarded upstream.
+
+### Third-party backend accounts
+
+Any Anthropic-compatible API can be added as an account alongside your Claude accounts. Give it a higher `priority` value (lower = preferred, so use e.g. `100`) and it will be used as a fallback when all Claude accounts are exhausted.
+
+```json
+{
+  "name": "deepseek",
+  "type": "oauth",
+  "accessToken": "sk-your-deepseek-api-key",
+  "upstream": "https://api.deepseek.com/anthropic",
+  "priority": 100,
+  "modelMap": {
+    "claude-haiku-4-5-20251001": "deepseek-v4-flash",
+    "claude-sonnet-4-6": "deepseek-v4-pro[1m]"
+  },
+  "models": ["deepseek-v4-pro[1m]", "deepseek-v4-pro", "deepseek-v4-flash"]
+}
+```
+
+- **`upstream`** — base URL of the target API. Requests are sent to `upstream + /v1/messages` (etc.) for this account only.
+- **`modelMap`** — when a Claude model name arrives in the request body, it is rewritten to the mapped name before forwarding.
+- **`models`** — model names this account exclusively handles. Once any account declares a `models` list, requests for those model names are locked to matching accounts. This lets you send a specific session to a third-party backend without touching others — use `--model` on launch or `/model` inside a session:
+
+```bash
+# This session routes to DeepSeek; all other sessions still use Claude accounts.
+claude --model 'deepseek-v4-pro[1m]'
+```
+
+Note: model names with brackets (e.g. `deepseek-v4-pro[1m]`) must be quoted in the shell.
+
+### MITM proxy mode (default)
+
+The plain reverse-proxy only intercepts what `ANTHROPIC_BASE_URL` covers. Some Claude Code features (e.g. the **Claude Design MCP**) use a **hardcoded** `https://api.anthropic.com` URL that ignores that variable, so they bypass the proxy. MITM proxy mode captures those too, which is why it's the default for `teamclaude run` (and the shell alias):
+
+```bash
+teamclaude run -- <claude args...>
+```
+
+To opt out and route via `ANTHROPIC_BASE_URL` only, pass `--no-mitm`:
+
+```bash
+teamclaude run --no-mitm -- <claude args...>
+```
+
+That launches claude pointed at teamclaude as an **HTTPS forward proxy** (`HTTPS_PROXY`) and trusts a locally-generated CA (`NODE_EXTRA_CA_CERTS`). For an intercepted host, teamclaude **terminates** the tunnel with a real HTTP/2 server (HTTP/1.1 clients are handled too) presenting its local leaf, then **forwards each request with a buffering, retrying client** — the same path the base URL mode uses. On each request it:
+
+- injects the active account's real token as **`authorization`** (dropping any client `x-api-key`);
+- rewrites the **`account_uuid`** inside `metadata.user_id` to the active account's UUID (so the body agrees with the injected token);
+- routes by the request's **`model`** (a Fable-exhausted account is skipped for Fable but still serves other models);
+- reads `anthropic-ratelimit-*` from responses for quota; and
+- **resends the request on a different account** if one returns a quota `429`, so a "you've reached your limit" is never surfaced while another account has headroom.
+
+Because the request is buffered, the retry is transparent to claude. Remote Control (`/v1/code/*`) and client token refreshes (`/v1/oauth/token`) are passed through with the client's own credential. Any host other than the upstream is blind-tunnelled. The server accepts *both* base-URL and proxy clients at once, so instances launched with and without `--no-mitm` can share one server.
 
 Trust model:
 - The CA is generated locally, stored in the config dir, and trusted **only** by the claude process you launch via `teamclaude run` (through `NODE_EXTRA_CA_CERTS`) — it is **never** added to your system trust store. The leaf private key is `0600`; the CA private key is never written to disk.
@@ -363,45 +474,6 @@ TLS is established **end-to-end with `api.anthropic.com` over the tunnel**, so t
 
 > **Cost:** in **always** mode *all* Claude traffic flows through the residential proxy, which sx.org meters by bandwidth — expect real per-GB cost. **on 429 only** uses the proxy just when you're actually being throttled, so it's the cheaper way to ride out rate limits.
 
-## Deployment as a systemd service
-
-Run the proxy as a persistent user service (no root required):
-
-```bash
-# Create the service unit
-mkdir -p ~/.config/systemd/user
-cat > ~/.config/systemd/user/teamclaude.service << 'EOF'
-[Unit]
-Description=TeamClaude — Multi-account Claude proxy with quota-based rotation
-Documentation=https://github.com/jphein/teamclaude
-
-[Service]
-Type=simple
-ExecStart=%h/.npm-global/bin/teamclaude server --headless
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-EOF
-
-# Enable and start
-systemctl --user daemon-reload
-systemctl --user enable --now teamclaude
-
-# Check status / logs
-systemctl --user status teamclaude
-journalctl --user -u teamclaude -f
-```
-
-The web dashboard's restart button and `/teamclaude/restart` endpoint call `systemctl --user restart teamclaude.service`.
-
-### Fast-mode stripping
-
-Claude Code's `/fast` mode sets `"speed": "fast"` in the request body and a `fast-mode-*` token in the `anthropic-beta` header. Fast mode routes through a separate billing path that charges **usage credits**, not the subscription's included quota. On accounts without credits, every fast-mode request immediately 429s — and the proxy would misinterpret that as quota exhaustion, rotating through every account in the pool from a single keystroke.
-
-TeamClaude silently strips fast mode from all forwarded requests, downgrading to standard Opus. If `/fast` doesn't seem to work behind the proxy, this is why — and it's intentional.
-
 ## How It Works
 
 1. Claude Code connects to the local proxy instead of `api.anthropic.com`
@@ -416,7 +488,22 @@ TeamClaude silently strips fast mode from all forwarded requests, downgrading to
 
 ## Security
 
-This is a **fork** of [`KarpelesLab/teamclaude`](https://github.com/KarpelesLab/teamclaude). The upstream project and the [`@karpeleslab/teamclaude`](https://www.npmjs.com/package/@karpeleslab/teamclaude) npm package are the canonical sources. This fork is for personal use and is not published to npm. See upstream's [SECURITY.md](https://github.com/KarpelesLab/teamclaude/blob/master/SECURITY.md) for reporting vulnerabilities.
+The only canonical sources for TeamClaude are this repository
+(https://github.com/KarpelesLab/teamclaude) and the
+[`@karpeleslab/teamclaude`](https://www.npmjs.com/package/@karpeleslab/teamclaude)
+npm package. TeamClaude is **never** distributed as a downloadable binary
+archive — be wary of soft-forks that bundle a `.zip` and tell you to extract and
+run it. See [SECURITY.md](SECURITY.md) for details and how to report issues.
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=KarpelesLab%2Fteamclaude&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=KarpelesLab/teamclaude&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=KarpelesLab/teamclaude&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=KarpelesLab/teamclaude&type=date&legend=top-left" />
+ </picture>
+</a>
 
 ## License
 

@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, chmod } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -33,6 +33,9 @@ export async function saveState(state) {
   const path = getStatePath();
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 });
+  // `mode` only applies when the file is CREATED; enforce 0600 on every save so
+  // a pre-existing state file (holding quota + tokens) can't linger world-readable.
+  await chmod(path, 0o600).catch(() => {});
 }
 
 export function createDefaultConfig() {
@@ -43,7 +46,6 @@ export function createDefaultConfig() {
     },
     upstream: 'https://api.anthropic.com',
     switchThreshold: 0.98,
-    loadBalance: false,
     accounts: [],
   };
 }
@@ -68,36 +70,39 @@ export async function loadOrCreateConfig() {
   return config;
 }
 
-/**
- * Build the `export ...` lines a Claude Code client needs to talk to this proxy.
- *
- * Defaults to `localhost`, which only works ON the proxy machine. Pass a `host`
- * (this machine's LAN or Tailscale IP) to produce output usable from another
- * computer on the network — remote clients hit the non-localhost auth gate in
- * server.js, so the API key line is required there, not optional.
- */
-export function buildEnvExports(config, { host = 'localhost', port } = {}) {
-  const p = port ?? config.proxy.port;
-  return [
-    `export ANTHROPIC_BASE_URL=http://${host}:${p}`,
-    `export ANTHROPIC_API_KEY=${config.proxy.apiKey}`,
-  ];
-}
-
 export async function saveConfig(config) {
   const path = getConfigPath();
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+  // Enforce 0600 even if the file already existed (the proxy apiKey + account
+  // tokens live here); `mode` above is honored only on creation.
+  await chmod(path, 0o600).catch(() => {});
 }
+
+// Serialize config updates. atomicConfigUpdate is a read-modify-write, so two
+// concurrent callers can both read the same config and then save in turn, and
+// the later save silently drops the earlier caller's change. This bites hardest
+// on startup, when several OAuth accounts refresh their tokens at once: only the
+// last writer's rotated refresh token persists, and the other accounts keep a
+// token that was just rotated away, so they fail on the next restart with
+// invalid_grant and need a re-login. Chaining the updates keeps every write.
+let configUpdateChain = Promise.resolve();
 
 /**
  * Atomically update the config: re-reads from disk, calls updater(config),
  * then saves. Returns the updated config. This prevents overwriting changes
- * made by other processes (e.g. `teamclaude import` while the server runs).
+ * made by other processes (e.g. `teamclaude import` while the server runs), and
+ * serializes concurrent callers so simultaneous updates queue instead of
+ * clobbering one another.
  */
-export async function atomicConfigUpdate(updater) {
-  const config = await loadConfig() || createDefaultConfig();
-  await updater(config);
-  await saveConfig(config);
-  return config;
+export function atomicConfigUpdate(updater) {
+  const run = async () => {
+    const config = await loadConfig() || createDefaultConfig();
+    await updater(config);
+    await saveConfig(config);
+    return config;
+  };
+  const result = configUpdateChain.then(run, run);
+  configUpdateChain = result.then(() => {}, () => {});
+  return result;
 }

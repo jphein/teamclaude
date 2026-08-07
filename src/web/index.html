@@ -470,10 +470,6 @@
         <input type="range" id="thr" min="50" max="100" step="1" value="98">
         <span class="val" id="thrVal">98%</span>
       </div>
-      <div class="threshold-row" title="Spread requests across all available accounts (least in-flight) instead of one sticky account">
-        <label for="lb">Balance</label>
-        <input type="checkbox" id="lb">
-      </div>
     </div>
   </header>
 
@@ -527,7 +523,6 @@
   const metaEl      = document.getElementById('meta');
   const thr         = document.getElementById('thr');
   const thrVal      = document.getElementById('thrVal');
-  const lbToggle    = document.getElementById('lb');
   const restartBtn  = document.getElementById('restartBtn');
   const restartStatusEl = document.getElementById('restartStatus');
   const svcStatsEl  = document.getElementById('svcStats');
@@ -636,7 +631,6 @@
     const totalTok = acct.usage.totalInputTokens + acct.usage.totalOutputTokens;
 
     const inFlight = acct.inFlight || 0;
-    const burstHits = (acct.stats && acct.stats.burstHits) || 0;
     const nameRow = el('div', { class: 'name' }, [
       el('span', { class: 'status-dot status-' + acct.status }),
       acct.name,
@@ -659,7 +653,6 @@
     ]);
     const metaText = fmtNum(acct.usage.totalRequests) + ' requests · '
       + fmtNum(totalTok) + ' tokens · last used ' + fmtAgo(acct.usage.lastUsed)
-      + (burstHits > 0 ? ' · ' + burstHits + ' burst-429' + (burstHits === 1 ? '' : 's') : '')
       + (acct.rateLimitedUntil ? ' · throttled until ' + new Date(acct.rateLimitedUntil).toLocaleTimeString() : '');
     const meta = el('div', { class: 'meta', text: metaText });
     return el('div', { class: 'card' + (isActive ? ' active' : '') + (acct.disabled ? ' off' : '') }, [nameRow, actions, bars, meta]);
@@ -694,8 +687,6 @@
         lastThreshold = serverPct;
       }
 
-      if (document.activeElement !== lbToggle) lbToggle.checked = !!data.loadBalance;
-
       cardsEl.textContent = '';
       for (const acct of data.accounts) {
         cardsEl.appendChild(renderAccount(acct, acct.name === data.currentAccount, data.switchThreshold));
@@ -709,14 +700,14 @@
         ['uptime', fmtUptime(sv.uptimeSeconds)],
         ['memory', fmtMB(sv.rssBytes)],
         ['pid', sv.pid != null ? String(sv.pid) : '—'],
-        ['port', String(data.port || 3456)],
+        ['port', String(sv.port || 3456)],
         ['accounts', data.accounts.filter(a => !a.disabled).length + '/' + data.accounts.length + ' in rotation'],
       ]) {
         svcStatsEl.appendChild(el('span', {}, [label + ' ', el('b', { text: value })]));
       }
 
-      const upDisplay = (data.upstream || 'api.anthropic.com').replace(/^https?:\/\//, '');
-      const portDisplay = data.port || 3456;
+      const upDisplay = (sv.upstream || 'api.anthropic.com').replace(/^https?:\/\//, '');
+      const portDisplay = sv.port || 3456;
       metaEl.textContent = `Active: ${data.currentAccount} · ${upDisplay}:${portDisplay} · ${new Date().toLocaleTimeString()}`;
     } catch (err) {
       wasDisconnected = true;
@@ -738,12 +729,12 @@
       const res = isToggle
         ? await fetch('/teamclaude/account', {
             method: 'POST',
-            headers: { 'content-type': 'application/json' },
+            headers: { 'content-type': 'application/json', 'x-teamclaude-control': '1' },
             body: JSON.stringify({ name, disabled: !btn.getAttribute('data-disabled') }),
           })
         : await fetch('/teamclaude/switch', {
             method: 'POST',
-            headers: { 'content-type': 'application/json' },
+            headers: { 'content-type': 'application/json', 'x-teamclaude-control': '1' },
             body: JSON.stringify({ account: name }),
           });
       if (!res.ok) {
@@ -765,7 +756,7 @@
   async function svcAction(btn, url, describe) {
     btn.disabled = true;
     try {
-      const res = await fetch(url, { method: 'POST' });
+      const res = await fetch(url, { method: 'POST', headers: { 'x-teamclaude-control': '1' } });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
       await refresh();
@@ -790,7 +781,7 @@
       try {
         const res = await fetch('/teamclaude/threshold', {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          headers: { 'content-type': 'application/json', 'x-teamclaude-control': '1' },
           body: JSON.stringify({ value }),
         });
         if (!res.ok) {
@@ -804,32 +795,13 @@
     }, 100);
   });
 
-  // ── Load-balance toggle ──────────────────────────────────────
-  lbToggle.addEventListener('change', async () => {
-    const enabled = lbToggle.checked;
-    try {
-      const res = await fetch('/teamclaude/loadbalance', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ enabled }),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.error || 'HTTP ' + res.status);
-      }
-    } catch (err) {
-      lbToggle.checked = !enabled; // revert on failure
-      showErr('Load-balance toggle failed: ' + err.message);
-    }
-  });
-
   // ── Service restart ──────────────────────────────────────────
   restartBtn.addEventListener('click', async () => {
     restartBtn.disabled = true;
     restartStatusEl.textContent = 'Restarting…';
     restartPending = true;
     try {
-      await fetch('/teamclaude/restart', { method: 'POST' });
+      await fetch('/teamclaude/restart', { method: 'POST', headers: { 'x-teamclaude-control': '1' } });
     } catch {
       // Expected — the service is going down
     }
@@ -839,12 +811,16 @@
   const activityMap = new Map(); // id → { method, path, account, ts }
 
   function renderActiveReqs() {
+    const now = Date.now();
+    // Evict stale in-flight entries: a request that never got a matching req_end
+    // (client aborted mid-body, or the process restarted under it) would otherwise
+    // linger as a permanent "active" row with an ever-climbing timer.
+    for (const [id, r] of activityMap) if (now - r.ts > 300000) activityMap.delete(id);
     activeReqsEl.textContent = '';
     const entries = [...activityMap.values()];
     activeCountEl.textContent = entries.length > 0 ? entries.length + ' active' : '';
     actSepEl.style.display = entries.length > 0 ? '' : 'none';
 
-    const now = Date.now();
     for (const r of entries) {
       const elapsed = ((now - r.ts) / 1000).toFixed(1);
       activeReqsEl.appendChild(el('div', { class: 'activity-item' }, [
@@ -893,6 +869,10 @@
 
   function connectActivity() {
     const es = new EventSource('/teamclaude/activity');
+    // On (re)connect, drop any active entries: their req_end may have fired while
+    // we were disconnected and won't be in the terminal-event replay, so they'd
+    // otherwise stick forever. The replay repopulates the completed log.
+    es.onopen = () => { activityMap.clear(); renderActiveReqs(); };
     es.onmessage = (e) => {
       const evt = JSON.parse(e.data);
       if (evt.type === 'req_start') {

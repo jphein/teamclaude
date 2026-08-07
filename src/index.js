@@ -2,21 +2,20 @@
 
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { readFile } from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, buildEnvExports, loadState, saveState } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { sameIdentity, orgKey, matchAccounts } from './identity.js';
-import { syncAccountsFromDisk } from './account-sync.js';
 import * as alias from './alias.js';
 import { ensureCerts } from './mitm.js';
 import { Prober } from './prober.js';
+import { Warmer } from './warmer.js';
 import { TUI } from './tui.js';
 import { SxManager } from './sx.js';
+import { autoUpdate, checkForUpdate, currentVersion, runUpdate, installKind, PKG_NAME } from './updater.js';
+import { renderStatus } from './status-renderer.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -44,14 +43,6 @@ switch (command) {
     await statusCommand();
     process.exit(0);
     break;
-  case 'switch':
-    await switchCommand();
-    process.exit(0);
-    break;
-  case 'threshold':
-    await thresholdCommand();
-    process.exit(0);
-    break;
   case 'accounts':
     await accountsCommand();
     process.exit(0);
@@ -76,11 +67,6 @@ switch (command) {
     await apiCommand();
     process.exit(0);
     break;
-  case 'version':
-  case '--version':
-  case '-v':
-    console.log(await getVersion());
-    break;
   case 'alias':
     aliasCommand();
     process.exit(0);
@@ -89,8 +75,23 @@ switch (command) {
     await probeCommand();
     process.exit(0);
     break;
-  case 'refresh':
-    await refreshCommand();
+  case 'warmup':
+    await warmupCommand();
+    process.exit(0);
+    break;
+  case 'route':
+  case 'routes':
+    await routeCommand();
+    process.exit(0);
+    break;
+  case 'update':
+    await updateCommand();
+    process.exit(0);
+    break;
+  case 'version':
+  case '--version':
+  case '-V':
+    console.log(currentVersion() || 'unknown');
     process.exit(0);
     break;
   case 'help':
@@ -134,9 +135,7 @@ async function serverCommand() {
   }
 
   const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold, {
-    loadBalance: config.loadBalance || false,
-  });
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp });
 
   // Restore quota observed in a previous run so a restart doesn't lose rotation
   // state (passive — we never call the API to re-learn it). Stale windows are
@@ -188,11 +187,19 @@ async function serverCommand() {
     }).catch(err => console.error(`[TeamClaude] Failed to save refreshed token: ${err.message}`));
   });
   const port = config.proxy.port;
+  // Bind loopback by default so the proxy isn't reachable off-box (it injects
+  // account tokens and — via CONNECT — can relay arbitrarily). Opt into a wider
+  // bind explicitly with TEAMCLAUDE_HOST or config.proxy.host (e.g. '0.0.0.0'),
+  // in which case set proxy.apiKey so the auth gate protects remote clients.
+  const bindHost = process.env.TEAMCLAUDE_HOST || config.proxy.host || '127.0.0.1';
   const headless = args.includes('--headless') || args.includes('--no-tui');
   const useTUI = !headless && process.stdout.isTTY && process.stdin.isTTY;
 
   // Opt-in background quota probe (config.quotaProbeSeconds, default 0 = off).
   let prober = null;
+  // Opt-in keep-warm scheduler (config.warmupSeconds, default 0 = off).
+  let warmer = null;
+  const serverStartedAt = Date.now();
 
   // sx.org proxy (IP-based-429 workaround). Dormant unless an API key is set in
   // config.sx.apiKey; when set we provision a proxy and route upstream through it.
@@ -212,6 +219,9 @@ async function serverCommand() {
     const diskConfig = await loadConfig();
     if (!diskConfig) return 0;
     const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
+    // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
+    config.routes = diskConfig.routes || [];
+    accountManager.setRoutes(config.routes);
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
     const diskSxKey = diskConfig.sx?.apiKey || null;
     const diskSxMode = diskConfig.sx?.mode || 'always';
@@ -227,32 +237,18 @@ async function serverCommand() {
         prober.reschedule(ms);
       }
     }
+    if (warmer) {
+      const ms = (diskConfig.warmupSeconds || 0) * 1000;
+      if (ms !== warmer.intervalMs) {
+        config.warmupSeconds = diskConfig.warmupSeconds || 0;
+        warmer.reschedule(ms);
+      }
+    }
     return added;
   };
 
   let tui = null;
   let hooks = {};
-
-  hooks.persistThreshold = (value) => atomicConfigUpdate(diskConfig => {
-    diskConfig.switchThreshold = value;
-  });
-
-  hooks.persistLoadBalance = (enabled) => atomicConfigUpdate(diskConfig => {
-    diskConfig.loadBalance = enabled;
-  });
-
-  // On-demand quota refresh (POST /teamclaude/probe, `teamclaude refresh`).
-  // `prober` is assigned later in startup; read it at call time.
-  hooks.probeNow = () => (prober ? prober.probeAll() : 0);
-
-  hooks.persistAccountDisabled = (name, disabled) => atomicConfigUpdate(diskConfig => {
-    for (const cfg of [diskConfig, config]) {
-      const acct = cfg.accounts.find(a => a.name === name);
-      if (!acct) continue;
-      if (disabled) acct.disabled = true;
-      else delete acct.disabled;
-    }
-  });
 
   if (useTUI) {
     tui = new TUI({
@@ -277,17 +273,22 @@ async function serverCommand() {
         // Persist other runtime-tunable settings edited from the TUI.
         if (config.switchThreshold != null) diskConfig.switchThreshold = config.switchThreshold;
         if (config.quotaProbeSeconds != null) diskConfig.quotaProbeSeconds = config.quotaProbeSeconds;
+        if (config.warmupSeconds != null) diskConfig.warmupSeconds = config.warmupSeconds;
+        // Persist the route table (edited from the TUI routes screen).
+        if (config.routes != null) diskConfig.routes = config.routes;
       }),
       syncAccounts: reloadAccounts,
-      onQuit: async () => {
-        prober?.stop();
-        if (quotaSaveInterval) clearInterval(quotaSaveInterval);
-        await persistQuotaState();
-        server.close(() => process.exit(0));
-      },
+      // `p` key: on-demand fleet-wide quota refresh. The prober is constructed
+      // after the TUI, so this is a thunk over the closure variable.
+      probeQuota: () => prober?.probeAll(),
+      // ctrl-c / q from the TUI: funnel through the same idempotent shutdown as
+      // POSIX signals (defined below). In raw mode ctrl-c never reaches the OS as
+      // a signal, so without this the process would only tear down via keypress.
+      onQuit: () => shutdown(),
     });
     hooks = {
       onRequestStart: (id, info) => tui.onRequestStart(id, info),
+      onRequestModel: (id, info) => tui.onRequestModel(id, info),
       onRequestRouted: (id, info) => tui.onRequestRouted(id, info),
       onRequestEnd: (id, info) => tui.onRequestEnd(id, info),
     };
@@ -295,15 +296,73 @@ async function serverCommand() {
 
   // Expose reload to the proxy's control endpoint (works with or without TUI).
   hooks.reload = reloadAccounts;
+  const buildVersion = currentVersion();
+  hooks.getStatusExtra = () => ({
+    server: {
+      version: buildVersion,
+      startedAt: new Date(serverStartedAt).toISOString(),
+      uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
+      pid: process.pid,
+      rssBytes: process.memoryUsage().rss,
+      port,
+      upstream: config.upstream || 'https://api.anthropic.com',
+    },
+    probe: prober?.getStatus() || {
+      enabled: false,
+      intervalSeconds: config.quotaProbeSeconds || 0,
+      running: false,
+      accounts: accountManager.accounts.map(account => ({
+        name: account.name,
+        status: account.type === 'oauth' ? 'never' : 'not-applicable',
+        lastProbedAt: null,
+        startedAt: null,
+        durationMs: null,
+        error: null,
+      })),
+    },
+    warm: warmer?.getStatus() || {
+      enabled: false,
+      intervalSeconds: config.warmupSeconds || 0,
+      running: false,
+      accounts: accountManager.accounts.map(account => ({
+        name: account.name,
+        status: (account.type === 'oauth' && !account.upstream) ? 'never' : 'not-applicable',
+        lastWarmedAt: null,
+        startedAt: null,
+        durationMs: null,
+        error: null,
+      })),
+    },
+  });
 
-  const server = createProxyServer(accountManager, config, hooks, sx, { version: await getVersion() });
+  // Web-dashboard control hooks — consumed by the /teamclaude/* endpoints in
+  // server.js. They work with or without the TUI, so the browser dashboard can
+  // drive the daemon (which, being TTY-less, can't host the interactive TUI).
+  hooks.probeNow = async () => {
+    // Same fleet-wide refresh the TUI 'p' key runs; returns how many OAuth
+    // accounts were eligible so the UI can report "probed N account(s)".
+    const n = accountManager.accounts.filter(a => a.type === 'oauth' && a.credential).length;
+    await prober?.probeAll();
+    return n;
+  };
+  hooks.persistThreshold = (value) => {
+    config.switchThreshold = value; // keep in-memory config in sync with the live rotation
+    return atomicConfigUpdate(async diskConfig => { diskConfig.switchThreshold = value; });
+  };
+  hooks.persistAccountDisabled = (name, disabled) =>
+    atomicConfigUpdate(async diskConfig => {
+      const acct = diskConfig.accounts?.find(a => a.name === name);
+      if (acct) acct.disabled = disabled;
+    });
+
+  const server = createProxyServer(accountManager, config, hooks, sx);
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
   // remove this handler so a later runtime 'error' isn't misreported as a
   // listen failure and exit the whole proxy.
   const onListenError = err => handleServerListenError(err, port);
   server.once('error', onListenError);
 
-  server.listen(port, () => {
+  server.listen(port, bindHost, () => {
     // Bind succeeded: stop treating errors as listen failures, but keep a
     // benign runtime handler so a later 'error' is logged rather than thrown.
     server.removeListener('error', onListenError);
@@ -317,10 +376,9 @@ async function serverCommand() {
       console.log(sep);
       console.log('  TeamClaude Proxy');
       console.log(sep);
-      console.log(`  Port:       ${port}`);
+      console.log(`  Bind:       ${bindHost}:${port}${bindHost === '127.0.0.1' ? ' (localhost only)' : ' (reachable off-box — ensure proxy.apiKey is set)'}`);
       console.log(`  Accounts:   ${accounts.length}`);
       console.log(`  Threshold:  ${(threshold * 100).toFixed(0)}%`);
-      console.log(`  Balancing:  ${accountManager.loadBalance ? 'on (least in-flight)' : 'off (single account)'}`);
       console.log(`  Upstream:   ${config.upstream || 'https://api.anthropic.com'}`);
       console.log('');
       accounts.forEach((a, i) => {
@@ -342,23 +400,46 @@ async function serverCommand() {
   prober = new Prober(accountManager, { intervalMs: (config.quotaProbeSeconds || 0) * 1000 });
   prober.start();
 
-  if (!tui) {
-    const shutdown = async () => {
-      console.log('\n[TeamClaude] Shutting down...');
-      prober?.stop();
-      clearInterval(quotaSaveInterval);
-      await persistQuotaState();
-      // Force live tunnels closed so server.close() can actually complete, and
-      // guarantee the process exits within a bound — otherwise a lingering
-      // keep-alive/MITM connection leaves server.close() hanging until systemd's
-      // TimeoutStopSec fires and SIGKILLs us (logged as "Failed: timeout").
-      server.closeAllConnections?.();
-      server.close(() => process.exit(0));
-      setTimeout(() => process.exit(0), 2000).unref();
-    };
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
+  // Start the opt-in keep-warm scheduler (no-op when warmupSeconds is 0). It
+  // spawns a minimal `claude` per idle account through this proxy, pinned via
+  // /tc-acct/<index>, so needs our own port and proxy key.
+  warmer = new Warmer(accountManager, {
+    intervalMs: (config.warmupSeconds || 0) * 1000,
+    port,
+    apiKey: config.proxy?.apiKey,
+  });
+  warmer.start();
+
+  // Background self-update for a backgrounded (headless) server. Skipped under
+  // the TUI, where npm's install output would corrupt the display — interactive
+  // users update via `teamclaude run` (post-session) or `teamclaude update`.
+  if (!tui) autoUpdate({ config }).catch(() => {});
+
+  // One idempotent shutdown funnel for BOTH modes and BOTH triggers: POSIX
+  // signals (SIGINT/SIGTERM) and the TUI's ctrl-c / q keypress (which in raw mode
+  // never reaches the OS as a signal). Guards re-entry: a second ctrl-c — an
+  // impatient user, or a signal racing the keypress — forces an immediate exit
+  // instead of re-running teardown, which would re-arm server.close() and leak a
+  // 'close' listener on the server each time (MaxListenersExceededWarning).
+  let shuttingDown = false;
+  async function shutdown() {
+    if (shuttingDown) process.exit(0); // second ctrl-c: stop waiting, just go
+    shuttingDown = true;
+    try { tui?.stop(); } catch { /* terminal already restored */ }
+    if (!tui) console.log('\n[TeamClaude] Shutting down...');
+    prober?.stop();
+    warmer?.stop();
+    if (quotaSaveInterval) clearInterval(quotaSaveInterval);
+    await persistQuotaState();
+    // Don't linger waiting on keep-alive / streaming connections: actively
+    // destroy them so server.close() can complete promptly, and hard-exit after a
+    // short grace period in case anything still hangs.
+    setTimeout(() => process.exit(0), 2000).unref?.();
+    server.closeAllConnections?.();
+    server.close(() => process.exit(0));
   }
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
 // ── import ──────────────────────────────────────────────────
@@ -486,24 +567,8 @@ async function loginOAuthCommand() {
 
 async function envCommand() {
   const config = await loadOrCreateConfig();
-  const host = argValue('--host');
-  const port = argValue('--port');
-
-  if (args.includes('--mitm')) {
-    const p = port ?? config.proxy.port;
-    const h = host || '127.0.0.1';
-    const upHost = upstreamHost(config);
-    const { caPath } = await ensureCerts(upHost);
-    console.log(`export HTTPS_PROXY=http://${h}:${p}`);
-    console.log(`export HTTP_PROXY=http://${h}:${p}`);
-    console.log(`export NO_PROXY=localhost,127.0.0.1,.local,.lan,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`);
-    console.log(`export NODE_EXTRA_CA_CERTS=${caPath}`);
-    console.log('unset ANTHROPIC_BASE_URL 2>/dev/null');
-  } else {
-    for (const line of buildEnvExports(config, { host: host || undefined, port: port || undefined })) {
-      console.log(line);
-    }
-  }
+  console.log(`export ANTHROPIC_BASE_URL=http://localhost:${config.proxy.port}`);
+  console.log(`export ANTHROPIC_API_KEY=${config.proxy.apiKey}`);
 }
 
 // ── run ─────────────────────────────────────────────────────
@@ -511,17 +576,24 @@ async function envCommand() {
 async function runCommand() {
   const config = await loadOrCreateConfig();
 
-  // Args after 'run'. teamclaude flags (e.g. --mitm) are recognized only before
-  // an optional `--` separator; everything after `--` goes verbatim to claude.
+  // Args after 'run'. teamclaude flags (e.g. --no-mitm) are recognized only
+  // before an optional `--` separator; everything after `--` goes verbatim to
+  // claude. MITM forward-proxy mode is the default so hardcoded api.anthropic.com
+  // endpoints are intercepted too; --no-mitm opts back into base-URL-only routing.
+  // --mitm is still accepted (now a no-op) for backward compatibility.
   const rest = args.slice(1);
   const sep = rest.indexOf('--');
   const tcFlags = sep >= 0 ? rest.slice(0, sep) : rest;
-  const useMitm = tcFlags.includes('--mitm');
-  const claudeArgs = sep >= 0 ? rest.slice(sep + 1) : rest.filter(a => a !== '--mitm');
+  const useMitm = !tcFlags.includes('--no-mitm');
+  const autoFallback = tcFlags.includes('--auto-fallback');
+  const claudeArgs = sep >= 0
+    ? rest.slice(sep + 1)
+    : rest.filter(a => a !== '--mitm' && a !== '--no-mitm' && a !== '--auto-fallback');
 
-  // Route through the proxy only when it's actually up; otherwise launch claude
-  // directly so a stopped proxy doesn't break `claude`. This is what lets the
-  // shell alias (`claude='teamclaude run --'`) be a dumb passthrough.
+  // Route through the proxy when it's up. When it's down we refuse by default —
+  // silently launching claude directly hides that requests are bypassing the
+  // proxy (no rotation, spending the user's own quota). Pass --auto-fallback to
+  // opt back into the transparent direct launch (e.g. for a dumb shell alias).
   const port = config.proxy.port;
   const env = { ...process.env };
   if (await isProxyUp(port)) {
@@ -533,7 +605,7 @@ async function runCommand() {
       const { caPath } = await ensureCerts(host);
       const proxyUrl = `http://127.0.0.1:${port}`;
       env.HTTPS_PROXY = env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxyUrl;
-      env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,.local,.lan,.internal,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16';
+      env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,::1';
       env.NODE_EXTRA_CA_CERTS = caPath;
       delete env.ANTHROPIC_BASE_URL;
     } else {
@@ -542,8 +614,13 @@ async function runCommand() {
       // lets Claude Code stay in subscription mode (full model access).
       env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
     }
+  } else if (autoFallback) {
+    console.error(`[TeamClaude] Proxy not running on port ${port} — launching claude directly (--auto-fallback; start it with: teamclaude server)`);
   } else {
-    console.error(`[TeamClaude] Proxy not running on port ${port} — launching claude directly (start it with: teamclaude server)`);
+    console.error(`[TeamClaude] Proxy not running on port ${port}.`);
+    console.error('Start it with: teamclaude server');
+    console.error('Or pass --auto-fallback to launch claude directly (bypassing the proxy) when it is down.');
+    process.exit(1);
   }
 
   // Use spawnSync so the Node process blocks entirely — behaves like execvp.
@@ -562,146 +639,36 @@ async function runCommand() {
     process.exit(1);
   }
 
+  // Session over — check for a newer teamclaude and (for a global npm install)
+  // self-update. Throttled to once/day, so this is a no-op on almost every run;
+  // it applies to the NEXT launch, never the session that just ran.
+  await autoUpdate({ config }).catch(() => {});
+
   process.exit(result.status ?? 1);
 }
 
 // ── status ──────────────────────────────────────────────────
 
-// ── refresh ─────────────────────────────────────────────────
-
-// Force a zero-spend quota probe on the running server, then show the result.
-// The proxy otherwise only learns quota from live response headers, so an idle
-// account's display goes stale — e.g. still "exhausted" after a plan upgrade.
-async function refreshCommand() {
-  const config = await loadOrCreateConfig();
-  const url = `http://localhost:${config.proxy.port}/teamclaude/probe`;
-  try {
-    const res = await fetch(url, { method: 'POST', headers: { 'x-api-key': config.proxy.apiKey } });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok) {
-      console.error(`Refresh failed: ${data.error || `HTTP ${res.status}`}`);
-      process.exit(1);
-    }
-    console.log(`Probed ${data.probed} account(s) — fresh quota:\n`);
-  } catch {
-    console.error('Proxy is not running — quota lives in the server, nothing to refresh.');
-    console.error('Start it with: teamclaude server');
-    process.exit(1);
-  }
-  await statusCommand();
-}
-
 async function statusCommand() {
   const config = await loadOrCreateConfig();
   const url = `http://localhost:${config.proxy.port}/teamclaude/status`;
+  const json = args.includes('--json');
+  const colorArg = argValue('--color') || args.find(arg => arg.startsWith('--color='))?.slice('--color='.length);
+  const color = colorArg === 'always'
+    || (colorArg !== 'never' && process.stdout.isTTY);
 
   try {
     const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey } });
     const data = await res.json();
-
-    console.log(`Active account: ${data.currentAccount}`);
-    console.log(`Switch at:      ${(data.switchThreshold * 100).toFixed(0)}% usage`);
-    console.log(`Load balancing: ${data.loadBalance ? 'on (least in-flight)' : 'off'}\n`);
-
-    for (const acct of data.accounts) {
-      const q = acct.quota;
-      const current = acct.name === data.currentAccount ? ' *' : '';
-
-      console.log(`  ${acct.name} (${acct.type})${current}`);
-      console.log(`    Status:   ${acct.status}${acct.disabled ? ' (disabled)' : ''}`);
-
-      if (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null) {
-        const ses = q.unified5h != null ? (q.unified5h * 100).toFixed(1) + '%' : '-';
-        const wk = q.unified7d != null ? (q.unified7d * 100).toFixed(1) + '%' : '-';
-        let line = `    Session:  ${ses} used    Weekly: ${wk} used`;
-        if (q.unified7dSonnet != null) line += `    Sonnet7d: ${(q.unified7dSonnet * 100).toFixed(1)}% used`;
-        console.log(line);
-      } else {
-        const tok = q.tokensLimit ? ((1 - q.tokensRemaining / q.tokensLimit) * 100).toFixed(1) + '%' : '-';
-        const req = q.requestsLimit ? ((1 - q.requestsRemaining / q.requestsLimit) * 100).toFixed(1) + '%' : '-';
-        console.log(`    Tokens:   ${tok} used    Requests: ${req} used`);
-      }
-
-      console.log(`    Total:    ${acct.usage.totalInputTokens + acct.usage.totalOutputTokens} tokens, ${acct.usage.totalRequests} requests`);
-      const inFlight = acct.inFlight || 0;
-      const burst = (acct.stats && acct.stats.burstHits) || 0;
-      if (inFlight > 0 || burst > 0) {
-        console.log(`    Load:     ${inFlight} in-flight, ${burst} burst-429s`);
-      }
-      if (acct.rateLimitedUntil) console.log(`    Throttled until: ${acct.rateLimitedUntil}`);
-      console.log('');
+    if (json) {
+      console.log(JSON.stringify(data, null, 2));
+      return;
     }
-  } catch {
-    console.error(`Cannot connect to proxy at localhost:${config.proxy.port}`);
+    console.log(renderStatus(data, { color }));
+  } catch (err) {
+    console.error('Cannot connect to proxy at localhost:' + config.proxy.port);
     console.error('Is the server running? Start with: teamclaude server');
-    process.exit(1);
-  }
-}
-
-// ── switch ──────────────────────────────────────────────────
-
-async function switchCommand() {
-  const config = await loadOrCreateConfig();
-  const name = args[1];
-  if (!name) {
-    console.error('Usage: teamclaude switch <account-name>');
-    process.exit(1);
-  }
-  const url = `http://localhost:${config.proxy.port}/teamclaude/switch`;
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-api-key': config.proxy.apiKey },
-      body: JSON.stringify({ account: name }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      console.error(data.error || `HTTP ${res.status}`);
-      process.exit(1);
-    }
-    console.log(`Switched to "${data.currentAccount}"`);
-  } catch {
-    console.error(`Cannot connect to proxy at localhost:${config.proxy.port}`);
-    console.error('Is the server running? Start with: teamclaude server');
-    process.exit(1);
-  }
-}
-
-// ── threshold ───────────────────────────────────────────────
-
-async function thresholdCommand() {
-  const config = await loadOrCreateConfig();
-  const raw = args[1];
-  if (!raw) {
-    console.error('Usage: teamclaude threshold <0..1 fraction or 0..100 percent>');
-    console.error('Examples: teamclaude threshold 85      # 85%');
-    console.error('          teamclaude threshold 0.85   # same');
-    console.error('          teamclaude threshold 85%    # same');
-    process.exit(1);
-  }
-  // Accept "85", "85%", or "0.85"
-  let v = Number(raw.endsWith('%') ? raw.slice(0, -1) : raw);
-  if (v > 1) v = v / 100;
-  if (Number.isNaN(v) || v < 0 || v > 1) {
-    console.error('Value must be a percentage (0..100) or fraction (0..1)');
-    process.exit(1);
-  }
-  const url = `http://localhost:${config.proxy.port}/teamclaude/threshold`;
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-api-key': config.proxy.apiKey },
-      body: JSON.stringify({ value: v }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      console.error(data.error || `HTTP ${res.status}`);
-      process.exit(1);
-    }
-    console.log(`Threshold set to ${(data.switchThreshold * 100).toFixed(0)}%`);
-  } catch {
-    console.error(`Cannot connect to proxy at localhost:${config.proxy.port}`);
-    console.error('Is the server running? Start with: teamclaude server');
+    if (err?.message) console.error(`Details: ${err.message}`);
     process.exit(1);
   }
 }
@@ -729,7 +696,7 @@ async function accountsCommand() {
       a.refreshToken = newTokens.refreshToken;
       a.expiresAt = newTokens.expiresAt;
       configDirty = true;
-    } catch (err) {
+    } catch {
       // refresh failed — fetchProfile will report the specific error
     }
   }));
@@ -926,6 +893,77 @@ async function probeCommand() {
   await notifyRunningServer(config);
 }
 
+// ── warmup ──────────────────────────────────────────────────
+
+async function warmupCommand() {
+  const config = await loadOrCreateConfig();
+  const arg = args[1];
+
+  if (arg === undefined) {
+    const cur = config.warmupSeconds || 0;
+    console.log(cur > 0 ? `Keep-warm: every ${cur}s` : 'Keep-warm: off');
+    console.log('Set with: teamclaude warmup <off|seconds>   e.g. teamclaude warmup 600');
+    console.log('Note: warming spawns a minimal `claude` per idle account and DOES spend a little quota');
+    console.log('(unlike the passive quota probe). It only warms accounts whose 5h window is idle.');
+    return;
+  }
+
+  let seconds;
+  if (arg === 'off' || arg === '0') {
+    seconds = 0;
+  } else {
+    seconds = parseInt(arg, 10);
+    if (Number.isNaN(seconds) || seconds < 0) {
+      console.error('Usage: teamclaude warmup <off|seconds>');
+      process.exit(1);
+    }
+    if (seconds > 0 && seconds < 60) {
+      console.error('Minimum keep-warm interval is 60s.');
+      process.exit(1);
+    }
+  }
+
+  config.warmupSeconds = seconds;
+  await saveConfig(config);
+  console.log(seconds > 0
+    ? `Keep-warm set to every ${seconds}s (spawns a minimal \`claude\` per idle account; spends a little quota).`
+    : 'Keep-warm disabled.');
+  await notifyRunningServer(config);
+}
+
+// ── update ──────────────────────────────────────────────────
+
+async function updateCommand() {
+  const cur = currentVersion();
+  console.log(`Current version: ${cur || 'unknown'}`);
+
+  const kind = installKind();
+  if (kind === 'git') {
+    console.log('This is a git checkout — update it with `git pull`, not npm.');
+    return;
+  }
+
+  const info = await checkForUpdate({ force: true });
+  if (!info) {
+    console.error('Could not reach the npm registry to check for updates.');
+    process.exitCode = 1;
+    return;
+  }
+  if (!info.updateAvailable) {
+    console.log(`Already up to date (latest is ${info.latest}).`);
+    return;
+  }
+
+  console.log(`Updating ${info.current} → ${info.latest} …`);
+  const ok = runUpdate(info.latest);
+  if (ok) {
+    console.log(`Updated to ${info.latest}. Restart teamclaude to use the new version.`);
+  } else {
+    console.error(`Update failed. Try manually: npm install -g ${PKG_NAME}@latest`);
+    process.exitCode = 1;
+  }
+}
+
 // ── remove ──────────────────────────────────────────────────
 
 /**
@@ -965,6 +1003,87 @@ async function removeCommand() {
   config.accounts.splice(config.accounts.indexOf(account), 1);
   await saveConfig(config);
   console.log(`Removed account "${account.name}"`);
+}
+
+// ── route ───────────────────────────────────────────────────
+
+const ROUTE_USAGE = [
+  'Usage: teamclaude route [list]',
+  '       teamclaude route add <name> --match "<glob>[,<glob>]" [--accounts "<name-or-index>[,...]"] [--bucket <quota-bucket>] [--color <name>]',
+  '       teamclaude route rm <name>',
+  '',
+  'A route pins model ids matching its globs to an exclusive set of accounts.',
+  'Omit --accounts to route to all accounts (e.g. just to override --bucket).',
+  '--color (red/green/yellow/blue/magenta/cyan) tints the route\'s inline marker in the TUI.',
+  'First matching route wins. Changes apply to a running server immediately.',
+].join('\n');
+
+const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
+
+function splitList(value) {
+  return (value || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+
+async function routeCommand() {
+  const sub = args[1] || 'list';
+  const config = await loadOrCreateConfig();
+  config.routes = Array.isArray(config.routes) ? config.routes : [];
+
+  if (sub === 'list') {
+    if (!config.routes.length) { console.log('No routes configured.'); return; }
+    for (const r of config.routes) {
+      const match = (Array.isArray(r.match) ? r.match : [r.match]).join(', ');
+      const accts = (r.accounts && r.accounts.length) ? r.accounts.join(', ') : '(all accounts)';
+      const bucket = r.bucket ? `  bucket=${r.bucket}` : '';
+      const color = r.color ? `  color=${r.color}` : '';
+      console.log(`${r.name || '(unnamed)'}: ${match} → ${accts}${bucket}${color}`);
+    }
+    return;
+  }
+
+  if (sub === 'add') {
+    const name = args[2] && !args[2].startsWith('--') ? args[2] : null;
+    const match = splitList(argValue('--match'));
+    const accounts = splitList(argValue('--accounts'));
+    const bucket = argValue('--bucket');
+    const color = argValue('--color');
+    if (!name || !match.length) {
+      console.error(ROUTE_USAGE);
+      process.exit(1);
+    }
+    if (color && !ROUTE_COLORS.includes(color.toLowerCase())) {
+      console.error(`Unknown color "${color}" — expected one of: ${ROUTE_COLORS.join(', ')}`);
+      process.exit(1);
+    }
+    const known = new Set(config.accounts.map(a => a.name));
+    for (const a of accounts) {
+      if (!known.has(a) && !/^\d+$/.test(a)) console.error(`Warning: no account named "${a}" (yet)`);
+    }
+    const route = { name, match };
+    if (accounts.length) route.accounts = accounts;
+    if (bucket) route.bucket = bucket;
+    if (color) route.color = color.toLowerCase();
+    const at = config.routes.findIndex(r => r.name === name);
+    if (at >= 0) { config.routes[at] = route; console.log(`Updated route "${name}"`); }
+    else { config.routes.push(route); console.log(`Added route "${name}"`); }
+    await saveConfig(config);
+    await notifyRunningServer(config);
+    return;
+  }
+
+  if (sub === 'rm' || sub === 'remove' || sub === 'delete') {
+    const name = args[2];
+    const before = config.routes.length;
+    config.routes = config.routes.filter(r => r.name !== name);
+    if (config.routes.length === before) { console.error(`Route "${name}" not found`); process.exit(1); }
+    await saveConfig(config);
+    await notifyRunningServer(config);
+    console.log(`Removed route "${name}"`);
+    return;
+  }
+
+  console.error(ROUTE_USAGE);
+  process.exit(1);
 }
 
 // ── priority ────────────────────────────────────────────────
@@ -1048,30 +1167,33 @@ Commands:
   import              Import credentials from Claude Code
   login               OAuth login via browser
   login --api         Add an API key account
-  env [--host H]      Print env vars to use with Claude (--host for remote machines)
-  run [--mitm] [-- args...]
-                      Run Claude Code through the proxy (direct if it's down);
-                      --mitm routes via an HTTPS forward proxy + local CA so even
-                      hardcoded api.anthropic.com endpoints are intercepted
+  env                 Print env vars to use with Claude
+  run [--no-mitm] [--auto-fallback] [-- args...]
+                      Run Claude Code through the proxy (errors if it's down,
+                      unless --auto-fallback launches claude directly instead).
+                      Routes via an HTTPS forward proxy + local CA by default, so
+                      even hardcoded api.anthropic.com endpoints are intercepted;
+                      --no-mitm uses base-URL routing only
   alias               Print a shell alias so plain 'claude' routes via the proxy
                       (--install to write it to your shell rc; --uninstall to remove)
-  status              Show proxy & account status (live)
-  switch <name>       Manually pin the active account
-  threshold <value>   Set rotation threshold (0..1 or 0..100%)
+  status [--json]     Show rich proxy/account/probe status (live)
+                      Use --color=always|never to control ANSI colors
   accounts            List configured accounts
   remove <name>       Remove an account (by name or email; --org to disambiguate)
   disable <name>      Temporarily exclude an account from rotation
   enable <name>       Re-enable a disabled account (also clears a stuck error)
   priority <name> <n> Set rotation priority (lower = preferred; --first/--last)
+  route [list|add|rm] Per-model routing: pin model globs to specific accounts
+                      (add <name> --match "<glob>" [--accounts "<name>"] [--bucket <b>])
   probe [off|secs]    Opt-in background quota refresh for idle accounts
                       (off by default; reads usage endpoint, spends no quota)
-  refresh             Probe all accounts' quota NOW and show status (use after
-                      a plan change/upgrade so the display isn't stale)
+  warmup [off|secs]   Opt-in: keep idle accounts' 5h timers running by sending
+                      a minimal claude request to each (off by default; spends
+                      a little quota, unlike probe)
   api <path>          Call an API endpoint with account credentials
+  update              Check npm for a newer teamclaude and install it
+  version             Print the installed version
   help                Show this help
-
-Web dashboard:
-  Open http://localhost:<port>/ui  in a browser (default port 3456)
 
 Options:
   --name NAME         Set account name (import/login)
@@ -1080,17 +1202,20 @@ Options:
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
-  --host HOST         Host/IP for env output (env, default: localhost; use this
-                      machine's LAN/Tailscale IP for other computers)
-  --port PORT         Port for env output (env, default: configured proxy port)
   --headless          Run the server without the interactive TUI (for backgrounding)
-  --mitm              (run) route claude via the HTTPS forward proxy + local CA
+  --no-mitm           (run) skip the forward proxy; route via ANTHROPIC_BASE_URL only
+  --auto-fallback     (run) if the proxy is down, launch claude directly instead
+                      of erroring out (bypasses the proxy: no rotation)
 
 The server always accepts both base-URL and proxy/CONNECT clients, so instances
-launched with and without --mitm can share one server.
+launched with and without --no-mitm can share one server.
 
 A running server re-syncs accounts from config on POST /teamclaude/reload
 (local only). add/login/enable/disable/priority trigger it automatically.
+
+A global npm install self-updates in the background (checked once/day, applied
+on the next launch). Disable with TEAMCLAUDE_DISABLE_AUTOUPDATE=1 or
+"autoUpdate": false in the config.
 
 Config: ${getConfigPath()}
 `);
@@ -1177,6 +1302,90 @@ function findConfigAccount(diskConfig, account) {
   return diskConfig.accounts.findIndex(a => sameIdentity(a, account));
 }
 
+/**
+ * Sync accounts from disk config: add new accounts and refresh credentials
+ * for existing ones (handles re-imported OAuth tokens, rotated API keys, etc.).
+ * Returns the number of new accounts added.
+ */
+async function syncAccountsFromDisk(diskConfig, memConfig, accountManager) {
+  let added = 0;
+  // Greedy 1:1 pairing of disk entries to in-memory accounts, account+org aware.
+  // Each disk entry claims at most one unclaimed manager account, so multiple
+  // same-person/different-org entries pair correctly instead of all matching the
+  // first one with that accountUuid.
+  const claimed = new Set();
+  const claim = (diskAcct) => {
+    for (let i = 0; i < accountManager.accounts.length; i++) {
+      if (!claimed.has(i) && sameIdentity(accountManager.accounts[i], diskAcct)) {
+        claimed.add(i);
+        return i;
+      }
+    }
+    return -1;
+  };
+
+  for (const diskAcct of diskConfig.accounts) {
+    const mgrIdx = claim(diskAcct);
+
+    if (mgrIdx < 0) {
+      // New account discovered on disk — add to running server
+      memConfig.accounts.push(diskAcct);
+      accountManager.addAccount(diskAcct);
+      claimed.add(accountManager.accounts.length - 1);
+      added++;
+      console.log(`[TeamClaude] Picked up new account "${diskAcct.name}" from config`);
+      continue;
+    }
+
+    const mgr = accountManager.accounts[mgrIdx];
+
+    // Backfill org identity and pick up renames/priority onto the running
+    // account (e.g. after disk-side org disambiguation or a `priority` change).
+    if (diskAcct.orgUuid && !mgr.orgUuid) mgr.orgUuid = diskAcct.orgUuid;
+    if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
+    if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
+    if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) mgr.priority = diskAcct.priority;
+    // Pick up enable/disable toggles; re-enabling clears a stuck error state.
+    const wantDisabled = !!diskAcct.disabled;
+    if (mgr.disabled !== wantDisabled) accountManager.setDisabled(mgr.index, wantDisabled);
+
+    // Existing account — resolve fresh credentials from disk
+    let freshCred = null;
+    if (diskAcct.type === 'oauth' && diskAcct.importFrom) {
+      try {
+        const creds = await importCredentials(diskAcct.importFrom);
+        freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt };
+      } catch (err) {
+        console.error(`[TeamClaude] Re-import failed for "${diskAcct.name}": ${err.message}`);
+      }
+    } else if (diskAcct.type === 'oauth' && diskAcct.accessToken) {
+      freshCred = { accessToken: diskAcct.accessToken, refreshToken: diskAcct.refreshToken, expiresAt: diskAcct.expiresAt };
+    } else if (diskAcct.type === 'apikey' && diskAcct.apiKey) {
+      freshCred = { apiKey: diskAcct.apiKey };
+    }
+
+    if (!freshCred) continue;
+
+    if (freshCred.accessToken) {
+      const changed = mgr.credential !== freshCred.accessToken ||
+        mgr.refreshToken !== freshCred.refreshToken;
+      // Don't overwrite in-memory credentials with staler ones from disk
+      // (e.g. after a TUI import updated the AM before saveConfig wrote to disk)
+      const diskIsStaler = freshCred.expiresAt && mgr.expiresAt &&
+        freshCred.expiresAt < mgr.expiresAt;
+      if (changed && !diskIsStaler) {
+        accountManager.updateAccountTokens(mgr.index, freshCred);
+        console.log(`[TeamClaude] Refreshed credentials for "${mgr.name}"`);
+      }
+    } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
+      mgr.credential = freshCred.apiKey;
+      if (mgr.status === 'error') mgr.status = 'active';
+      console.log(`[TeamClaude] Updated API key for "${mgr.name}"`);
+    }
+  }
+  return added;
+}
+
 // ── helpers ─────────────────────────────────────────────────
 
 async function resolveAccounts(config) {
@@ -1208,17 +1417,7 @@ function argValue(flag) {
   return (i >= 0 && args[i + 1]) ? args[i + 1] : null;
 }
 
-async function getVersion() {
-  try {
-    const dir = dirname(fileURLToPath(import.meta.url));
-    const pkg = JSON.parse(await readFile(join(dir, '..', 'package.json'), 'utf-8'));
-    return pkg.version;
-  } catch {
-    return 'unknown';
-  }
-}
-
-// Hostname of the configured upstream (the host MITM-intercepts under `run --mitm`).
+// Hostname of the configured upstream (the host MITM-intercepts under `run`).
 function upstreamHost(config) {
   try { return new URL(config.upstream || 'https://api.anthropic.com').hostname; }
   catch { return 'api.anthropic.com'; }

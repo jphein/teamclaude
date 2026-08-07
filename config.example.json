@@ -6,6 +6,7 @@
   "upstream": "https://api.anthropic.com",
   "switchThreshold": 0.98,
   "quotaProbeSeconds": 0,
+  "autoUpdate": true,
   "accounts": [
     {
       "name": "primary-max",
@@ -28,6 +29,14 @@
       "priority": 10,
       "disabled": false,
       "apiKey": "sk-ant-api03-your-api-key"
+    }
+  ],
+  "routes": [
+    {
+      "name": "fable",
+      "match": ["*fable*"],
+      "accounts": ["primary-max"],
+      "color": "magenta"
     }
   ]
 }

@@ -1,13 +1,15 @@
-// MITM forward-proxy support: local cert lifecycle + transparent CONNECT relay.
+// MITM forward-proxy support: local cert lifecycle + terminating CONNECT proxy.
 //
 // When a claude instance is launched with HTTPS_PROXY pointed at teamclaude it
-// sends `CONNECT api.anthropic.com:443`. We act as a transparent MITM: dial the
-// real upstream first (mirroring SNI + adopting its negotiated ALPN), present
-// claude our locally-minted leaf advertising that same protocol, then relay the
-// decrypted stream — rewriting ONLY the auth header (h2 via our HPACK codec, h1
-// via a plaintext head edit) and reading quota from responses. Everything else
-// is copied as-is. A host routing table decides per-CONNECT behavior:
-//   api.anthropic.com → rewrite,  www.example.org → local test server,
+// sends `CONNECT api.anthropic.com:443`. Rather than byte-relaying the tunnel, we
+// TERMINATE it with a real Node HTTP/2 server (allowHTTP1, so an h1 client works
+// too) presenting our locally-minted leaf, then forward each request with a
+// buffering, retrying client — the SAME path the base proxy uses
+// (createProxyRequestListener). That gives per-request account selection, body
+// account_uuid rewriting, and — critically — the ability to resend a request on a
+// different account when one returns a quota 429, instead of surfacing it. A host
+// routing table decides per-CONNECT behavior:
+//   api.anthropic.com → terminate + forward,  www.example.org → local test server,
 //   anything else      → blind tunnel.
 
 import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
@@ -15,18 +17,10 @@ import { X509Certificate } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import net from 'node:net';
 import tls from 'node:tls';
+import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
-import { h2Relay, h1Relay, rewriteH1Auth } from './h2/relay.js';
-import { cachedLookup } from './dns-cache.js';
-import { makeLogThrottle } from './log-throttle.js';
-
-// Normalize an error to a stable class for log-throttling: drop the per-call
-// OpenSSL context id and digits so a client's identical retries share one key.
-const errClass = (err) => (err?.code || err?.message || 'error').replace(/[0-9a-fA-F]{6,}/g, '#').replace(/\d+/g, '#');
-import { AccountUuidPatcher } from './account-uuid-rewrite.js';
-import { makeMitmTap, makeActivityTap, combineTaps } from './request-log.js';
-import { tunnelTls } from './sx.js';
+import { createProxyRequestListener, safeKeyEqual, isLoopbackAddr } from './server.js';
 
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
@@ -112,338 +106,145 @@ export function hostMode(host, config) {
 }
 
 /**
- * Build a `connect` event handler implementing the transparent MITM described
- * at the top of this file.
+ * Build a `connect` event handler implementing the terminating MITM described at
+ * the top of this file.
  * @param ensureLeaf async () => { key, cert }   // current leaf PEMs
  */
-export function createConnectHandler({ config, accountManager, ensureLeaf, upstreamTlsOptions = {}, logDir = null, hooks = {}, log = () => {}, sx = null }) {
-  // Registry of active MITM tunnels keyed by account index.  When any tunnel
-  // discovers its account is no longer the best, ALL tunnels for that account
-  // are torn down — not just the one that observed the quota change.
-  const tunnels = new Map(); // accountIndex → Set<teardownFn>
-  // Throttle repeated per-client handshake errors (e.g. a browser that doesn't
-  // trust our CA retrying forever) so one misconfigured client can't flood the log.
-  const errLog = makeLogThrottle();
+export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null }) {
+  const upstream = config.upstream || 'https://api.anthropic.com';
+  const proxyApiKey = config.proxy?.apiKey;
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx });
+
+  // One terminating h2/h1 server, minted lazily on the first intercepted CONNECT.
+  // TLS uses our leaf; ALPN negotiates h2 or http/1.1 (allowHTTP1) with whatever
+  // the client offers. It emits 'request' for BOTH protocols, so `forward` — the
+  // shared buffering/retrying proxy listener — handles them identically. Each
+  // CONNECT feeds it the raw tunnel socket; the client keeps the tunnel open and
+  // multiplexes many requests over it, each independently account-selected.
+  let serverPromise = null;
+  const getServer = () => (serverPromise ||= (async () => {
+    const { key, cert } = await ensureLeaf();
+    const srv = http2.createSecureServer({ key, cert, allowHTTP1: true });
+    srv.on('request', forward);
+    srv.on('sessionError', (e) => log(`[TeamClaude] MITM session error: ${e.message}`));
+    srv.on('clientError', (e, sock) => { try { sock.destroy(); } catch { /* already gone */ } });
+    return srv;
+  })().catch((err) => {
+    // Don't let a transient cert/disk failure poison the memo forever: reset it
+    // so the next intercepted CONNECT retries instead of re-awaiting a cached
+    // rejection (which would leave the MITM path dead until a restart).
+    serverPromise = null;
+    throw err;
+  }));
 
   return (req, clientSocket, head) => {
     clientSocket.on('error', () => {});
+
+    // Auth gate — mirror the HTTP path: loopback is exempt, everything else must
+    // present the proxy apiKey via Proxy-Authorization. Without this, a remote
+    // client can CONNECT api.anthropic.com and have a rotated ACCOUNT TOKEN
+    // injected (token theft), or blind-tunnel to arbitrary hosts (open relay /
+    // SSRF) — the HTTP path already blocks the equivalent for remote clients.
+    if (!connectAuthorized(req, clientSocket, proxyApiKey)) {
+      try {
+        clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="teamclaude"\r\nConnection: close\r\n\r\n');
+      } catch { /* client already gone */ }
+      clientSocket.destroy();
+      return;
+    }
+
     const [host, portStr] = (req.url || '').split(':');
     const port = parseInt(portStr, 10) || 443;
     const mode = hostMode(host, config);
 
     if (mode === 'tunnel') {
+      // Until the upstream connects we still owe the client a CONNECT status
+      // line. If we tore the socket down on an upstream failure without one,
+      // the client reports "Proxy connection ended before receiving CONNECT
+      // response" — so before the tunnel is live, surface failures as a real
+      // proxy error status instead of a silent drop.
+      let established = false, closed = false;
+      // Tear down BOTH sockets when either errors or closes, so a one-sided
+      // failure can't leave the paired socket lingering (FD leak). The `closed`
+      // guard makes it idempotent (error+close both fire) and ensures we write
+      // at most one status line.
+      const teardown = (statusLine) => {
+        if (closed) return;
+        closed = true;
+        if (!established && statusLine) {
+          try { clientSocket.write(`HTTP/1.1 ${statusLine}\r\nConnection: close\r\n\r\n`); } catch { /* client already gone */ }
+        }
+        up.destroy(); clientSocket.destroy();
+      };
       const up = net.connect(port, host, () => {
+        established = true;
         reply200Raw(clientSocket);
         if (head && head.length) up.write(head);
         up.pipe(clientSocket); clientSocket.pipe(up);
       });
-      up.on('error', () => clientSocket.destroy());
+      up.on('error', (err) => {
+        if (!established) log(`[TeamClaude] tunnel ${host}:${port} failed: ${err.message}`);
+        teardown('502 Bad Gateway');
+      });
+      // A FIN before the tunnel is live (no preceding 'error') is still a failed
+      // dial from the client's view — surface a 502 rather than a silent drop.
+      up.on('close', () => teardown('502 Bad Gateway'));
+      clientSocket.on('close', () => teardown()); // client gone: nothing to write
+      up.setTimeout(30_000, () => teardown('504 Gateway Timeout')); // bound a stalled connect/idle tunnel
       return;
     }
 
-    intercept({ host, port, mode, clientSocket, head, accountManager, ensureLeaf, upstreamTlsOptions, logDir, hooks, log, sx, tunnels })
-      .catch((err) => {
-        // A client that rejects our forged cert (no CA imported) retries endlessly;
-        // coalesce identical repeats per client to one log line per window.
-        const d = errLog(`${clientSocket.remoteAddress || '?'} ${host} ${errClass(err)}`);
-        if (d.log) log(`[TeamClaude] MITM ${host}: ${err.message}${d.suppressed ? ` (${d.suppressed} repeats suppressed)` : ''}`);
-        clientSocket.destroy();
-      });
+    if (mode === 'test') {
+      // The built-in test host is answered locally, never forwarded upstream.
+      ensureLeaf().then(({ key, cert }) => {
+        reply200Raw(clientSocket);
+        serveTest(termClaude(clientSocket, head, key, cert, ['http/1.1']));
+      }).catch((err) => { log(`[TeamClaude] MITM ${host}: ${err.message}`); reply502Raw(clientSocket); clientSocket.destroy(); });
+      return;
+    }
+
+    // rewrite: terminate the tunnel and forward each request with buffering +
+    // retry. Reply 200, hand the raw socket (ClientHello and all) to the h2/h1
+    // server, which does TLS + protocol negotiation itself. If the terminating
+    // server can't be minted (cert/disk/TLS-init failure) we haven't replied yet
+    // — send a 502 so the client sees a real proxy error instead of "Proxy
+    // connection ended before receiving CONNECT response".
+    getServer().then((srv) => {
+      reply200Raw(clientSocket);
+      if (head && head.length) clientSocket.unshift(head);
+      srv.emit('connection', clientSocket);
+    }).catch((err) => { log(`[TeamClaude] MITM ${host}: ${err.message}`); reply502Raw(clientSocket); clientSocket.destroy(); });
   };
 }
 
-async function intercept({ host, port, mode, clientSocket, head, accountManager, ensureLeaf, upstreamTlsOptions, logDir, hooks = {}, log, sx, tunnels }) {
-  const { key, cert } = await ensureLeaf();
-
-  if (mode === 'test') {
-    reply200Raw(clientSocket);
-    const tlsSock = termClaude(clientSocket, head, key, cert, ['http/1.1']);
-    serveTest(tlsSock);
-    return;
+// Authorize a CONNECT: no key configured → open (matches the HTTP path); a
+// loopback client is exempt; otherwise the proxy apiKey must be presented via
+// `Proxy-Authorization` (Bearer <key>, or Basic where the key is the username
+// or password — so `--proxy http://<key>@host:port` works). Exported for tests.
+export function connectAuthorized(req, socket, proxyApiKey) {
+  if (!proxyApiKey) return true;
+  if (isLoopbackAddr(socket?.remoteAddress)) return true;
+  const m = /^\s*(basic|bearer)\s+(.+?)\s*$/i.exec(req?.headers?.['proxy-authorization'] || '');
+  if (!m) return false;
+  let presented = m[2];
+  if (m[1].toLowerCase() === 'basic') {
+    const dec = Buffer.from(m[2], 'base64').toString('utf8'); // "user:pass"
+    const i = dec.indexOf(':');
+    const user = i >= 0 ? dec.slice(0, i) : dec;
+    const pass = i >= 0 ? dec.slice(i + 1) : '';
+    presented = pass || user;
   }
-
-  // rewrite: be a faithful ALPN mirror. We don't terminate TLS at the byte
-  // level (that's node:tls), so to avoid imposing our own protocol preference we
-  // peek the client's ClientHello, read the exact ALPN list it offers, present
-  // THAT list to the upstream, let the upstream pick, then terminate the client
-  // with whatever the upstream selected. The upstream decides — constrained to
-  // what the client can speak — so an http/1.1-only client (undici/claude) and
-  // an h2 client both negotiate end-to-end exactly as they would directly.
-  const account = accountManager.getActiveAccount();
-  if (!account) { clientSocket.destroy(); return; }
-  // Count this tunnel against its account for least-in-flight balancing, and
-  // release when the client connection closes (covers graceful drain and hard
-  // destroy alike). Acquire at selection time so concurrent CONNECTs see the
-  // incrementing count and don't all stampede the same "least loaded" account.
-  // Optional-chained to match the rest of this path's loose coupling to the
-  // account manager (a partial manager just opts out of in-flight tracking).
-  const releaseSlot = accountManager.acquire?.(account.index) ?? (() => {});
-  clientSocket.once('close', releaseSlot);
-  await accountManager.ensureTokenFresh(account.index);
-
-  reply200Raw(clientSocket);
-  const offered = await peekClientAlpn(clientSocket, head); // client's ALPN list, or null
-
-  // When sx.org is enabled, dial the upstream THROUGH its proxy (different egress
-  // IP — the IP-based-429 workaround); TLS still terminates end-to-end at the
-  // upstream, so the proxy sees only ciphertext. Otherwise connect directly.
-  // autoSelectFamily (happy-eyeballs) is the default on Node 20+ but not 18; set
-  // it explicitly so a dual-stack upstream whose IPv6 path is unreachable falls
-  // back to IPv4 instead of hanging the connect (option ignored pre-18.13).
-  let upstreamSock;
-  if (sx?.useForConnect()) {
-    upstreamSock = await tunnelTls({
-      proxy: sx.getProxy(), targetHost: host, targetPort: port,
-      tlsOptions: { ...(offered ? { ALPNProtocols: offered } : {}), ...upstreamTlsOptions },
-    });
-  } else {
-    upstreamSock = tls.connect({
-      host, port, servername: host, autoSelectFamily: true, lookup: cachedLookup,
-      ...(offered ? { ALPNProtocols: offered } : {}),
-      ...upstreamTlsOptions,
-    });
-    await new Promise((resolve, reject) => {
-      upstreamSock.once('secureConnect', resolve);
-      upstreamSock.once('error', reject);
-    });
-  }
-  const upstreamAlpn = upstreamSock.alpnProtocol; // false if none negotiated
-  const alpn = upstreamAlpn || 'http/1.1';        // relay protocol selector
-
-  // Terminate the client advertising exactly what the upstream chose (a subset
-  // of what the client offered, so it always overlaps).
-  const claudeTls = new tls.TLSSocket(clientSocket, {
-    isServer: true, key, cert,
-    ...(upstreamAlpn ? { ALPNProtocols: [upstreamAlpn] } : {}),
-  });
-  claudeTls.on('error', () => { claudeTls.destroy(); upstreamSock.destroy(); });
-  upstreamSock.on('error', () => claudeTls.destroy());
-  await new Promise((resolve, reject) => {
-    claudeTls.once('secure', resolve);
-    claudeTls.once('error', reject);
-  });
-
-  // Per-stream streaming body patcher: align metadata.user_id.account_uuid with
-  // the injected account (same length; no-op if the account has no UUID).
-  const makeBodyPatcher = account.accountUuid
-    ? () => new AccountUuidPatcher(account.accountUuid)
-    : null;
-  // Fan request lifecycle out to the on-disk log (when configured) AND the live
-  // TUI activity feed, so MITM traffic is visible in the TUI like reverse-proxy
-  // traffic — not just on disk.
-  const tap = combineTaps(makeMitmTap(logDir, account.name), makeActivityTap(hooks, account.name));
-
-  // Graceful teardown: hand off to the relay's drain() — finish in-flight
-  // requests, signal the client to migrate (h2 GOAWAY / h1 connection close) so
-  // its NEXT request opens a fresh tunnel pinned to the new account, then close —
-  // instead of destroying the sockets mid-request (which surfaced to Claude Code
-  // as intermittent "API errors"). Falls back to a hard destroy only if teardown
-  // races tunnel setup before the relay handle exists.
-  let relayHandle = null;
-  const teardown = () => {
-    if (relayHandle) relayHandle.drain();
-    else { claudeTls.destroy(); upstreamSock.destroy(); }
-  };
-
-  // Register this tunnel so it can be torn down when the account goes bad.
-  if (tunnels) {
-    if (!tunnels.has(account.index)) tunnels.set(account.index, new Set());
-    const bucket = tunnels.get(account.index);
-    bucket.add(teardown);
-    const cleanup = () => bucket.delete(teardown);
-    claudeTls.once('close', cleanup);
-    upstreamSock.once('close', cleanup);
-  }
-
-  // Tear down ALL tunnels for an account, not just the one that observed it.
-  const teardownAll = () => {
-    if (!tunnels) return teardown();
-    const bucket = tunnels.get(account.index);
-    if (!bucket || bucket.size === 0) return;
-    const count = bucket.size;
-    for (const fn of bucket) fn();
-    console.log(`[TeamClaude] Draining ${count} MITM tunnel(s) for "${account.name}" (finishing in-flight requests)`);
-  };
-
-  if (alpn === 'h2') {
-    relayHandle = h2Relay(claudeTls, upstreamSock, {
-      rewriteRequest: makeRewriteRequest(account),
-      makeBodyPatcher,
-      onResponseHeaders: makeQuotaObserver(accountManager, account, sx, teardownAll),
-      tap,
-      log,
-    });
-  } else {
-    // Resolve the credential per request, NOT at tunnel setup: keep-alive
-    // tunnels outlive token refreshes, and a baked Bearer string keeps sending
-    // the expiring token (401 spray minutes after every refresh). The h2 path
-    // already reads live via makeRewriteRequest.
-    relayHandle = h1Relay(claudeTls, upstreamSock, {
-      rewriteHead: (h) => rewriteH1Auth(h, account.type === 'oauth'
-        ? { authorization: `Bearer ${account.credential}` }
-        : { apiKey: account.credential }),
-      makeBodyPatcher,
-      onResponseHeaders: makeQuotaObserver(accountManager, account, sx, teardownAll),
-      tap,
-    });
-  }
+  return safeKeyEqual(presented, proxyApiKey);
 }
 
 function reply200Raw(sock) { sock.write('HTTP/1.1 200 Connection Established\r\n\r\n'); }
+function reply502Raw(sock) { try { sock.write('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ } }
 
 function termClaude(clientSocket, head, key, cert, alpn) {
   if (head && head.length) clientSocket.unshift(head);
   const t = new tls.TLSSocket(clientSocket, { isServer: true, key, cert, ALPNProtocols: alpn });
   t.on('error', () => t.destroy());
   return t;
-}
-
-// Read the client's first TLS record (the ClientHello) to learn the ALPN
-// protocol list it offers, WITHOUT consuming it: bytes are unshifted back so the
-// real TLS handshake still sees the full ClientHello. Returns the protocol
-// string array, or null if there is no ALPN extension / it can't be parsed (in
-// which case we offer the upstream no ALPN and mirror its no-ALPN result).
-function peekClientAlpn(sock, head) {
-  return new Promise((resolve) => {
-    let buf = head && head.length ? Buffer.from(head) : Buffer.alloc(0);
-    let done = false;
-    const finish = (result) => {
-      if (done) return; done = true;
-      sock.removeListener('readable', onReadable);
-      sock.removeListener('end', onEnd);
-      sock.removeListener('error', onEnd);
-      if (buf.length) sock.unshift(buf); // put the ClientHello back for node:tls
-      resolve(result);
-    };
-    const tryParse = () => {
-      const r = parseClientHelloAlpn(buf);
-      if (r === undefined && buf.length < 16384) return false; // need more bytes
-      finish(Array.isArray(r) ? r : null);
-      return true;
-    };
-    // Read in PAUSED mode (readable/read) — never switch the socket to flowing,
-    // or the TLSSocket we hand it to afterwards won't receive the unshifted bytes.
-    const onReadable = () => {
-      let chunk;
-      while ((chunk = sock.read()) !== null) {
-        buf = Buffer.concat([buf, chunk]);
-        if (tryParse()) return;
-      }
-    };
-    const onEnd = () => finish(null);
-    sock.on('readable', onReadable);
-    sock.once('end', onEnd);
-    sock.once('error', onEnd);
-    if (tryParse()) return; // head may already contain the whole ClientHello
-    onReadable();           // drain anything already buffered
-  });
-}
-
-// Parse the ALPN protocol list out of a TLS ClientHello.
-//   returns string[]  — ALPN extension present
-//   returns null       — parsed far enough to know there is no usable ALPN
-//   returns undefined  — need more bytes to decide
-export function parseClientHelloAlpn(buf) {
-  if (buf.length < 5) return undefined;
-  if (buf[0] !== 0x16) return null;                 // not a handshake record
-  const recEnd = 5 + buf.readUInt16BE(3);
-  if (buf.length < recEnd) return undefined;        // wait for the full record
-  let p = 5;
-  if (buf[p] !== 0x01) return null;                 // not a ClientHello
-  const hsEnd = p + 4 + ((buf[p + 1] << 16) | (buf[p + 2] << 8) | buf[p + 3]);
-  const end = Math.min(hsEnd, recEnd);
-  p += 4;
-  p += 2 + 32;                                      // client_version + random
-  if (p >= end) return null;
-  p += 1 + buf[p];                                  // session_id
-  if (p + 2 > end) return null;
-  p += 2 + buf.readUInt16BE(p);                     // cipher_suites
-  if (p + 1 > end) return null;
-  p += 1 + buf[p];                                  // compression_methods
-  if (p + 2 > end) return null;
-  let extEnd = p + 2 + buf.readUInt16BE(p);
-  p += 2;
-  extEnd = Math.min(extEnd, end);
-  while (p + 4 <= extEnd) {
-    const type = buf.readUInt16BE(p);
-    const len = buf.readUInt16BE(p + 2);
-    p += 4;
-    if (type === 0x0010) {                          // application_layer_protocol_negotiation
-      let q = p + 2;                                // skip ALPN list length
-      const listEnd = Math.min(p + len, extEnd);
-      const protos = [];
-      while (q < listEnd) {
-        const l = buf[q]; q += 1;
-        if (q + l > listEnd) break;
-        protos.push(buf.toString('latin1', q, q + l));
-        q += l;
-      }
-      return protos.length ? protos : null;
-    }
-    p += len;
-  }
-  return null;                                      // no ALPN extension
-}
-
-// Rewrite only the auth field on an h2 request header list (account token in,
-// client's x-api-key out). Preserves order; marks auth never-indexed.
-function makeRewriteRequest(account) {
-  const isOAuth = account.type === 'oauth';
-  return (fields) => {
-    let replaced = false;
-    const out = [];
-    for (const f of fields) {
-      const n = f.name.toString().toLowerCase();
-      if (n === 'x-api-key') continue;
-      if (n === 'authorization') {
-        if (isOAuth) { out.push({ name: f.name, value: Buffer.from(`Bearer ${account.credential}`), sensitive: true }); replaced = true; }
-        continue;
-      }
-      out.push(f);
-    }
-    if (!replaced) {
-      out.push(isOAuth
-        ? { name: Buffer.from('authorization'), value: Buffer.from(`Bearer ${account.credential}`), sensitive: true }
-        : { name: Buffer.from('x-api-key'), value: Buffer.from(account.credential), sensitive: true });
-    }
-    return out;
-  };
-}
-
-function makeQuotaObserver(accountManager, account, sx = null, teardown = null) {
-  let tornDown = false;
-  const scheduleTeardown = () => {
-    if (tornDown || !teardown) return;
-    tornDown = true;
-    setTimeout(teardown, 500);
-  };
-  return (fields) => {
-    const m = {};
-    for (const f of fields) m[f.name.toString().toLowerCase()] = f.value.toString();
-    if (!m[':status']) return;
-    const rl = {};
-    for (const k in m) if (k.startsWith('anthropic-ratelimit-')) rl[k] = m[k];
-    if (Object.keys(rl).length) accountManager.updateQuota(account.index, rl);
-    if (m[':status'] === '429') {
-      let ra = parseInt(m['retry-after'], 10);
-      if (Number.isNaN(ra)) ra = 60;
-      ra = Math.min(Math.max(ra, 1), 300);
-      accountManager.markRateLimited(account.index, ra);
-      sx?.noteRateLimited(ra);
-      scheduleTeardown();
-      return;
-    }
-    // Proactively tear down the tunnel when a better account is available —
-    // don't wait for a 429.  Only tear down if rotation would actually pick
-    // a DIFFERENT account (if all are exhausted, churning tunnels is pointless).
-    if (teardown && accountManager._isAvailable && !accountManager._isAvailable(account)) {
-      const better = accountManager._pickBestAvailable?.();
-      if (better && better.index !== account.index) {
-        console.log(`[TeamClaude] MITM tunnel for "${account.name}" is no longer the best account — draining`);
-        scheduleTeardown();
-      }
-    }
-  };
 }
 
 // Answer the built-in test host locally over h1 with a canned JSON response.

@@ -19,6 +19,7 @@ import net from 'node:net';
 import tls from 'node:tls';
 import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
+import { cachedLookup } from './dns-cache.js';
 import { generateCertChain } from './x509.js';
 import { createProxyRequestListener, safeKeyEqual, isLoopbackAddr, relayUpgrade, resolveAccountPin } from './server.js';
 
@@ -194,7 +195,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         }
         up.destroy(); clientSocket.destroy();
       };
-      const up = net.connect(port, host, () => {
+      const up = net.connect({ port, host, lookup: cachedLookup }, () => {
         established = true;
         reply200Raw(clientSocket);
         if (head && head.length) up.write(head);

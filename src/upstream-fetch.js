@@ -14,6 +14,7 @@ import https from 'node:https';
 import { ReadableStream } from 'node:stream/web';
 import { tunnelTls } from './sx.js';
 import { proxyForHost, proxyAgent } from './upstream-proxy.js';
+import { cachedLookup } from './dns-cache.js';
 
 // Pooled keep-alive agents for the direct (non-sx) path. Node's global fetch
 // multiplexes ALL requests to an origin over a SINGLE HTTP/2 connection; under
@@ -27,8 +28,11 @@ import { proxyForHost, proxyAgent } from './upstream-proxy.js';
 // per-origin and bounds the fan-out. Escape hatch:
 // TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH=1 reverts to the old global-fetch path.
 const MAX_SOCKETS = Number(process.env.TEAMCLAUDE_UPSTREAM_MAX_SOCKETS) || 256;
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
+// `lookup: cachedLookup` (dns-cache.js) keeps new connections working through
+// resolver blips: cached/coalesced resolve4 with serve-stale, so a burst of
+// dials can't flood the stub resolver into ENOTFOUND (the 2026-07/08 storms).
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS, lookup: cachedLookup });
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS, lookup: cachedLookup });
 const USE_GLOBAL_FETCH = /^(1|true|yes|on)$/i.test(process.env.TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH || '');
 
 // Time to wait for RESPONSE HEADERS before treating the upstream socket as dead.
@@ -106,7 +110,10 @@ export function upstreamFetch(url, opts = {}, sx = null, useProxy = false) {
  */
 export function proxyFetch(url, opts = {}) {
   const { headersTimeoutMs, ...rest } = opts;
-  if (!proxyForHost(new URL(url).hostname)) return fetch(url, rest);
+  // The no-proxy path also goes through pooledFetch (not global fetch): undici
+  // offers no per-call lookup hook, and these control-plane calls must survive
+  // resolver blips via the DNS cache — a failed token refresh during a storm
+  // is exactly the wedge that takes an account (and its sessions) down.
   return pooledFetch(url, rest, resolveHeadersTimeout(headersTimeoutMs));
 }
 

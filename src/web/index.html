@@ -726,7 +726,15 @@
       // re-attached afterwards so a half-typed code (and focus) survives.
       const reauthHadFocus = document.activeElement === reauthCodeEl;
       cardsEl.textContent = '';
-      for (const acct of data.accounts) {
+      // Sort so the account whose 7-day window resets SOONEST is on top (spend
+      // the soonest-expiring weekly quota first), tie-broken by soonest 5h reset.
+      // A missing/already-cleared reset (null) sorts last — it isn't "expiring".
+      const reset7 = a => a.quota?.unified7dReset ?? Infinity;
+      const reset5 = a => a.quota?.unified5hReset ?? a.quota?.resetsAt ?? Infinity;
+      const cmp = (x, y) => (x === y ? 0 : x < y ? -1 : 1);
+      const ordered = [...data.accounts].sort((a, b) =>
+        cmp(reset7(a), reset7(b)) || cmp(reset5(a), reset5(b)));
+      for (const acct of ordered) {
         cardsEl.appendChild(renderAccount(acct, acct.name === data.currentAccount, data.switchThreshold));
       }
       attachReauthPanel(reauthHadFocus);

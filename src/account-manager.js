@@ -238,6 +238,9 @@ export class AccountManager {
     // session reset made a sooner-expiring account the better choice. This runs
     // on every request so the behaviour holds without the TUI render loop.
     this.refreshExpiredQuotas();
+    // Diagnostic only: lets _logSkipReason attribute a skip to the client
+    // session that caused it (selection itself never reads this).
+    this._skipLogSessionId = sessionId;
     // Session-affinity distribution (opt-in): keep a session on its pinned
     // account for cache reuse, and route a new session to the least-loaded
     // account. Only when enabled, only for a real session, and only outside a
@@ -295,6 +298,11 @@ export class AccountManager {
         this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (current.priority || 0));
       return betterExists ? this._selectNext(exclude, model, advisorModel) : current;
     }
+    // The current account just lost eligibility for THIS request. Say why: the
+    // card can read healthy while a model-scoped bucket (Fable/Sonnet weekly) or
+    // the advisor model's bucket is what actually excluded it, and without this
+    // the only visible symptom is a bare "Switched to account" line.
+    if (current) this._logSkipReason(current, model, advisorModel, exclude);
     const next = this._selectNext(exclude, model, advisorModel);
     if (next) return next;
     // No account is under the switch threshold. Before refusing locally, allow a
@@ -303,6 +311,38 @@ export class AccountManager {
     // quota (or upstream's own 429 converts soft exhaustion into a hard
     // rate-limit hold). null here means the caller emits the synthetic 429.
     return allowProbe ? this._selectProbe(exclude, model) : null;
+  }
+
+  /** Explain, at most once per 10s per account, why `account` is not eligible
+   * for a request (model + advisor model in play, and the bucket that failed).
+   * Diagnostic only — never changes selection. */
+  _logSkipReason(account, model, advisorModel, exclude) {
+    const now = Date.now();
+    this._skipLogAt ??= new Map();
+    if (now < (this._skipLogAt.get(account.index) || 0)) return;
+    this._skipLogAt.set(account.index, now + 10_000);
+
+    const q = account.quota;
+    const t = this.switchThreshold;
+    const pct = (v) => v == null ? 'n/a' : `${(v * 100).toFixed(0)}%`;
+    let why;
+    if (account.disabled) why = 'disabled by operator';
+    else if (exclude?.has(account.index)) why = 'already tried this request';
+    else if (account.status === 'throttled') why = `throttled until ${new Date(account.rateLimitedUntil || 0).toLocaleTimeString()}`;
+    else if (account.status === 'exhausted' || account.status === 'error') why = `status=${account.status}`;
+    else if (q.unified5h != null && q.unified5h >= t) why = `5h bucket ${pct(q.unified5h)} >= ${pct(t)}`;
+    else if (this._governingWeekly(account, model) >= t) {
+      why = `${this._weeklyBucketFor(model)} bucket ${pct(this._governingWeekly(account, model))} >= ${pct(t)}`;
+    } else if (model && !this._routeAllows(account, model)) why = `route/ownership bars model "${model}"`;
+    else if (advisorModel && this._modelWeeklyExhausted(account, advisorModel)) {
+      why = `advisor model "${advisorModel}" bucket ${pct(q[this._weeklyBucketFor(advisorModel)])} >= ${pct(t)}`;
+    } else if (advisorModel && !this._routeAllows(account, advisorModel)) why = `route/ownership bars advisor model "${advisorModel}"`;
+    else why = 'no longer eligible';
+
+    const forWhat = model ? `model "${model}"` : 'request (model unknown)';
+    const adv = advisorModel ? ` advisor "${advisorModel}"` : '';
+    const sid = this._skipLogSessionId ? ` [session ${String(this._skipLogSessionId).slice(0, 8)}]` : '';
+    console.log(`[TeamClaude] Skipping "${account.name}" for ${forWhat}${adv}${sid} — ${why}`);
   }
 
   /** Session-affinity selection (opt-in, issue #109). Honor a known session's

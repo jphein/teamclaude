@@ -639,6 +639,21 @@
   }
 
   // ── Account cards ────────────────────────────────────────────
+  // Fable and Sonnet meter their own weekly quota on top of the shared 5h/7d
+  // buckets, and selection skips an account whose family bucket is spent — for
+  // that model only. Without these bars a card can read "95%, active" while
+  // every Fable request bounces off it. Returns [] for plans that don't report
+  // a family bucket, so those cards keep the plain 5h/7d pair.
+  function familyBuckets(q) {
+    if (!q) return [];
+    return [
+      { key: 'unified7dFable', label: '7d fable' },
+      { key: 'unified7dSonnet', label: '7d sonnet' },
+    ]
+      .filter(f => q[f.key] != null)
+      .map(f => ({ label: f.label, util: q[f.key], reset: q[f.key + 'Reset'] ?? null }));
+  }
+
   function makeBar(label, util, threshold, resetTs) {
     const inner = el('span', { style: 'width:' + (util == null ? 0 : Math.min(100, util * 100)) + '%' });
     const r = fmtReset(resetTs);
@@ -667,6 +682,15 @@
       isActive ? el('span', { class: 'badge active-badge', text: 'active' }) : null,
       acct.disabled ? el('span', { class: 'badge', style: 'background:transparent;color:var(--bad);border:1px solid var(--bad);', text: 'disabled' }) : null,
       inFlight > 0 ? el('span', { class: 'badge', style: 'background:transparent;color:var(--accent,#4a9eff);', text: inFlight + ' live' }) : null,
+      // A spent family bucket bars only that model family, so the account stays
+      // "active" and under the shared threshold — name it, or the card looks
+      // healthy while requests for that family keep switching away.
+      ...familyBuckets(q).filter(f => f.util >= threshold).map(f => el('span', {
+        class: 'badge', style: 'background:transparent;color:var(--warn,#e0a030);border:1px solid var(--warn,#e0a030);',
+        title: f.label.replace('7d ', '') + ' weekly quota is spent — this account is skipped for '
+          + f.label.replace('7d ', '') + ' requests only; other models still route here',
+        text: f.label.replace('7d ', '') + ' spent',
+      })),
       el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', text: acct.type }),
     ]);
     const actions = el('div', { class: 'card-actions' }, [
@@ -682,9 +706,11 @@
         text: 'Reauth',
       }) : null,
     ]);
+    const families = familyBuckets(q);
     const bars = el('div', { class: 'bars' }, [
       ...makeBar('5h', u5h, threshold, q.unified5hReset ?? q.resetsAt),
       ...makeBar('7d', u7d, threshold, q.unified7dReset),
+      ...families.flatMap(f => makeBar(f.label, f.util, threshold, f.reset)),
     ]);
     const metaText = fmtNum(acct.usage.totalRequests) + ' requests · '
       + fmtNum(totalTok) + ' tokens · last used ' + fmtAgo(acct.usage.lastUsed)

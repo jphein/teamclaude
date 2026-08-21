@@ -81,10 +81,16 @@ test('logging never changes which account selection returns', () => {
   const quiet = managerWithSpentFable();
   quiet._logSkipReason = () => {};                  // silence the diagnostic
   const loud = managerWithSpentFable();
-  const a = quiet.getActiveAccount(null, 'claude-fable-5', null, 'sess-1234');
-  const b = captureLog(() => loud.getActiveAccount(null, 'claude-fable-5', null, 'sess-1234'));
-  const picked = loud.accounts[loud.currentIndex];
-  assert.equal(a.name, 'fresh');
-  assert.equal(picked.name, 'fresh');
-  assert.ok(b.some(l => l.includes('Skipping')));   // the loud one did log
+  let loudPick;
+  const quietPick = quiet.getActiveAccount(null, 'claude-fable-5', null, 'sess-1234');
+  const lines = captureLog(() => {
+    loudPick = loud.getActiveAccount(null, 'claude-fable-5', null, 'sess-1234');
+  });
+  // Compare what selection RETURNED — the pointer deliberately stays put for a
+  // model-scoped skip (see model-scoped-detour.test.js), so currentIndex is not
+  // the thing under test here.
+  assert.equal(quietPick.name, 'fresh');
+  assert.equal(loudPick.name, quietPick.name);
+  assert.equal(loud.currentIndex, quiet.currentIndex);
+  assert.ok(lines.some(l => l.includes('Skipping')));   // the loud one did log
 });

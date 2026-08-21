@@ -298,11 +298,20 @@ export class AccountManager {
         this._isAvailable(a, model, advisorModel) && !exclude?.has(a.index) && (a.priority || 0) < (current.priority || 0));
       return betterExists ? this._selectNext(exclude, model, advisorModel) : current;
     }
-    // The current account just lost eligibility for THIS request. Say why: the
-    // card can read healthy while a model-scoped bucket (Fable/Sonnet weekly) or
-    // the advisor model's bucket is what actually excluded it, and without this
-    // the only visible symptom is a bare "Switched to account" line.
-    if (current) this._logSkipReason(current, model, advisorModel, exclude);
+    // The current account just lost eligibility for THIS request. If the only
+    // thing barring it is the REQUEST'S OWN model (a spent Fable/Sonnet weekly
+    // bucket, or a route/ownership rule), the account is still fully usable for
+    // every other model — so serve this one request elsewhere and leave the
+    // pointer where it is. Moving it would hand the account away: unrelated
+    // sessions on other models then find the new account available and stay
+    // there, and a manual pin evaporates for reasons nothing on screen explains.
+    const detour = current
+      && !exclude?.has(current.index)
+      && this._isModelScopedSkip(current, model, advisorModel)
+      ? this._pickBestAvailable(exclude, model, advisorModel)
+      : null;
+    if (current) this._logSkipReason(current, model, advisorModel, exclude, detour);
+    if (detour) return detour;
     const next = this._selectNext(exclude, model, advisorModel);
     if (next) return next;
     // No account is under the switch threshold. Before refusing locally, allow a
@@ -313,10 +322,21 @@ export class AccountManager {
     return allowProbe ? this._selectProbe(exclude, model) : null;
   }
 
+  /** True when `account` is barred from this request ONLY by the model in play
+   * — its family weekly bucket or a route/ownership rule — while the shared
+   * buckets and its account-level status are all fine. Those bars are per-model
+   * and per-request, so they must not move the global current account. */
+  _isModelScopedSkip(account, model, advisorModel) {
+    if (!account || (!model && !advisorModel)) return false;
+    // Availability ignoring the model (shared 5h + shared weekly + status) vs
+    // availability with it: eligible-without / barred-with means model-scoped.
+    return this._isAvailable(account, null, null) && !this._isAvailable(account, model, advisorModel);
+  }
+
   /** Explain, at most once per 10s per account, why `account` is not eligible
    * for a request (model + advisor model in play, and the bucket that failed).
    * Diagnostic only — never changes selection. */
-  _logSkipReason(account, model, advisorModel, exclude) {
+  _logSkipReason(account, model, advisorModel, exclude, detour = null) {
     const now = Date.now();
     this._skipLogAt ??= new Map();
     if (now < (this._skipLogAt.get(account.index) || 0)) return;
@@ -342,7 +362,10 @@ export class AccountManager {
     const forWhat = model ? `model "${model}"` : 'request (model unknown)';
     const adv = advisorModel ? ` advisor "${advisorModel}"` : '';
     const sid = this._skipLogSessionId ? ` [session ${String(this._skipLogSessionId).slice(0, 8)}]` : '';
-    console.log(`[TeamClaude] Skipping "${account.name}" for ${forWhat}${adv}${sid} — ${why}`);
+    const tail = detour
+      ? ` — ${why}; serving this request on "${detour.name}", "${account.name}" stays current`
+      : ` — ${why}`;
+    console.log(`[TeamClaude] Skipping "${account.name}" for ${forWhat}${adv}${sid}${tail}`);
   }
 
   /** Session-affinity selection (opt-in, issue #109). Honor a known session's

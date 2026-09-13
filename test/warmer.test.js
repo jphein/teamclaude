@@ -22,7 +22,7 @@ function fakeSpawner(result = 0) {
 }
 
 function makeWarmer(am, spawnFn, opts = {}) {
-  return new Warmer(am, { intervalMs: 0, port: 3456, apiKey: 'tc-key', spawnFn, log: () => {}, ...opts });
+  return new Warmer(am, { intervalMs: 0, transport: 'claude', port: 3456, apiKey: 'tc-key', spawnFn, log: () => {}, ...opts });
 }
 
 // ── eligibility ──────────────────────────────────────────────────────────────

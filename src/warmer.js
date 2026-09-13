@@ -12,14 +12,38 @@
 // per window. To keep that cost minimal we warm an account only when its 5h
 // window is not already running, and we use the cheapest model.
 //
-// Mechanism (chosen in #76): for each eligible idle account we spawn a one-shot,
-// minimal `claude` (`--bare -p`) pointed at THIS proxy with the account pinned
-// via the `/tc-acct/<index>` path prefix. Using the real client means the
-// warm-up request is byte-identical to normal Claude Code traffic, routed to
-// exactly the account we want to warm.
+// Mechanism: one minimal message per eligible idle account, sent to THIS proxy
+// with the account pinned via the `/tc-acct/<pin>` path prefix. Two transports:
+//  - 'direct' (default): the warmer POSTs a one-token /v1/messages request to
+//    the proxy itself. Nothing sits between us and the pin, so the request
+//    provably reaches the intended account.
+//  - 'claude': spawn a one-shot `claude --bare -p` with ANTHROPIC_BASE_URL set
+//    to the pinned proxy URL (upstream's #76 design: byte-identical to real
+//    Claude Code traffic). Fragile wherever `claude` is a wrapper that re-sources
+//    its own provider env — on such a host the pin is silently dropped and the
+//    "warm-up" lands on the CURRENT account (measured 2026-09-13: strace showed
+//    the wrapper redirecting every spawn to the MITM proxy, base URL ignored).
+//
+// Triggers, independently switchable: an interval (warmupSeconds), a reset
+// schedule (warmupSchedule), and "on exhaustion" (warmOnExhaustion): sweep the
+// moment ANY account uses up its 5h window. Using accounts in sequence
+// otherwise staggers their windows (each starts when rotation first reaches
+// it); warming the rest at the instant one runs out lines their windows up, so
+// by the time the fleet is spent the first refresh is already close.
 
 import { spawn } from 'node:child_process';
 import { encodePinComponent } from './claude-env.js';
+
+// Bare model names are Claude Code aliases; a raw /v1/messages call needs the
+// full id. Anything not listed is passed through as an id.
+const DIRECT_MODEL_IDS = {
+  haiku: 'claude-haiku-4-5-20251001',
+  sonnet: 'claude-sonnet-5',
+  opus: 'claude-opus-5',
+};
+export function directModelId(model) {
+  return DIRECT_MODEL_IDS[model] || model;
+}
 import {
   ROLLING_NEAR_RESET_TOLERANCE_MS,
   ROLLING_POST_RESET_BUFFER_MS,
@@ -48,11 +72,14 @@ export class Warmer {
   constructor(accountManager, {
     intervalMs = 0,
     schedule = null,
+    onExhaustion = false,
+    transport = 'direct',
     port,
     apiKey = null,
     model = 'haiku',
     prompt = 'hi',
     spawnFn = defaultSpawn,
+    fetchFn = globalThis.fetch,
     timeoutMs = 120_000,
     log = console.log,
     nowFn = Date.now,
@@ -62,11 +89,14 @@ export class Warmer {
     this.am = accountManager;
     this.intervalMs = intervalMs;
     this.schedule = schedule;
+    this.onExhaustion = onExhaustion;
+    this.transport = transport === 'claude' ? 'claude' : 'direct';
     this.port = port;
     this.apiKey = apiKey;
     this.model = model;
     this.prompt = prompt;
     this.spawnFn = spawnFn;
+    this.fetchFn = fetchFn;
     this.timeoutMs = timeoutMs;
     this.log = log;
     this.nowFn = nowFn;
@@ -83,13 +113,34 @@ export class Warmer {
     this.lastRunFinishedAt = null;
     this.nextRunAt = intervalMs > 0 ? this.nowFn() + intervalMs : null;
     this.scheduleStatus = null;
+    this.lastTrigger = null; // 'interval' | 'schedule' | 'exhaustion:<account>' | 'manual'
     this.accountStatus = new Map();
+    this._unsubscribe = null;
   }
 
   start() {
     this._stopped = false;
     if (this.schedule) this.rescheduleSchedule(this.schedule);
     else if (this.intervalMs > 0) this.reschedule(this.intervalMs);
+    // Always subscribe; the handler checks the flag at fire time so the mode
+    // can be toggled live (setOnExhaustion) without re-wiring.
+    if (!this._unsubscribe && typeof this.am.on5hExhausted === 'function') {
+      this._unsubscribe = this.am.on5hExhausted(({ account }) => this._onExhausted(account));
+    }
+  }
+
+  /** Turn the on-exhaustion trigger on/off at runtime. */
+  setOnExhaustion(on) {
+    on = !!on;
+    if (on === this.onExhaustion) return;
+    this.onExhaustion = on;
+    this.log(`[TeamClaude] Warm-on-exhaustion ${on ? 'enabled' : 'disabled'}`);
+  }
+
+  _onExhausted(account) {
+    if (!this.onExhaustion || this._stopped) return;
+    this.log(`[TeamClaude] "${account.name}" used up its 5h window — warming the cold accounts`);
+    this.warmAll(`exhaustion:${account.name}`).catch(() => {});
   }
 
   /** Change interval at runtime (0 = off). Warms once immediately when turned on. */
@@ -108,8 +159,8 @@ export class Warmer {
       this.nextRunAt = this.nowFn() + intervalMs;
       // Immediate sweep only on an off→on transition. Re-running it on every
       // interval *change* would spend quota each time the interval is edited.
-      if (!wasOn) this.warmAll().catch(() => {});
-      this.timer = setInterval(() => this.warmAll().catch(() => {}), intervalMs);
+      if (!wasOn) this.warmAll('interval').catch(() => {});
+      this.timer = setInterval(() => this.warmAll('interval').catch(() => {}), intervalMs);
       this.timer.unref?.();
       this.log(`[TeamClaude] Keep-warm enabled (every ${Math.round(intervalMs / 1000)}s)`);
     } else if (wasOn) {
@@ -150,7 +201,7 @@ export class Warmer {
         this._armSchedule(generation);
         return;
       }
-      await this.warmAll();
+      await this.warmAll('schedule');
       if (generation === this._scheduleGeneration && !this._stopped && this.schedule) {
         this._armSchedule(generation);
       }
@@ -163,6 +214,8 @@ export class Warmer {
   stop() {
     this._scheduleGeneration += 1;
     this._stopped = true;
+    this._unsubscribe?.();
+    this._unsubscribe = null;
     if (this.timer) { this.clearTimeoutFn(this.timer); this.timer = null; }
     this._clearDeferredWarmups();
     this.nextRunAt = null;
@@ -197,8 +250,9 @@ export class Warmer {
 
   /** Warm every eligible account once. Overlapping cycles are skipped. Sequential
    *  on purpose: one subprocess at a time keeps load and the quota burst gentle. */
-  async warmAll() {
+  async warmAll(trigger = 'manual') {
     if (this._running) return;
+    this.lastTrigger = trigger;
     const now = this.nowFn();
     const generation = this._scheduleGeneration;
     const targets = [];
@@ -323,11 +377,18 @@ export class Warmer {
         else this.accountStatus.delete(account.name);
         return;
       }
-      const code = await this.spawnFn(this._spawnSpec(account, signal));
+      let error = null;
+      if (this.transport === 'direct') {
+        const status = await this._directWarm(account, signal);
+        if (status < 200 || status >= 300) error = `HTTP ${status}`;
+      } else {
+        const code = await this.spawnFn(this._spawnSpec(account, signal));
+        if (code !== 0) error = `claude exited ${code}`;
+      }
       const finishedAt = Date.now();
       this._record(account, {
-        status: code === 0 ? 'ok' : 'error',
-        error: code === 0 ? null : `claude exited ${code}`,
+        status: error ? 'error' : 'ok',
+        error,
         startedAt, finishedAt, durationMs: finishedAt - startedAt,
       });
     } catch (err) {
@@ -340,20 +401,56 @@ export class Warmer {
     }
   }
 
-  /** The `claude` invocation for one account. Pure/deterministic so tests can
-   *  assert the args and env without spawning anything. */
-  _spawnSpec(account, signal) {
-    // One user can have accounts in several organizations, all sharing the
-    // same accountUuid. Qualify it with orgUuid when possible so each warm-up
-    // reaches the intended subscription. The rotation index is NOT usable: it
-    // is array position, so removing an account would repoint this at a
-    // different one. Fall back to the display name when the uuid isn't known
-    // yet (e.g. before the first profile fetch).
+  /** Pinned proxy base URL for one account. One user can have accounts in
+   *  several organizations, all sharing the same accountUuid: qualify it with
+   *  orgUuid when possible so each warm-up reaches the intended subscription.
+   *  The rotation index is NOT usable: it is array position, so removing an
+   *  account would repoint this at a different one. Fall back to the display
+   *  name when the uuid isn't known yet (e.g. before the first profile fetch). */
+  _pinnedBaseUrl(account) {
     const identity = account.accountUuid && account.orgUuid
       ? `${account.accountUuid}/${account.orgUuid}`
       : account.accountUuid || account.name;
-    const pin = encodePinComponent(identity);
-    const baseUrl = `http://127.0.0.1:${this.port}/tc-acct/${pin}`;
+    return `http://127.0.0.1:${this.port}/tc-acct/${encodePinComponent(identity)}`;
+  }
+
+  /** The direct-transport request for one account. Pure so tests can assert
+   *  the URL, headers and body without a network. */
+  _directSpec(account) {
+    return {
+      url: `${this._pinnedBaseUrl(account)}/v1/messages`,
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'anthropic-version': '2023-06-01',
+        // The proxy strips this and substitutes the pinned account's token.
+        'x-api-key': this.apiKey || 'tc-warm',
+      },
+      body: JSON.stringify({
+        model: directModelId(this.model),
+        max_tokens: 1,
+        messages: [{ role: 'user', content: this.prompt }],
+      }),
+    };
+  }
+
+  /** POST the minimal message to the pinned proxy path. Resolves with the HTTP
+   *  status; rejects on a network error, abort or timeout. Node's fetch ignores
+   *  HTTP(S)_PROXY, so this always reaches our own loopback listener. */
+  async _directWarm(account, signal) {
+    const spec = this._directSpec(account);
+    const timeout = AbortSignal.timeout(this.timeoutMs);
+    const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    const res = await this.fetchFn(spec.url, { method: spec.method, headers: spec.headers, body: spec.body, signal: combined });
+    // Drain so the connection is released; the body itself is irrelevant.
+    try { await res.text(); } catch { /* the status is what matters */ }
+    return res.status;
+  }
+
+  /** The `claude` invocation for one account ('claude' transport). Pure so
+   *  tests can assert the args and env without spawning anything. */
+  _spawnSpec(account, signal) {
+    const baseUrl = this._pinnedBaseUrl(account);
     return {
       command: 'claude',
       // `--bare -p`: minimal, non-interactive, auth strictly via ANTHROPIC_API_KEY
@@ -372,9 +469,12 @@ export class Warmer {
   getStatus() {
     const schedule = this.scheduleStatus || null;
     return {
-      enabled: !!this.schedule || this.intervalMs > 0,
+      enabled: !!this.schedule || this.intervalMs > 0 || this.onExhaustion,
       mode: this.schedule ? 'reset' : (this.intervalMs > 0 ? 'interval' : 'off'),
       intervalSeconds: Math.round(this.intervalMs / 1000),
+      onExhaustion: this.onExhaustion,
+      transport: this.transport,
+      lastTrigger: this.lastTrigger,
       ...(schedule || {}),
       running: this._running,
       lastRunStartedAt: iso(this.lastRunStartedAt),

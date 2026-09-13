@@ -56,9 +56,14 @@ The rolling **5-hour session window** only starts once an account sends a real m
 teamclaude warmup 600                                      # warm idle accounts every 600s
 teamclaude warmup reset 15:30 --timezone Europe/Moscow     # target a daily 15:30 reset
 teamclaude warmup rolling 15:30 --timezone Europe/Moscow   # anchor resets at 15:30, then every 5h
-teamclaude warmup off                                      # disable either mode
+teamclaude warmup exhaustion on                            # warm the cold accounts the moment one uses up its 5h window
+teamclaude warmup off                                      # disable every trigger
 teamclaude warmup                                          # show current setting
 ```
+
+**On exhaustion** (`warmOnExhaustion`, independent of the modes above): sweep the moment *any* account's shared 5h bucket reaches the switch threshold — seen in live response headers or by the quota probe. Using accounts in sequence otherwise staggers their windows: each starts only when rotation first reaches it, so the last account's window ends hours after the first one's. Warming the rest at the instant one runs out lines the windows up, so by the time the whole fleet is spent the first refresh is already close. Fires once per window per account; the exhausted account itself and any account whose window is already running are skipped, so the cost is one minimal request per *cold* account per rotation.
+
+**Transport** (`warmTransport`): `direct` (default) — the proxy POSTs a one-token `haiku` `/v1/messages` request to its own `/tc-acct/<pin>` path, so the warm-up provably reaches the intended account. `claude` — spawn a one-shot `claude -p --bare --model haiku "hi"` with `ANTHROPIC_BASE_URL` pointed at the pinned path (byte-identical to real Claude Code traffic; requires the `claude` CLI on `PATH`). Prefer `direct` wherever `claude` is a wrapper that sets its own provider env — such a wrapper overwrites the base URL and the warm-up silently lands on the *current* account instead. Status shows `onExhaustion`, `transport` and `lastTrigger` (`interval`, `schedule`, `exhaustion:<account>` or `manual`) under `warm` in `teamclaude status --json`.
 
 > ⚠️ **This spends a little quota — unlike the passive quota probe.** The 5h timer can't be started by a read-only call, so keep-warm sends a real (minimal) message: for each eligible idle account it spawns a one-shot `claude -p --bare --model haiku --output-format text "hi"` pointed at this proxy, pinned to that account. It only warms accounts whose 5h window is **not already running**, skips disabled/throttled/errored and third-party-backend accounts, and uses the cheapest model — but it does consume a few tokens and a slice of the 5h/weekly buckets per account per window. Requires the `claude` CLI on `PATH`. Minimum interval 60s; changes apply live. Status shows under `warm` in `teamclaude status --json`.
 

@@ -5,9 +5,9 @@
 [![node](https://img.shields.io/node/v/@karpeleslab/teamclaude.svg)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Multi-account Claude proxy with automatic quota-based rotation for [Claude Code](https://claude.ai/claude-code).
+Multi-account proxy for [Claude Code](https://claude.ai/claude-code) and [Codex](https://github.com/openai/codex): it pools Claude Max, ChatGPT/Codex, API-key and third-party backend accounts, and rotates on quota.
 
-It sits between Claude Code and the Anthropic API, holds several Claude Max (or API key) accounts, and moves to the next one when the current account gets close to its session or weekly limit. The session keeps running instead of stopping on a 429.
+It sits between the coding agent and the provider's API, holds several accounts, and moves to the next one when the current account gets close to its session or weekly limit. The session keeps running instead of stopping on a 429. Claude accounts serve Claude Code, Codex accounts serve the Codex CLI, and both pools share one proxy.
 
 ![TeamClaude TUI](screenshots/teamclaude.png)
 
@@ -23,7 +23,7 @@ teamclaude server    # start the proxy, shows the TUI
 teamclaude run       # in another terminal: Claude Code through the proxy
 ```
 
-Already logged into Claude Code? `teamclaude import` takes its credentials instead of a fresh OAuth round. API keys, and one email holding accounts in several orgs, are covered in [docs/accounts.md](docs/accounts.md).
+Already logged into Claude Code? `teamclaude import` takes its credentials instead of a fresh OAuth round. A container image is on GHCR — see [Running in a container](docs/usage.md#running-in-a-container). API keys, and one email holding accounts in several orgs, are covered in [docs/accounts.md](docs/accounts.md).
 
 ## What it does
 
@@ -35,6 +35,7 @@ Already logged into Claude Code? `teamclaude import` takes its credentials inste
 - Catches hardcoded `api.anthropic.com` endpoints (the Claude Design MCP, for one) through a local MITM forward proxy, not only what `ANTHROPIC_BASE_URL` covers.
 - Holds the request open until quota resets instead of returning 429 when every account is spent, so an unattended run finishes on its own (`holdSeconds`, off by default).
 - Refreshes OAuth tokens before they expire and writes them back to config. Client refreshes pass through untouched.
+- Pools OpenAI Codex subscriptions alongside Claude accounts (experimental): the Codex CLI is routed through the same proxy, by config or transparently through the MITM proxy, and rotates on its own quota.
 - Takes any Anthropic-compatible API (DeepSeek, GLM) as a low-priority fallback for when the Claude accounts are done.
 - No dependencies. Node built-ins only.
 
@@ -69,9 +70,19 @@ Step-by-step lifecycle: [docs/routing.md](docs/routing.md#request-lifecycle).
 
 ## Documentation
 
+## This fork (jphein/teamclaude)
+
+Runs as a systemd user service on a headless box and is driven from a browser. On top of upstream it adds:
+
+- **Web dashboard** at `/ui` — accounts, per-family weekly buckets sorted by soonest expiry, live activity and log streaming, threshold slider, enable/disable, probe, restart, and per-account OAuth **reauth** from the browser.
+- **DNS cache** (`src/dns-cache.js`) on every upstream dial — cached, coalesced resolves with serve-stale so a resolver blip can't turn into an `ENOTFOUND` flood.
+- **Graceful MITM drain** on rotation and shutdown, least-in-flight load balancing, burst-limit tracking.
+- **`noProxy` config** — fixed `NO_PROXY` entries merged into `teamclaude env` so homelab traffic never routes through the proxy.
+- **Skip-reason logging** — every rotation or diversion says which bucket barred which account, for which model and session.
+
 | Page | Contents |
 | --- | --- |
-| [Accounts](docs/accounts.md) | OAuth login, import, API keys, multiple orgs, third-party backends |
+| [Accounts](docs/accounts.md) | OAuth login, import, API keys, multiple orgs, Codex accounts, third-party backends |
 | [Usage](docs/usage.md) | Server and TUI, running Claude Code, shell alias, command reference, logging |
 | [Routing](docs/routing.md) | Rotation, the two kinds of 429, storm control, model routes, session spreading, pinning, prompt cache |
 | [Quota](docs/quota.md) | Quota probe, keep-warm, holding on exhaustion |

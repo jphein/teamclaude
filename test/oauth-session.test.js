@@ -52,15 +52,19 @@ test('createOAuthSession builds a PKCE authorize URL with a live callback listen
   }
 });
 
-test('createOAuthSession rejects the callback on state mismatch', async () => {
+test('createOAuthSession answers a state-mismatched callback 400 and keeps waiting', async () => {
+  // A stray or forged callback must not settle (or kill) the login: the state
+  // is checked first and a mismatch is answered 400 without touching it.
   const session = await createOAuthSession();
   try {
     const redirect = new URL(new URL(session.authUrl).searchParams.get('redirect_uri'));
-    // Attach the rejection handler before triggering the callback — real
-    // callers (CLI race, reauth manager) subscribe at session creation.
-    const rejected = assert.rejects(session.codePromise, /state mismatch/i);
-    await fetch(`http://127.0.0.1:${redirect.port}/callback?code=X&state=nope`);
-    await rejected;
+    const res = await fetch(`http://127.0.0.1:${redirect.port}/callback?code=X&state=nope`);
+    assert.equal(res.status, 400);
+    const settled = await Promise.race([
+      session.codePromise.then(() => 'resolved', () => 'rejected'),
+      new Promise(r => setTimeout(() => r('pending'), 200)),
+    ]);
+    assert.equal(settled, 'pending');
   } finally {
     session.close();
   }

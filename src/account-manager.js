@@ -333,6 +333,9 @@ export class AccountManager {
     // as a spent family bucket does not (#276).
     this.providerCursors = new Map();
     this.switchThreshold = switchThreshold;
+    // Listeners for the once-per-window "5h bucket exhausted" event (see
+    // on5hExhausted / _note5hExhausted). The keep-warm scheduler subscribes.
+    this._on5hExhausted = [];
     this.setRoutes(routes);
     // Monotonic across every observation, so a stamp read under one move never
     // matches another. Live before the settings, since turning the knob on
@@ -3311,6 +3314,7 @@ export class AccountManager {
     const r5h = resetHeaderMs(headers['anthropic-ratelimit-unified-5h-reset']);
     const r7d = resetHeaderMs(headers['anthropic-ratelimit-unified-7d-reset']);
     if (r5h != null) account.quota.unified5hReset = r5h;
+    this._note5hExhausted(account);
     if (r7d != null) account.quota.unified7dReset = r7d;
 
     // Model-scoped weekly bucket — surfaced in headers as `7d_oi` ("7-day,
@@ -3502,6 +3506,7 @@ export class AccountManager {
     if (usage.fiveHour) {
       if (usage.fiveHour.utilization != null) q.unified5h = usage.fiveHour.utilization;
       if (usage.fiveHour.resetAt != null) q.unified5hReset = usage.fiveHour.resetAt;
+      this._note5hExhausted(account);
     }
     if (usage.sevenDay) {
       if (usage.sevenDay.utilization != null) {
@@ -3635,6 +3640,37 @@ export class AccountManager {
     const account = this.accounts[accountIndex];
     if (!account || !reading || reading.error) return;
     account.quota.backend = reading;
+  }
+
+  /**
+   * Subscribe to "an account just used up its 5-hour window": fired once per
+   * window when the shared 5h bucket first reaches the switch threshold, from
+   * any quota source (live response headers, the MITM-tunnel header parse, or
+   * the usage-endpoint probe). Listener receives { account, reset }. Listener
+   * errors are logged, never propagated — quota accounting must not depend on
+   * a subscriber.
+   */
+  on5hExhausted(fn) {
+    this._on5hExhausted.push(fn);
+    return () => { this._on5hExhausted = this._on5hExhausted.filter(f => f !== fn); };
+  }
+
+  _note5hExhausted(account) {
+    const q = account.quota;
+    if (q.unified5h == null || q.unified5h < this.switchThreshold) return;
+    // One event per window. The window is identified by its reset timestamp;
+    // sources round it differently (seconds vs ms), so treat resets within a
+    // minute of each other as the same window.
+    const reset = q.unified5hReset || 0;
+    const seen = account._5hExhaustedFiredFor;
+    if (seen != null && Math.abs(seen - reset) < 60_000) return;
+    account._5hExhaustedFiredFor = reset;
+    if (!this._on5hExhausted.length) return;
+    console.log(`[TeamClaude] Account "${account.name}" used up its 5h window${reset ? ` (resets ${new Date(reset).toLocaleTimeString()})` : ''}`);
+    for (const fn of this._on5hExhausted) {
+      try { fn({ account, reset: reset || null }); }
+      catch (err) { console.error(`[TeamClaude] 5h-exhausted listener failed: ${err?.message || err}`); }
+    }
   }
 
   /**

@@ -457,6 +457,8 @@ async function serverCommand() {
         delete config.warmupSchedule;
         config.warmupSeconds = diskConfig.warmupSeconds || 0;
       }
+      config.warmOnExhaustion = !!diskConfig.warmOnExhaustion;
+      warmer.setOnExhaustion(config.warmOnExhaustion);
     }
     return added;
   };
@@ -482,6 +484,7 @@ async function serverCommand() {
         if (config.switchThreshold != null) diskConfig.switchThreshold = config.switchThreshold;
         if (config.quotaProbeSeconds != null) diskConfig.quotaProbeSeconds = config.quotaProbeSeconds;
         if (config.warmupSeconds != null) diskConfig.warmupSeconds = config.warmupSeconds;
+        if (config.warmOnExhaustion != null) diskConfig.warmOnExhaustion = config.warmOnExhaustion;
         // The telemetry mode and the model blocklist are edited from the settings
         // screen too; the server reads them live from `config`, but without this
         // the edit never reached disk and was silently undone by the next start.
@@ -591,6 +594,9 @@ async function serverCommand() {
     warm: warmer?.getStatus() || {
       enabled: false,
       intervalSeconds: config.warmupSeconds || 0,
+      onExhaustion: !!config.warmOnExhaustion,
+      transport: config.warmTransport || 'direct',
+      lastTrigger: null,
       running: false,
       accounts: accountManager.accounts.map(account => ({
         name: account.name,
@@ -714,6 +720,8 @@ async function serverCommand() {
   warmer = new Warmer(accountManager, {
     intervalMs: (config.warmupSeconds || 0) * 1000,
     schedule: config.warmupSchedule || null,
+    onExhaustion: !!config.warmOnExhaustion,
+    transport: config.warmTransport || 'direct',
     port,
     apiKey: config.proxy?.apiKey,
   });
@@ -1664,11 +1672,28 @@ async function warmupCommand() {
     }
     const cur = config.warmupSeconds || 0;
     console.log(cur > 0 ? `Keep-warm: every ${cur}s` : 'Keep-warm: off');
+    console.log(`Warm on exhaustion: ${config.warmOnExhaustion ? 'on' : 'off'}`);
     console.log('Set with: teamclaude warmup <off|seconds>');
     console.log('          teamclaude warmup reset HH:MM --timezone Area/City');
     console.log('          teamclaude warmup rolling HH:MM --timezone Area/City');
-    console.log('Note: warming spawns a minimal `claude` per idle account and DOES spend a little quota');
+    console.log('          teamclaude warmup exhaustion [on|off]   warm the cold accounts when one uses up its 5h window');
+    console.log('Note: warming sends a minimal request per idle account and DOES spend a little quota');
     console.log('(unlike the passive quota probe). It only warms accounts whose 5h window is idle.');
+    return;
+  }
+
+  if (arg === 'exhaustion') {
+    const v = args[2] ?? 'on';
+    if (v !== 'on' && v !== 'off') {
+      console.error('Usage: teamclaude warmup exhaustion [on|off]');
+      process.exit(1);
+    }
+    config.warmOnExhaustion = v === 'on';
+    await saveConfig(config);
+    console.log(config.warmOnExhaustion
+      ? 'Warm on exhaustion enabled: when any account uses up its 5h window, every cold account gets a minimal request so their windows line up (spends a little quota).'
+      : 'Warm on exhaustion disabled.');
+    await notifyRunningServer(config);
     return;
   }
 
@@ -1719,9 +1744,10 @@ async function warmupCommand() {
 
   config.warmupSeconds = seconds;
   delete config.warmupSchedule;
+  if (seconds === 0) config.warmOnExhaustion = false; // `off` means off: every trigger
   await saveConfig(config);
   console.log(seconds > 0
-    ? `Keep-warm set to every ${seconds}s (spawns a minimal \`claude\` per idle account; spends a little quota).`
+    ? `Keep-warm set to every ${seconds}s (sends a minimal request per idle account; spends a little quota).`
     : 'Keep-warm disabled.');
   await notifyRunningServer(config);
 }
@@ -2140,6 +2166,9 @@ Commands:
                       Schedule daily warm-up for a target reset in an IANA zone
   warmup rolling HH:MM --timezone Area/City
                       Anchor a continuous five-hour reset cadence in an IANA zone
+  warmup exhaustion [on|off]
+                      Opt-in: when any account uses up its 5h window, warm the
+                      cold ones right away so their windows line up
   api <path>          Call an API endpoint with account credentials
   update              Check npm for a newer teamclaude and install it
   version             Print the installed version

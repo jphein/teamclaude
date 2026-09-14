@@ -334,13 +334,17 @@ test('reauth endpoints return 501 when the hook is not wired', async () => {
   });
 });
 
-test('mutating reauth endpoints are CSRF-guarded (403 without the header)', async () => {
+test('mutating reauth endpoints are CSRF-guarded (403 for a cross-origin page)', async () => {
+  // The guard is the shared same-origin check on every POST /teamclaude/*:
+  // Origin / Sec-Fetch-Site are browser-set and unforgeable from page JS, so a
+  // page on another site is refused while curl and the CLI (no such headers)
+  // and the same-origin dashboard pass.
   let started = false;
   const reauth = { start: async () => { started = true; return { authUrl: 'x' }; } };
   await withProxy({ reauth }, async (port) => {
     const res = await fetch(`http://127.0.0.1:${port}/teamclaude/reauth`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' },
       body: JSON.stringify({ name: 'a' }),
     });
     assert.equal(res.status, 403);

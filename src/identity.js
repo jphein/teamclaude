@@ -10,6 +10,11 @@
 // The org discriminator prefers the org UUID but falls back to the org name
 // (the profile endpoint has always returned a name), so identity still works on
 // entries created before org UUIDs were stored.
+//
+// Provider is part of it too: a Codex account has no Anthropic UUID at all, so
+// without it one email's Claude and ChatGPT subscriptions compare as one account.
+
+import { providerOf } from './provider.js';
 
 /** Stable org discriminator for an account record: org UUID, else org name, else null. */
 export function orgKey(acct) {
@@ -17,22 +22,47 @@ export function orgKey(acct) {
 }
 
 /**
+ * Whether two records name the same organization: true, false, or null when
+ * they carry no field in common to compare.
+ *
+ * Compared field by field rather than through orgKey. Which field a record
+ * carries depends on what the profile returned when the account was added, so
+ * one record holding only the uuid and another holding only the name describe
+ * one organization while their keys differ — and comparing those keys called
+ * one account two, which on the save path carried its row over a second time
+ * (#328). The uuid decides when both sides have one; the name decides when
+ * both have one and either lacks a uuid; a uuid against a name is no evidence
+ * either way.
+ */
+export function sameOrg(a, b) {
+  if (a?.orgUuid && b?.orgUuid) return a.orgUuid === b.orgUuid;
+  if (a?.orgName && b?.orgName) return a.orgName === b.orgName;
+  return null;
+}
+
+/**
  * Whether two account records refer to the same account+org.
  *
- * - Both have an accountUuid: it must match. If both org keys are known they
- *   must also match; but if either side's org is still unknown we treat them as
- *   the same. This lets a freshly-profiled login backfill a legacy entry (which
- *   has no stored org) instead of creating a duplicate. Once both sides carry an
- *   org key, a *different* org is correctly seen as a distinct account.
+ * - Different providers: never the same account, and the one case that needs no
+ *   UUID. Checked first because the name fallback below is what a cross-provider
+ *   pair reaches — a Codex account has no accountUuid to tell it apart from its
+ *   Claude namesake, so one email holding both subscriptions read as one account.
+ * - Both have an accountId (the ChatGPT one): it must match. Same evidence class
+ *   as the accountUuid below, so it decides before the name.
+ * - Both have an accountUuid: it must match. If the organizations can be
+ *   compared (see sameOrg) they must also match; but if either side's org is
+ *   still unknown we treat them as the same. This lets a freshly-profiled login
+ *   backfill a legacy entry (which has no stored org) instead of creating a
+ *   duplicate. Once both sides carry a comparable org field, a *different* org
+ *   is correctly seen as a distinct account.
  * - Otherwise (API-key accounts, or no UUID yet): fall back to matching by name.
  */
 export function sameIdentity(a, b) {
+  if (providerOf(a) !== providerOf(b)) return false;
+  if (a?.accountId && b?.accountId) return a.accountId === b.accountId;
   if (a?.accountUuid && b?.accountUuid) {
     if (a.accountUuid !== b.accountUuid) return false;
-    const ka = orgKey(a);
-    const kb = orgKey(b);
-    if (ka && kb) return ka === kb;
-    return true;
+    return sameOrg(a, b) !== false;
   }
   return a?.name === b?.name;
 }
@@ -41,13 +71,14 @@ export function sameIdentity(a, b) {
  * Are these two records definitely NOT the same account? True only when both
  * sides are fully identified and point at different account+org pairs — an
  * unknown UUID or org on either side means "cannot tell", never "different".
+ * Two providers are the exception: separate plans, whoever holds them.
  */
 export function distinctAccounts(a, b) {
+  if (providerOf(a) !== providerOf(b)) return true;
+  if (a?.accountId && b?.accountId) return a.accountId !== b.accountId;
   if (!a?.accountUuid || !b?.accountUuid) return false;
   if (a.accountUuid !== b.accountUuid) return true;
-  const ka = orgKey(a);
-  const kb = orgKey(b);
-  return !!(ka && kb && ka !== kb);
+  return sameOrg(a, b) === false;
 }
 
 /**
@@ -63,9 +94,47 @@ export function distinctAccounts(a, b) {
  * hard to trace back to the login that caused it.
  */
 export function findUpsertTarget(accounts, incoming) {
+  // A UUID match is evidence; a name match is a guess, and sameIdentity makes
+  // both in one pass — it compares UUIDs only when BOTH records carry one and
+  // falls back to the name otherwise. So an entry with no UUID matched any
+  // incoming record sharing its name, and if it sat earlier in the list it won
+  // over the entry whose account+org actually matched, landing the credential on
+  // the namesake row (#236). Two entries with one name where the earlier has no
+  // UUID is just a hand-added entry beside a logged-in one, or an account added
+  // before its first probe.
+  //
+  // So look for the evidence before accepting the guess — and the strongest
+  // evidence first. The uuid pass below still takes sameIdentity's tolerant
+  // answer, which says yes to an entry that never stored an organization, so a
+  // legacy entry sitting earlier in the list won over the one whose
+  // organization actually matched (#327). An entry with no organization ahead
+  // of one that has it is a hand-added entry beside a logged-in one, or any
+  // account before its first probe.
+  if (incoming?.accountUuid) {
+    const exact = accounts.findIndex(a => a?.accountUuid === incoming.accountUuid && sameOrg(a, incoming) === true);
+    if (exact >= 0) return exact;
+    const byUuid = accounts.findIndex(a => a?.accountUuid && sameIdentity(a, incoming));
+    if (byUuid >= 0) return byUuid;
+  }
   const byIdentity = accounts.findIndex(a => sameIdentity(a, incoming));
   if (byIdentity >= 0) return byIdentity;
   return accounts.findIndex(a => a.name === incoming.name && !distinctAccounts(a, incoming));
+}
+
+/**
+ * The entry to store at a `findUpsertTarget` hit: `incoming` over `prev`, with
+ * two of the existing entry's fields pinned.
+ *
+ * `name` because a login should not rename an account the operator named. `id`
+ * because a running server holds an account built from this entry and finds it
+ * again by that id (see account-pairing.js) — reissuing it here would strand
+ * that account with no entry to be saved onto, and the token it refreshes next
+ * would be dropped instead of persisted. An `incoming` record carrying neither
+ * field already leaves both alone; pinning them says so, and keeps saying so if
+ * one day it carries them.
+ */
+export function updateAccountEntry(prev, incoming) {
+  return { ...prev, ...incoming, name: prev.name, id: prev.id };
 }
 
 /** The email portion of a display name, stripping any " (org)" suffix. */
@@ -93,4 +162,29 @@ export function matchAccounts(accounts, query, orgFilter) {
     );
   }
   return matches;
+}
+
+/**
+ * Automatic naming is safe only when the profile identifies the account.
+ * An explicit name is the caller's opt-in to importing without detection.
+ */
+export function canUpsertOAuthAccount(profile, userNamed) {
+  return Boolean(
+    userNamed
+    || (profile && !profile.error && (profile.accountUuid || profile.email))
+  );
+}
+
+/**
+ * Copy only known profile identity fields. Omitting unavailable fields keeps a
+ * named re-import from erasing identity already stored on the account.
+ */
+/** @returns {{ accountUuid?: string, orgUuid?: string, orgName?: string }} */
+export function oauthIdentityFields(profile) {
+  if (!profile || profile.error) return {};
+  return Object.fromEntries(
+    ['accountUuid', 'orgUuid', 'orgName']
+      .filter(key => profile[key])
+      .map(key => [key, profile[key]])
+  );
 }

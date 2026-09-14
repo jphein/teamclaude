@@ -26,8 +26,43 @@ Reacting the wrong way to either one makes things worse, so they are handled sep
 
 - A **quota rejection** (a spent 5h or weekly bucket, `unified-…-status: rejected`) switches accounts immediately.
 - A **rate-limit 429** (the per-minute throttle) does **not** switch. It pauses the account so concurrent requests wait instead of flooding, retries the same account (absorbing short `retry-after`s inline, default ≤ 60s via `TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS`), and only surfaces a 429 to the client for longer waits.
+- A **request-scoped 429** — no `retry-after` and no `anthropic-ratelimit-*` headers at all, which is how upstream refuses a model id it will not serve — is about the request, not the account. Nothing is paused. The request gets the same one hop to an idle sibling (or, with no sibling, one retry after 2s); if the answer is the same, the 429 goes back to the client without a fabricated `retry-after`, and the client's own backoff applies.
 
 Rotating on a rate-limit 429 would just move the burst to the next account and throw away the first account's prompt cache.
+
+## OAuth entitlement denials
+
+A `403` whose structured error code is `error.details.error_code: oauth_not_allowed_for_organization` means the selected account's organization does not permit OAuth authentication. TeamClaude fails the current request over to another account and keeps the denied account out of automatic rotation for five minutes. The cooldown is shared by later requests, is not persisted, and expires automatically so an organization policy change can recover without restarting the proxy. Other `403` responses still fail over for that request but do not quarantine the account.
+
+If every configured account returns that exact denial, TeamClaude's terminal `502` says that no account served the request, names the denied accounts and error code, and recommends waiting for automatic re-admission or pinning a different eligible account. It does not recommend `teamclaude login`, which remains the diagnostic for a generic credential refusal.
+
+An explicit [`TC_ACCT` pin](#pin-a-session-to-one-account) continues to target exactly the requested account and never fails over, even while that account is excluded from automatic rotation.
+
+## One failover hop on a rate limit
+
+A **quota rejection** (a 429 carrying `...unified-*-status: rejected`) is durable
+exhaustion and rotates, as it always has. A plain **rate-limit 429** does not
+rotate as a policy — moving a shared burst to the next account just throttles
+that one too and discards the first account's prompt cache.
+
+That reasoning holds under load. It does not hold when a sibling is sitting
+idle, which is the common shape for a small fleet of personal subscriptions: one
+account throttled, another at 9% weekly, and the whole proxy stalling for 60s at
+a time.
+
+So a rate-limit 429 takes **one** failover hop, onto an account that is not
+already tried and not inside its own 429 pause. The same single hop applies to
+an upstream **5xx** (`529 Overloaded` above all), which is the provider
+declining to serve rather than anything about the account.
+
+One hop, not a walk of the fleet, and the reason is worth knowing: **if the
+second account is rate-limited too, the limit is almost certainly scoped to the
+egress IP rather than to either account** — every account leaves from the same
+address. Continuing to rotate would prove nothing and pay a cold cache for each
+attempt. After the hop the existing behaviour takes over: the sx.org fresh-IP
+retry if `sx.mode` is `429`, otherwise the inline wait, otherwise a 429 to the
+client with its `retry-after`. An IP-scoped limit is logged as such, since that
+is what an operator chasing a fleet-wide throttle is looking for.
 
 ## Storm control
 
@@ -50,7 +85,7 @@ The same gate handles rate-limit 429s: TeamClaude pauses the account for the `re
 
 ## Model-aware routing
 
-The per-model weekly cap (e.g. Fable) is tracked separately, so an account whose Fable quota is spent is skipped **only** for Fable requests and still serves Opus/Sonnet. Requests are routed by their `model`, read exactly from the request body in both base-URL and MITM modes. `teamclaude status` shows this per account (a `Models` line) and any families it detects appear as **auto** routes.
+The per-model weekly cap (e.g. Fable) is tracked separately, so an account whose Fable quota is spent is skipped **only** for Fable requests and still serves Opus/Sonnet. **Eligibility for a family model takes the higher of that family's bucket and the shared weekly one**, because family spend meters twice, once in the family bucket and once in the shared one. An account already past its shared weekly cap is therefore unavailable for family traffic too, rather than continuing to serve it and pushing the shared bucket further past the cap. The reverse still holds: a spent *family* bucket bars only that family. One consequence worth knowing: on the weekly buckets the family gate is the stricter of the two, so an account whose weekly quota lets it serve Fable can also serve Opus. That is a statement about quota only, since a `routes` pin or a blocklist can still make an account ineligible for one model and not the other. Requests are routed by their `model`, read exactly from the request body in both base-URL and MITM modes. `teamclaude status` shows this per account (a `Models` line) and any families it detects appear as **auto** routes.
 
 Advisor requests (Claude Code's `/advisor`) carry a **second** model nested in the tools array. Routing sees it too, so the request lands on an account eligible for both the main model and the advisor, falling back to main-model-only routing when no account can serve both.
 
@@ -97,7 +132,86 @@ Default rotation is purely quota-driven, so many parallel sessions all pile onto
 "distributeSessions": true
 ```
 
-When on, TeamClaude routes each **new** session to the least-loaded eligible account (fewest active sessions, then fewest in-flight) and **pins** it there, so a session keeps hitting the same account and preserves its prompt cache — while different sessions spread across accounts instead of funnelling onto one. Account **priority still wins** (a higher-priority account is never skipped to balance load), and a session whose account becomes exhausted re-routes automatically. Off by default; single-session use is unaffected either way.
+When on, TeamClaude routes each **new** session to the least-loaded eligible account (fewest active sessions, then fewest in-flight) and **pins** it there for the model family's weekly quota bucket, so a session keeps hitting the same account for that family and preserves its prompt cache — while different sessions spread across accounts instead of funnelling onto one. Account **priority still wins** (a higher-priority account is never skipped to balance load), and a session whose account becomes exhausted re-routes automatically. Off by default; single-session use is unaffected either way.
+
+More precisely, a session holds **one pin per weekly quota bucket**, not one overall, because eligibility is decided per bucket: an account whose Fable weekly is spent still serves Opus. So a Fable request that has to divert elsewhere leaves the session's Opus pin where it is, and each family with its **own** bucket keeps its own cache affinity. The consequence is that a session using two families commonly sits on two accounts, and the per-account session counts in `teamclaude status` can therefore add up to more than the number of active sessions.
+
+**Families that share a bucket share a pin, including when only one of them is separately metered.** Upstream can report a *learned* weekly bucket scoped to a family the static table has no entry for; routing then meters that family on its own window (see [Expiry-pressure routing](#expiry-pressure-routing)) while affinity still keys on the shared bucket the family falls under. Such a family has its own quota clock and not its own pin, so anything that moves the pin moves both — a known limitation of pinning by bucket rather than by governing window, and the reason the cost bound below is stated per pin rather than per family.
+
+### Adaptive distribution
+
+Even distribution treats every account as interchangeable, which is wrong once a fleet is mixed. It sends a Pro account the same share as a Max 20x, so the small one hits its weekly wall days before the big one is half spent — and spreading evenly **fragments** the weekly windows: five accounts each left at 60% at reset is five windows' worth of credit thrown away, where four spent accounts and one untouched is the same work with the headroom kept where it can still be used.
+
+```json
+"distributeSessions": "adaptive"
+```
+
+Adaptive mode does the opposite of even: it concentrates new sessions on the account with the **least remaining weekly credit**, to finish that window off — while tapering its share away as it nears the switch threshold, so the account is spent down to the wall and never into it, and backing off when it is congested, so concentrating never costs response time. A session's pin, priority ordering, and the drain-on-disable behaviour are all unchanged.
+
+Plan size comes from authoritative account metadata; only dynamic behavior is learned from traffic:
+
+| Input | Source | Used for |
+| --- | --- | --- |
+| **Plan tier** | OAuth profile organization and seat tier, using the same persisted 1x/5x/20x mapping as quota summary. | Making “least remaining” comparable across differently sized subscriptions without estimating the subscription from traffic. |
+| **Tolerated concurrency** | AIMD: retreat below the load that upstream throttled, creep back up while running at the cap without trouble. Load is measured as active sessions plus requests in flight, the same figure the score compares against the cap. | The response-speed term: an account's share of *new sessions* decays as its load approaches the learned cap, so concentrating for quota reasons stops before the next session would just queue. It shapes placement only — it does not bound admission, and a request already on an account is never held back by it. |
+
+The taper's width is adaptive too, rather than a fixed percentage: it is how much of the window the account would spend in the next 30 minutes **at its own observed burn rate**, so a fast-burning account is given a wide margin and an idle one may run much closer to the threshold.
+
+The threshold it tapers toward is **your** `switchThreshold`, including the per-bucket form — set `{ "default": 0.98, "unified7d": 0.85 }` and the weekly taper reaches zero at 85%, not 98%.
+
+Quota response headers supply utilization and reset time. Burn rate is learned from fresh readings of each individual quota window; a response that refreshes only shared weekly quota does not rebaseline a cached family window. The burn-rate and concurrency learners run, and persist to the state file, in **every** mode — they have no effect on routing unless `distributeSessions` is `"adaptive"`, but what they have already observed is in hand the moment it is.
+
+**Reading the result.** In this mode `teamclaude status` adds an `Adaptive` line per account, and the header reads `adapting`:
+
+```
+> account-a (Max 20x) (oauth, prio 0) active 3 sess
+  Weekly   [███████████░░░░░░░] 62% reset 3d8h
+  Adaptive next · weight 36% of opus+  ·  3 sess / 3 inflight  ·  head 36.0% of 98%  ·  plan 20x  ·  conc 6.0
+```
+
+`next` names the account the deterministic picker would choose for the next new session. `weight` is that account's score normalized across the competing tier; it explains how strongly the inputs favor an account, but is not a routing probability. `plan` is the subscription multiplier read from the OAuth profile, not inferred from traffic. An unknown future tier is shown as `plan unknown`, and its competing tier falls back to plain utilization fractions rather than guessing. `weight n/a (all reserved)` means every account in the tier is inside its reserve, so the even fallback decides the next target.
+
+**Turning it off drains, it doesn't cut.** The setting is applied live on config reload, and switching it off would otherwise move every distributed session to the current account on its *next* request — each one throwing away the prompt cache it built on its old account, and all of them arriving at one account at once. Instead, the sessions running at that moment keep their accounts, and only **new** sessions go back to plain quota-driven rotation. Affinity therefore winds down as those sessions finish rather than snapping, and a draining session whose account becomes ineligible simply rejoins normal rotation. While this is happening `teamclaude status` reads `draining N` (the TUI header shows `drain N`) instead of `single-account`, and it clears itself once the last of those sessions is done or idles out.
+
+With `expiryRouting.preempt` on, a governing-window **rollover** also ends the drain for the session whose account rolled, and it rejoins normal rotation there and then. The drain trades expiring quota for a warm prompt cache, and that trade is priced on the window the account had when the drain started; once that window has gained a full week the account is the one the fleet should be spending last. Nothing else bounds it — a session making requests never idles out — so without this a long-lived session rides a rolled-over account for as long as it keeps talking.
+
+## Expiry-pressure routing
+
+> **The config key `expiryRouting` is provisional.** [#176](https://github.com/KarpelesLab/teamclaude/issues/176) proposes a `routingStrategy` enum for the adjacent drain-concentration problem, and a strategy value such as `"expiry"` is a plausible home for this behaviour. The mechanism below is settled; only its spelling on disk is open, and it will follow whatever shape that discussion settles on.
+
+The soonest-reset preference in [Choosing an account](#choosing-an-account) only applies at the moments selection *has* to pick — daemon start and threshold rotation. On a fleet whose weekly utilization never reaches the threshold, those moments never come: routing can sit on the account whose window just reset a full week out while another account's ample weekly quota quietly expires unspent. Enable `expiryRouting` to make the horizon a standing preference instead:
+
+```json
+"expiryRouting": { "enabled": true, "tolerance": 1.5, "preempt": true }
+```
+
+Each account gets a **pressure** score for the request's model: headroom in the governing weekly bucket over the seconds until it resets. High pressure means ample quota about to expire, so spend it first. Headroom is the numerator, so a soon reset alone does not favour a nearly-drained account. Both halves come from the **same** bucket, so an account reporting Fable use but no Fable window is not given the shared window's horizon and ranked on quota it does not have. Fable and Sonnet requests score on their own weekly bucket, so one account can rank differently per model. A family with no bucket of its own scores on whichever binds it, the shared weekly or a scoped weekly upstream reports for it, the same tighter-of-the-two the availability gate uses. So a learned bucket the family table never heard of cannot be spent past while the shared window looks roomy. Codex is outside that: upstream files its per-model weeklies under `codexModelBuckets`, which no governing-window reader consults, so its pressure comes from the shared weekly alone. The 5h bucket stays an availability gate: its much shorter horizon would swamp the weekly comparison. `teamclaude status --json` reports each account's `pressure` against the shared weekly, the ordering the router works from.
+
+An account whose governing bucket is not fully reported is handled in two separate steps, and they do not answer the same way.
+
+**Admission is unconditional.** Such an account stays in the band rather than being filtered out of it, whichever half of the reading is missing: being used is how that quota becomes known, so banding it out would make the unknown permanent. This mirrors the existing unknown-reset probe bias.
+
+**Ranking depends on what is actually known.** A bucket reporting no utilization at all is a genuine unknown and ranks at the top of the band, for the reason just given. A bucket whose utilization *is* reported but whose window is not is a different case: the headroom is known and only the clock is missing, so it is ranked by a **lower bound** on its pressure — the score it would have if that window were resetting as late as a weekly window can, a full seven days out. A real window resets no later than that, so the bound can only understate, and such an account is never preferred over a measured one on the strength of a number nobody reported. Ranking it as a genuine unknown instead would put an account 95% through its Fable quota ahead of one holding 95% of that quota with an hour left to spend it.
+
+Selection then draws from the **top pressure band**: accounts within `tolerance` (a ratio, ≥ 1) of the best pressure in the top priority tier. Inside the band the usual rules apply unchanged — `distributeSessions` still spreads new sessions by load, priority still wins, and the storm ramp still paces failover. `tolerance` is the dial between load spreading and expiry pressure: large values approach pure load-balancing, `1.0` is strict highest-pressure-first (and effectively disables session spreading).
+
+With `preempt` on, a **pinned session** (and the sticky current account) is re-routed when its account's governing weekly window **rolls over** — the account just became both the freshest and the furthest-dated choice, so staying would burn the window that gained a full week while sooner-expiring quota goes unspent. That rollover is the only thing **this feature** does to a pin. Pressure on its own never moves one, and neither does the pinned account's quota draining — that is the policy working, and re-routing on it would thrash the prompt cache for nothing. Everything that moved a pin before still does, unchanged. A pin **stops being honoured** when the account cannot serve the request (every reason `teamclaude status` names on its **Blocked** line, from spent quota through a rate-limit hold to an upstream refusal), when a higher-priority account is available, or when that account was already tried and failed earlier in the same request. A pin is **bypassed outright** by a manual route pin and by a `/tc-acct/` (`TC_ACCT`) override, both of which resolve before session affinity is consulted at all. And a pin can simply **cease to exist**: removing an account deletes the pins that named it, and a session idle past the known window is forgotten along with all of them. (That enumeration is the three writers of a session's pin map — `touch`, `remapAccounts`, and record expiry — plus the two paths that resolve ahead of affinity; it is the search, not a recollection.) Cost of the rollover itself: at most one cache-miss turn per PIN per rollover of the window that pin is measured on, roughly once per account per week.
+
+**A rollover is measured against what the last request read where it came to rest.** The whole state is one reading per pin and one for the sticky current account, taken when a request arrives to find it already placed. A selection that only *sends* a request may never arrive, so it writes only where no roll can be lost: a choice that never named an account, or one whose recorded windows have not rolled. The roll a preemption pushes traffic off is **held** until an attempt selecting under this move's stamp is **served** at the destination — upstream's response headers gave a status below 400 — and the reading is still the one that move left there: once it has moved away and come back its stamp is a later one, and the roll stays held. A body that fails afterwards does not un-serve the attempt. A second preemption before the first is settled holds both: each escaped account keeps its own reading until traffic returns to it or a stay is served under the stamp of the move that escaped that roll. The account a hand-back leaves keeps its own roll the same way, under no move's stamp: the move that leaves it is a move back, so a stay served where it returns to is no evidence about the account it left. A reading no walk established names no fleet of its own, so the roll it loses is held for the fleet of the roll being handed back, since a hold naming nobody can be settled by nobody. A roll is handed back once. A reading restored from a hold is held again only for a window that has rolled since the hand-back, so two accounts that have each rolled cannot trade their rolls for ever. A stay served on the account a roll is held against releases it whatever move stamped it, and only for the fleet the hold names, because the reading has come back to the account that owes it. The sticky current account's reading is one slot every provider shares, so the hold names the fleet that last established the reading it preserves, and only where the destination is that fleet's own subscription, which no other fleet is ever served at, does a success of its own release the roll; anywhere else the destination holds one reading for whoever it serves, and a success by whichever fleet is served there releases it. A request whose provider does not own the cursor borrows it, and gives it back but not the reading. With no roll standing on the account it names, a borrowed walk leaves it naming the borrower's, so the owner's next request re-reads that account and the test compares the reading against itself. A roll on the account the cursor names is missed whenever the reading names somewhere else by the owner's next request, whether the borrow that moved it fell before that roll or after. Only a borrower resting on a cursor of its own moves a reading whose account has already rolled, so a fleet without one yet leaves a standing roll for the owner to preempt on. That rest also puts the displaced roll into the hold, so only the later order leaves anything to recover. A fail-back is handed the roll where the borrow followed it, and nothing where it came first.
+
+Arriving is not being served, so the hold survives a retry that never leaves the destination, whether a 401 re-entering selection on the same account or a short-wait 429 with no idle sibling. However many requests start there, none has been answered.
+
+A retry of the same request can confirm the move, because the stamp is re-read before every attempt selects. But only after something has come to rest at the destination: the move writes nothing there, so the first attempt to arrive takes the reading, having selected before it was stamped. The attempt that made the move selected earlier still.
+
+**A rollover that happens before anything has read that account is not detected.** That window is one request wide, and every first placement has it: a session's opening account, a rotation's destination, an operator's switch. In practice it costs the account's next roll rather than this one. Traffic that returns before the destination has served anything is preempted off the rolled account again as soon as anywhere better is available, because the stay was never confirmed. Traffic that returns after a serve finds the roll released and reads the origin whole, keeping the week that account gained until the window rolls again. A request still in flight when a later one confirms the stay pays that price: the confirmation speaks only for its own attempt. Where a learned scoped window shares a pin with the bucket it falls under (see above), every family on the pin pays that turn. A rollover that moves nothing logs why: no eligible account could take the traffic, or the re-rank ran and the account it was on still ranked best. Without that line a stuck preemption looks like no rollover, or the ordering agreeing that staying is right.
+
+With `"preempt": false` the band only refines the moments selection was already going to pick — a rotation, or placing a new session — so the "standing preference" above is really a property of `preempt: true`. Without it, the sticky current account (distribution off) or an existing session pin stays where it is across a rollover, and long-lived sessions can still ride an account whose window just reset a week out.
+
+Off by default. With the knob off, every routing decision is byte-identical to the one the router makes without this feature. The one addition either way is the status payload: `teamclaude status --json` gains an `expiryRouting` echo of the resolved settings and a per-account `pressure` figure whether the knob is on or off, since pressure is a measurement of the fleet rather than a report of the feature's state. Changes apply to a running server via `POST /teamclaude/reload` (or any CLI command that notifies the server). **Off means there is no state at all**, and that is what makes the byte-identity promise checkable rather than a rule every reader has to remember: no reading is taken while preemption is off, and every reading is dropped the moment it is turned off. Switching it back on takes a fresh reading for the current account and for every live session pin — including any that a reload turning `distributeSessions` off in the same pass has just put into the drain, whose only bound is the rollover above — so the fleet is measured from the reload rather than from its next roll. The cost of that lifetime is stated rather than hidden: **a rollover that happens while the feature is off is not carried across.** It was not being watched for, and the alternative is mechanism state that outlives the knob.
+
+A status read, a TUI paint, the quota poll behind the status line and the opening placement at launch all meet an expired 5-hour window before any request. The status read clears the window and never switches, knob off or on. The other three call the combined clear-and-switch. With the knob off they take it themselves, with no request in hand and so on the model-less ranking. Launch then places the cursor outright, so its switch settles nothing either way. With the knob on none of them switches, because a reset is spent by a request and none of these is one.
+
+The event stays recorded on the account. The first request that can be sent both there and to the cursor's account acts on it, ranked on the window governing that request. Acting on it can mean staying. The band that refuses the move covers the fleet the cursor serves and not this attempt's reach, so it holds the accounts the request's provider partition leaves that are available for its models, the ones already tried included, since that cursor also serves the requests behind this one. A request that also names an advisor model is admitted on both models, by the same test that selection applies. So it spends the event only onto an account it could itself be sent to. Where no account the request can be sent to serves the advisor model, selection routes on the main model alone. The switch follows it there, so advisor traffic can still spend a reset. The flag is not in the quota state the proxy saves, and the poll that raised it already cleared the window, so a restart drops the event. Startup then places traffic by the ranking any start uses, owed nothing, the cursor included.
 
 ## Pin a session to one account
 

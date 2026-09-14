@@ -84,13 +84,16 @@ test('GET /teamclaude/status keeps the family buckets the card renders', async (
   const am = new AccountManager([{ name: 'a', type: 'apikey', apiKey: 'k1' }], 0.99);
   am.accounts[0].quota.unified7d = 0.95;
   am.accounts[0].quota.unified7dFable = 1;
-  am.accounts[0].quota.unified7dFableReset = 1787288399939;
+  // A reset in the future: an expired one is (correctly) cleared before the
+  // card sees it, which is what broke this test on 2026-08-21.
+  const fableReset = Date.now() + 3600_000;
+  am.accounts[0].quota.unified7dFableReset = fableReset;
   const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test' }, upstream: 'https://api.anthropic.com' }, {});
   const port = await new Promise(r => proxy.listen(0, '127.0.0.1', () => r(proxy.address().port)));
   try {
     const status = await (await fetch(`http://127.0.0.1:${port}/teamclaude/status`)).json();
     const quota = status.accounts[0].quota;
     assert.equal(quota.unified7dFable, 1);
-    assert.equal(quota.unified7dFableReset, 1787288399939);
+    assert.equal(quota.unified7dFableReset, fableReset);
   } finally { proxy.close(); }
 });

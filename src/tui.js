@@ -1,11 +1,43 @@
 import { createWriteStream } from 'node:fs';
+import { gatingUtilization } from './model.js';
 import { importCredentials, fetchProfile } from './oauth.js';
-import { sameIdentity, findUpsertTarget } from './identity.js';
-import { parseProxyUrl, proxyToUrl, describeProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
+import {
+  sameIdentity,
+  findUpsertTarget,
+  updateAccountEntry,
+  canUpsertOAuthAccount,
+  oauthIdentityFields,
+} from './identity.js';
+import { configIndexFor, managerAccountFor, markAccountRemoved } from './account-pairing.js';
+import { mintAccountId } from './account-id.js';
+import { formatPercent } from './status-renderer.js';
+import { resolveMaxUsage } from './model.js';
+import { parseProxyUrl, proxyToUrl, describeProxy, describeSelfProxy, resolveUpstreamProxy, setUpstreamProxy, getUpstreamProxy } from './upstream-proxy.js';
+import { sanitizeText, safeLine } from './safe-text.js';
 
 // ── ANSI helpers ─────────────────────────────────────────────
 
 const SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'.split('');
+
+// Repaint cadence.
+//
+// The spinner is drawn only alongside in-flight requests, so animating it while
+// the proxy is idle wakes the process twice a second to redraw a frame nobody
+// can tell apart from the last one. On a laptop that is enough to keep the
+// machine from going to sleep (#134), which is a poor trade for animating
+// nothing. Tick fast only while there is something to animate; otherwise tick
+// slowly, just often enough that elapsed times and quota countdowns stay honest.
+const SPIN_MS = 500;
+const IDLE_TICK_MS = 5_000;
+// Even when the composed frame is unchanged, repaint occasionally: the terminal
+// is shared state, and anything that writes over it (a stray warning, a resumed
+// job) would otherwise leave the screen corrupted until the next real change.
+const FORCE_REPAINT_MS = 60_000;
+// Longest quota-probe interval the settings screen accepts. Node's timers take
+// a 32-bit millisecond delay: past 2,147,483 s setInterval overflows and fires
+// every millisecond, which is a probe storm rather than a slow probe. A week
+// is far under that and already longer than any quota window.
+const PROBE_MAX_SECONDS = 7 * 24 * 3600;
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
 const BOLD = `${ESC}1m`;
@@ -47,10 +79,18 @@ function sessionColorCode(sid) {
   for (let i = 0; i < sid.length; i++) h = (h * 31 + sid.charCodeAt(i)) >>> 0;
   return SESSION_FG[h % SESSION_FG.length];
 }
-// Fixed-width colored short id (blank-padded when there's no session, e.g. a
-// telemetry request), so the activity column stays aligned.
-const sessionTag = sid =>
-  sid ? fg(sessionColorCode(sid), sid.slice(0, SESSION_ID_LEN)) : ' '.repeat(SESSION_ID_LEN);
+// Fixed-width colored session label: the name Claude Code holds on disk for the
+// session (see session-titles.js), else the short id. Blank-padded when there's
+// no session (e.g. a telemetry request). One width for every row, named or not,
+// keeps the columns after it aligned. Measured in display columns, not UTF-16
+// units, so a CJK title takes the same room as an ASCII one.
+// The id is a client header. Node's parser lets C1 bytes (U+009B is a CSI on
+// its own) through, so only an id of the shape Claude Code actually sends is
+// shown as-is; anything else is stripped down before it reaches the frame.
+const SAFE_SID = /^[A-Za-z0-9._-]+$/;
+const shortSid = sid => (SAFE_SID.test(sid) ? sid : safeLine(sid, 64) || '?').slice(0, SESSION_ID_LEN);
+const sessionTag = (sid, title = null, width = SESSION_ID_LEN) =>
+  sid ? fg(sessionColorCode(sid), rpad(truncate(title || shortSid(sid), width), width)) : ' '.repeat(width);
 
 // Which quota-family bar (F7/S7) a route binds to, or null for a general route.
 // Auto routes are named 'fable'/'sonnet'; a configured route is classified by its
@@ -70,7 +110,55 @@ const routeGlyph = (paint, eligible, pinned) =>
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const strip = s => s.replace(ANSI_RE, '');
-const vw = s => strip(s).length;
+
+// What a composed line may still carry when it reaches the frame: the SGR
+// colour this file adds, and nothing else that a terminal would act on. Every
+// other escape form (an OSC 52 clipboard write, a CSI erase, a bare C0/C1
+// control) came from a value that was not ours, and unlike sanitizeText this
+// keeps the colour, so it can run on a line after it has been painted.
+// Alternatives, in order: SGR (kept), OSC through its BEL/ST terminator, any
+// other CSI, any remaining control or format character.
+const NON_SGR_CONTROL = /(\x1b\[[0-9;]*m)|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b\[[0-?]*[ -/]*[@-~]|\p{C}/gu;
+export const scrubLine = s => String(s).replace(NON_SGR_CONTROL, (m, sgr) => sgr || '');
+const SGR_AT = /\x1b\[[0-9;]*m/y;   // sticky: "an SGR starting exactly here"
+
+// Terminal display width of one code point: 0 for combining and zero-width
+// marks, 2 for East Asian wide/fullwidth characters and emoji, 1 otherwise.
+// A compact subset of Unicode's East_Asian_Width and combining ranges, enough
+// to keep the account table aligned for CJK and accented names without a full
+// property database. It does not resolve emoji ZWJ sequences, so a multi-part
+// emoji is counted per component; names rarely contain those.
+function charWidth(cp) {
+  if (cp === 0) return 0;
+  if (
+    (cp >= 0x0300 && cp <= 0x036f) || (cp >= 0x0483 && cp <= 0x0489) ||
+    (cp >= 0x0591 && cp <= 0x05bd) || (cp >= 0x0610 && cp <= 0x061a) ||
+    (cp >= 0x064b && cp <= 0x065f) || (cp >= 0x0e31 && cp <= 0x0e3a) ||
+    cp === 0x200b || (cp >= 0x200d && cp <= 0x200f) ||
+    (cp >= 0x20d0 && cp <= 0x20ff) || (cp >= 0xfe00 && cp <= 0xfe0f)
+  ) return 0;
+  if (
+    (cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x2e80 && cp <= 0x303e) ||
+    (cp >= 0x3041 && cp <= 0x33ff) || (cp >= 0x3400 && cp <= 0x4dbf) ||
+    (cp >= 0x4e00 && cp <= 0x9fff) || (cp >= 0xa000 && cp <= 0xa4cf) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) || (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0xfe30 && cp <= 0xfe4f) || (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f300 && cp <= 0x1faff) ||
+    (cp >= 0x20000 && cp <= 0x3fffd)
+  ) return 2;
+  return 1;
+}
+
+// Visible terminal width of a string: ANSI escapes stripped, then each code
+// point measured by charWidth. Replaces a bare .length, which miscounts CJK
+// (1 unit, 2 columns) and combining marks (1 unit, 0 columns) and so would
+// misalign the table for non-ASCII names.
+export function displayWidth(s) {
+  let w = 0;
+  for (const ch of strip(s)) w += charWidth(ch.codePointAt(0));
+  return w;
+}
+const vw = displayWidth;
 
 function rpad(s, w) {
   const gap = w - vw(s);
@@ -83,27 +171,104 @@ function splitCsv(value) {
   return (value || '').split(',').map(s => s.trim()).filter(Boolean);
 }
 
-/** Truncate a string with ANSI codes to exactly w visible characters, then reset. */
-function truncate(s, w) {
-  let visible = 0;
+/** Truncate a string with ANSI codes to at most w display columns, then reset. */
+export function truncate(s, w) {
+  let width = 0;
   let out = '';
   let i = 0;
-  while (i < s.length && visible < w) {
+  while (i < s.length) {
     if (s[i] === '\x1b') {
-      const end = s.indexOf('m', i);
-      if (end >= 0) { out += s.slice(i, end + 1); i = end + 1; continue; }
+      // Only a well-formed SGR is copied through. Copying "ESC up to the next
+      // m" carried an erase or a clipboard write into the frame whole.
+      SGR_AT.lastIndex = i;
+      const m = SGR_AT.exec(s);
+      if (m) { out += m[0]; i += m[0].length; continue; }
+      i++; continue;
     }
-    out += s[i];
-    visible++;
-    i++;
+    const cp = s.codePointAt(i);
+    // A stray control (BEL, a C1 byte) is dropped, not drawn.
+    if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f)) { i++; continue; }
+    const cw = charWidth(cp);
+    // A wide glyph that would cross the limit is dropped whole rather than split;
+    // the one leftover column is filled by the caller's padding.
+    if (width + cw > w) break;
+    const len = cp > 0xffff ? 2 : 1;
+    out += s.slice(i, i + len);
+    width += cw;
+    i += len;
   }
   return out + RESET;
 }
 
-/** Fit a line to exactly w columns: truncate if too long, pad if too short. */
-function fitLine(s, w) {
+// Quota bar width bounds: narrow enough that a `2d14h` label still fits, wide
+// enough that a very wide terminal doesn't turn the row into one long bar.
+const BAR_MIN = 5;
+const BAR_MAX = 20;
+
+// Floor for the account name column. It grows past this toward the longest name
+// when the row has width to spare, but never drops below it, so a narrow
+// terminal lays the table out exactly as it did before the column could grow.
+const NAME_MIN = 12;
+
+// Which pair of bars a row draws: the subscription buckets (Ses/Wk, plus the
+// S7/F7 family bars) when any unified reading exists, else the metered Tok/Req
+// pair an API-key account reports. The account row budget is drawn per
+// category (#234): the two kinds of row share no bar, so sizing an API-key row
+// for family bars it never draws only left it short of the edge.
+function rowCategory(q) {
+  return (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null)
+    ? 'unified' : 'metered';
+}
+
+// Families this account can't serve right now: a family whose own weekly bucket
+// is over the switch threshold is barred from that model while the account is
+// otherwise active. Shared by the row renderer (which draws the `⊘` tag) and the
+// column layout (which reserves the width that tag needs).
+// `threshold` is a number, or a per-bucket lookup (bucket → number) so a family
+// is judged against its OWN configured threshold rather than the global one.
+/**
+ * Short row tag for an account that bills real money past its plan limits:
+ * `$!` once something has actually been billed, `$` while it merely can be,
+ * '' when it cannot. ASCII on purpose — the row is width-budgeted to the cell,
+ * and a glyph whose width varies by terminal would push it past the edge.
+ *
+ * Deliberately not shown for an account that spent earlier and has since been
+ * switched off: the row reports what rotating onto this account costs now, and
+ * the status screen carries the fuller history.
+ */
+export function spendTag(quota) {
+  const spend = quota?.spend;
+  if (!spend?.enabled) return '';
+  return (spend.usedMinor || 0) > 0 ? '$!' : '$';
+}
+
+export function blockedFamilies(quota, threshold) {
+  const at = typeof threshold === 'function' ? threshold : () => threshold;
+  const out = [];
+  for (const [label, key] of [['Sonnet', 'unified7dSonnet'], ['Fable', 'unified7dFable']]) {
+    if (quota[key] == null) continue;      // family not metered separately here
+    // Compared against gatingUtilization — the value the ROUTER gates on — not
+    // against the family bucket alone. Family spend meters into the shared
+    // weekly too, so an account under its family cap can be over the shared one
+    // and unable to serve that family at all (#175). This tag displays a routing
+    // decision, so deriving it a second way here would be a copy that drifts.
+    const gating = gatingUtilization(quota, key);
+    if (gating != null && gating >= at(key)) out.push(label);
+  }
+  return out;
+}
+
+/** Fit a line to exactly w columns: truncate if too long, pad if too short.
+ *  Truncation drops a wide glyph that would straddle the limit, so the result
+ *  can come up one column short; pad that too — the frame is repainted in
+ *  place, and a line narrower than the terminal leaves the previous frame's
+ *  last cell visible. */
+export function fitLine(s, w) {
   const v = vw(s);
-  if (v > w) return truncate(s, w);
+  if (v > w) {
+    const t = truncate(s, w);
+    return t + ' '.repeat(Math.max(0, w - vw(t)));
+  }
   if (v < w) return s + ' '.repeat(w - v);
   return s;
 }
@@ -122,11 +287,56 @@ function formatReset(resetTs) {
   return rh > 0 ? `${days}d${rh}h` : `${days}d`;
 }
 
+// Rolling-window lengths for the Claude Max buckets, used to color a bar by
+// burn rate rather than raw fill (see barColor). The five-hour session bucket
+// and the seven-day weekly buckets (unified, Sonnet, Fable) reset on these.
+const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
+const SEVEN_DAY_MS = 7 * 24 * 60 * 60 * 1000;
+
+// { bg, fg } SGR params per severity. White label on red (dark everywhere),
+// black on the lighter green/yellow/orange (bright-white would vanish on the
+// light backgrounds many terminal themes render for them).
+const BAR_GREEN = { bg: '42', fg: '30' };
+const BAR_YELLOW = { bg: '43', fg: '30' };
+const BAR_ORANGE = { bg: '48;5;208', fg: '30' };
+const BAR_RED = { bg: '41', fg: '97' };
+
+/**
+ * Pick a bar color. A bucket at or above `threshold` is red whatever its pace:
+ * that is the point where the rotation stops routing to it — eligibility()
+ * calls the account out as "at or above the switch threshold", and the row's
+ * `⊘` tag comes off the same comparison in blockedFamilies — so a green bar
+ * would contradict the rest of the row. Below it, and with a window still
+ * running, color by burn rate: how far usage is ahead of the share of the window
+ * already elapsed, so a bucket that is 80% spent with the week nearly over
+ * reads calm, not alarming. Fall back to raw utilization when there is no pace
+ * to measure — no window at all (API-key token/request bars, whose reset
+ * cadence is unknown), or a window whose reset has passed, which says nothing
+ * about the fill still being reported against it.
+ */
+function barColor(ratio, resetTs, windowMs, threshold) {
+  if (threshold != null && ratio >= threshold) return BAR_RED;
+  const remaining = resetTs ? resetTs - Date.now() : 0;
+  if (windowMs && remaining > 0) {
+    const elapsed = Math.max(0, windowMs - remaining);
+    const timePct = (elapsed / windowMs) * 100;
+    const diff = ratio * 100 - timePct;
+    if (diff <= 0) return BAR_GREEN;
+    if (diff <= 5) return BAR_YELLOW;
+    if (diff <= 15) return BAR_ORANGE;
+    return BAR_RED;
+  }
+  return ratio < 0.7 ? BAR_GREEN : ratio < 0.9 ? BAR_YELLOW : BAR_RED;
+}
+
 /**
  * Render a progress bar using background colors with text overlaid.
  * The label (e.g. "Ses 2h30m" or "45%") is drawn on top of the bar.
+ * windowMs is the bucket's rolling-window length; when known, the color tracks
+ * burn rate instead of raw fill. threshold is the routing switch threshold, at
+ * or above which the bar goes red regardless of pace.
  */
-function bar(ratio, w = 10, resetTs) {
+export function bar(ratio, w = 10, resetTs, windowMs, threshold) {
   const rst = formatReset(resetTs);
 
   if (ratio == null || isNaN(ratio)) {
@@ -141,8 +351,7 @@ function bar(ratio, w = 10, resetTs) {
 
   ratio = Math.max(0, Math.min(1, ratio));
   const f = Math.round(ratio * w);
-  // Background colors: 42=green, 43=yellow, 41=red; 100=bright black (gray) for empty
-  const bg = ratio < 0.7 ? 42 : ratio < 0.9 ? 43 : 41;
+  const { bg, fg } = barColor(ratio, resetTs, windowMs, threshold);
 
   // Build the label to overlay: show reset time if available, else percentage
   const pct = (ratio * 100).toFixed(0) + '%';
@@ -158,10 +367,32 @@ function bar(ratio, w = 10, resetTs) {
   const empty = chars.slice(f);
 
   let out = '';
-  if (filled) out += `${ESC}${bg};97m${filled}`;
+  if (filled) out += `${ESC}${bg};${fg}m${filled}`;
   if (empty) out += `${ESC}100;37m${empty}`;
   out += RESET;
   return out;
+}
+
+// The request fields the hooks hand us come from the client — the path and
+// method off the request line, the model peeked from the body, the session id
+// from a header — so they are cut down once here, before they are stored to be
+// drawn every frame and logged.
+const REQ_FIELD_MAX = { method: 16, path: 256, model: 64, account: 64, sessionId: 64 };
+function cleanRequestInfo(info) {
+  const out = { ...info };
+  for (const [k, max] of Object.entries(REQ_FIELD_MAX)) {
+    if (out[k] != null) out[k] = safeLine(out[k], max);
+  }
+  return out;
+}
+
+// A stored key, shown enough to recognise and no more. First-4/last-4 on a key
+// of eight characters or fewer is the whole key; a short one shows its tail only.
+export function maskKey(key) {
+  const k = String(key);
+  if (k.length <= 4) return '****';
+  if (k.length < 12) return `…${k.slice(-4)}`;
+  return `${k.slice(0, 4)}…${k.slice(-4)}`;
 }
 
 function timestamp() {
@@ -172,10 +403,19 @@ function timestamp() {
 
 export class TUI {
   constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null, activityLogPath = null,
+    // Attach mode: the accounts belong to a server in another process, reached
+    // over its control plane. Everything that would mutate local state is off,
+    // and a switch becomes a request (applySwitch) instead of an assignment.
+    remote = false, applySwitch = null,
     // Injectable so the import path can be exercised without a real credentials
     // file or a live profile call.
-    readCredentials = importCredentials, readProfile = fetchProfile }) {
+    readCredentials = importCredentials, readProfile = fetchProfile,
+    // Names the activity column against the session id the client sent. Absent
+    // or disabled leaves every row showing the short id.
+    sessionTitles = null }) {
     this.am = accountManager;
+    this.remote = remote;
+    this.applySwitch = applySwitch;
     this.config = config;
     this.saveConfig = saveConfig;
     this.syncAccounts = syncAccounts;
@@ -187,6 +427,7 @@ export class TUI {
     this._readCredentials = readCredentials;
     this._readProfile = readProfile;
     this._activityStream = null;
+    this.sessionTitles = sessionTitles;
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
@@ -202,32 +443,54 @@ export class TUI {
     this.inputPrompt = '';
     this.inputBuf = '';
     this.inputCb = null;
+    this.inputSecret = false;    // a key is being typed: the footer echoes * for each char
     this.inputReturn = 'normal'; // mode to fall back to when an input is cancelled
     this.frame = 0;
     this.running = false;
     this.timer = null;
+    // Injectable so a test can drive the repaint tick by hand instead of
+    // sleeping through real 500ms/5s intervals.
+    this._setTimeout = setTimeout;
     this._origLog = null;
     this._origErr = null;
   }
 
   // ── lifecycle ──────────────────────────────────────
 
+  /**
+   * Open the activity log, if one is configured.
+   *
+   * Split out of start() so it can be exercised without entering the alt screen
+   * or putting stdin in raw mode — neither of which a test process can do.
+   *
+   * 0600 like every sibling (config, state, request log and its directory): the
+   * activity log names which client made each call, so on a shared host it is
+   * the record that says who was working on what and when (#259). Mode applies
+   * on creation only, so a file the operator already placed keeps the
+   * permissions they chose rather than being chmod'ed underneath them.
+   */
+  _openActivityLog() {
+    if (!this.activityLogPath) return null;
+    this._activityStream = createWriteStream(this.activityLogPath, { flags: 'a', mode: 0o600 });
+    this._activityStream.on('error', err => {
+      // Swallow write errors — can't log them to the TUI without recursion
+      this._activityStream = null;
+      process.stderr.write(`[TeamClaude] activity log error: ${err.message}\n`);
+    });
+    return this._activityStream;
+  }
+
   start() {
     this.running = true;
-    if (this.activityLogPath) {
-      this._activityStream = createWriteStream(this.activityLogPath, { flags: 'a' });
-      this._activityStream.on('error', err => {
-        // Swallow write errors — can't log them to the TUI without recursion
-        this._activityStream = null;
-        process.stderr.write(`[TeamClaude] activity log error: ${err.message}\n`);
-      });
-    }
+    this._openActivityLog();
     process.stdout.write(`${ESC}?1049h${ESC}?25l`);
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.setEncoding('utf8');
     this._dataHandler = d => this._onData(d);
-    this._resizeHandler = () => this.render();
+    // A resize reflows the terminal itself, so the cached frame says nothing
+    // about what is on screen — always repaint.
+    this._resizeHandler = () => this.render({ force: true });
     process.stdin.on('data', this._dataHandler);
     process.stdout.on('resize', this._resizeHandler);
 
@@ -237,16 +500,41 @@ export class TUI {
     console.log = (...a) => this._addLog(a.join(' '));
     console.error = (...a) => this._addLog(a.join(' '));
 
+    this._lastFrame = null;   // entering the alt screen always paints
     this.render();
-    this.timer = setInterval(() => {
-      this.frame = (this.frame + 1) % SPINNER.length;
+    this._scheduleTick();
+  }
+
+  /** Fast while something is animating, slow when there is nothing to animate. */
+  _tickDelay() { return this.active.size > 0 ? SPIN_MS : IDLE_TICK_MS; }
+
+  _scheduleTick() {
+    if (!this.running) return;
+    this.timer = this._setTimeout(() => {
+      if (!this.running) return;
+      // Only advance the spinner when it is actually on screen; otherwise the
+      // frame counter would change every tick and defeat the repaint dedupe.
+      if (this.active.size > 0) this.frame = (this.frame + 1) % SPINNER.length;
       this.render();
-    }, 500);
+      this._scheduleTick();
+    }, this._tickDelay());
+    this.timer.unref?.();
+  }
+
+  /**
+   * Re-arm the tick after the animating/idle state changes, so a request
+   * arriving during an idle tick starts animating now rather than up to
+   * IDLE_TICK_MS later.
+   */
+  _retick() {
+    if (!this.running) return;
+    if (this.timer) clearTimeout(this.timer);
+    this._scheduleTick();
   }
 
   stop() {
     this.running = false;
-    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     if (this._origLog) { console.log = this._origLog; console.error = this._origErr; }
     if (this._activityStream) { this._activityStream.end(); this._activityStream = null; }
     process.stdin.removeListener('data', this._dataHandler);
@@ -256,24 +544,39 @@ export class TUI {
     process.stdin.pause();
   }
 
+  // A title lookup costs a directory scan and a file read, so it stays off the
+  // render path: this returns what is cached and schedules the rest.
+  _sessionTag(sid) {
+    const titles = this.sessionTitles;
+    if (!titles?.enabled) return sessionTag(sid);
+    return sessionTag(sid, titles.get(sid), titles.width);
+  }
+
   // ── server hooks ───────────────────────────────────
 
   onRequestStart(id, info) {
+    info = cleanRequestInfo(info);
+    // Start the lookup now, so the title is cached by the time the request ends
+    // and its log line is composed.
+    this._sessionTag(info.sessionId);
     this.active.set(id, { ...info, t: timestamp(), started: Date.now(), account: null });
     this.render();
+    if (this.active.size === 1) this._retick();   // idle → animating
   }
 
   onRequestModel(id, info) {
     const r = this.active.get(id);
-    if (r && info.model) { r.model = info.model; this.render(); }
+    const model = info.model ? safeLine(info.model, 64) : '';
+    if (r && model) { r.model = model; this.render(); }
   }
 
   onRequestRouted(id, info) {
     const r = this.active.get(id);
-    if (r) r.account = info.account;
+    if (r) r.account = info.account == null ? info.account : safeLine(info.account, 64);
   }
 
   onRequestEnd(id, info) {
+    info = cleanRequestInfo(info);
     const r = this.active.get(id);
     this.active.delete(id);
     const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
@@ -281,15 +584,21 @@ export class TUI {
     const model = info.model ? ` (${info.model})` : ''; // shown when the request named a model
     const sid = info.sessionId || r?.sessionId || null;
     const pin = (info.pinned || r?.pinned) ? dim(' [pin]') : '';
-    this._addLog(`${sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
+    this._addLog(`${this._sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
+    if (this.active.size === 0) this._retick();   // animating → idle
   }
 
   _addLog(msg) {
-    msg = msg.replace(/^\[TeamClaude\]\s*/, '');
+    // The screen copy keeps the colour callers painted on, and only that: a
+    // request's model string is repainted from this list every frame for as
+    // long as the entry lives, so an escape stored here would fire 200 times.
+    msg = scrubLine(msg).replace(/^\[TeamClaude\]\s*/, '');
     const t = timestamp();
     this.log.unshift({ t, msg });
     if (this.log.length > 200) this.log.length = 200;
-    if (this._activityStream) this._activityStream.write(`${t}  ${strip(msg)}\n`);
+    // sanitizeText, not `strip`: the latter removes SGR colour only, so an
+    // erase or cursor-move sequence reached the file, as did a newline.
+    if (this._activityStream) this._activityStream.write(`${t}  ${sanitizeText(msg)}\n`);
     if (this.running) this.render();
   }
 
@@ -327,13 +636,18 @@ export class TUI {
   _keyNormal(k) {
     if (k === 'q') { this.stop(); this.onQuit?.(); }
     else if (k === 's' && this.am.accounts.length > 0) {
-      this.mode = 'select'; this.selAction = 'switch'; this.selIdx = this.am.currentIndex; this.selRoute = null; this.selReturn = 'normal';
+      // currentIndex is -1 when nothing is marked current (attach mode, when the
+      // server names an account that has since gone); start at the top instead.
+      this.mode = 'select'; this.selAction = 'switch'; this.selIdx = Math.max(0, this.am.currentIndex); this.selRoute = null; this.selReturn = 'normal';
     }
+    else if (k === 'R') { this._doSync(); }
+    // The keys below all edit local state or call out to Anthropic, neither of
+    // which attach mode can do — the server owns both.
+    else if (this.remote) { /* nothing else is available here */ }
     else if (k === 'd' && this.am.accounts.length > 0) {
       this.mode = 'select'; this.selAction = 'toggle'; this.selIdx = this.am.currentIndex; this.selReturn = 'normal';
     }
     else if (k === 'p' && this.am.accounts.length > 0) { this._doProbe(); }
-    else if (k === 'R') { this._doSync(); }
     else if (k === 'g') { this.mode = 'settings'; this.setIdx = 0; this._loadSxBalance(); }
   }
 
@@ -344,17 +658,23 @@ export class TUI {
   _settingsFields() {
     const fields = [];
 
-    fields.push({
+    // A per-bucket table can't be edited from a single ±1% control, and writing
+    // a plain number over it would silently discard the operator's per-bucket
+    // values. So the row shows the table and sends them to the config file.
+    const perBucket = this._perBucketThresholds();
+    fields.push(perBucket ? {
+      id: 'threshold',
+      label: 'Switch threshold',
+      hint: 'per-bucket — edit config',
+      value: () => green(perBucket),
+    } : {
       id: 'threshold',
       label: 'Switch threshold',
       hint: '←→ ±1%',
-      value: () => {
-        const thr = this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98;
-        return green(`${Math.round(thr * 100)}%`);
-      },
+      value: () => green(formatPercent(this.am.effectiveThreshold ?? this.config.switchThreshold ?? 0.98)),
       left: () => this._nudgeThreshold(-1),
       right: () => this._nudgeThreshold(+1),
-      enter: () => this._promptInput('Switch threshold % (1-100)', v => this._doSetThreshold(v.trim())),
+      enter: () => this._promptInput('Switch threshold % (1-100, tenths allowed)', v => this._doSetThreshold(v.trim())),
     });
 
     fields.push({
@@ -384,6 +704,18 @@ export class TUI {
       right: () => this._cycleEventLogging(+1),
       enter: () => this._cycleEventLogging(+1),
     });
+
+    if (this.sessionTitles) {
+      fields.push({
+        id: 'sessionTitles',
+        label: 'Session titles',
+        hint: '←→ toggle',
+        value: () => (this.sessionTitles.enabled ? green('on') : gray('off')),
+        left: () => this._toggleSessionTitles(),
+        right: () => this._toggleSessionTitles(),
+        enter: () => this._toggleSessionTitles(),
+      });
+    }
 
     fields.push({
       id: 'routes',
@@ -433,8 +765,11 @@ export class TUI {
       label: 'Upstream proxy',
       hint: 'Enter to set',
       value: () => {
-        const { proxy, source } = getUpstreamProxy();
-        if (!proxy) return dim('(direct)');
+        const resolved = getUpstreamProxy();
+        const { proxy, source } = resolved;
+        // A dropped self-proxy reads as "(direct)" too, and the operator would
+        // have no way to tell that a value they set is not in force.
+        if (!proxy) return source === 'self' ? dim('(direct) ') + gray(describeSelfProxy(resolved)) : dim('(direct)');
         // Name the environment when that is where it came from: a value the
         // operator did not put in the config, silently in force, is exactly the
         // thing that is hard to account for later.
@@ -465,10 +800,9 @@ export class TUI {
         label: 'sx.org API key',
         hint: 'Enter to set',
         value: () => {
-          const key = this.config.sx?.apiKey;
-          return key ? key.slice(0, 4) + '…' + key.slice(-4) : dim('(not set)');
+          return this.config.sx?.apiKey ? maskKey(this.config.sx.apiKey) : dim('(not set)');
         },
-        enter: () => this._promptInput('sx.org API key', v => this._doSetSxKey(v.trim())),
+        enter: () => this._promptInput('sx.org API key', v => this._doSetSxKey(v.trim()), { secret: true }),
       });
 
       if (this.config.sx?.apiKey) {
@@ -500,18 +834,35 @@ export class TUI {
   }
 
   // Open the text-input prompt and return to the settings screen afterward.
-  _promptInput(prompt, cb) {
+  // `secret` masks the echo — the footer is on screen for as long as a key is
+  // being typed, and a terminal is the one thing a screen-share always shows.
+  _promptInput(prompt, cb, { secret = false } = {}) {
     this.mode = 'input';
     this.inputReturn = 'settings';
     this.inputPrompt = prompt;
     this.inputBuf = '';
+    this.inputSecret = secret;
     this.inputCb = v => { if (v) cb(v); };
   }
 
   _nudgeThreshold(deltaPct) {
-    const cur = Math.round((this.am.switchThreshold ?? this.config.switchThreshold ?? 0.98) * 100);
+    // Stepping from the exact percent, not a rounded one, so a threshold set to
+    // a tenth keeps its fraction instead of snapping to the nearest whole.
+    const cur = (this.am.effectiveThreshold ?? this.config.switchThreshold ?? 0.98) * 100;
     const next = Math.max(1, Math.min(100, cur + deltaPct));
-    if (next !== cur) this._doSetThreshold(String(next));
+    if (next !== cur) return this._doSetThreshold(String(next));
+  }
+
+  /** A one-line rendering of a per-bucket threshold table, or null when the
+   * threshold is a single number. */
+  _perBucketThresholds() {
+    const t = this.am.switchThreshold ?? this.config.switchThreshold;
+    if (!t || typeof t !== 'object') return null;
+    const pct = v => `${Math.round(v * 100)}%`;
+    return Object.entries(t)
+      .filter(([, v]) => typeof v === 'number' && Number.isFinite(v))
+      .map(([k, v]) => `${k}:${pct(v)}`)
+      .join(' ');
   }
 
   _nudgeProbe(deltaSec) {
@@ -525,12 +876,14 @@ export class TUI {
     if (!Number.isFinite(pct) || pct < 1 || pct > 100) {
       this._addLog('Invalid threshold — enter 1–100'); this.mode = 'settings'; if (this.running) this.render(); return;
     }
-    const v = Math.round(pct) / 100;
+    // Tenths of a percent are kept; anything finer is quantised so the stored
+    // value is the one the screen shows.
+    const v = Math.round(pct * 10) / 1000;
     this.config.switchThreshold = v;
     this.am.switchThreshold = v; // apply to the running rotation immediately
     try { await this.saveConfig(this.config); }
     catch (e) { this._addLog(`Failed to save: ${e.message}`); }
-    this._addLog(`Switch threshold set to ${Math.round(v * 100)}%`);
+    this._addLog(`Switch threshold set to ${formatPercent(v)}`);
     this.mode = 'settings';
     if (this.running) this.render();
   }
@@ -539,6 +892,9 @@ export class TUI {
     let secs = parseInt(input, 10);
     if (Number.isNaN(secs) || secs < 0) {
       this._addLog('Invalid interval — enter 0 (off) or seconds'); this.mode = 'settings'; if (this.running) this.render(); return;
+    }
+    if (secs > PROBE_MAX_SECONDS) {
+      this._addLog(`Invalid interval — at most ${PROBE_MAX_SECONDS}s (7 days)`); this.mode = 'settings'; if (this.running) this.render(); return;
     }
     if (secs > 0 && secs < 30) secs = 30; // match the CLI minimum (don't hammer the usage endpoint)
     this.config.quotaProbeSeconds = secs;
@@ -559,8 +915,10 @@ export class TUI {
     // Tab / ←→ (switch only): cycle which route the pick applies to. null = the
     // global default account; each getRoutes() entry = a per-route manual pin.
     // ↑↓ move within the account list, so ←→ are free to move across targets.
-    else if ((k === 'tab' || k === 'right') && this.selAction === 'switch') this._cycleSelRoute(+1);
-    else if (k === 'left' && this.selAction === 'switch') this._cycleSelRoute(-1);
+    // Pins are runtime state of the server's rotation, so attach mode — which
+    // can only ask for the default account — leaves these keys alone.
+    else if ((k === 'tab' || k === 'right') && this.selAction === 'switch' && !this.remote) this._cycleSelRoute(+1);
+    else if (k === 'left' && this.selAction === 'switch' && !this.remote) this._cycleSelRoute(-1);
     else if (k === 'enter') {
       if (this.selAction === 'switch') {
         this._doSwitchSelection();
@@ -592,8 +950,14 @@ export class TUI {
   // retry, rather than silently returning to normal.
   _doSwitchSelection() {
     const acct = this.am.accounts[this.selIdx];
+    // The list can shrink under the cursor between polls in attach mode. Say so
+    // rather than swallowing the keypress.
+    if (!acct) { this.mode = 'normal'; this._addLog('That account is no longer listed'); return; }
+    // Attach mode: the rotation lives in another process, so this is a request
+    // whose result the next poll reflects, not a local assignment.
+    if (this.applySwitch) { this.mode = 'normal'; this._doSwitchRemote(acct); return; }
     if (this.selRoute === null) {
-      this.am.currentIndex = this.selIdx;
+      this.am.setCurrentAccount(this.selIdx);
       this._addLog(`Switched to "${acct.name}"`);
       this.mode = 'normal';
       return;
@@ -614,6 +978,34 @@ export class TUI {
     }
   }
 
+  // Ask the running server to switch. A failure is reported as one, so the
+  // dashboard never implies a switch that the server refused.
+  async _doSwitchRemote(acct) {
+    try {
+      const res = await this.applySwitch(acct.name);
+      // The server resolves the name it was given and echoes what it settled on;
+      // prefer that over what was highlighted here. `eligible: false` means the
+      // switch applied to an account that cannot currently serve requests, which
+      // the row already shows but is worth stating at the moment it is chosen.
+      const name = res?.account ? safeLine(res.account, 64) || acct.name : acct.name;
+      if (res?.eligible === false) {
+        // The server knows WHY — disabled, out of quota, outranked by a
+        // higher-priority account — so quote it rather than restating the
+        // generic case. Control characters and length are clamped: this string
+        // arrives over the wire and is drawn into a fixed-width frame.
+        // The server's reasons are phrased to follow "<name> is ...", so they are
+        // composed that way here too.
+        const given = typeof res.reason === 'string' ? res.reason.replace(/\p{C}/gu, ' ').trim().slice(0, 60) : '';
+        this._addLog(`Switched to "${name}" — ${given ? `it is ${given}` : 'it cannot serve requests right now'}`);
+      } else {
+        this._addLog(`Switched to "${name}"`);
+      }
+    } catch (e) {
+      this._addLog(`Switch failed: ${e.message}`);
+    }
+    if (this.running) this.render();
+  }
+
   // The add chooser is opened from the settings screen (g → Add account), so
   // every exit path returns there.
   _keyAdd(k) {
@@ -623,6 +1015,7 @@ export class TUI {
       this.inputReturn = 'settings';
       this.inputPrompt = 'API key';
       this.inputBuf = '';
+      this.inputSecret = true;
       this.inputCb = v => { if (v) this._doAddKey(v); };
     }
     else if (k === 'esc' || k === 'q') { this.mode = 'settings'; }
@@ -632,10 +1025,10 @@ export class TUI {
     if (k === 'enter') {
       const cb = this.inputCb;
       const v = this.inputBuf;
-      this.mode = this.inputReturn; this.inputCb = null; this.inputBuf = '';
+      this.mode = this.inputReturn; this.inputCb = null; this.inputBuf = ''; this.inputSecret = false;
       cb?.(v);
     }
-    else if (k === 'esc') { this.mode = this.inputReturn; this.inputCb = null; this.inputBuf = ''; }
+    else if (k === 'esc') { this.mode = this.inputReturn; this.inputCb = null; this.inputBuf = ''; this.inputSecret = false; }
     else if (k === 'bs') { this.inputBuf = this.inputBuf.slice(0, -1); }
     else if (k.length === 1) { this.inputBuf += k; }
   }
@@ -704,6 +1097,7 @@ export class TUI {
 
     const resolved = setUpstreamProxy(resolveUpstreamProxy(this.config));
     if (resolved.proxy) this._addLog(`Upstream proxy set to ${describeProxy(resolved.proxy)}`);
+    else if (resolved.source === 'self') this._addLog(`Connecting directly — ${describeSelfProxy(resolved)}`);
     else this._addLog('Upstream proxy cleared — connecting directly');
     this.mode = 'settings';
   }
@@ -749,6 +1143,18 @@ export class TUI {
     if (this.running) this.render();
   }
 
+  async _toggleSessionTitles() {
+    // The shared config object is what a save writes and a reload re-applies,
+    // so it is the record; the store is configured from it, never the reverse.
+    const enabled = !this.sessionTitles.enabled;
+    this.config.sessionTitles = { ...this.config.sessionTitles, enabled };
+    this.sessionTitles.configure(this.config.sessionTitles);
+    try { await this.saveConfig(this.config); }
+    catch (e) { this._addLog(`Failed to save: ${e.message}`); }
+    this._addLog(`Session titles: ${enabled ? 'on' : 'off'}`);
+    if (this.running) this.render();
+  }
+
   async _cycleEventLogging(dir = 1) {
     // Claude Code telemetry display/handling: show → hide → block → show.
     const order = ['show', 'hide', 'block'];
@@ -776,10 +1182,10 @@ export class TUI {
       this._addLog('Importing credentials...');
       const creds = await this._readCredentials('~/.claude/.credentials.json');
       const profile = await this._readProfile(creds.accessToken);
-      const profileOk = profile && !profile.error;
 
-      if (!profileOk) {
-        this._addLog(`Warning: could not fetch profile — ${profile?.error || 'no token'}`);
+      if (!canUpsertOAuthAccount(profile, false)) {
+        this._addLog(`Import refused: could not identify OAuth account — ${profile?.error || 'profile unavailable'}`);
+        return;
       }
 
       let name;
@@ -792,11 +1198,15 @@ export class TUI {
         name = `account-${n}`;
       }
 
+      /** @type {Object<string, any>} */
       const entry = {
         name, type: 'oauth', source: 'import',
-        accountUuid: profile?.accountUuid || null,
-        orgUuid: profile?.orgUuid || null,
-        orgName: profile?.orgName || null,
+        ...oauthIdentityFields(profile),
+        organizationType: profile?.organizationType || null,
+        rateLimitTier: profile?.rateLimitTier || creds.rateLimitTier || null,
+        seatTier: profile?.seatTier || null,
+        hasClaudeMax: profile?.hasClaudeMax ?? null,
+        hasClaudePro: profile?.hasClaudePro ?? null,
         accessToken: creds.accessToken,
         refreshToken: creds.refreshToken,
         expiresAt: creds.expiresAt,
@@ -810,16 +1220,26 @@ export class TUI {
 
       if (idx >= 0) {
         const prev = this.config.accounts[idx];
-        this.config.accounts[idx] = { ...prev, ...entry, name: prev.name };
-        // Update the running account manager entry
-        const amAcct = this.am.accounts.find(a => sameIdentity(a, entry)) || this.am.accounts[idx];
+        this.config.accounts[idx] = updateAccountEntry(prev, entry);
+        // The account to update is the one built from this entry. Identity cannot
+        // answer that: the entry may have matched on a bare name while carrying no
+        // UUID, and then no account matches the freshly profiled identity at all.
+        // Falling back to `accounts[idx]` there applied a CONFIG index to this
+        // list and wrote the new credential and the new UUID onto whichever
+        // account sat at that position — a different person's, once
+        // resolveAccounts has dropped anything ahead of it. An entry with no
+        // running account now updates nothing, which is what there is to do.
+        const amAcct = managerAccountFor(this.am.accounts, prev);
         if (amAcct) {
           amAcct.credential = creds.accessToken;
           amAcct.refreshToken = creds.refreshToken;
           amAcct.expiresAt = creds.expiresAt;
-          amAcct.accountUuid = entry.accountUuid;
-          amAcct.orgUuid = entry.orgUuid;
-          amAcct.orgName = entry.orgName;
+          if (entry.accountUuid) amAcct.accountUuid = entry.accountUuid;
+          if (entry.orgUuid) amAcct.orgUuid = entry.orgUuid;
+          if (entry.orgName) amAcct.orgName = entry.orgName;
+          for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+            amAcct[field] = entry[field];
+          }
           if (amAcct.status === 'error') amAcct.status = 'active';
         }
         this._addLog(`Updated account "${prev.name}"`);
@@ -837,6 +1257,9 @@ export class TUI {
             entry.name = `${name} (${orgLbl(entry)})`;
           }
         }
+        // One object into both lists, so the account is built carrying its
+        // entry's id and the two pair from the moment they exist.
+        entry.id = mintAccountId();
         this.config.accounts.push(entry);
         this.am.addAccount(entry);
         this._addLog(`Imported account "${entry.name}"`);
@@ -851,8 +1274,11 @@ export class TUI {
   async _doAddKey(apiKey) {
     const n = this.config.accounts.filter(a => a.name.startsWith('api-')).length + 1;
     const name = `api-${n}`;
-    this.config.accounts.push({ name, type: 'apikey', apiKey });
-    this.am.addAccount({ name, type: 'apikey', apiKey });
+    // One object, not two equal literals: the account has to be built from the
+    // entry itself to carry its id, which is what pairs the two afterwards.
+    const entry = { id: mintAccountId(), name, type: 'apikey', apiKey };
+    this.config.accounts.push(entry);
+    this.am.addAccount(entry);
     await this.saveConfig(this.config);
     this._addLog(`Added API key account "${name}"`);
   }
@@ -860,8 +1286,21 @@ export class TUI {
   async _doRemove(idx) {
     if (idx < 0 || idx >= this.am.accounts.length) return;
     const name = this.am.accounts[idx].name;
+    // Resolved before removeAccount, which splices this list and renumbers it.
+    // The selected row is a manager index; applying it to the config list
+    // deleted whichever entry sat at that position instead — the credential-less
+    // one resolveAccounts dropped, or a neighbour, either of which leaves the
+    // fleet running an account whose entry is gone.
+    const cfgIdx = configIndexFor(this.config.accounts, this.am.accounts, idx);
     this.am.removeAccount(idx);
-    this.config.accounts.splice(idx, 1);
+    if (cfgIdx >= 0) {
+      // Record the id before the row goes: the save adopts rows that are on disk
+      // and not in memory (an account added by another process since the last
+      // reload), and removal is itself a save — so without this the entry being
+      // deleted would be read back off disk and written straight out again.
+      markAccountRemoved(this.config, this.config.accounts[cfgIdx]?.id);
+      this.config.accounts.splice(cfgIdx, 1);
+    }
     if (this.selIdx >= this.am.accounts.length) this.selIdx = Math.max(0, this.am.accounts.length - 1);
     await this.saveConfig(this.config);
     this._addLog(`Removed account "${name}"`);
@@ -871,30 +1310,48 @@ export class TUI {
     if (idx < 0 || idx >= this.am.accounts.length) return;
     const acct = this.am.accounts[idx];
     const next = !acct.disabled;
+    const cfgIdx = configIndexFor(this.config.accounts, this.am.accounts, idx);
     this.am.setDisabled(idx, next); // re-enabling also clears a stuck error state
     // Write an explicit boolean (not delete): saveConfig merges over the on-disk
     // entry, so a `delete` would leave a stale `disabled: true` from disk intact.
-    if (this.config.accounts[idx]) this.config.accounts[idx].disabled = next;
+    // Onto this account's own entry: a manager index is not a config index, so
+    // the flag used to land on a neighbour and the next save persisted it there,
+    // leaving one account disabled on disk while the operator watched another go
+    // grey on screen.
+    if (cfgIdx >= 0) this.config.accounts[cfgIdx].disabled = next;
     await this.saveConfig(this.config);
     this._addLog(`${next ? 'Disabled' : 'Enabled'} account "${acct.name}"`);
   }
 
   // ── rendering ──────────────────────────────────────
 
-  render() {
+  render({ force = false } = {}) {
     if (!this.running) return;
     // Guard against re-entry: clearing an expired quota logs, and _addLog calls
     // render() again — without this the nested call would render twice.
     if (this._rendering) return;
     this._rendering = true;
     try {
-      this._render();
+      this._render(force);
     } finally {
       this._rendering = false;
     }
   }
 
-  _render() {
+  /**
+   * Write `buf` to the terminal unless it is byte-identical to what is already
+   * there. An idle proxy composes the same screen every tick, and writing it
+   * again costs a wake-up and a terminal round trip to change nothing.
+   */
+  _paint(buf, force) {
+    const stale = Date.now() - (this._lastPaintAt || 0) >= FORCE_REPAINT_MS;
+    if (!force && !stale && buf === this._lastFrame) return;
+    this._lastFrame = buf;
+    this._lastPaintAt = Date.now();
+    process.stdout.write(buf);
+  }
+
+  _render(force = false) {
     // Reset the display the instant a quota window (e.g. 5-hour session) expires,
     // instead of waiting for the next request to clear it.
     this.am.refreshExpiredQuotas();
@@ -902,7 +1359,7 @@ export class TUI {
     const H = process.stdout.rows || 24;
 
     if (W < 40 || H < 8) {
-      process.stdout.write(`${ESC}H${ESC}2JTerminal too small (need 40x8+)\r\n`);
+      this._paint(`${ESC}H${ESC}2JTerminal too small (need 40x8+)\r\n`, force);
       return;
     }
 
@@ -913,9 +1370,14 @@ export class TUI {
     const port = this.config.proxy?.port || 3456;
     const sess = this.am.sessionStats();
     const sessStr = (sess.active || sess.known)
-      ? `${sess.active} sess${this.am.distributeSessions ? green(' dist') : ''}  `
+      ? `${sess.active} sess${this.am.distributeSessions
+        ? green(this.am.distributionMode === 'adaptive' ? ' adapt' : ' dist')
+        : (sess.draining ? yellow(` drain ${sess.draining}`) : '')}  `
       : '';
-    const right = `${sessStr}Port ${port} ${green('▲')} `;
+    // ▼ marks a dashboard that lost contact with the server it polls (attach
+    // mode): what is on screen is the last snapshot, not the current state.
+    const live = this.am.connected === false ? red('▼') : green('▲');
+    const right = `${sessStr}Port ${port} ${live} `;
     lines.push(left + ' '.repeat(Math.max(1, W - vw(left) - vw(right))) + right);
     lines.push(' ' + dim('─'.repeat(W - 2)));
 
@@ -941,29 +1403,110 @@ export class TUI {
     // ── Accounts
     if (this.am.accounts.length === 0) {
       lines.push('');
-      lines.push(yellow('  No accounts configured. Press [g] → Add account.'));
+      // Attach mode cannot add an account, and pointing at a key that does
+      // nothing here would be worse than saying only what is known.
+      lines.push(yellow(this.remote
+        ? '  The server reports no accounts.'
+        : '  No accounts configured. Press [g] → Add account.'));
     } else {
       lines.push('');
-      const showBoth = W >= 70;
-      const bw = showBoth
-        ? Math.max(5, Math.min(20, Math.floor((W - 56) / 2)))
-        : Math.max(5, Math.min(20, W - 45));
 
       // Routes drive the inline markers; general (non-family) routes get a stable
       // column each at the row start so the marker's position identifies the route.
       const routes = this.am.getRoutes();
       const genRoutes = routes.filter(r => routeFamily(r) === null);
+      // Bar width, budgeted PER ROW CATEGORY (#234). A subscription row draws
+      // Ses/Wk and the S7/F7 family bars; an API-key row draws Tok/Req and
+      // nothing else. Neither shares a bar with the other, so the two are laid
+      // out against separate budgets: every subscription row lines up with the
+      // other subscription rows, every API-key row with the other API-key rows,
+      // and an API-key row no longer pays for family columns it never draws (or
+      // for a blocked-family tag only a subscription row can carry). Within a
+      // category the budget is still shared, on purpose: bars line up and equal
+      // lengths mean equal percentages, and the whitespace that costs a row
+      // without a tag is the price of that.
+      //
+      // The budget must count every column the widest row in the category
+      // actually draws, or the row overruns the terminal and fitLine cuts the
+      // tail off — which is how the S7/F7 bars lost the reset countdown they
+      // carry. Three parts beyond the bars themselves:
+      //   - the fixed prefix (marker, name, type, status, first bar label),
+      //   - the route-marker cells, one per general route,
+      //   - 6 columns of label for each bar past the first (`  Wk `, ` ►F7  `).
+      // The `⊘ Sonnet Fable` tag is reserved for only when some account is
+      // actually blocked; the common case where nothing is spends those columns
+      // on the bars instead of leaving the row short of the edge.
+      const categoryOf = a => rowCategory(a.quota);
+      const routeCells = genRoutes.length ? genRoutes.length + 1 : 0;
+      const budgetFor = (members) => {
+        const anyFable = members.some(a => a.quota.unified7dFable != null);
+        const anySonnet = members.some(a => a.quota.unified7dSonnet != null);
+        const tagW = members.reduce((w, a) => {
+          const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key));
+          return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
+        }, 0);
+        // Same rule for the `$`/`$!` money tag: a column the row can draw is a
+        // column the budget has to know about, or the row overflows exactly the
+        // way #228 fixed.
+        const spendW = members.reduce((w, a) => {
+          const tag = spendTag(a.quota);
+          return tag ? Math.max(w, 2 + vw(tag)) : w;
+        }, 0);
+        const fixed = 28 + NAME_MIN + routeCells + tagW + spendW;
+        const roomFor = n => fixed + 6 * (n - 1) + n * BAR_MIN <= W;
+        // The family bars are the first thing to go: below the width where they
+        // fit even at BAR_MIN they would push the row past the edge, and a row
+        // cut mid-bar reads worse than one that simply doesn't draw them (the
+        // `⊘` tag still says which family is barred).
+        // The second shared bar answers to roomFor too, not just to a width
+        // threshold. `W >= 70` alone let the reservations (a 16-column
+        // blocked-family tag on two families, plus route cells) leave less than
+        // BAR_MIN per bar, and the floor below then overrode the budget: two
+        // accounts blocked on both families drew 72 columns at W=70, which
+        // fitLine silently cut (#234).
+        const showBoth = W >= 70 && roomFor(2);
+        const showFamily = showBoth && (anyFable || anySonnet) && roomFor(2 + (anyFable ? 1 : 0) + (anySonnet ? 1 : 0));
+        const nbars = (showBoth ? 2 : 1) + (showFamily ? (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) : 0);
+        // Backstop for the case no count of bars can fix: when even one bar at
+        // BAR_MIN overruns the row, the floor has to yield. A narrow bar reads
+        // worse than a wide one; a row cut mid-bar loses the reset countdown its
+        // tail carries, and does it without saying so.
+        const avail = Math.floor((W - fixed - 6 * (nbars - 1)) / nbars);
+        const bw = avail < BAR_MIN
+          ? Math.max(1, avail)
+          : Math.min(BAR_MAX, avail);
+        const slack = Math.max(0, W - fixed - 6 * (nbars - 1) - nbars * bw);
+        return { bw, showBoth, showFamily, anyFable, anySonnet, slack };
+      };
+      const budgets = new Map();
+      for (const a of this.am.accounts) {
+        const cat = categoryOf(a);
+        if (!budgets.has(cat)) budgets.set(cat, budgetFor(this.am.accounts.filter(m => categoryOf(m) === cat)));
+      }
+      const anyFable = [...budgets.values()].some(b => b.anyFable);
+      const anySonnet = [...budgets.values()].some(b => b.anySonnet);
+
+      // Whatever the chrome and the capped bars leave over goes to the name
+      // column, up to the longest name in the fleet, so a wide terminal shows
+      // whole addresses instead of `a-considerab`. The name column is one width
+      // for the whole table (it is the prefix every row shares), so it grows by
+      // the smallest slack any category has left: `fixed` already reserves
+      // NAME_MIN, so only the surplus past it is spent here, and no category's
+      // rows are pushed past the budget above.
+      const longestName = Math.max(0, ...this.am.accounts.map(a => vw(a.name)));
+      const slack = Math.min(...[...budgets.values()].map(b => b.slack));
+      const nameW = Math.max(NAME_MIN, Math.min(longestName, NAME_MIN + slack));
+
       // The single account each secondary bucket currently routes to (null = none
       // can serve it right now). Marked next to that account's F7/S7 bar — the
       // secondary-quota analogue of ► marking the default route's current account.
-      const anyFable = this.am.accounts.some(a => a.quota.unified7dFable != null);
-      const anySonnet = this.am.accounts.some(a => a.quota.unified7dSonnet != null);
       const familyTarget = {
         fable: anyFable ? this.am.previewRouteIndex('claude-fable-5') : null,
         sonnet: anySonnet ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
       };
       for (let i = 0; i < this.am.accounts.length; i++) {
-        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget));
+        const b = budgets.get(categoryOf(this.am.accounts[i]));
+        lines.push(this._renderAcct(i, b.bw, b.showBoth, routes, genRoutes, familyTarget, b.showFamily, nameW));
       }
     }
 
@@ -971,11 +1514,13 @@ export class TUI {
     // ► marks a route the account serves — next to the F7/S7 bar for a Fable/Sonnet
     // route, at the row start for a general route — bold when it's the route's pin.
 
-    // ── Activity header
+    // ── Activity header. Attach mode sees no request traffic — the server logs
+    // that in its own process — so the pane is named for what it does hold:
+    // messages from the actions taken here.
     lines.push('');
     const ac = this.active.size;
     const acTag = ac > 0 ? `  ${cyan(ac + ' active')}` : '';
-    const aHdr = ` Activity${acTag} `;
+    const aHdr = this.remote ? ' Messages ' : ` Activity${acTag} `;
     lines.push(aHdr + dim('─'.repeat(Math.max(1, W - vw(aHdr)))));
 
     // Active requests
@@ -986,7 +1531,7 @@ export class TUI {
       const m = r.model ? dim(` (${r.model})`) : ''; // filled in as soon as the model is peeked from the stream
       const pin = r.pinned ? dim(' [pin]') : '';
       const a = r.account ? ` → ${r.account}${pin}` : '';
-      lines.push(` ${sp} ${gray(r.t)}  ${sessionTag(r.sessionId)} ${r.method} ${r.path}${m}${a} ${dim(`(${el}s...)`)}`);
+      lines.push(` ${sp} ${gray(r.t)}  ${this._sessionTag(r.sessionId)} ${r.method} ${r.path}${m}${a} ${dim(`(${el}s...)`)}`);
     }
 
     // Completed log
@@ -1011,17 +1556,29 @@ export class TUI {
     }
     // Show cursor only in input mode
     buf += this.mode === 'input' ? `${ESC}?25h` : `${ESC}?25l`;
-    process.stdout.write(buf);
+    this._paint(buf, force);
   }
 
-  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}) {
+  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN) {
     const a = this.am.accounts[idx];
     const isCur = idx === this.am.currentIndex;
     const isSel = this.mode === 'select' && idx === this.selIdx;
 
-    // Prefix: selection marker + current marker
-    const sel = isSel ? cyan('>') : ' ';
+    // Prefix: selection marker + current marker.
+    //
+    // In switch mode with a Fable/Sonnet route as the pin target, the cursor
+    // moves to that family's bar — in front of `F7` / `S7`, where the pin's ►
+    // will land — and the row start keeps a dim `>` so the row stays easy to
+    // find. The move only happens when the row draws that bar; a row without
+    // it keeps the cursor at the start, since there is nothing to point at.
+    const q = a.quota;
+    const selFamily = isSel && this.selAction === 'switch' && this.selRoute ? routeFamily(this.selRoute) : null;
+    const barShown = fam => showBoth && showFamily && q[fam === 'fable' ? 'unified7dFable' : 'unified7dSonnet'] != null;
+    const cursorAt = selFamily && barShown(selFamily) ? selFamily : null;
+    const sel = !isSel ? ' ' : cursorAt ? dim('>') : cyan('>');
     const cur = isCur ? green('►') : ' ';
+    // The column before a family bar's marker: the cursor when it moved here, else the separator space.
+    const famLead = fam => (cursorAt === fam ? cyan('>') : ' ');
 
     // General-route markers: one fixed column per general route (stable order), so
     // the same route always sits in the same slot across accounts. A member shows
@@ -1047,8 +1604,13 @@ export class TUI {
       return routeGlyph(routeColorFn(r?.color), true, pinned);
     };
 
-    // Name (bold if selected)
-    const rawName = a.name.slice(0, 12).padEnd(12);
+    // Name (bold if selected), cut and padded in display columns. A
+    // slice/padEnd pair counts UTF-16 units instead, so a six-character CJK
+    // name keeps all six characters and still collects six columns of padding,
+    // shifting everything after it. truncate stops a column short of the limit
+    // when it drops a wide glyph that would straddle it, so rpad finishes the
+    // cell.
+    const rawName = rpad(truncate(a.name, nameW), nameW);
     const name = isSel ? bold(rawName) : rawName;
 
     // Type
@@ -1068,14 +1630,15 @@ export class TUI {
     status = rpad(status, 10);
 
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
-    const q = a.quota;
-    let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null;
+    let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null, w1 = null, w2 = null;
 
-    if (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null) {
+    if (rowCategory(q) === 'unified') {
       r1 = q.unified5h;
       r2 = q.unified7d;
       t1 = q.unified5hReset;
       t2 = q.unified7dReset;
+      w1 = FIVE_HOUR_MS;
+      w2 = SEVEN_DAY_MS;
     } else {
       l1 = 'Tok';
       l2 = 'Req';
@@ -1087,28 +1650,52 @@ export class TUI {
       t2 = t1;
     }
 
-    let line = ` ${sel}${cur} ${startSlot}${name} ${type} ${status} ${l1} ${bar(r1, bw, t1)}`;
+    // The live routing threshold, so a bucket the rotation already refuses to
+    // use reads red however healthy its pace looks.
+    // Each bar reddens at ITS bucket's threshold (a per-bucket table may set
+    // the weekly one lower than the 5-hour one); the attach-mode manager
+    // mirrors thresholdFor, so both dashboards agree with the gate.
+    const thFor = (k) => (typeof this.am.thresholdFor === 'function' ? this.am.thresholdFor(k) : this.am.switchThreshold);
+    // A per-account cap (accounts[].maxUsage) is the lower ceiling when it is
+    // set, and it is the harder one — past it the account is sent nothing at
+    // all. Reddening at the cap keeps the bar honest about where this account
+    // actually stops. Read straight off the account so the attached dashboard,
+    // which has the payload but no AccountManager, agrees with the server.
+    const limFor = (k) => {
+      const cap = resolveMaxUsage(a.maxUsage, k);
+      const th = thFor(k);
+      return cap == null ? th : (typeof th === 'number' ? Math.min(th, cap) : cap);
+    };
+    const th1 = limFor(r1 === q.unified5h ? 'unified5h' : 'tokens');
+    const th2 = limFor(r2 === q.unified7d ? 'unified7d' : 'requests');
+
+    let line = ` ${sel}${cur} ${startSlot}${name} ${type} ${status} ${l1} ${bar(r1, bw, t1, w1, th1)}`;
     if (showBoth) {
-      line += `  ${l2} ${bar(r2, bw, t2)}`;
+      line += `  ${l2} ${bar(r2, bw, t2, w2, th2)}`;
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
-      if (q.unified7dSonnet != null) {
-        line += ` ${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset)}`;
+      if (showFamily && q.unified7dSonnet != null) {
+        line += `${famLead('sonnet')}${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset, SEVEN_DAY_MS, limFor('unified7dSonnet'))}`;
       }
       // Fable weekly bar — only shown when the usage probe has populated it.
-      if (q.unified7dFable != null) {
-        line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset)}`;
+      if (showFamily && q.unified7dFable != null) {
+        line += `${famLead('fable')}${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, limFor('unified7dFable'))}`;
       }
     }
-    // Explicit "disabled for these models" tag (issue #85): a family whose own
-    // weekly bucket is over the switch threshold can't serve that model even
-    // while the account is otherwise active. A spent shared 5h blocks everything
-    // and is already conveyed by the Ses bar + status, so it's not repeated here.
-    const th = this.am.switchThreshold;
-    const blocked = [];
-    if (q.unified7dSonnet != null && q.unified7dSonnet >= th) blocked.push('Sonnet');
-    if (q.unified7dFable != null && q.unified7dFable >= th) blocked.push('Fable');
+    // Explicit "disabled for these models" tag (issue #85): a family the account
+    // can't serve even while it is otherwise active. A spent shared 5h blocks
+    // everything and is already conveyed by the Ses bar + status, so it's not
+    // repeated here.
+    //
+    // limFor, not thresholdFor: it is min(per-bucket threshold, per-account cap),
+    // so the tag covers both ceilings and still judges each family against its
+    // OWN configured threshold.
+    const blocked = blockedFamilies(q, limFor);
     if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
+    // Money tag last, so it sits at the end of the row where the eye lands after
+    // the bars. Red once real money has moved, yellow while it only could.
+    const money = spendTag(q);
+    if (money) line += `  ${(money === '$!' ? red : yellow)(money)}`;
     return line;
   }
 
@@ -1146,6 +1733,7 @@ export class TUI {
     // ── Activity log
     lines.push(bold('  Activity log') + dim('  — what to do with Claude Code\'s telemetry'));
     lines.push(row(byId('eventlog')));
+    if (byId('sessionTitles')) lines.push(row(byId('sessionTitles')));
     lines.push('');
     // ── Routing
     lines.push(bold('  Routing') + dim('  — pin model families to specific accounts, or block them outright'));
@@ -1189,6 +1777,11 @@ export class TUI {
     lines.push(dim('  off       never use sx.org (API key is kept)'));
     lines.push('');
     lines.push(dim('  TLS stays end-to-end; residential traffic is metered by sx.org.'));
+    if (!key) {
+      lines.push('');
+      lines.push(dim('  No sx.org account yet? Signing up via https://sx.org/c/ufVrLW'));
+      lines.push(dim('  costs nothing extra and supports TeamClaude development.'));
+    }
   }
 
   // ── routes editor ──────────────────────────────────
@@ -1476,7 +2069,9 @@ export class TUI {
   _renderFooter() {
     switch (this.mode) {
       case 'normal':
-        return ` ${bold('s')}witch  ${bold('d')}isable  ${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
+        return this.remote
+          ? ` ${bold('s')}witch  ${bold('R')}eload  ${bold('q')}uit`
+          : ` ${bold('s')}witch  ${bold('d')}isable  ${bold('p')}robe quota  ${bold('R')}eload  ${bold('g')} settings  ${bold('q')}uit`;
       case 'settings':
         return ` ${dim('↑↓')} navigate  ${dim('←→')} change  ${bold('Enter')} edit  ${bold('Esc')} back`;
       case 'routes':
@@ -1488,6 +2083,9 @@ export class TUI {
       case 'blocklist':
         return ` ${dim('↑↓')} select  ${bold('a')}dd  ${bold('d')}elete  ${bold('Esc')} back`;
       case 'select': {
+        if (this.selAction === 'switch' && this.remote) {
+          return ` ${dim('↑↓')} select  ${bold('Enter')} switch  ${bold('Esc')} cancel`;
+        }
         if (this.selAction === 'switch') {
           const target = this.selRoute
             ? routeColorFn(this.selRoute.color)(`route ${this.selRoute.name}`)
@@ -1500,7 +2098,7 @@ export class TUI {
       case 'add':
         return ` ${bold('i')}mport Claude Code  ${bold('k')} API key  ${bold('Esc')} cancel`;
       case 'input':
-        return ` ${this.inputPrompt}: ${this.inputBuf}█`;
+        return ` ${this.inputPrompt}: ${this.inputSecret ? '*'.repeat(this.inputBuf.length) : this.inputBuf}█`;
       default:
         return '';
     }

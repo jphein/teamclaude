@@ -41,7 +41,7 @@ test('POST /teamclaude/switch pins the account by name', async () => {
   await withProxy({}, async (port, am) => {
     const res = await post(port, '/teamclaude/switch', { account: 'b' });
     assert.equal(res.status, 200);
-    assert.equal((await res.json()).currentAccount, 'b');
+    assert.equal((await res.json()).account, 'b');
     assert.equal(am.currentIndex, 1);
   });
 });
@@ -88,22 +88,24 @@ test('POST /teamclaude/account 404s an unknown account', async () => {
 });
 
 test('POST /teamclaude/probe runs the probe hook; 501 when unwired', async () => {
-  await withProxy({ probeNow: async () => 3 }, async (port) => {
+  // `probed` counts the OAuth accounts the fleet-wide refresh covers (none here).
+  await withProxy({ probeQuota: async () => {} }, async (port) => {
     const res = await post(port, '/teamclaude/probe');
     assert.equal(res.status, 200);
-    assert.deepEqual(await res.json(), { ok: true, probed: 3 });
+    assert.deepEqual(await res.json(), { ok: true, probed: 0 });
   });
   await withProxy({}, async (port) => {
     assert.equal((await post(port, '/teamclaude/probe')).status, 501);
   });
 });
 
-test('mutating endpoints reject requests without the CSRF header (403)', async () => {
+test('mutating endpoints reject cross-origin page requests (403)', async () => {
   await withProxy({ persistThreshold: () => {} }, async (port, am) => {
-    // No x-teamclaude-control header → blocked before any state change.
+    // Browser-set Origin / Sec-Fetch-Site from another site → blocked before
+    // any state change (the shared same-origin guard on POST /teamclaude/*).
     const res = await fetch(`http://127.0.0.1:${port}/teamclaude/threshold`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' },
       body: JSON.stringify({ value: 0.5 }),
     });
     assert.equal(res.status, 403);

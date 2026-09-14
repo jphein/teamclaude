@@ -23,9 +23,18 @@ import dns from 'node:dns';
 
 const DNS_TTL = 300_000; // 300s — well above the ~32s record TTL, for resilience
 
-function deliver(opts, cb, ips) {
-  if (opts?.all) cb(null, ips.map((address) => ({ address, family: 4 })));
-  else cb(null, ips[0], 4);
+// Cache entries are [{ address, family }]: A records from c-ares are family 4;
+// the getaddrinfo fallback may hand back both families (a dual-stack
+// `localhost`, a LAN name with an AAAA), and a dial that asks for `all` must
+// see every address with its real family — happy-eyeballs tries each and the
+// operator's error line names each one that refused.
+function deliver(opts, cb, entries) {
+  if (opts?.all) cb(null, entries.map(({ address, family }) => ({ address, family })));
+  else cb(null, entries[0].address, entries[0].family);
+}
+
+function familyOf(address) {
+  return address.includes(':') ? 6 : 4;
 }
 
 export function makeCachedLookup({
@@ -49,10 +58,10 @@ export function makeCachedLookup({
     const queue = [[opts, cb]];
     inflight.set(hostname, queue);
 
-    const settle = (ips) => {
+    const settle = (entries) => {
       inflight.delete(hostname);
-      cache.set(hostname, { ips, expires: now() + ttlMs });
-      for (const [o, c] of queue) deliver(o, c, ips);
+      cache.set(hostname, { ips: entries, expires: now() + ttlMs });
+      for (const [o, c] of queue) deliver(o, c, entries);
     };
     const failAll = (err) => {
       inflight.delete(hostname);
@@ -60,7 +69,7 @@ export function makeCachedLookup({
     };
 
     resolve4(hostname, (err, ips) => {
-      if (!err && ips && ips.length > 0) return settle(ips);
+      if (!err && ips && ips.length > 0) return settle(ips.map((address) => ({ address, family: 4 })));
 
       // Serve stale rather than fail if we ever resolved this host: the
       // last-known-good IP outlives any resolver blip.
@@ -72,12 +81,16 @@ export function makeCachedLookup({
       }
 
       // Cold cache and no A record via c-ares: fall back to getaddrinfo, which
-      // still honors /etc/hosts and the search-domain list (LAN names).
-      fallbackLookup(hostname, { all: true, family: 4 }, (fbErr, addrs) => {
+      // still honors /etc/hosts and the search-domain list (LAN names). Both
+      // families: restricting to IPv4 here hid a dual-stack host's ::1 from
+      // the dial and from the "every address refused" log line.
+      fallbackLookup(hostname, { all: true }, (fbErr, addrs) => {
         if (fbErr || !addrs || addrs.length === 0) {
-          return failAll(err || fbErr || new Error(`no A record for ${hostname}`));
+          return failAll(err || fbErr || new Error(`no address for ${hostname}`));
         }
-        settle(addrs.map((a) => (typeof a === 'string' ? a : a.address)));
+        settle(addrs.map((a) => (typeof a === 'string'
+          ? { address: a, family: familyOf(a) }
+          : { address: a.address, family: a.family || familyOf(a.address) })));
       });
     });
   };

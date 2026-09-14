@@ -24,6 +24,9 @@ on:
 jobs:
   publish:
     name: publish to npm
+    # The npm package is upstream's; a fork has no Trusted Publisher for it and
+    # this job would fail on every push to master.
+    if: github.repository == 'KarpelesLab/teamclaude'
     runs-on: ubuntu-latest
     permissions:
       contents: write   # create the git tag + GitHub release

@@ -154,3 +154,30 @@ test('coalesced waiters all get the fallback answer', () => {
   assert.equal(got[0], '10.0.6.7');
   assert.deepEqual(got[1], [{ address: '10.0.6.7', family: 4 }]);
 });
+
+test('a dual-stack fallback answer keeps every address with its own family', () => {
+  // CI's `localhost` is 127.0.0.1 AND ::1. Forcing family 4 on the fallback hid
+  // the ::1 from a happy-eyeballs dial and from the "every address refused"
+  // log line (connect-error-message tests, skipped on IPv4-only hosts).
+  const { fn, calls } = deferredResolver();
+  const fb = deferredFallback();
+  const lookup = makeCachedLookup({ resolve4: fn, fallbackLookup: fb.fn });
+  let all, first, fam;
+  lookup('localhost', { all: true }, (e, a) => { all = a; });
+  lookup('localhost', {}, (e, a, f) => { first = a; fam = f; });
+  calls[0].cb(new Error('ENOTFOUND'));
+  fb.calls[0].cb(null, [{ address: '127.0.0.1', family: 4 }, { address: '::1', family: 6 }]);
+  assert.deepEqual(all, [{ address: '127.0.0.1', family: 4 }, { address: '::1', family: 6 }]);
+  assert.equal(first, '127.0.0.1');
+  assert.equal(fam, 4);
+
+  // A string-form answer (older lookup shims) is classified by shape.
+  const { fn: fn2, calls: calls2 } = deferredResolver();
+  const fb2 = deferredFallback();
+  const lookup2 = makeCachedLookup({ resolve4: fn2, fallbackLookup: fb2.fn });
+  let out;
+  lookup2('v6only', { all: true }, (e, a) => { out = a; });
+  calls2[0].cb(new Error('ENODATA'));
+  fb2.calls[0].cb(null, ['fd00::7']);
+  assert.deepEqual(out, [{ address: 'fd00::7', family: 6 }]);
+});

@@ -39,6 +39,7 @@ function familyOf(address) {
 
 export function makeCachedLookup({
   resolve4 = dns.resolve4,
+  resolve6 = dns.resolve6,
   fallbackLookup = dns.lookup,
   ttlMs = DNS_TTL,
   now = () => Date.now(),
@@ -68,8 +69,20 @@ export function makeCachedLookup({
       for (const [, c] of queue) c(err);
     };
 
-    resolve4(hostname, (err, ips) => {
-      if (!err && ips && ips.length > 0) return settle(ips.map((address) => ({ address, family: 4 })));
+    // A and AAAA together, one query each, still coalesced per host and
+    // cached as one entry. IPv4 stays first so the dial order is unchanged
+    // for hosts that have both; a host with only one family (or a resolver
+    // that answers ENODATA for the other) is simply that family.
+    let pending = 2;
+    let v4 = [], v6 = [], err4 = null, err6 = null;
+    const onBoth = () => {
+      if (--pending > 0) return;
+      const entries = [
+        ...v4.map((address) => ({ address, family: 4 })),
+        ...v6.map((address) => ({ address, family: 6 })),
+      ];
+      if (entries.length > 0) return settle(entries);
+      const err = err4 || err6;
 
       // Serve stale rather than fail if we ever resolved this host: the
       // last-known-good IP outlives any resolver blip.
@@ -92,7 +105,9 @@ export function makeCachedLookup({
           ? { address: a, family: familyOf(a) }
           : { address: a.address, family: a.family || familyOf(a.address) })));
       });
-    });
+    };
+    resolve4(hostname, (e, ips) => { err4 = e; v4 = (!e && ips) ? ips : []; onBoth(); });
+    resolve6(hostname, (e, ips) => { err6 = e; v6 = (!e && ips) ? ips : []; onBoth(); });
   };
 }
 

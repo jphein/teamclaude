@@ -28,7 +28,7 @@ const DNS_TTL = 300_000; // 300s — well above the ~32s record TTL, for resilie
 // `localhost`, a LAN name with an AAAA), and a dial that asks for `all` must
 // see every address with its real family — happy-eyeballs tries each and the
 // operator's error line names each one that refused.
-/** @typedef {{ address: string, family: 4 | 6 }} Entry */
+/** @typedef {{ address: string, family: number }} Entry */
 /** @typedef {{ all?: boolean, family?: number } | undefined} LookupOpts */
 /** @typedef {(err: Error | null, address?: any, family?: number) => void} LookupCb */
 
@@ -38,7 +38,7 @@ function deliver(opts, cb, entries) {
   else cb(null, entries[0].address, entries[0].family);
 }
 
-/** @param {string} address @returns {4 | 6} */
+/** @param {string} address @returns {number} */
 function familyOf(address) {
   return address.includes(':') ? 6 : 4;
 }
@@ -50,13 +50,20 @@ export function makeCachedLookup({
   ttlMs = DNS_TTL,
   now = () => Date.now(),
 } = {}) {
+  /** @type {Map<string, { ips: Entry[], expires: number }>} */
   const cache = new Map();    // hostname → { ips, expires }
+  /** @type {Map<string, Array<[LookupOpts, LookupCb]>>} */
   const inflight = new Map(); // hostname → [ [opts, cb], ... ] waiters sharing one query
 
-  /** @param {string} hostname @param {LookupOpts | LookupCb} opts @param {LookupCb} [cb] */
-  return function cachedLookup(hostname, opts, cb) {
-    if (typeof opts === 'function') { cb = opts; opts = {}; }
-    if (!cb) throw new TypeError('cachedLookup: callback required');
+  // Typed loosely on purpose: Node's Agent/net `lookup` option types differ
+  // by version, and this function is handed to all of them.
+  /** @param {string} hostname @param {any} optsOrCb @param {any} [maybeCb] */
+  function cachedLookup(hostname, optsOrCb, maybeCb) {
+    /** @type {LookupOpts} */
+    const opts = typeof optsOrCb === 'function' ? {} : (optsOrCb || {});
+    /** @type {LookupCb} */
+    const cb = typeof optsOrCb === 'function' ? optsOrCb : maybeCb;
+    if (typeof cb !== 'function') throw new TypeError('cachedLookup: callback required');
 
     const entry = cache.get(hostname);
     if (entry && entry.expires > now()) return deliver(opts, cb, entry.ips);
@@ -64,6 +71,7 @@ export function makeCachedLookup({
     const waiters = inflight.get(hostname);
     if (waiters) { waiters.push([opts, cb]); return; } // join the in-flight query
 
+    /** @type {Array<[LookupOpts, LookupCb]>} */
     const queue = [[opts, cb]];
     inflight.set(hostname, queue);
 
@@ -121,7 +129,8 @@ export function makeCachedLookup({
     };
     resolve4(hostname, (e, ips) => { err4 = e; v4 = (!e && ips) ? [...ips] : []; onBoth(); });
     resolve6(hostname, (e, ips) => { err6 = e; v6 = (!e && ips) ? [...ips] : []; onBoth(); });
-  };
+  }
+  return cachedLookup;
 }
 
 // The process-wide shared instance. Import THIS everywhere so one host's answer

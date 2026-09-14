@@ -28,11 +28,17 @@ const DNS_TTL = 300_000; // 300s — well above the ~32s record TTL, for resilie
 // `localhost`, a LAN name with an AAAA), and a dial that asks for `all` must
 // see every address with its real family — happy-eyeballs tries each and the
 // operator's error line names each one that refused.
+/** @typedef {{ address: string, family: 4 | 6 }} Entry */
+/** @typedef {{ all?: boolean, family?: number } | undefined} LookupOpts */
+/** @typedef {(err: Error | null, address?: any, family?: number) => void} LookupCb */
+
+/** @param {LookupOpts} opts @param {LookupCb} cb @param {Entry[]} entries */
 function deliver(opts, cb, entries) {
   if (opts?.all) cb(null, entries.map(({ address, family }) => ({ address, family })));
   else cb(null, entries[0].address, entries[0].family);
 }
 
+/** @param {string} address @returns {4 | 6} */
 function familyOf(address) {
   return address.includes(':') ? 6 : 4;
 }
@@ -47,8 +53,10 @@ export function makeCachedLookup({
   const cache = new Map();    // hostname → { ips, expires }
   const inflight = new Map(); // hostname → [ [opts, cb], ... ] waiters sharing one query
 
+  /** @param {string} hostname @param {LookupOpts | LookupCb} opts @param {LookupCb} [cb] */
   return function cachedLookup(hostname, opts, cb) {
     if (typeof opts === 'function') { cb = opts; opts = {}; }
+    if (!cb) throw new TypeError('cachedLookup: callback required');
 
     const entry = cache.get(hostname);
     if (entry && entry.expires > now()) return deliver(opts, cb, entry.ips);
@@ -59,11 +67,13 @@ export function makeCachedLookup({
     const queue = [[opts, cb]];
     inflight.set(hostname, queue);
 
+    /** @param {Entry[]} entries */
     const settle = (entries) => {
       inflight.delete(hostname);
       cache.set(hostname, { ips: entries, expires: now() + ttlMs });
       for (const [o, c] of queue) deliver(o, c, entries);
     };
+    /** @param {Error} err */
     const failAll = (err) => {
       inflight.delete(hostname);
       for (const [, c] of queue) c(err);
@@ -74,7 +84,10 @@ export function makeCachedLookup({
     // for hosts that have both; a host with only one family (or a resolver
     // that answers ENODATA for the other) is simply that family.
     let pending = 2;
-    let v4 = [], v6 = [], err4 = null, err6 = null;
+    /** @type {string[]} */ let v4 = [];
+    /** @type {string[]} */ let v6 = [];
+    /** @type {Error | null} */ let err4 = null;
+    /** @type {Error | null} */ let err6 = null;
     const onBoth = () => {
       if (--pending > 0) return;
       const entries = [
@@ -82,7 +95,7 @@ export function makeCachedLookup({
         ...v6.map((address) => ({ address, family: 6 })),
       ];
       if (entries.length > 0) return settle(entries);
-      const err = err4 || err6;
+      const err = err4 || err6 || new Error(`no address for ${hostname}`);
 
       // Serve stale rather than fail if we ever resolved this host: the
       // last-known-good IP outlives any resolver blip.
@@ -99,15 +112,15 @@ export function makeCachedLookup({
       // the dial and from the "every address refused" log line.
       fallbackLookup(hostname, { all: true }, (fbErr, addrs) => {
         if (fbErr || !addrs || addrs.length === 0) {
-          return failAll(err || fbErr || new Error(`no address for ${hostname}`));
+          return failAll(fbErr || err);
         }
         settle(addrs.map((a) => (typeof a === 'string'
           ? { address: a, family: familyOf(a) }
           : { address: a.address, family: a.family || familyOf(a.address) })));
       });
     };
-    resolve4(hostname, (e, ips) => { err4 = e; v4 = (!e && ips) ? ips : []; onBoth(); });
-    resolve6(hostname, (e, ips) => { err6 = e; v6 = (!e && ips) ? ips : []; onBoth(); });
+    resolve4(hostname, (e, ips) => { err4 = e; v4 = (!e && ips) ? [...ips] : []; onBoth(); });
+    resolve6(hostname, (e, ips) => { err6 = e; v6 = (!e && ips) ? [...ips] : []; onBoth(); });
   };
 }
 

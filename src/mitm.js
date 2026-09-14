@@ -357,7 +357,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         }
         up.destroy(); clientSocket.destroy();
       };
-      const up = net.connect({ port, host, lookup: guardedLookup(clientSocket, { lookup: cachedLookup }) }, () => {
+      const up = net.connect({ port, host, lookup: guardedLookup(clientSocket, { lookup: /** @type {any} */ (cachedLookup) }) }, () => {
         // The lookup already vetted every resolved address; this re-checks the
         // one actually connected (cheap, and independent of how the dial got
         // there). A tunnel back to our own listener — any local address, our

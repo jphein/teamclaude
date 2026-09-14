@@ -58,6 +58,9 @@ export class Warmer {
    * @param {Object} opts
    * @param {number} [opts.intervalMs]
    * @param {Object|null} [opts.schedule]
+   * @param {boolean} [opts.onExhaustion]
+   * @param {'direct'|'claude'} [opts.transport]
+   * @param {typeof fetch} [opts.fetchFn]
    * @param {number} [opts.port]
    * @param {string|null} [opts.apiKey]
    * @param {string} [opts.model]

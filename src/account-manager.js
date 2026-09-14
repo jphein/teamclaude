@@ -335,7 +335,14 @@ export class AccountManager {
     this.switchThreshold = switchThreshold;
     // Listeners for the once-per-window "5h bucket exhausted" event (see
     // on5hExhausted / _note5hExhausted). The keep-warm scheduler subscribes.
+    /** @type {Array<(ev: { account: any, reset: number | null }) => void>} */
     this._on5hExhausted = [];
+    // Skip-reason log throttle (per account) and the session a skip is
+    // attributed to — diagnostics only, see _logSkipReason.
+    /** @type {Map<number, number>} */
+    this._skipLogAt = new Map();
+    /** @type {string | null} */
+    this._skipLogSessionId = null;
     this.setRoutes(routes);
     // Monotonic across every observation, so a stamp read under one move never
     // matches another. Live before the settings, since turning the knob on
@@ -933,7 +940,6 @@ export class AccountManager {
    * Diagnostic only — never changes selection. */
   _logSkipReason(account, model, advisorModel, exclude, detour = null) {
     const now = Date.now();
-    this._skipLogAt ??= new Map();
     if (now < (this._skipLogAt.get(account.index) || 0)) return;
     this._skipLogAt.set(account.index, now + 10_000);
 

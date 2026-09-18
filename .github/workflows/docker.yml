@@ -30,6 +30,9 @@ env:
 jobs:
   docker:
     name: build and push
+    # The ghcr.io image is upstream's; on a fork this job would publish a copy
+    # under the fork owner's namespace on every push to master.
+    if: github.repository == 'KarpelesLab/teamclaude'
     runs-on: ubuntu-latest
     permissions:
       contents: read

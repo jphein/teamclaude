@@ -337,6 +337,8 @@ export class AccountManager {
     // on5hExhausted / _note5hExhausted). The keep-warm scheduler subscribes.
     /** @type {Array<(ev: { account: any, reset: number | null }) => void>} */
     this._on5hExhausted = [];
+    /** @type {Array<(ev: { account: any, reset: number }) => void>} */
+    this._on5hWindowStarted = [];
     // Skip-reason log throttle (per account) and the session a skip is
     // attributed to — diagnostics only, see _logSkipReason.
     /** @type {Map<number, number>} */
@@ -3320,7 +3322,7 @@ export class AccountManager {
     const r5h = resetHeaderMs(headers['anthropic-ratelimit-unified-5h-reset']);
     const r7d = resetHeaderMs(headers['anthropic-ratelimit-unified-7d-reset']);
     if (r5h != null) account.quota.unified5hReset = r5h;
-    this._note5hExhausted(account);
+    this._note5hWindow(account);
     if (r7d != null) account.quota.unified7dReset = r7d;
 
     // Model-scoped weekly bucket — surfaced in headers as `7d_oi` ("7-day,
@@ -3512,7 +3514,7 @@ export class AccountManager {
     if (usage.fiveHour) {
       if (usage.fiveHour.utilization != null) q.unified5h = usage.fiveHour.utilization;
       if (usage.fiveHour.resetAt != null) q.unified5hReset = usage.fiveHour.resetAt;
-      this._note5hExhausted(account);
+      this._note5hWindow(account);
     }
     if (usage.sevenDay) {
       if (usage.sevenDay.utilization != null) {
@@ -3661,6 +3663,54 @@ export class AccountManager {
     return () => { this._on5hExhausted = this._on5hExhausted.filter(f => f !== fn); };
   }
 
+  /**
+   * Subscribe to "an account just started a fresh 5-hour window": fired once
+   * per window, the first time a quota source reports a reset timestamp that
+   * is in the future and differs from the last window this account was seen
+   * in. The first request on a cold account is the typical trigger. A window
+   * restored from disk at startup is the baseline, not an event. Listener
+   * receives { account, reset }.
+   */
+  /** @param {(ev: { account: any, reset: number }) => void} fn */
+  on5hWindowStarted(fn) {
+    this._on5hWindowStarted.push(fn);
+    return () => { this._on5hWindowStarted = this._on5hWindowStarted.filter(f => f !== fn); };
+  }
+
+  /** 5h-window bookkeeping after any quota update: window-started first (the
+   *  new window's start is the event), then exhausted. */
+  /** @param {any} account */
+  _note5hWindow(account) {
+    this._note5hWindowStarted(account);
+    this._note5hExhausted(account);
+  }
+
+  /** @param {any} account */
+  _note5hWindowStarted(account) {
+    const reset = account.quota.unified5hReset;
+    if (!reset || reset <= Date.now()) return;
+    // The two sources round the reset differently (seconds vs ms): within a
+    // minute of the last seen window is the same window, not a new one.
+    const seen = account._5hWindowSeen;
+    if (seen != null && Math.abs(seen - reset) < 60_000) return;
+    account._5hWindowSeen = reset;
+    if (seen === undefined) {
+      // First observation of this account in this process with no restored
+      // baseline: still a real start if the window is fresh (a cold account's
+      // first request), but a window well underway was running before we
+      // looked, so it is a baseline, not an event.
+      const util = account.quota.unified5h;
+      const fresh = util != null && util < this.switchThreshold && reset - Date.now() > 5 * 3600_000 - 10 * 60_000;
+      if (!fresh) return;
+    }
+    if (!this._on5hWindowStarted.length) return;
+    console.log(`[TeamClaude] Account "${account.name}" started a 5h window (resets ${new Date(reset).toLocaleTimeString()})`);
+    for (const fn of this._on5hWindowStarted) {
+      try { fn({ account, reset }); }
+      catch (err) { console.error(`[TeamClaude] 5h-window-started listener failed: ${/** @type {any} */ (err)?.message || err}`); }
+    }
+  }
+
   _note5hExhausted(account) {
     const q = account.quota;
     if (q.unified5h == null || q.unified5h < this.switchThreshold) return;
@@ -3675,7 +3725,7 @@ export class AccountManager {
     console.log(`[TeamClaude] Account "${account.name}" used up its 5h window${reset ? ` (resets ${new Date(reset).toLocaleTimeString()})` : ''}`);
     for (const fn of this._on5hExhausted) {
       try { fn({ account, reset: reset || null }); }
-      catch (err) { console.error(`[TeamClaude] 5h-exhausted listener failed: ${err?.message || err}`); }
+      catch (err) { console.error(`[TeamClaude] 5h-exhausted listener failed: ${/** @type {any} */ (err)?.message || err}`); }
     }
   }
 
@@ -3976,6 +4026,9 @@ export class AccountManager {
       this.concurrencyLearner.restore(account.index, match.adaptive?.concCap);
       // We already know this account's weekly window, so it isn't "probing".
       if (account.quota.unified7dReset != null) account.probing = false;
+      // A restored 5h window was running before this process: baseline for
+      // the window-started event, not an event itself.
+      if (account.quota.unified5hReset != null) /** @type {any} */ (account)._5hWindowSeen = account.quota.unified5hReset;
     }
   }
 

@@ -25,11 +25,16 @@
 //    the wrapper redirecting every spawn to the MITM proxy, base URL ignored).
 //
 // Triggers, independently switchable: an interval (warmupSeconds), a reset
-// schedule (warmupSchedule), and "on exhaustion" (warmOnExhaustion): sweep the
-// moment ANY account uses up its 5h window. Using accounts in sequence
-// otherwise staggers their windows (each starts when rotation first reaches
-// it); warming the rest at the instant one runs out lines their windows up, so
-// by the time the fleet is spent the first refresh is already close.
+// schedule (warmupSchedule), and "align" (warmOnExhaustion): sweep the cold
+// accounts the moment ANY account starts a fresh 5h window or uses one up.
+// Using accounts in sequence otherwise staggers their windows (each starts
+// when rotation first reaches it); starting the rest the instant one starts —
+// and again when one runs out — keeps every window on the same clock, so by
+// the time the fleet is spent the first refresh is already close. A window
+// that merely expired between those moments leaves an account cold until the
+// next one; that is why the start of a window is a trigger and not only the
+// end of one (2026-09-21: two accounts sat cold for 12 h with only the
+// exhaustion trigger).
 
 import { spawn } from 'node:child_process';
 import { encodePinComponent } from './claude-env.js';
@@ -127,8 +132,13 @@ export class Warmer {
     else if (this.intervalMs > 0) this.reschedule(this.intervalMs);
     // Always subscribe; the handler checks the flag at fire time so the mode
     // can be toggled live (setOnExhaustion) without re-wiring.
-    if (!this._unsubscribe && typeof this.am.on5hExhausted === 'function') {
-      this._unsubscribe = this.am.on5hExhausted(({ account }) => this._onExhausted(account));
+    const am = /** @type {any} */ (this.am);
+    if (!this._unsubscribe && typeof am.on5hExhausted === 'function') {
+      const offExhausted = am.on5hExhausted((/** @type {{ account: any }} */ { account }) => this._onExhausted(account));
+      const offStarted = typeof am.on5hWindowStarted === 'function'
+        ? am.on5hWindowStarted((/** @type {{ account: any }} */ { account }) => this._onWindowStarted(account))
+        : () => {};
+      this._unsubscribe = () => { offExhausted(); offStarted(); };
     }
   }
 
@@ -137,13 +147,47 @@ export class Warmer {
     on = !!on;
     if (on === this.onExhaustion) return;
     this.onExhaustion = on;
-    this.log(`[TeamClaude] Warm-on-exhaustion ${on ? 'enabled' : 'disabled'}`);
+    this.log(`[TeamClaude] Keep-warm align (window start / exhaustion) ${on ? 'enabled' : 'disabled'}`);
   }
 
+  /** @param {any} account */
   _onExhausted(account) {
     if (!this.onExhaustion || this._stopped) return;
-    this.log(`[TeamClaude] "${account.name}" used up its 5h window — warming the cold accounts`);
     this.warmAll(`exhaustion:${account.name}`).catch(() => {});
+  }
+
+  /** @param {any} account */
+  _onWindowStarted(account) {
+    if (!this.onExhaustion || this._stopped) return;
+    // A sweep's own warm-ups start windows too; while one is running, those
+    // events are the sweep's doing, not a reason for another.
+    if (this._running) return;
+    this.warmAll(`window-start:${account.name}`).catch(() => {});
+  }
+
+  /** One journal line per sweep naming who is warmed and why the rest are not.
+   *  Nothing is logged for a sweep with nobody to warm — the aligned steady
+   *  state — except for an explicit (manual/interval/schedule) trigger. */
+  /** @param {string} trigger @param {any[]} targets @param {number} now */
+  _describeSweep(trigger, targets, now) {
+    /** @type {string[]} */
+    const skipped = [];
+    for (const account of /** @type {any} */ (this.am).accounts) {
+      if (targets.includes(account)) continue;
+      if (account.type !== 'oauth' || !account.credential || account.upstream) continue;
+      let why;
+      if (account.disabled) why = 'disabled';
+      else if (account.status === 'throttled') why = 'throttled';
+      else if (account.status === 'error' || account.status === 'exhausted') why = account.status;
+      else {
+        const reset = Number(account.quota?.unified5hReset);
+        why = Number.isFinite(reset) && reset > now ? `window running until ${new Date(reset).toLocaleTimeString()}` : 'not eligible';
+      }
+      skipped.push(`"${account.name}" (${why})`);
+    }
+    const who = targets.length ? targets.map((/** @type {any} */ a) => `"${a.name}"`).join(', ') : 'nobody';
+    const rest = skipped.length ? `; leaving ${skipped.join(', ')}` : '';
+    return `[TeamClaude] Keep-warm (${trigger}): warming ${who}${rest}`;
   }
 
   /** Change interval at runtime (0 = off). Warms once immediately when turned on. */
@@ -274,6 +318,8 @@ export class Warmer {
       }
     }
 
+    const fromEvent = trigger.startsWith('exhaustion:') || trigger.startsWith('window-start:');
+    if (targets.length || !fromEvent) this.log(this._describeSweep(trigger, targets, now));
     await this._warmTargets(targets, { generation });
     for (const item of deferred) {
       this._deferWarmAccount(item.account, item.runAt, generation);

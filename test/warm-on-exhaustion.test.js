@@ -173,3 +173,82 @@ test('an explicit model id passes through; bare aliases map to full ids', async 
   await new Warmer(am, { intervalMs: 0, port: 1, model: 'claude-sonnet-5', fetchFn: fetch, log: () => {} }).warmAll();
   assert.equal(JSON.parse(fetch.calls[0].init.body).model, 'claude-sonnet-5');
 });
+
+// ── window-started: the trigger that keeps windows aligned between exhaustions ─
+
+test('a cold account\'s first request starts a window and fires on5hWindowStarted once', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const fired = [];
+  am.on5hWindowStarted(ev => fired.push(ev.account.name));
+  const reset = Date.now() + 5 * 3600_000 - 2000; // a window that just began
+  am.updateQuota(0, headers5h(0.01, reset));
+  assert.deepEqual(fired, ['a']);
+  am.updateQuota(0, headers5h(0.2, reset));       // same window
+  am.updateQuota(0, headers5h(0.3, reset + 800)); // header rounding jitter
+  assert.deepEqual(fired, ['a'], 'one event per window');
+  am.updateQuota(0, headers5h(0.01, reset + 6 * 3600_000)); // the next window
+  assert.deepEqual(fired, ['a', 'a']);
+});
+
+test('a window already well underway when first seen is a baseline, not a start', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  let fired = 0;
+  am.on5hWindowStarted(() => fired++);
+  am.updateQuota(0, headers5h(0.4, Date.now() + 2 * 3600_000)); // 3h into its window
+  assert.equal(fired, 0);
+  am.updateQuota(0, headers5h(0.01, Date.now() + 5 * 3600_000 - 1000)); // then a fresh one
+  assert.equal(fired, 1);
+});
+
+test('a window restored from disk is a baseline; an expired reset never fires', () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  am.restoreQuotaState([{ name: 'a', type: 'oauth', quota: { unified5h: 0.1, unified5hReset: Date.now() + 4 * 3600_000 } }]);
+  let fired = 0;
+  am.on5hWindowStarted(() => fired++);
+  am.updateQuota(0, headers5h(0.2, am.accounts[0].quota.unified5hReset));
+  assert.equal(fired, 0, 'the restored window was running before this process');
+  am.updateQuota(1, headers5h(0, Date.now() - 1000));
+  assert.equal(fired, 0, 'a past reset is not a window');
+});
+
+test('with align on, an account starting a window warms the cold ones — once, not in a cascade', async () => {
+  const am = new AccountManager([oauth('hot'), oauth('cold1'), oauth('cold2')], 0.98);
+  const fetched = [];
+  // The warm-up's own response reports a fresh window for the pinned account,
+  // exactly as the proxy would after forwarding it.
+  const fetchFn = async (url) => {
+    const pin = decodeURIComponent(url.split('/tc-acct/')[1].split('/')[0]);
+    fetched.push(pin);
+    const idx = am.accounts.findIndex(a => a.name === pin);
+    am.updateQuota(idx, headers5h(0.001, Date.now() + 5 * 3600_000 - 500));
+    return { status: 200, text: async () => '{}' };
+  };
+  const logs = [];
+  const warmer = new Warmer(am, { intervalMs: 0, onExhaustion: true, port: 1, fetchFn, log: l => logs.push(l) });
+  warmer.start();
+
+  am.updateQuota(0, headers5h(0.01, Date.now() + 5 * 3600_000 - 1000)); // JP starts on "hot"
+  for (let i = 0; i < 6; i++) await tick();
+
+  assert.deepEqual(fetched.sort(), ['cold1', 'cold2'], 'both cold accounts warmed exactly once');
+  assert.equal(warmer.getStatus().lastTrigger, 'window-start:hot');
+  const sweeps = logs.filter(l => l.includes('Keep-warm (window-start:'));
+  assert.equal(sweeps.length, 1, logs.join('\n'));
+  assert.match(sweeps[0], /warming "cold1", "cold2"; leaving "hot" \(window running until/);
+  warmer.stop();
+});
+
+test('an event sweep with nobody to warm is silent; a manual one says so', async () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  am.accounts[1].quota.unified5hReset = Date.now() + 3600_000;
+  const logs = [];
+  const warmer = new Warmer(am, { intervalMs: 0, onExhaustion: true, port: 1, fetchFn: fakeFetch(200), log: l => logs.push(l) });
+  warmer.start();
+  am.accounts[0].quota.unified5hReset = Date.now() + 3600_000;
+  am.updateQuota(0, headers5h(1, am.accounts[0].quota.unified5hReset)); // a exhausts, b already running
+  await tick(); await tick();
+  assert.equal(logs.filter(l => l.includes('Keep-warm (')).length, 0, logs.join('\n'));
+  await warmer.warmAll('manual');
+  assert.match(logs.at(-1), /Keep-warm \(manual\): warming nobody; leaving "a" \(window running until .*\), "b" \(window running until/);
+  warmer.stop();
+});

@@ -179,7 +179,7 @@ teamclaude threshold 90      # Utilization at which rotation leaves an account
 teamclaude distribute on     # Spread new sessions across equal-priority accounts
 teamclaude probe 300         # Enable background quota refresh (off by default)
 teamclaude warmup 600        # Enable keep-warm (off by default, spends quota)
-teamclaude warmup exhaustion on  # Warm the cold accounts when one uses up its 5h window
+teamclaude warmup align on   # Keep every account's 5h window on the same clock
 teamclaude warmup reset 15:30 --timezone Europe/Moscow
                              # Schedule warm-up for a daily target reset
 teamclaude warmup rolling 15:30 --timezone Europe/Moscow

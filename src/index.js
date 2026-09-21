@@ -1671,27 +1671,27 @@ async function warmupCommand() {
     }
     const cur = config.warmupSeconds || 0;
     console.log(cur > 0 ? `Keep-warm: every ${cur}s` : 'Keep-warm: off');
-    console.log(`Warm on exhaustion: ${config.warmOnExhaustion ? 'on' : 'off'}`);
+    console.log(`Align (warm the cold accounts when any account starts or uses up a 5h window): ${config.warmOnExhaustion ? 'on' : 'off'}`);
     console.log('Set with: teamclaude warmup <off|seconds>');
     console.log('          teamclaude warmup reset HH:MM --timezone Area/City');
     console.log('          teamclaude warmup rolling HH:MM --timezone Area/City');
-    console.log('          teamclaude warmup exhaustion [on|off]   warm the cold accounts when one uses up its 5h window');
+    console.log('          teamclaude warmup align [on|off]        keep every account\'s 5h window on the same clock');
     console.log('Note: warming sends a minimal request per idle account and DOES spend a little quota');
     console.log('(unlike the passive quota probe). It only warms accounts whose 5h window is idle.');
     return;
   }
 
-  if (arg === 'exhaustion') {
+  if (arg === 'align' || arg === 'exhaustion') { // `exhaustion` is the original name of this switch
     const v = args[2] ?? 'on';
     if (v !== 'on' && v !== 'off') {
-      console.error('Usage: teamclaude warmup exhaustion [on|off]');
+      console.error('Usage: teamclaude warmup align [on|off]');
       process.exit(1);
     }
     config.warmOnExhaustion = v === 'on';
     await saveConfig(config);
     console.log(config.warmOnExhaustion
-      ? 'Warm on exhaustion enabled: when any account uses up its 5h window, every cold account gets a minimal request so their windows line up (spends a little quota).'
-      : 'Warm on exhaustion disabled.');
+      ? 'Align enabled: whenever any account starts a fresh 5h window or uses one up, every cold account gets a minimal request so all windows run on the same clock (spends a little quota).'
+      : 'Align disabled.');
     await notifyRunningServer(config);
     return;
   }
@@ -2165,9 +2165,9 @@ Commands:
                       Schedule daily warm-up for a target reset in an IANA zone
   warmup rolling HH:MM --timezone Area/City
                       Anchor a continuous five-hour reset cadence in an IANA zone
-  warmup exhaustion [on|off]
-                      Opt-in: when any account uses up its 5h window, warm the
-                      cold ones right away so their windows line up
+  warmup align [on|off]
+                      Opt-in: when any account starts or uses up a 5h window,
+                      warm the cold ones so every window runs on the same clock
   api <path>          Call an API endpoint with account credentials
   update              Check npm for a newer teamclaude and install it
   version             Print the installed version

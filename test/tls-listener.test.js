@@ -238,6 +238,26 @@ test('a client trusting the BUNDLE (both CAs) completes the handshake — the li
   } finally { srv.close(); server.close(); }
 });
 
+test('the MITM leaf also verifies through the bundle, in either CA order (the other half of a shared name)', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-tls-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const mitm = generateCertChain(['api.anthropic.com']); // MITM chain, default CA name
+  await writeFile(join(dir, 'teamclaude-ca.pem'), mitm.caCertPem);
+  await ensureListenerCerts(['localhost'], dir);
+  const bundle = await readFile(join(dir, CA_BUNDLE), 'utf8');
+  const srv = tls.createServer({ key: mitm.leafKeyPem, cert: mitm.leafCertPem }, (s) => s.end());
+  const port = await new Promise(r => srv.listen(0, '127.0.0.1', () => r(srv.address().port)));
+  try {
+    for (const ca of [bundle, bundle.split(/(?=-----BEGIN CERTIFICATE-----)/).reverse().join('')]) {
+      const ok = await new Promise((resolve) => {
+        const sock = tls.connect({ host: '127.0.0.1', port, ca, servername: 'api.anthropic.com' }, () => { sock.destroy(); resolve(true); });
+        sock.on('error', (e) => resolve(e.code || e.message));
+      });
+      assert.equal(ok, true, 'MITM handshake with the bundle, in either CA order');
+    }
+  } finally { srv.close(); }
+});
+
 test('a listener chain from before the rename (MITM CA name) is regenerated', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'tc-tls-'));
   t.after(() => rm(dir, { recursive: true, force: true }));

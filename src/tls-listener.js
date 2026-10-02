@@ -17,21 +17,20 @@
 // Regenerating the MITM chain mints a new CA, and every client already running
 // with the old one in memory would fail its MITM handshakes; the listener must
 // never cause that. Clients trust both CAs through one bundle file
-// (teamclaude-ca-bundle.pem) that is rewritten whenever either chain changes.
+// (teamclaude-ca-bundle.pem), rewritten by either chain's regeneration path
+// (refreshCaBundle in mitm.js).
 
 import tls from 'node:tls';
 import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
-import { leafCovers } from './mitm.js';
+import { leafCovers, keyMatchesCert, refreshCaBundle, CA_BUNDLE, LISTENER_CA } from './mitm.js';
 
 export const DEFAULT_TLS_PORT = 3443;
-const LISTENER_CA = 'teamclaude-listener-ca.pem';
 const LISTENER_CERT = 'teamclaude-listener.pem';
 const LISTENER_KEY = 'teamclaude-listener.key';
-const MITM_CA = 'teamclaude-ca.pem';
-export const CA_BUNDLE = 'teamclaude-ca-bundle.pem';
+export { CA_BUNDLE };
 
 const certDir = () => dirname(getConfigPath());
 
@@ -78,16 +77,10 @@ async function atomicWrite(path, data, mode) {
   await rename(tmp, path);
 }
 
-/**
- * Rewrite the trust bundle (MITM CA + listener CA) when its content differs.
- * @param {string} dir @param {string} listenerCaPem
- */
-export async function writeCaBundle(dir, listenerCaPem) {
-  const mitm = await readIf(join(dir, MITM_CA));
-  const body = [mitm, listenerCaPem].filter((p) => typeof p === 'string' && p).map((p) => /** @type {string} */ (p).trim() + '\n').join('');
-  const path = join(dir, CA_BUNDLE);
-  if ((await readIf(path)) !== body) await atomicWrite(path, body, 0o644);
-  return path;
+/** Rewrite the trust bundle (MITM CA + listener CA); see refreshCaBundle.
+ * @param {string} dir */
+export async function writeCaBundle(dir) {
+  return /** @type {Promise<string>} */ (refreshCaBundle(dir));
 }
 
 /**
@@ -102,16 +95,17 @@ export async function ensureListenerCerts(hosts, dir = certDir()) {
   let regenerated = false;
   /** @type {{ caPem: string | null, certPem: string | null, keyPem: string | null }} */
   let chain = { caPem, certPem, keyPem };
-  if (!(caPem && certPem && keyPem && leafCovers(caPem, certPem, hosts))) {
+  if (!(caPem && certPem && keyPem && leafCovers(caPem, certPem, hosts) && keyMatchesCert(certPem, keyPem))) {
     const g = generateCertChain(hosts); // CA key discarded, as for the MITM chain
     await mkdir(dir, { recursive: true });
-    await atomicWrite(join(dir, LISTENER_CA), String(g.caCertPem), 0o644);
-    await atomicWrite(join(dir, LISTENER_CERT), String(g.leafCertPem), 0o644);
+    // Key first (see keyMatchesCert): a torn write regenerates next start.
     await atomicWrite(join(dir, LISTENER_KEY), String(g.leafKeyPem), 0o600);
+    await atomicWrite(join(dir, LISTENER_CERT), String(g.leafCertPem), 0o644);
+    await atomicWrite(join(dir, LISTENER_CA), String(g.caCertPem), 0o644);
     chain = { caPem: String(g.caCertPem), certPem: String(g.leafCertPem), keyPem: String(g.leafKeyPem) };
     regenerated = true;
   }
-  const bundlePath = await writeCaBundle(dir, /** @type {string} */ (chain.caPem));
+  const bundlePath = await writeCaBundle(dir);
   return { cert: /** @type {string} */ (chain.certPem), key: /** @type {string} */ (chain.keyPem), caPath: join(dir, LISTENER_CA), bundlePath, regenerated };
 }
 
@@ -146,6 +140,7 @@ export function createTlsListener(httpServer, creds, log = console.error) {
     const who = socket?.remoteAddress || '?';
     const now = Date.now();
     if (now - (lastLog.get(who) || 0) < 60_000) return;
+    if (lastLog.size > 1000) lastLog.clear(); // bounded: one entry per noisy address
     lastLog.set(who, now);
     log(`[TeamClaude] TLS listener: handshake from ${who} failed: ${/** @type {any} */ (err)?.code || err?.message}`);
   });

@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import tls from 'node:tls';
 import https from 'node:https';
 import { generateCertChain, ipSanBytes } from '../src/x509.js';
-import { leafCovers } from '../src/mitm.js';
+import { leafCovers, keyMatchesCert, ensureCerts } from '../src/mitm.js';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
@@ -18,8 +18,11 @@ import {
 // Every certificate this file causes to exist lands in a throwaway config dir,
 // never the operator's ~/.config (the CONNECT test reaches MITM code that
 // mints certificates on demand).
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { after } from 'node:test';
+import { dirname } from 'node:path';
 process.env.TEAMCLAUDE_CONFIG = join(mkdtempSync(join(tmpdir(), 'tc-tls-home-')), 'teamclaude.json');
+after(() => rmSync(dirname(/** @type {string} */ (process.env.TEAMCLAUDE_CONFIG)), { recursive: true, force: true }));
 
 // ── config ───────────────────────────────────────────────────────────────────
 
@@ -159,4 +162,41 @@ test('a client that does not trust the listener CA is refused at the handshake',
     });
     assert.ok(err, 'handshake must fail without the CA');
   });
+});
+
+// ── review findings (Oracle, PR #14) ─────────────────────────────────────────
+
+test('M1: a torn cert/key pair is treated as stale and regenerated, for the listener and the MITM chain', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-tls-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const a = await ensureListenerCerts(['localhost'], dir);
+  const other = generateCertChain(['localhost']);
+  assert.equal(keyMatchesCert(a.cert, a.key), true);
+  assert.equal(keyMatchesCert(a.cert, other.leafKeyPem), false);
+  // Simulate a crash between the renames: new key on disk, old cert.
+  await writeFile(join(dir, 'teamclaude-listener.key'), other.leafKeyPem);
+  const b = await ensureListenerCerts(['localhost'], dir);
+  assert.equal(b.regenerated, true, 'a mismatched pair must not be reused');
+  assert.equal(keyMatchesCert(b.cert, b.key), true);
+  tls.createServer({ key: b.key, cert: b.cert }).close(); // would throw on a mismatch
+
+  // MITM chain: same rule (ensureCerts writes under TEAMCLAUDE_CONFIG's dir).
+  const home = dirname(/** @type {string} */ (process.env.TEAMCLAUDE_CONFIG));
+  const m1 = await ensureCerts(['api.anthropic.com']);
+  await writeFile(join(home, 'teamclaude-leaf.key'), other.leafKeyPem);
+  const m2 = await ensureCerts(['api.anthropic.com']);
+  assert.notEqual(m2.leafCertPem, m1.leafCertPem, 'regenerated');
+  assert.equal(keyMatchesCert(m2.leafCertPem, m2.leafKeyPem), true);
+});
+
+test('M2: the CA bundle follows the MITM chain when it is minted after the listener started', async () => {
+  const home = dirname(/** @type {string} */ (process.env.TEAMCLAUDE_CONFIG));
+  for (const f of ['teamclaude-ca.pem', 'teamclaude-leaf.pem', 'teamclaude-leaf.key']) await rm(join(home, f), { force: true });
+  const l = await ensureListenerCerts(['localhost'], home);
+  let bundle = await readFile(l.bundlePath, 'utf8');
+  assert.equal((bundle.match(/BEGIN CERTIFICATE/g) || []).length, 1, 'only the listener CA before any MITM chain exists');
+  const m = await ensureCerts(['api.anthropic.com']); // lazily minted, as on a first intercepted CONNECT
+  bundle = await readFile(l.bundlePath, 'utf8');
+  assert.ok(bundle.includes(m.caCertPem.trim()), 'the MITM CA joined the bundle');
+  assert.ok(bundle.includes((await readFile(l.caPath, 'utf8')).trim()), 'the listener CA is still there');
 });

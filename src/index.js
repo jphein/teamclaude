@@ -652,15 +652,21 @@ async function serverCommand() {
   const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage);
 
   // Optional TLS listener (proxy.tls): a second port serving the same handlers
-  // over TLS. Validated before anything binds — a malformed block must stop the
-  // start rather than leave off-box keys on the wire in cleartext.
+  // over TLS. A malformed block is reported (log + status) and TLS stays off;
+  // exiting would protect no key — the plain port serves either way — and
+  // would take down every local client over a typo.
   let tlsCfg = null;
+  let tlsConfigError = null;
   try { tlsCfg = resolveTlsConfig(config.proxy); }
-  catch (err) { console.error(`[TeamClaude] ${/** @type {any} */ (err).message}`); process.exit(1); }
+  catch (err) {
+    tlsConfigError = /** @type {any} */ (err).message;
+    console.error(`[TeamClaude] TLS listener not started: ${tlsConfigError}`);
+  }
   /** @type {import('node:tls').Server | null} */
   let tlsServer = null;
   /** @type {Record<string, any> | null} */
-  let tlsStatus = tlsCfg ? { enabled: true, listening: false, port: tlsCfg.port } : null;
+  let tlsStatus = tlsCfg ? { enabled: true, listening: false, port: tlsCfg.port }
+    : tlsConfigError ? { enabled: false, listening: false, error: tlsConfigError } : null;
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
   // remove this handler so a later runtime 'error' isn't misreported as a
   // listen failure and exit the whole proxy.
@@ -680,11 +686,14 @@ async function serverCommand() {
       const tlsHost = cfg.host || bindHost;
       loadListenerCredentials(cfg).then((creds) => {
         const srv = createTlsListener(server, creds);
-        srv.once('error', (err) => {
+        /** @param {Error} err */
+        const onBindError = (err) => {
           console.error(`[TeamClaude] TLS listener on ${tlsHost}:${cfg.port} failed: ${err.message} (plain listener unaffected)`);
           tlsStatus = { ...tlsStatus, listening: false, error: err.message };
-        });
+        };
+        srv.once('error', onBindError);
         srv.listen(cfg.port, tlsHost, () => {
+          srv.removeListener('error', onBindError);
           tlsServer = srv;
           srv.on('error', (err) => console.error(`[TeamClaude] TLS listener error: ${err.message}`));
           tlsStatus = { enabled: true, listening: true, host: tlsHost, port: cfg.port, certificate: creds.source,

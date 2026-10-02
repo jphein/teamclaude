@@ -76,7 +76,9 @@ export function leafCovers(caCertPem, leafCertPem, hosts, now = Date.now()) {
       if (!Number.isFinite(validTo) || validTo - now < MIN_CERT_REMAINING_MS) return false;
     }
     const names = (leaf.subjectAltName || '').split(',').map((s) => s.trim());
-    return hosts.every((h) => names.includes(`DNS:${h}`));
+    // An IP literal is checked against the iPAddress SANs (Node normalises
+    // the spelling); a name against the dNSName entries.
+    return hosts.every((h) => (net.isIP(h) ? leaf.checkIP(h) !== undefined : names.includes(`DNS:${h}`)));
   } catch {
     return false;
   }

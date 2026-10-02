@@ -1,0 +1,162 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { X509Certificate } from 'node:crypto';
+import { mkdtemp, writeFile, readFile, stat, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import tls from 'node:tls';
+import https from 'node:https';
+import { generateCertChain, ipSanBytes } from '../src/x509.js';
+import { leafCovers } from '../src/mitm.js';
+import { AccountManager } from '../src/account-manager.js';
+import { createProxyServer } from '../src/server.js';
+import {
+  resolveTlsConfig, listenerHosts, ensureListenerCerts, loadListenerCredentials, createTlsListener,
+  DEFAULT_TLS_PORT, CA_BUNDLE,
+} from '../src/tls-listener.js';
+
+// Every certificate this file causes to exist lands in a throwaway config dir,
+// never the operator's ~/.config (the CONNECT test reaches MITM code that
+// mints certificates on demand).
+import { mkdtempSync } from 'node:fs';
+process.env.TEAMCLAUDE_CONFIG = join(mkdtempSync(join(tmpdir(), 'tc-tls-home-')), 'teamclaude.json');
+
+// ── config ───────────────────────────────────────────────────────────────────
+
+test('resolveTlsConfig: off unless configured, defaults when on', () => {
+  for (const off of [undefined, null, {}, { tls: false }, { tls: null }, { tls: { enabled: false } }]) {
+    assert.equal(resolveTlsConfig(off), null, JSON.stringify(off));
+  }
+  assert.deepEqual(resolveTlsConfig({ tls: true }), { port: DEFAULT_TLS_PORT, host: null, cert: null, key: null, hosts: [] });
+  assert.deepEqual(resolveTlsConfig({ port: 3456, tls: { port: 3443, hosts: ['10.0.6.107', 'familiar', 'familiar'] } }),
+    { port: 3443, host: null, cert: null, key: null, hosts: ['10.0.6.107', 'familiar'] });
+  assert.deepEqual(resolveTlsConfig({ tls: { cert: '/c.pem', key: '/k.pem', host: '0.0.0.0' } }),
+    { port: DEFAULT_TLS_PORT, host: '0.0.0.0', cert: '/c.pem', key: '/k.pem', hosts: [] });
+});
+
+test('resolveTlsConfig: a malformed block throws instead of silently staying cleartext', () => {
+  const bad = [
+    { tls: 'yes' }, { tls: [] }, { tls: { port: 0 } }, { tls: { port: 70000 } }, { tls: { port: 'x' } },
+    { port: 3456, tls: { port: 3456 } }, { tls: { cert: '/c.pem' } }, { tls: { key: '/k.pem' } },
+    { tls: { hosts: 'familiar' } }, { tls: { hosts: [''] } }, { tls: { host: '' } },
+  ];
+  for (const b of bad) assert.throws(() => resolveTlsConfig(b), undefined, JSON.stringify(b));
+});
+
+test('listenerHosts always covers loopback plus the configured names', () => {
+  assert.deepEqual(listenerHosts({ hosts: ['10.0.6.107', 'localhost'] }), ['localhost', '127.0.0.1', '10.0.6.107']);
+});
+
+// ── IP SANs ──────────────────────────────────────────────────────────────────
+
+test('ipSanBytes packs IPv4 and IPv6 literals and ignores names', () => {
+  assert.deepEqual([...ipSanBytes('10.0.6.107')], [10, 0, 6, 107]);
+  assert.equal(ipSanBytes('::1').length, 16);
+  assert.equal(ipSanBytes('::1')[15], 1);
+  assert.deepEqual([...ipSanBytes('fd00::7')].slice(0, 2), [0xfd, 0x00]);
+  assert.deepEqual([...ipSanBytes('::ffff:10.0.6.107')].slice(12), [10, 0, 6, 107]);
+  assert.equal(ipSanBytes('familiar'), null);
+});
+
+test('a leaf issued for an IP carries an iPAddress SAN a client can verify, and leafCovers checks it', () => {
+  const chain = generateCertChain(['familiar', '10.0.6.107', '::1']);
+  const leaf = new X509Certificate(chain.leafCertPem);
+  assert.equal(leaf.checkIP('10.0.6.107'), '10.0.6.107');
+  assert.equal(leaf.checkIP('::1'), '::1');
+  assert.equal(leaf.checkHost('familiar'), 'familiar');
+  assert.equal(leaf.checkIP('10.0.6.108'), undefined);
+  assert.equal(leafCovers(chain.caCertPem, chain.leafCertPem, ['familiar', '10.0.6.107']), true);
+  assert.equal(leafCovers(chain.caCertPem, chain.leafCertPem, ['10.0.6.108']), false, 'an IP it was not issued for');
+});
+
+// ── the listener's own chain ─────────────────────────────────────────────────
+
+test('ensureListenerCerts: own chain, key 0600, bundle holds both CAs, MITM CA untouched, reused until hosts change', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-tls-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const mitm = generateCertChain(['api.anthropic.com']);
+  await writeFile(join(dir, 'teamclaude-ca.pem'), mitm.caCertPem);
+
+  const a = await ensureListenerCerts(['localhost', '127.0.0.1', '10.0.6.107'], dir);
+  assert.equal(a.regenerated, true);
+  assert.equal((await stat(join(dir, 'teamclaude-listener.key'))).mode & 0o777, 0o600);
+  const bundle = await readFile(join(dir, CA_BUNDLE), 'utf8');
+  assert.ok(bundle.includes(mitm.caCertPem.trim()), 'MITM CA in the bundle');
+  assert.ok(bundle.includes((await readFile(a.caPath, 'utf8')).trim()), 'listener CA in the bundle');
+  assert.equal(await readFile(join(dir, 'teamclaude-ca.pem'), 'utf8'), mitm.caCertPem, 'the MITM CA is never rewritten');
+  assert.ok(new X509Certificate(a.cert).verify(new X509Certificate(await readFile(a.caPath, 'utf8')).publicKey));
+
+  const b = await ensureListenerCerts(['localhost', '127.0.0.1', '10.0.6.107'], dir);
+  assert.equal(b.regenerated, false, 'reused while it covers the hosts');
+  assert.equal(b.cert, a.cert);
+
+  const c = await ensureListenerCerts(['localhost', '127.0.0.1', '10.0.6.200'], dir);
+  assert.equal(c.regenerated, true, 'a new client address means a new certificate');
+  assert.equal(await readFile(join(dir, 'teamclaude-ca.pem'), 'utf8'), mitm.caCertPem);
+});
+
+test('loadListenerCredentials reads operator files when given', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-tls-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const chain = generateCertChain(['proxy.example']);
+  await writeFile(join(dir, 'c.pem'), chain.leafCertPem);
+  await writeFile(join(dir, 'k.pem'), chain.leafKeyPem);
+  const creds = await loadListenerCredentials(resolveTlsConfig({ tls: { cert: join(dir, 'c.pem'), key: join(dir, 'k.pem') } }), dir);
+  assert.equal(creds.source, 'files');
+  assert.equal(creds.cert, chain.leafCertPem);
+});
+
+// ── end to end: the same handlers over TLS ───────────────────────────────────
+
+async function withTlsProxy(fn) {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-tls-'));
+  const am = new AccountManager([{ name: 'a', type: 'apikey', apiKey: 'k1' }], 0.98);
+  const config = { proxy: { apiKey: 'tc-secret' }, upstream: 'http://127.0.0.1:9' };
+  const server = createProxyServer(am, config, {});
+  const creds = await ensureListenerCerts(listenerHosts({ hosts: [] }), dir);
+  const ca = await readFile(creds.caPath, 'utf8');
+  const tlsSrv = createTlsListener(server, creds, () => {});
+  const port = await new Promise(r => tlsSrv.listen(0, '127.0.0.1', () => r(tlsSrv.address().port)));
+  try { await fn({ port, ca }); } finally { tlsSrv.close(); server.close(); await rm(dir, { recursive: true, force: true }); }
+}
+
+test('over TLS, the dashboard and the status gate behave exactly as on the plain port', async () => {
+  await withTlsProxy(async ({ port, ca }) => {
+    const get = (path) => new Promise((resolve, reject) => {
+      https.get({ host: '127.0.0.1', port, path, ca, servername: 'localhost' }, (res) => {
+        let body = ''; res.on('data', d => { body += d; }); res.on('end', () => resolve({ status: res.statusCode, body }));
+      }).on('error', reject);
+    });
+    const ui = await get('/ui');
+    assert.equal(ui.status, 200);
+    assert.match(ui.body, /TeamClaude/);
+    const st = await get('/teamclaude/status');
+    assert.equal(st.status, 200, 'loopback over TLS keeps the loopback exemption (peer address is real)');
+  });
+});
+
+test('over TLS, a CONNECT reaches the proxy\'s connect handler (key travels encrypted)', async () => {
+  await withTlsProxy(async ({ port, ca }) => {
+    const reply = await new Promise((resolve, reject) => {
+      const sock = tls.connect({ host: '127.0.0.1', port, ca, servername: 'localhost' }, () => {
+        const auth = Buffer.from('tc-secret:x').toString('base64');
+        sock.write(`CONNECT www.example.org:443 HTTP/1.1\r\nHost: www.example.org:443\r\nProxy-Authorization: Basic ${auth}\r\n\r\n`);
+      });
+      let buf = '';
+      sock.on('data', d => { buf += d; if (buf.includes('\r\n')) { sock.destroy(); resolve(buf.split('\r\n')[0]); } });
+      sock.on('error', reject);
+      setTimeout(() => { sock.destroy(); resolve(buf || 'no reply'); }, 4000);
+    });
+    assert.match(reply, /^HTTP\/1\.1 200/, reply);
+  });
+});
+
+test('a client that does not trust the listener CA is refused at the handshake', async () => {
+  await withTlsProxy(async ({ port }) => {
+    const err = await new Promise((resolve) => {
+      const sock = tls.connect({ host: '127.0.0.1', port, servername: 'localhost' }, () => { sock.destroy(); resolve(null); });
+      sock.on('error', resolve);
+    });
+    assert.ok(err, 'handshake must fail without the CA');
+  });
+});

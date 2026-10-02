@@ -39,6 +39,24 @@ curl --proxy http://localhost:3456 --cacert ~/.config/teamclaude-ca.pem https://
 # → {"teamclaude":"mitm-proxy-ok","host":"www.example.org",...}
 ```
 
+## TLS listener
+
+A client on another machine authenticates with the proxy key in its proxy URL (`HTTPS_PROXY=http://<key>@host:3456`), and over plain HTTP that key travels on every `CONNECT` in cleartext. `proxy.tls` adds a second port that terminates TLS and serves the same handlers, so the key rides inside the encrypted session.
+
+```json
+"proxy": {
+  "host": "0.0.0.0",
+  "apiKey": "tc-…",
+  "tls": { "port": 3443, "hosts": ["10.0.6.107", "familiar"] }
+}
+```
+
+- **The plain port stays.** Clients on the proxy host keep `http://127.0.0.1:3456`; only off-box clients move to the TLS port.
+- **Certificate.** Without `cert`/`key`, the proxy issues its own listener chain, valid for `localhost`, `127.0.0.1` and every entry in `hosts`. List each name or IP clients actually dial: an IP needs an IP entry. This is a separate CA from the MITM one, so issuing or renewing it never invalidates the MITM certificate that running clients already trust.
+- **Trust.** The proxy writes `teamclaude-ca-bundle.pem` (MITM CA + listener CA) next to its config. Copy it to the client and point `NODE_EXTRA_CA_CERTS` at it, so one file covers both the proxy hop and the intercepted upstream.
+- **Client.** `HTTPS_PROXY=https://<key>@<host>:3443`. Claude Code (verified on 2.1.288) does the TLS handshake with the proxy and sends `CONNECT` with `Proxy-Authorization` inside it. Plain Node 24 `fetch` with `NODE_USE_ENV_PROXY` did not complete the proxy handshake in the same test; other tools need their own check.
+- **Status.** `server.tls` in `teamclaude status --json` reports whether it is listening, on which host and port, and which CA paths clients need.
+
 ## Upstream proxy
 
 For a host that has **no direct route to the internet** — the corporate case, where

@@ -97,3 +97,13 @@ test('GET /teamclaude/status keeps the family buckets the card renders', async (
     assert.equal(quota.unified7dFableReset, fableReset);
   } finally { proxy.close(); }
 });
+
+test('familyBuckets adds any scoped weekly family upstream reports beyond Fable and Sonnet', async () => {
+  const familyBuckets = await loadFamilyBuckets();
+  const bars = familyBuckets({
+    unified7dFable: 0.5, unified7dFableReset: 111,
+    scopedWeekly: { fable: { utilization: 0.5, resetAt: 111 }, haiku: { utilization: 0.2, resetAt: 333 }, mythos: { utilization: null } },
+  });
+  assert.deepEqual(bars.map(b => b.label), ['7d fable', '7d haiku'], 'fable once, a learned family added, a null bucket skipped');
+  assert.equal(bars[1].reset, 333);
+});

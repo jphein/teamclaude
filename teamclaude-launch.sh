@@ -8,11 +8,16 @@
 remote=~/.config/claude-code/teamclaude-remote.env
 if [ -f "$remote" ]; then
   . "$remote"
+  # Fail closed: hand out the key only after an authenticated status check passes.
   if ! curl -sf -m4 --noproxy '*' -H "x-api-key: $TC_KEY" "http://$TC_REMOTE/teamclaude/status" >/dev/null 2>&1; then
-    notify-send -i dialog-warning 'TeamClaude' "Proxy at $TC_REMOTE is not answering"
+    notify-send -i dialog-error 'TeamClaude' "Proxy at $TC_REMOTE is not answering; dashboard not opened"
+    exit 1
   fi
   printf '%s' "$TC_KEY" | wl-copy 2>/dev/null
-  notify-send -i dialog-information 'TeamClaude' 'Proxy key is on the clipboard if the dashboard asks for it'
+  # Don't leave the key on the clipboard: clear it after 45 s unless something else was copied.
+  ( sleep 45; [ "$(wl-paste -n 2>/dev/null)" = "$TC_KEY" ] && wl-copy --clear ) >/dev/null 2>&1 &
+  disown
+  notify-send -i dialog-information 'TeamClaude' 'Proxy key is on the clipboard for 45 s if the dashboard asks for it'
   xdg-open "http://$TC_REMOTE/teamclaude/dashboard" >/dev/null 2>&1
   exit 0
 fi

@@ -473,6 +473,31 @@
   .log-line.log-err  { color: var(--bad); }
   .log-line.log-warn { color: var(--warn); }
 
+  /* ── Problems banner (only when something is wrong) ── */
+  #problems { display: none; margin-bottom: 0.875rem; }
+  #problems > div { padding: 0.55rem 1rem; border-radius: 6px; margin-bottom: 0.4rem; font-size: 0.88rem; border: 1px solid; }
+  #problems .bad  { color: var(--bad);  border-color: var(--bad);  background: color-mix(in srgb, var(--bad) 10%, transparent); }
+  #problems .warn { color: var(--warn); border-color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+
+  /* ── Per-account block reason ── */
+  .card .blocked { font-size: 0.8rem; color: var(--warn); margin: 0.1rem 0 0.35rem; }
+
+  /* ── Status tables (routing, clients, dimensions, sessions) ── */
+  .tables { display: grid; gap: 0.875rem; margin-top: 0.875rem; }
+  .tables .panel { overflow-x: auto; }
+  table.st { width: 100%; border-collapse: collapse; font-size: 0.82rem; font-variant-numeric: tabular-nums; }
+  table.st th { text-align: left; font-weight: 600; color: var(--text-dim); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; padding: 0.3rem 0.5rem; border-bottom: 1px solid var(--panel-border); white-space: nowrap; }
+  table.st td { padding: 0.32rem 0.5rem; border-bottom: 1px solid var(--panel-border); vertical-align: top; }
+  table.st tr:last-child td { border-bottom: 0; }
+  table.st .num { text-align: right; }
+  table.st .dim { color: var(--text-dim); }
+  table.st .tag { color: var(--text-dim); font-size: 0.75rem; margin-left: 0.35rem; }
+  table.st .ok { color: var(--good); }
+  table.st .no, table.st .badt { color: var(--bad); }
+  table.st .warnt { color: var(--warn); }
+  .filters { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; font-size: 0.8rem; color: var(--text-dim); margin-bottom: 0.4rem; }
+  .filters select { background: var(--panel); color: var(--text); border: 1px solid var(--panel-border); border-radius: 4px; padding: 0.15rem 0.3rem; font: inherit; }
+
   /* ── Footer ── */
   .err {
     background: var(--bad);
@@ -504,6 +529,7 @@
   </header>
 
   <div id="errBox"></div>
+  <div id="problems"></div>
 
   <!-- Service manager -->
   <div class="svc">
@@ -517,7 +543,29 @@
     </div>
   </div>
 
+  <div class="svc-stats" id="fleetLine" style="margin:-0.35rem 0 0.875rem 0.25rem"></div>
+
   <div class="cards" id="cards"></div>
+
+  <div class="tables">
+    <div class="panel" id="routesWrap" style="display:none">
+      <div class="panel-hdr"><span class="panel-title">Routing</span></div>
+      <table class="st" id="routes"></table>
+    </div>
+    <div class="panel" id="clientsWrap" style="display:none">
+      <div class="panel-hdr"><span class="panel-title">Clients</span></div>
+      <table class="st" id="clients"></table>
+    </div>
+    <div id="dimensionsWrap" class="tables" style="margin-top:0"></div>
+    <div class="panel" id="sessionsWrap" style="display:none">
+      <div class="panel-hdr"><span class="panel-title">Sessions</span><span class="active-count" id="sessionCount"></span></div>
+      <div class="filters">
+        <label>Project <select id="fProject"></select></label>
+        <label>Client <select id="fClient"></select></label>
+      </div>
+      <table class="st" id="sessions"></table>
+    </div>
+  </div>
 
   <div class="bottom-row">
     <!-- Activity panel -->
@@ -545,6 +593,11 @@
     <span id="meta">Loading…</span>
   </footer>
 </div>
+<script>
+// Shared, tested status helpers from src/dashboard.js — the same code the
+// key-gated /teamclaude/dashboard runs. Injected by the server at this marker.
+/*__TC_SHARED_HELPERS__*/
+</script>
 <script>
   // All DOM construction uses createElement + textContent — never innerHTML with untrusted data.
 
@@ -646,12 +699,22 @@
   // a family bucket, so those cards keep the plain 5h/7d pair.
   function familyBuckets(q) {
     if (!q) return [];
-    return [
-      { key: 'unified7dFable', label: '7d fable' },
-      { key: 'unified7dSonnet', label: '7d sonnet' },
+    const out = [
+      { key: 'unified7dFable', family: 'fable', label: '7d fable' },
+      { key: 'unified7dSonnet', family: 'sonnet', label: '7d sonnet' },
     ]
       .filter(f => q[f.key] != null)
-      .map(f => ({ label: f.label, util: q[f.key], reset: q[f.key + 'Reset'] ?? null }));
+      .map(f => ({ family: f.family, label: f.label, util: q[f.key], reset: q[f.key + 'Reset'] ?? null }));
+    // Families learned from the usage payload's `limits` array (scopedWeekly):
+    // upstream can meter a third family before this page knows its name.
+    const scoped = q.scopedWeekly || {};
+    for (const fam of Object.keys(scoped).sort()) {
+      if (out.some(f => f.family === fam)) continue;
+      const b = scoped[fam] || {};
+      if (b.utilization == null) continue;
+      out.push({ family: fam, label: '7d ' + fam, util: b.utilization, reset: b.resetAt ?? null });
+    }
+    return out.map(({ label, util, reset }) => ({ label, util, reset }));
   }
 
   function makeBar(label, util, threshold, resetTs) {
@@ -668,12 +731,16 @@
     ];
   }
 
-  function renderAccount(acct, isActive, threshold) {
+  function renderAccount(acct, isActive, threshold, mixedProviders) {
     const q = acct.quota;
     const u5h = q.unified5h != null ? q.unified5h
       : (q.tokensLimit ? 1 - q.tokensRemaining / q.tokensLimit : null);
     const u7d = q.unified7d;
-    const totalTok = acct.usage.totalInputTokens + acct.usage.totalOutputTokens;
+    // Cache read/write included: uncached input alone understates Claude Code
+    // traffic by orders of magnitude (shared accountTokens helper).
+    const totalTok = accountTokens(acct.usage);
+    const recent = Number.isFinite(acct.sessions) ? acct.sessions : 0;
+    const known = Number.isFinite(acct.knownSessions) ? acct.knownSessions : 0;
 
     const inFlight = acct.inFlight || 0;
     const nameRow = el('div', { class: 'name' }, [
@@ -692,7 +759,15 @@
         text: f.label.replace('7d ', '') + ' spent',
       })),
       el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', text: acct.type }),
+      mixedProviders ? el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', text: providerLabel(acct.provider) }) : null,
+      el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', title: 'rotation priority (lower is preferred)', text: 'prio ' + (acct.priority || 0) }),
+      recent ? el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', title: 'sessions that used this account recently', text: recent + ' recent' }) : null,
+      known > recent ? el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', title: 'sessions pinned to this account', text: known + ' known' }) : null,
     ]);
+    // Why selection is skipping this account right now (null = it can serve).
+    const blocked = acct.unavailable
+      ? el('div', { class: 'blocked', text: 'blocked: ' + (UNAVAILABLE_TEXT[acct.unavailable] || acct.unavailable) })
+      : null;
     const actions = el('div', { class: 'card-actions' }, [
       el('button', { class: 'switch', 'data-name': acct.name, disabled: isActive || acct.disabled, text: 'Switch' }),
       el('button', {
@@ -716,13 +791,153 @@
       + fmtNum(totalTok) + ' tokens · last used ' + fmtAgo(acct.usage.lastUsed)
       + (acct.rateLimitedUntil ? ' · throttled until ' + new Date(acct.rateLimitedUntil).toLocaleTimeString() : '');
     const meta = el('div', { class: 'meta', text: metaText });
-    return el('div', { class: 'card' + (isActive ? ' active' : '') + (acct.disabled ? ' off' : ''), 'data-name': acct.name }, [nameRow, actions, bars, meta]);
+    return el('div', { class: 'card' + (isActive ? ' active' : '') + (acct.disabled ? ' off' : ''), 'data-name': acct.name }, [nameRow, actions, blocked, bars, meta]);
   }
 
   // ── Error display ────────────────────────────────────────────
   function showErr(msg) {
     errEl.textContent = '';
     if (msg) errEl.appendChild(el('div', { class: 'err', text: msg }));
+  }
+
+  // ── Fleet status panels (shared helpers from src/dashboard.js) ──
+  let lastStatus = null;
+  const sessionFilters = { project: '', client: '' };
+  function td(text, cls) { return el('td', cls ? { class: cls, text } : { text }); }
+  function th(text, num) { return el('th', num ? { class: 'num', text } : { text }); }
+  function fmtAgoTs(v) { return v ? fmtAgo(typeof v === 'number' ? new Date(v).toISOString() : v) : '—'; }
+
+  // Who is current per provider, and how many sessions are live.
+  function renderFleetLine(s) {
+    const line = document.getElementById('fleetLine');
+    line.textContent = '';
+    const cur = s.currentAccounts || null;
+    const providers = cur ? Object.keys(cur).sort((a, b) => a === 'anthropic' ? -1 : b === 'anthropic' ? 1 : a.localeCompare(b)) : [];
+    line.appendChild(el('span', { class: 'svc-title', text: 'Fleet' }));
+    if (providers.length > 1) {
+      for (const p of providers) line.appendChild(el('span', {}, [providerLabel(p) + ' current ', el('b', { text: cur[p] || 'none' })]));
+    } else {
+      line.appendChild(el('span', {}, ['current ', el('b', { text: s.currentAccount || 'none' })]));
+    }
+    const sess = s.sessions || {};
+    line.appendChild(el('span', {}, ['sessions ', el('b', { text: (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known' })]));
+    const w = s.warm || {};
+    if (w.enabled) {
+      const how = [w.intervalSeconds ? 'every ' + w.intervalSeconds + 's' : null, w.onExhaustion ? 'align' : null].filter(Boolean).join(' + ') || 'on';
+      line.appendChild(el('span', {}, ['keep-warm ', el('b', { text: how + (w.lastTrigger ? ' · last ' + w.lastTrigger.split('@')[0] : '') })]));
+    }
+  }
+
+  // Top of the page and only when something is wrong.
+  function renderProblems(s) {
+    const wrap = document.getElementById('problems');
+    const list = problems(s);
+    wrap.textContent = '';
+    wrap.style.display = list.length ? 'block' : 'none';
+    for (const p of list) wrap.appendChild(el('div', { class: p.severity, text: p.text }));
+  }
+
+  // Where each metered family goes right now, and which accounts could take it.
+  function renderRoutes(s) {
+    const wrap = document.getElementById('routesWrap');
+    const rows = routeRows(s);
+    if (!rows.length) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+    const table = document.getElementById('routes');
+    table.textContent = '';
+    table.appendChild(el('tr', {}, [th('Family'), th('Goes to'), th('Can serve it')]));
+    for (const r of rows) {
+      const fam = el('td', {}, [r.label, r.match ? el('span', { class: 'tag', text: r.match }) : null]);
+      const to = el('td', r.blocked ? { class: 'badt' } : {}, [r.blocked ? 'blocked' : (r.target || '—')]);
+      if (r.pinned) to.appendChild(el('span', { class: 'tag', text: ' · pinned to ' + r.pinned }));
+      if (r.pinMismatch) to.appendChild(el('span', { class: 'warnt', text: ' (not eligible)' }));
+      if (r.kind === 'default' && r.target !== r.current) {
+        to.appendChild(el('span', { class: 'warnt', text: r.currentUnavailable
+          ? ' · current account ' + r.current + ' is blocked: ' + (UNAVAILABLE_TEXT[r.currentUnavailable] || r.currentUnavailable)
+          : ' · outranks the current account ' + r.current }));
+      }
+      let can;
+      if (r.kind === 'default') can = td('no route of its own', 'dim');
+      else if (r.blocked || (!r.eligible.length && !r.ineligible.length)) can = td('—');
+      else can = el('td', {}, [
+        el('span', { class: 'ok', text: r.eligible.length + ' of ' + (r.eligible.length + r.ineligible.length) + (r.ineligible.length ? ' ' : '') }),
+        r.ineligible.length ? el('span', { class: 'no', text: r.ineligible.join(', ') }) : null,
+      ]);
+      table.appendChild(el('tr', {}, [fam, to, can]));
+    }
+  }
+
+  // Per-client usage (proxy.clientKeys); hidden when no client has been seen.
+  function renderClients(clients) {
+    const wrap = document.getElementById('clientsWrap');
+    const names = Object.keys(clients || {});
+    if (!names.length) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+    const tot = c => (c.inputTokens || 0) + (c.outputTokens || 0);
+    names.sort((a, b) => tot(clients[b]) - tot(clients[a]));
+    const table = document.getElementById('clients');
+    table.textContent = '';
+    table.appendChild(el('tr', {}, [th('Client'), th('Requests', 1), th('WebSockets', 1), th('Input tok', 1), th('Output tok', 1), th('Last used', 1)]));
+    for (const n of names) {
+      const c = clients[n];
+      table.appendChild(el('tr', {}, [td(n), td(fmtNum(c.requests || 0), 'num'), td(fmtNum(c.connections || 0), 'num'),
+        td(fmtNum(c.inputTokens || 0), 'num'), td(fmtNum(c.outputTokens || 0), 'num'), td(fmtAgoTs(c.lastUsed), 'num')]));
+    }
+  }
+
+  // One table per configured usage dimension (proxy.usageDimensions).
+  function renderDimensions(dimensions) {
+    const wrap = document.getElementById('dimensionsWrap');
+    wrap.textContent = '';
+    for (const name of Object.keys(dimensions || {})) {
+      const entries = dimensions[name] || {};
+      const rows = sortRows(Object.keys(entries).map(key => {
+        const e = entries[key] || {};
+        return { name: key, requests: e.requests || 0, inputTokens: e.inputTokens || 0, outputTokens: e.outputTokens || 0, lastUsed: e.lastUsed ? Date.parse(e.lastUsed) : 0 };
+      }), 'inputTokens', 'desc');
+      if (!rows.length) continue;
+      const title = name.charAt(0).toUpperCase() + name.slice(1);
+      const table = el('table', { class: 'st' }, [el('tr', {}, [th(title), th('Req', 1), th('Input tok', 1), th('Output tok', 1), th('Last used', 1)])]);
+      for (const r of rows) {
+        table.appendChild(el('tr', {}, [td(r.name), td(fmtNum(r.requests), 'num'), td(fmtNum(r.inputTokens), 'num'), td(fmtNum(r.outputTokens), 'num'), td(fmtAgoTs(r.lastUsed), 'num')]));
+      }
+      wrap.appendChild(el('div', { class: 'panel' }, [el('div', { class: 'panel-hdr' }, [el('span', { class: 'panel-title', text: title })]), table]));
+    }
+  }
+
+  // Per-session detail; present only when proxy.sessionDetail is on.
+  function fillSelect(select, values, key) {
+    const keep = sessionFilters[key];
+    select.textContent = '';
+    select.appendChild(el('option', { value: '', text: 'all' }));
+    for (const v of values) select.appendChild(el('option', { value: v, text: v }));
+    select.value = values.includes(keep) ? keep : '';
+    sessionFilters[key] = select.value;
+  }
+  function renderSessions(sessions) {
+    const wrap = document.getElementById('sessionsWrap');
+    if (!sessions || !sessions.items) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+    const all = sessionRows(sessions);
+    fillSelect(document.getElementById('fProject'), uniqSorted(all.map(r => r.project)), 'project');
+    fillSelect(document.getElementById('fClient'), uniqSorted(all.map(r => r.client)), 'client');
+    const rows = sortRows(filterSessionRows(all, sessionFilters), 'lastSeen', 'desc');
+    document.getElementById('sessionCount').textContent = rows.length + ' of ' + all.length;
+    const table = document.getElementById('sessions');
+    table.textContent = '';
+    table.appendChild(el('tr', {}, [th('Session'), th('Client'), th('Project'), th('Accounts'), th('Req', 1), th('Cache read', 1),
+      th('Cache write', 1), th('Input', 1), th('Output', 1), th('Context', 1), th('Last seen', 1)]));
+    for (const r of rows) {
+      table.appendChild(el('tr', {}, [td(String(r.id).slice(0, 8) + (r.active ? '' : ' ·idle'), r.active ? '' : 'dim'), td(r.client || '—'), td(r.project || '—'),
+        td(r.accounts || '—'), td(fmtNum(r.requests), 'num'), td(fmtNum(r.cacheRead), 'num'), td(fmtNum(r.cacheCreation), 'num'),
+        td(fmtNum(r.input), 'num'), td(fmtNum(r.output), 'num'), td(fmtNum(r.context), 'num'), td(fmtAgoTs(r.lastSeen), 'num')]));
+    }
+  }
+  for (const [id, key] of [['fProject', 'project'], ['fClient', 'client']]) {
+    document.getElementById(id).addEventListener('change', e => {
+      sessionFilters[key] = e.target.value;
+      if (lastStatus) renderSessions(lastStatus.sessions);
+    });
   }
 
   // ── Status poll ──────────────────────────────────────────────
@@ -760,10 +975,21 @@
       const cmp = (x, y) => (x === y ? 0 : x < y ? -1 : 1);
       const ordered = [...data.accounts].sort((a, b) =>
         cmp(reset7(a), reset7(b)) || cmp(reset5(a), reset5(b)));
+      // A mixed Claude/Codex fleet has one current account per provider.
+      const currents = data.currentAccounts || null;
+      const isCurrent = a => currents ? currents[a.provider] === a.name : a.name === data.currentAccount;
+      const mixed = new Set(data.accounts.map(a => a.provider || 'anthropic')).size > 1;
       for (const acct of ordered) {
-        cardsEl.appendChild(renderAccount(acct, acct.name === data.currentAccount, data.switchThreshold));
+        cardsEl.appendChild(renderAccount(acct, isCurrent(acct), data.switchThreshold, mixed));
       }
       attachReauthPanel(reauthHadFocus);
+      lastStatus = data;
+      renderFleetLine(data);
+      renderProblems(data);
+      renderRoutes(data);
+      renderClients(data.clients);
+      renderDimensions(data.usageDimensions);
+      renderSessions(data.sessions);
 
       const sv = data.server || {};
       svcStatsEl.textContent = '';

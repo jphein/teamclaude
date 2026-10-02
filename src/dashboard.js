@@ -347,6 +347,26 @@ const SHARED_HELPERS = [
 // would ReferenceError on first render.
 const SHARED_CONSTS = `var STARVED_MIN = ${STARVED_MIN};\nvar STARVED_LIST_MAX = ${STARVED_LIST_MAX};`;
 
+/**
+ * The page-side helpers both dashboards run: the pure functions above plus the
+ * constants they close over. /ui (src/web/index.html) has this injected at its
+ * placeholder by the server, so the two pages render status from one tested
+ * implementation instead of two that drift (the full page was missing the
+ * routing table, problems banner, block reasons and session/client tables the
+ * key-gated page had — 2026-10-02).
+ */
+export function sharedHelpersScript() {
+  return `var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};\n${SHARED_CONSTS}\n\n${SHARED_HELPERS}`;
+}
+
+/** Marker in src/web/index.html that the server replaces with sharedHelpersScript(). */
+export const UI_HELPERS_PLACEHOLDER = '/*__TC_SHARED_HELPERS__*/';
+
+/** /ui's HTML with the shared helpers injected (an absent marker is left alone). */
+export function injectUiHelpers(html) {
+  return html.split(UI_HELPERS_PLACEHOLDER).join(sharedHelpersScript());
+}
+
 const PAGE = `<!doctype html>
 <html lang="en">
 <head>

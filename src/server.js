@@ -19,7 +19,7 @@ import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { safeLine } from './safe-text.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
-import { renderDashboardHtml, dashboardCsp } from './dashboard.js';
+import { renderDashboardHtml, dashboardCsp, injectUiHelpers } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
 import { classificationPath } from './classification-path.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
@@ -468,7 +468,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // GET /ui — the single-page dashboard, cached after first read.
       if (req.method === 'GET' && (req.url === '/ui' || req.url === '/ui/' || req.url === '/ui/index.html')) {
         try {
-          if (dashboardHtml === null) dashboardHtml = await readFile(join(__dirname, 'web', 'index.html'), 'utf-8');
+          if (dashboardHtml === null) dashboardHtml = injectUiHelpers(await readFile(join(__dirname, 'web', 'index.html'), 'utf-8'));
           res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
           res.end(dashboardHtml);
         } catch (err) {

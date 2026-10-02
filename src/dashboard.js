@@ -362,7 +362,8 @@ export function sharedHelpersScript() {
 /** Marker in src/web/index.html that the server replaces with sharedHelpersScript(). */
 export const UI_HELPERS_PLACEHOLDER = '/*__TC_SHARED_HELPERS__*/';
 
-/** /ui's HTML with the shared helpers injected (an absent marker is left alone). */
+/** /ui's HTML with the shared helpers injected (an absent marker is left alone).
+ * @param {string} html */
 export function injectUiHelpers(html) {
   return html.split(UI_HELPERS_PLACEHOLDER).join(sharedHelpersScript());
 }

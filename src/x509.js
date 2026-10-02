@@ -6,6 +6,7 @@
 // the launched claude process trusts via NODE_EXTRA_CA_CERTS. Nothing here is a
 // general-purpose ASN.1 library — just what these two certs need.
 
+import { isIP } from 'node:net';
 import { generateKeyPairSync, sign as cryptoSign, randomBytes } from 'node:crypto';
 
 // ── ASN.1 DER primitives ──────────────────────────────────────
@@ -91,6 +92,31 @@ function keyUsage(bits) {
   return tlv(0x03, Buffer.concat([Buffer.from([unused]), bytes]));
 }
 
+/** Raw bytes for an iPAddress SAN, or null when `s` is not an IP literal.
+ * @param {string} s @returns {Buffer | null} */
+export function ipSanBytes(s) {
+  const v = isIP(s);
+  if (v === 4) return Buffer.from(s.split('.').map(Number));
+  if (v === 6) {
+    // Expand '::' then pack eight 16-bit groups (an embedded IPv4 tail is
+    // folded into the last two groups).
+    let str = s;
+    const m = str.match(/(\d+\.\d+\.\d+\.\d+)$/);
+    if (m) {
+      const b = m[1].split('.').map(Number);
+      str = str.slice(0, -m[1].length) + ((b[0] << 8) | b[1]).toString(16) + ':' + ((b[2] << 8) | b[3]).toString(16);
+    }
+    const [head, tail = null] = str.split('::');
+    const h = head ? head.split(':') : [];
+    const t = tail === null ? [] : (tail ? tail.split(':') : []);
+    const groups = tail === null ? h : [...h, ...Array(8 - h.length - t.length).fill('0'), ...t];
+    const out = Buffer.alloc(16);
+    groups.forEach((g, i) => out.writeUInt16BE(parseInt(g || '0', 16), i * 2));
+    return out;
+  }
+  return null;
+}
+
 function buildCert({ subjectCN, issuerCN, spkiDer, signKey, isCA, altDnsNames = [], days }) {
   const now = new Date();
   const notBefore = new Date(now.getTime() - 60 * 60 * 1000);          // 1h back for clock skew
@@ -104,7 +130,13 @@ function buildCert({ subjectCN, issuerCN, spkiDer, signKey, isCA, altDnsNames = 
   if (!isCA) {
     extList.push(ext('2.5.29.37', false, seq([oid('1.3.6.1.5.5.7.3.1')]))); // extKeyUsage serverAuth
     if (altDnsNames.length) {
-      extList.push(ext('2.5.29.17', false, seq(altDnsNames.map((d) => ctxPrim(2, Buffer.from(d)))))); // SAN dNSName
+      // dNSName [2] for names, iPAddress [7] (4 or 16 raw bytes) for literal
+      // IPs: a client that dials the proxy by address (10.0.6.107) checks the
+      // certificate against an IP SAN, never against a DNS name.
+      extList.push(ext('2.5.29.17', false, seq(altDnsNames.map((/** @type {string} */ d) => {
+        const ip = ipSanBytes(d);
+        return ip ? ctxPrim(7, ip) : ctxPrim(2, Buffer.from(d));
+      }))));
     }
   }
 

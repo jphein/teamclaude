@@ -13,7 +13,7 @@
 //   anything else      → blind tunnel (never to this machine — see forward-target.js).
 
 import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
-import { X509Certificate } from 'node:crypto';
+import { X509Certificate, createPublicKey, randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import net from 'node:net';
 import tls from 'node:tls';
@@ -50,7 +50,9 @@ async function readIf(p) {
 }
 
 async function atomicWrite(path, data, mode) {
-  const tmp = `${path}.tmp${process.pid}`;
+  // pid alone collides when two writes of one file overlap in this process
+  // (two bundle refreshes); the random part keeps each rename its own.
+  const tmp = `${path}.tmp${process.pid}.${randomBytes(4).toString('hex')}`;
   await writeFile(tmp, data, { mode });
   await rename(tmp, path);
 }
@@ -76,10 +78,52 @@ export function leafCovers(caCertPem, leafCertPem, hosts, now = Date.now()) {
       if (!Number.isFinite(validTo) || validTo - now < MIN_CERT_REMAINING_MS) return false;
     }
     const names = (leaf.subjectAltName || '').split(',').map((s) => s.trim());
-    return hosts.every((h) => names.includes(`DNS:${h}`));
+    // An IP literal is checked against the iPAddress SANs (Node normalises
+    // the spelling); a name against the dNSName entries.
+    return hosts.every((h) => (net.isIP(h) ? leaf.checkIP(h) !== undefined : names.includes(`DNS:${h}`)));
   } catch {
     return false;
   }
+}
+
+/**
+ * Does `keyPem` belong to the certificate `certPem`? A crash between the
+ * cert and key renames leaves a pair that verifies against its CA and covers
+ * every host — and still cannot serve a single handshake
+ * (ERR_OSSL_X509_KEY_VALUES_MISMATCH), on every restart, until someone deletes
+ * the files by hand. Treated as stale so it regenerates instead. Exported for
+ * tests.
+ * @param {string} certPem @param {string} keyPem
+ */
+export function keyMatchesCert(certPem, keyPem) {
+  try {
+    const fromCert = new X509Certificate(certPem).publicKey.export({ type: 'spki', format: 'der' });
+    const fromKey = createPublicKey(keyPem).export({ type: 'spki', format: 'der' });
+    return Buffer.compare(fromCert, fromKey) === 0;
+  } catch {
+    return false;
+  }
+}
+
+export const CA_BUNDLE = 'teamclaude-ca-bundle.pem';
+export const LISTENER_CA = 'teamclaude-listener-ca.pem';
+
+/**
+ * Rewrite teamclaude-ca-bundle.pem (MITM CA + TLS-listener CA) in `dir`, when
+ * the listener chain exists and the content differs. Called from BOTH chains'
+ * regeneration paths: a bundle refreshed only at listener start went stale the
+ * moment the MITM chain was minted or renewed later, and off-box clients
+ * trusting it then failed their MITM handshakes.
+ * @param {string} [dir]
+ * @returns {Promise<string | null>} the bundle path, or null without a listener CA
+ */
+export async function refreshCaBundle(dir = certDir()) {
+  const [mitm, listener] = await Promise.all([readIf(join(dir, CA_CERT)), readIf(join(dir, LISTENER_CA))]);
+  if (!listener) return null;
+  const body = [mitm, listener].filter((p) => typeof p === 'string' && p).map((p) => /** @type {string} */ (p).trim() + '\n').join('');
+  const path = join(dir, CA_BUNDLE);
+  if ((await readIf(path)) !== body) await atomicWrite(path, body, 0o644);
+  return path;
 }
 
 /**
@@ -97,15 +141,18 @@ export async function ensureCerts(host) {
     readIf(fpath(CA_CERT)), readIf(fpath(LEAF_CERT)), readIf(fpath(LEAF_KEY)),
   ]);
 
-  if (caCertPem && leafCertPem && leafKeyPem && leafCovers(caCertPem, leafCertPem, hosts)) {
+  if (caCertPem && leafCertPem && leafKeyPem && leafCovers(caCertPem, leafCertPem, hosts) && keyMatchesCert(leafCertPem, leafKeyPem)) {
     return { caPath: fpath(CA_CERT), caCertPem, leafCertPem, leafKeyPem };
   }
 
   const chain = generateCertChain(hosts); // caKeyPem intentionally discarded
   await mkdir(certDir(), { recursive: true });
-  await atomicWrite(fpath(CA_CERT), chain.caCertPem, 0o644);
-  await atomicWrite(fpath(LEAF_CERT), chain.leafCertPem, 0o644);
+  // Key first: a crash after it and before the cert leaves a mismatched pair,
+  // which keyMatchesCert above now treats as stale on the next start.
   await atomicWrite(fpath(LEAF_KEY), chain.leafKeyPem, 0o600);
+  await atomicWrite(fpath(LEAF_CERT), chain.leafCertPem, 0o644);
+  await atomicWrite(fpath(CA_CERT), chain.caCertPem, 0o644);
+  await refreshCaBundle().catch(() => {});
   return {
     caPath: fpath(CA_CERT),
     caCertPem: chain.caCertPem,

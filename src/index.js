@@ -10,6 +10,7 @@ import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, DEFAULT_SWITCH_THRESHOLD, distributionMode } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { createProxyServer } from './server.js';
+import { resolveTlsConfig, loadListenerCredentials, createTlsListener } from './tls-listener.js';
 import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import {
   sameIdentity,
@@ -574,6 +575,8 @@ async function serverCommand() {
       port,
       upstream: config.upstream || 'https://api.anthropic.com',
       eventLoop: eventLoopMonitor.status(),
+      // proxy.tls listener state; null when TLS is not configured.
+      tls: tlsStatus,
     },
     probe: prober?.getStatus() || {
       enabled: false,
@@ -647,6 +650,23 @@ async function serverCommand() {
   });
 
   const server = createProxyServer(accountManager, config, hooks, sx, clientUsage, dimensionUsage);
+
+  // Optional TLS listener (proxy.tls): a second port serving the same handlers
+  // over TLS. A malformed block is reported (log + status) and TLS stays off;
+  // exiting would protect no key — the plain port serves either way — and
+  // would take down every local client over a typo.
+  let tlsCfg = null;
+  let tlsConfigError = null;
+  try { tlsCfg = resolveTlsConfig(config.proxy); }
+  catch (err) {
+    tlsConfigError = /** @type {any} */ (err).message;
+    console.error(`[TeamClaude] TLS listener not started: ${tlsConfigError}`);
+  }
+  /** @type {import('node:tls').Server | null} */
+  let tlsServer = null;
+  /** @type {Record<string, any> | null} */
+  let tlsStatus = tlsCfg ? { enabled: true, listening: false, port: tlsCfg.port }
+    : tlsConfigError ? { enabled: false, listening: false, error: tlsConfigError } : null;
   // Catch bind-time errors (e.g. EADDRINUSE) only. Once the socket is bound we
   // remove this handler so a later runtime 'error' isn't misreported as a
   // listen failure and exit the whole proxy.
@@ -658,6 +678,34 @@ async function serverCommand() {
     // benign runtime handler so a later 'error' is logged rather than thrown.
     server.removeListener('error', onListenError);
     server.on('error', err => console.error(`[TeamClaude] Server error: ${err.message}`));
+    // The TLS port starts only once the plain one is up. A TLS failure (bad
+    // cert path, port in use) is logged and leaves the plain proxy serving:
+    // this process is every local client's proxy too.
+    if (tlsCfg) {
+      const cfg = tlsCfg;
+      const tlsHost = cfg.host || bindHost;
+      loadListenerCredentials(cfg).then((creds) => {
+        const srv = createTlsListener(server, creds);
+        /** @param {Error} err */
+        const onBindError = (err) => {
+          console.error(`[TeamClaude] TLS listener on ${tlsHost}:${cfg.port} failed: ${err.message} (plain listener unaffected)`);
+          tlsStatus = { ...tlsStatus, listening: false, error: err.message };
+        };
+        srv.once('error', onBindError);
+        srv.listen(cfg.port, tlsHost, () => {
+          srv.removeListener('error', onBindError);
+          tlsServer = srv;
+          srv.on('error', (err) => console.error(`[TeamClaude] TLS listener error: ${err.message}`));
+          tlsStatus = { enabled: true, listening: true, host: tlsHost, port: cfg.port, certificate: creds.source,
+            caPath: creds.caPath, caBundlePath: creds.bundlePath };
+          console.log(`[TeamClaude] TLS listener: https://${tlsHost}:${cfg.port} (${creds.source === 'files' ? 'certificate from proxy.tls.cert/key' : 'automatic certificate'}${creds.regenerated ? ', newly issued' : ''})`
+            + (creds.bundlePath ? ` — clients trust ${creds.bundlePath}` : ''));
+        });
+      }).catch((err) => {
+        console.error(`[TeamClaude] TLS listener not started: ${err.message} (plain listener unaffected)`);
+        tlsStatus = { ...tlsStatus, listening: false, error: err.message };
+      });
+    }
     // Announce an egress proxy, especially one inherited from the environment:
     // it changes where every upstream byte goes, and a value nobody typed here
     // should never be in force silently.
@@ -756,6 +804,7 @@ async function serverCommand() {
     // destroy them so server.close() can complete promptly, and hard-exit after a
     // short grace period in case anything still hangs.
     setTimeout(() => process.exit(0), 2000).unref?.();
+    tlsServer?.close();
     server.closeAllConnections?.();
     server.close(() => process.exit(0));
   }

@@ -193,8 +193,8 @@ export function createLeaf(hosts, ca, { days = LEAF_DAYS } = {}) {
  * Generate a fresh CA + a leaf covering `hosts` (string or array). Returns PEM
  * strings. `caDays` / `leafDays` override the default lifetimes (tests).
  */
-export function generateCertChain(hosts, { caDays = CA_DAYS, leafDays = LEAF_DAYS } = {}) {
-  const ca = createCA(undefined, { days: caDays });
+export function generateCertChain(hosts, { caDays = CA_DAYS, leafDays = LEAF_DAYS, caCn = undefined } = {}) {
+  const ca = createCA(caCn, { days: caDays });
   const leaf = createLeaf(hosts, ca, { days: leafDays });
   return {
     caCertPem: ca.certPem,

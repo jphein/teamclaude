@@ -12,7 +12,7 @@ import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
   resolveTlsConfig, listenerHosts, ensureListenerCerts, loadListenerCredentials, createTlsListener,
-  DEFAULT_TLS_PORT, CA_BUNDLE,
+  DEFAULT_TLS_PORT, CA_BUNDLE, LISTENER_CA_CN,
 } from '../src/tls-listener.js';
 
 // Every certificate this file causes to exist lands in a throwaway config dir,
@@ -210,4 +210,42 @@ test('N1: concurrent bundle refreshes in one process never fail on a shared temp
   const results = await Promise.allSettled(Array.from({ length: 60 }, () => refreshCaBundle(dir)));
   assert.equal(results.filter(r => r.status === 'rejected').length, 0);
   assert.equal(((await readFile(join(dir, CA_BUNDLE), 'utf8')).match(/BEGIN CERTIFICATE/g) || []).length, 2);
+});
+
+// ── the CA-name collision (2026-10-02, found in the live deploy) ─────────────
+
+test('a client trusting the BUNDLE (both CAs) completes the handshake — the listener CA has its own name', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-tls-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  // A real MITM CA in the dir, as on any host that has intercepted once.
+  await writeFile(join(dir, 'teamclaude-ca.pem'), generateCertChain(['api.anthropic.com']).caCertPem);
+  const creds = await ensureListenerCerts(listenerHosts({ hosts: [] }), dir);
+  assert.match(new X509Certificate(await readFile(creds.caPath, 'utf8')).subject, new RegExp(`CN=${LISTENER_CA_CN}`));
+  const bundle = await readFile(join(dir, CA_BUNDLE), 'utf8');
+  assert.equal((bundle.match(/BEGIN CERTIFICATE/g) || []).length, 2);
+  const am = new AccountManager([{ name: 'a', type: 'apikey', apiKey: 'k1' }], 0.98);
+  const server = createProxyServer(am, { proxy: { apiKey: 'tc' }, upstream: 'http://127.0.0.1:9' }, {});
+  const srv = createTlsListener(server, creds, () => {});
+  const port = await new Promise(r => srv.listen(0, '127.0.0.1', () => r(srv.address().port)));
+  try {
+    for (const ca of [bundle, bundle.split(/(?=-----BEGIN CERTIFICATE-----)/).reverse().join('')]) {
+      const ok = await new Promise((resolve) => {
+        const sock = tls.connect({ host: '127.0.0.1', port, ca, servername: 'localhost' }, () => { sock.destroy(); resolve(true); });
+        sock.on('error', (e) => resolve(e.code || e.message));
+      });
+      assert.equal(ok, true, 'handshake with the bundle, in either CA order');
+    }
+  } finally { srv.close(); server.close(); }
+});
+
+test('a listener chain from before the rename (MITM CA name) is regenerated', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-tls-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const old = generateCertChain(['localhost', '127.0.0.1']); // default name, as shipped in #14
+  await writeFile(join(dir, 'teamclaude-listener-ca.pem'), old.caCertPem);
+  await writeFile(join(dir, 'teamclaude-listener.pem'), old.leafCertPem);
+  await writeFile(join(dir, 'teamclaude-listener.key'), old.leafKeyPem);
+  const c = await ensureListenerCerts(['localhost', '127.0.0.1'], dir);
+  assert.equal(c.regenerated, true);
+  assert.match(new X509Certificate(await readFile(c.caPath, 'utf8')).subject, new RegExp(`CN=${LISTENER_CA_CN}`));
 });

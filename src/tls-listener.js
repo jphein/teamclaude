@@ -21,7 +21,7 @@
 // (refreshCaBundle in mitm.js).
 
 import tls from 'node:tls';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, X509Certificate } from 'node:crypto';
 import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { getConfigPath } from './config.js';
@@ -29,6 +29,12 @@ import { generateCertChain } from './x509.js';
 import { leafCovers, keyMatchesCert, refreshCaBundle, CA_BUNDLE, LISTENER_CA } from './mitm.js';
 
 export const DEFAULT_TLS_PORT = 3443;
+// Must differ from the MITM CA's name ("TeamClaude Local CA"). The certs carry
+// no key identifiers, so a client trusting the bundle picks a CA by issuer
+// name; two CAs with one name made every listener handshake fail with
+// "certificate signature failure" — the first match was the MITM CA
+// (measured on familiar, 2026-10-02, OpenSSL and Claude Code alike).
+export const LISTENER_CA_CN = 'TeamClaude Listener CA';
 const LISTENER_CERT = 'teamclaude-listener.pem';
 const LISTENER_KEY = 'teamclaude-listener.key';
 export { CA_BUNDLE };
@@ -86,6 +92,13 @@ export async function writeCaBundle(dir) {
   return /** @type {Promise<string>} */ (refreshCaBundle(dir));
 }
 
+/** Was this CA issued under the listener's own name? A chain from before the
+ * rename shares the MITM CA's name and is regenerated.
+ * @param {string} caPem */
+function hasListenerCaName(caPem) {
+  try { return new X509Certificate(caPem).subject.includes(`CN=${LISTENER_CA_CN}`); } catch { return false; }
+}
+
 /**
  * The listener's own chain, reused while it is valid for `hosts` and has life
  * left (same rule as the MITM leaf), regenerated otherwise.
@@ -98,8 +111,8 @@ export async function ensureListenerCerts(hosts, dir = certDir()) {
   let regenerated = false;
   /** @type {{ caPem: string | null, certPem: string | null, keyPem: string | null }} */
   let chain = { caPem, certPem, keyPem };
-  if (!(caPem && certPem && keyPem && leafCovers(caPem, certPem, hosts) && keyMatchesCert(certPem, keyPem))) {
-    const g = generateCertChain(hosts); // CA key discarded, as for the MITM chain
+  if (!(caPem && certPem && keyPem && leafCovers(caPem, certPem, hosts) && keyMatchesCert(certPem, keyPem) && hasListenerCaName(caPem))) {
+    const g = generateCertChain(hosts, { caCn: LISTENER_CA_CN }); // CA key discarded, as for the MITM chain
     await mkdir(dir, { recursive: true });
     // Key first (see keyMatchesCert): a torn write regenerates next start.
     await atomicWrite(join(dir, LISTENER_KEY), String(g.leafKeyPem), 0o600);

@@ -21,6 +21,7 @@
 // (refreshCaBundle in mitm.js).
 
 import tls from 'node:tls';
+import { randomBytes } from 'node:crypto';
 import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { getConfigPath } from './config.js';
@@ -72,7 +73,9 @@ async function readIf(p) {
 
 /** @param {string} path @param {string} data @param {number} mode */
 async function atomicWrite(path, data, mode) {
-  const tmp = `${path}.tmp${process.pid}`;
+  // pid alone collides when two writes of one file overlap in this process
+  // (two bundle refreshes); the random part keeps each rename its own.
+  const tmp = `${path}.tmp${process.pid}.${randomBytes(4).toString('hex')}`;
   await writeFile(tmp, data, { mode });
   await rename(tmp, path);
 }

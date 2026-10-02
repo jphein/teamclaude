@@ -13,7 +13,7 @@
 //   anything else      → blind tunnel (never to this machine — see forward-target.js).
 
 import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
-import { X509Certificate, createPublicKey } from 'node:crypto';
+import { X509Certificate, createPublicKey, randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import net from 'node:net';
 import tls from 'node:tls';
@@ -50,7 +50,9 @@ async function readIf(p) {
 }
 
 async function atomicWrite(path, data, mode) {
-  const tmp = `${path}.tmp${process.pid}`;
+  // pid alone collides when two writes of one file overlap in this process
+  // (two bundle refreshes); the random part keeps each rename its own.
+  const tmp = `${path}.tmp${process.pid}.${randomBytes(4).toString('hex')}`;
   await writeFile(tmp, data, { mode });
   await rename(tmp, path);
 }

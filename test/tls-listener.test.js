@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import tls from 'node:tls';
 import https from 'node:https';
 import { generateCertChain, ipSanBytes } from '../src/x509.js';
-import { leafCovers, keyMatchesCert, ensureCerts } from '../src/mitm.js';
+import { leafCovers, keyMatchesCert, ensureCerts, refreshCaBundle } from '../src/mitm.js';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
@@ -199,4 +199,15 @@ test('M2: the CA bundle follows the MITM chain when it is minted after the liste
   bundle = await readFile(l.bundlePath, 'utf8');
   assert.ok(bundle.includes(m.caCertPem.trim()), 'the MITM CA joined the bundle');
   assert.ok(bundle.includes((await readFile(l.caPath, 'utf8')).trim()), 'the listener CA is still there');
+});
+
+test('N1: concurrent bundle refreshes in one process never fail on a shared temp file', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-tls-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await ensureListenerCerts(['localhost'], dir);
+  await writeFile(join(dir, 'teamclaude-ca.pem'), generateCertChain(['api.anthropic.com']).caCertPem);
+  await rm(join(dir, CA_BUNDLE), { force: true });
+  const results = await Promise.allSettled(Array.from({ length: 60 }, () => refreshCaBundle(dir)));
+  assert.equal(results.filter(r => r.status === 'rejected').length, 0);
+  assert.equal(((await readFile(join(dir, CA_BUNDLE), 'utf8')).match(/BEGIN CERTIFICATE/g) || []).length, 2);
 });

@@ -124,6 +124,11 @@ test('forwardHeaders: headers the Connection header nominates are dropped', () =
   );
 });
 
+test('forwardHeaders: the operator\'s usage-dimension labels stay with the proxy', () => {
+  const cfg = { ...PROXY, usageDimensions: [{ name: 'project', header: 'x-teamclaude-project' }] };
+  assert.deepEqual(forwardHeaders({ 'x-teamclaude-project': 'secret-codename', accept: 'a' }, cfg), { accept: 'a' });
+});
+
 test('end to end: Basic and joined forms are dropped before the target sees them', async () => {
   await withCanary(async ({ proxyPort, url, seen }) => {
     for (const authorization of [

@@ -1069,11 +1069,14 @@ export function forwardHeaders(incoming, proxyConfig) {
   };
   // Headers the client's own Connection header nominates are hop-by-hop too.
   const nominated = new Set(String(incoming?.connection ?? '').split(',').map((t) => t.trim().toLowerCase()).filter(Boolean));
+  // The operator's usage-dimension labels (project, branch, …) are for this
+  // proxy's accounting; the Anthropic path strips them too (ctx.stripHeaders).
+  const labels = usageDimensionHeaderNames(proxyConfig);
   /** @type {import('node:http').OutgoingHttpHeaders} */
   const headers = {};
   for (const [key, value] of Object.entries(incoming || {})) {
     const lk = key.toLowerCase();
-    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection' || nominated.has(lk)) continue;
+    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection' || nominated.has(lk) || labels.has(lk)) continue;
     if (lk === 'x-api-key') continue;
     if (lk === 'authorization' && carriesProxyKey(value)) continue;
     headers[key] = value;

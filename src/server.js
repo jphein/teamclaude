@@ -410,7 +410,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // Dispatched BEFORE the loopback-only checks below: a page cannot make a
       // browser emit an absolute-form request line, the relay injects no fleet
       // credential, and its Host header names the TARGET, not this proxy.
-      if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res); return; }
+      if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res, config.proxy); return; }
 
       // A request admitted ONLY by the loopback exemption — no valid key — is
       // held to two more conditions. Both target the same actor: a web page in
@@ -951,7 +951,11 @@ export function describeConnectError(err) {
 // client's own headers — no account selection, no token injection,
 // content-encoding passed through (a transparent forward proxy). Anthropic is
 // HTTPS-only, so in practice this only ever sees third-party hosts.
-export function relayHttpForward(req, res) {
+//
+// "The client's own headers" excludes the credentials the client presented to
+// THIS proxy (forwardHeaders below): those authenticate to us, and relaying
+// them would hand the proxy key to whichever third-party host the request names.
+export function relayHttpForward(req, res, proxyConfig = undefined) {
   let target;
   try { target = new URL(req.url); } catch {
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -977,14 +981,7 @@ export function relayHttpForward(req, res) {
   if (refused) { refuse(refused); return; }
 
   const transport = target.protocol === 'http:' ? http : https;
-  /** @type {import('node:http').OutgoingHttpHeaders} */
-  const headers = {};
-  for (const [key, value] of Object.entries(req.headers)) {
-    const lk = key.toLowerCase();
-    // Drop hop-by-hop + proxy-control headers; `host` is reset from the target.
-    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection') continue;
-    headers[key] = value;
-  }
+  const headers = forwardHeaders(req.headers, proxyConfig);
 
   const upstreamReq = transport.request(target, { method: req.method, headers, lookup: guardedLookup(req.socket) }, (upstreamRes) => {
     const responseHeaders = {};
@@ -1006,6 +1003,85 @@ export function relayHttpForward(req, res) {
   res.on('close', () => upstreamReq.destroy());
   if (['GET', 'HEAD'].includes(req.method)) upstreamReq.end();
   else req.pipe(upstreamReq);
+}
+
+/**
+ * The headers a plain-HTTP forward sends to its third-party target.
+ *
+ * Dropped: hop-by-hop and proxy-control headers (`host` is reset from the
+ * target), and every credential that authenticates to this proxy rather than
+ * to the target:
+ *   - `x-api-key`: always. On this path it is the proxy key the gate just
+ *     checked (a remote caller cannot reach here without one). A loopback tool
+ *     with an x-api-key of its own for a plain-HTTP third party loses it — an
+ *     accepted compatibility cost: the proxy cannot tell the two apart by name,
+ *     and a missing header is a visible failure at worst while the leak was a
+ *     silent one. Plain-HTTP APIs keyed by x-api-key are not supported through
+ *     HTTP_PROXY.
+ *   - `proxy-authorization`: always (the CONNECT gate's channel; in
+ *     HOP_BY_HOP_HEADERS).
+ *   - ANY header whose name or value contains one of this proxy's keys — in plain text
+ *     (`Bearer <key>`, `Token <key>`, a Digest `username="<key>"`, a custom
+ *     header) or inside a `Basic` payload once decoded — and in any element of
+ *     an array value. Containment rather than matching known credential forms,
+ *     because no list of forms is complete. Keys are long random strings, so a
+ *     target credential that happens to contain one is not a real case; any
+ *     header without a key in it — the client's own credential for the target
+ *     included — passes through, as a transparent forward proxy should.
+ *   - headers the client's `Connection` header nominates (hop-by-hop by
+ *     definition), and the operator's usage-dimension label headers (they
+ *     name what the proxy accounts by; a target that reads a header of the
+ *     same name does not get it through this proxy — the operator chose it).
+ * Nothing is ever added: no account credential is injected on this path.
+ *
+ * Scope: this stops a proxy key the client sent in the clear (in a header's
+ * name or value, or in a Basic payload) from being passed on. It does not stop
+ * an admitted caller who deliberately re-encodes a key (plain base64,
+ * percent-encoding) to send it on: that caller is choosing to disclose it, and
+ * no header filter can recognise every encoding. The substring check is not
+ * constant-time; it runs only for admitted callers, and the keys are long
+ * random strings, so timing it gives no practical way to recover another key.
+ *
+ * @param {import('node:http').IncomingHttpHeaders} incoming
+ * @param {any} proxyConfig
+ * @returns {import('node:http').OutgoingHttpHeaders}
+ */
+export function forwardHeaders(incoming, proxyConfig) {
+  const keys = [proxyConfig?.apiKey, ...(Array.isArray(proxyConfig?.clientKeys) ? proxyConfig.clientKeys.map((/** @type {any} */ e) => e?.key) : [])]
+    .filter((k) => typeof k === 'string' && k.length > 0);
+  // Every `Basic <payload>` in a value, decoded (base64 or base64url), so a key
+  // inside one is visible to the containment check below.
+  /** @param {string} s */
+  const decodedBasics = (s) => [...s.matchAll(/basic\s+([A-Za-z0-9+/_=-]+)/gi)]
+    .map((m) => Buffer.from(m[1], 'base64').toString('utf8'));
+  // Any element of an array value containing a proxy key — in plain text or
+  // in a decoded Basic payload — condemns the whole header.
+  /** @param {unknown} value */
+  const carriesProxyKey = (value) => {
+    if (keys.length === 0) return false;
+    const values = Array.isArray(value) ? value : [value];
+    return values.some((one) => {
+      const s = String(one ?? '');
+      return [s, ...decodedBasics(s)].some((text) => keys.some((k) => text.includes(k)));
+    });
+  };
+  // Headers the client's own Connection header nominates are hop-by-hop too.
+  const nominated = new Set(String(incoming?.connection ?? '').split(',').map((t) => t.trim().toLowerCase()).filter(Boolean));
+  // The operator's usage-dimension labels (project, branch, …) are for this
+  // proxy's accounting; the Anthropic path strips them too (ctx.stripHeaders).
+  const labels = usageDimensionHeaderNames(proxyConfig);
+  /** @type {import('node:http').OutgoingHttpHeaders} */
+  const headers = {};
+  for (const [key, value] of Object.entries(incoming || {})) {
+    const lk = key.toLowerCase();
+    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection' || nominated.has(lk) || labels.has(lk)) continue;
+    if (lk === 'x-api-key') continue;
+    // Names arrive lowercased (Node normalises them) while keys are mixed-case
+    // base64url, so a name is compared case-insensitively; values are not.
+    if (carriesProxyKey(value) || keys.some((k) => lk.includes(k.toLowerCase()))) continue;
+    headers[key] = value;
+  }
+  return headers;
 }
 
 // Paths relayed with the CLIENT's own credential, never a rotated account token.

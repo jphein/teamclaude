@@ -654,12 +654,15 @@
   const appEl = document.getElementById('app');
   const keyInputEl = document.getElementById('keyInput');
   let needKey = false;
-  // The key as entered this page load: the fallback when localStorage is
-  // blocked (private windows, site-data policies), so unlocking still works.
+  // The key as entered this page load. Once set it is authoritative, so a
+  // blocked or read-only localStorage (private windows, site-data policies,
+  // a full quota still holding an old key) cannot make the page send anything
+  // but what the operator just typed.
   let pageKey = '';
 
   function storedKey() {
-    try { return localStorage.getItem(KEY_STORAGE) || pageKey; } catch { return pageKey; }
+    if (pageKey) return pageKey;
+    try { return localStorage.getItem(KEY_STORAGE) || ''; } catch { return ''; }
   }
   // `sentKey` is the key the refused request carried. Requests are concurrent,
   // so a 401 can arrive after the operator has already entered a new key; only
@@ -728,12 +731,15 @@
       try {
         for (;;) {
           const { value, done } = await reader.read();
-          if (done) break;
-          const parsed = sseFrames(buf + decoder.decode(value, { stream: true }));
+          // At the end, flush the decoder and let a held-back CR count.
+          const parsed = done
+            ? sseFrames(buf + decoder.decode(), true)
+            : sseFrames(buf + decoder.decode(value, { stream: true }));
           buf = parsed.rest;
           for (const data of parsed.events) {
             try { onData(JSON.parse(data)); } catch { /* one bad frame must not end the stream */ }
           }
+          if (done) break;
         }
       } catch { /* dropped mid-stream, or stopped: reconnect below unless stopped */ }
       retry(3000);

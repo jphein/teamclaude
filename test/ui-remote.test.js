@@ -274,6 +274,23 @@ test('sseFrames parses complete events and keeps the partial tail', () => {
     assert.deepEqual([...p1.events, ...p2.events], ['{"a":1}\n{"b":2}', '"z"'], `cut at ${cut}`);
     assert.equal(p2.rest, '');
   }
+  // CR-only framing: the final CR is held mid-stream, and counts at the end.
+  assert.deepEqual(sseFrames('data: {"ok":true}\r\r'), { events: [], rest: 'data: {"ok":true}\n\r' });
+  assert.deepEqual(sseFrames('data: {"ok":true}\n\r', true).events, ['{"ok":true}']);
+  // At the end an unterminated event is still dropped, not dispatched.
+  assert.deepEqual(sseFrames('data: {"partial"', true).events, []);
+});
+
+test('an entered key wins over storage that still holds an old key and will not change', async () => {
+  const page = await bootPage({ readOnlyStorage: 'stale-key' });
+  const boot = page.take();
+  assert.ok(boot.every(f => f.key === 'stale-key'), 'boots with what storage holds');
+  assert.equal(page.elements.get('keybox').style.display, 'block');
+  page.auto401 = false;
+  await page.unlock('fresh-key');
+  const after = page.take();
+  assert.deepEqual(after.map(f => f.url).sort(), BOOT_URLS);
+  assert.ok(after.every(f => f.key === 'fresh-key'), JSON.stringify(after));
 });
 
 test('script hashes are taken over LF-normalised text, as a browser computes them', () => {
@@ -289,7 +306,7 @@ test('script hashes are taken over LF-normalised text, as a browser computes the
 // Runs the real /ui scripts in a vm with a stub DOM, storage and fetch. Every
 // fetch is recorded with the key it carried; `auto401` answers each with a 401
 // at once, otherwise the call stays pending until the test settles it.
-async function bootPage({ storageThrows = false } = {}) {
+async function bootPage({ storageThrows = false, readOnlyStorage = null } = {}) {
   const html = injectUiHelpers(await readFile(UI, 'utf8'));
   const elements = new Map();
   const makeEl = (id) => {
@@ -315,7 +332,10 @@ async function bootPage({ storageThrows = false } = {}) {
   const blocked = () => { throw new Error('SecurityError: storage blocked'); };
   const localStorage = storageThrows
     ? { getItem: blocked, setItem: blocked, removeItem: blocked }
-    : {
+    : readOnlyStorage !== null
+      // Reads work and return an old key; every write throws (a full quota).
+      ? { getItem: () => readOnlyStorage, setItem: blocked, removeItem: blocked }
+      : {
         getItem: (k) => (store.has(k) ? store.get(k) : null),
         setItem: (k, v) => store.set(k, String(v)),
         removeItem: (k) => store.delete(k),

@@ -266,15 +266,18 @@ export function withKey(init, key) {
 // send a header, so /ui reads its activity and log streams with fetch and the
 // key in x-api-key instead. Feed it the buffered text; it returns the `data`
 // payload of every complete event, and the unconsumed tail to keep buffering.
+// `atEnd` is the stream's last call: nothing follows, so a trailing CR is a
+// line ending in its own right. An unterminated event is still not dispatched.
 /**
  * @param {string | null | undefined} buffer
+ * @param {boolean} [atEnd]
  * @returns {{ events: string[], rest: string }}
  */
-export function sseFrames(buffer) {
+export function sseFrames(buffer, atEnd) {
   var raw = String(buffer || '');
   // A chunk can end between the CR and LF of one CRLF: hold a trailing CR back
   // until the next chunk says which it was, or it would count as two newlines.
-  var held = raw.charAt(raw.length - 1) === '\r' ? '\r' : '';
+  var held = !atEnd && raw.charAt(raw.length - 1) === '\r' ? '\r' : '';
   if (held) raw = raw.slice(0, -1);
   var text = raw.replace(/\r\n?/g, '\n');
   /** @type {string[]} */

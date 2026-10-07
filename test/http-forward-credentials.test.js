@@ -12,7 +12,7 @@ import { allowLoopbackForward } from '../src/forward-target.js';
 // http:// URL handed its proxy key to that host (2026-10-07, found by the
 // ubox0 lane). The target is a canary that records what it was sent.
 
-const SHARED = 'test-shared-proxy-key-0001';
+const SHARED = 'test-Shared-Proxy-KEY-0001';
 const CLIENT = 'test-client-proxy-key-0002';
 const PROXY = { apiKey: SHARED, clientKeys: [{ name: 'alice', key: CLIENT }] };
 const ACCOUNT_TOKEN = 'test-account-token-must-not-leak';
@@ -128,7 +128,11 @@ test('forwardHeaders: a proxy key in any scheme or any header is dropped, by con
   ]) {
     assert.deepEqual(forwardHeaders({ [name]: value, accept: 'a' }, PROXY), { accept: 'a' }, `${name}: ${value}`);
   }
-  // …or in a header's name.
+  // …or in a header's name, which Node delivers lowercased: a mixed-case key
+  // must still be recognised there.
+  const MIXED_FAKE = 'Mixed-Case-Fake';
+  const mixed = { apiKey: MIXED_FAKE };
+  assert.deepEqual(forwardHeaders({ [`x-${mixed.apiKey}`.toLowerCase()]: '1', accept: 'a' }, mixed), { accept: 'a' });
   assert.deepEqual(forwardHeaders({ [`x-${CLIENT}`]: '1', accept: 'a' }, PROXY), { accept: 'a' });
   // Headers without a key in them are untouched, whatever they look like.
   const own = { authorization: 'Digest username="me", realm="target"', 'x-custom-auth': 'key=target-key', cookie: 'session=abc' };
@@ -149,6 +153,10 @@ test('forwardHeaders: the operator\'s usage-dimension labels stay with the proxy
 
 test('end to end: Basic and joined forms are dropped before the target sees them', async () => {
   await withCanary(async ({ proxyPort, url, seen }) => {
+    // A mixed-case key in a header name, sent as written: it arrives lowercased.
+    seen.length = 0;
+    assert.equal(await proxyGet(proxyPort, url, { 'x-api-key': CLIENT, [`X-${SHARED}`]: '1' }), 200);
+    assert.ok(!Object.keys(seen[0]).some((n) => n.includes(SHARED.toLowerCase())), JSON.stringify(Object.keys(seen[0])));
     for (const authorization of [
       `Basic ${Buffer.from(`u:${CLIENT}`).toString('base64')}`,
       `Bearer ${SHARED}, Bearer target-token`,

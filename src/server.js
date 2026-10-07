@@ -1076,7 +1076,9 @@ export function forwardHeaders(incoming, proxyConfig) {
     const lk = key.toLowerCase();
     if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection' || nominated.has(lk) || labels.has(lk)) continue;
     if (lk === 'x-api-key') continue;
-    if (carriesProxyKey(value) || carriesProxyKey(key)) continue;
+    // Names arrive lowercased (Node normalises them) while keys are mixed-case
+    // base64url, so a name is compared case-insensitively; values are not.
+    if (carriesProxyKey(value) || keys.some((k) => lk.includes(k.toLowerCase()))) continue;
     headers[key] = value;
   }
   return headers;

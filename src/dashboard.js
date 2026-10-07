@@ -51,7 +51,11 @@ export function inlineScriptHashes(html) {
     if (open < 0) break;
     const close = html.indexOf('</script>', open + 8);
     if (close < 0) break;
-    hashes.push(`'sha256-${createHash('sha256').update(html.slice(open + 8, close), 'utf8').digest('base64')}'`);
+    // A browser hashes the script text after the HTML parser has normalised
+    // CRLF and bare CR to LF, so a checkout with CRLF endings must hash the
+    // same text or every script on the page is blocked.
+    const text = html.slice(open + 8, close).replace(/\r\n?/g, '\n');
+    hashes.push(`'sha256-${createHash('sha256').update(text, 'utf8').digest('base64')}'`);
     from = close + 9;
   }
   return hashes;
@@ -267,7 +271,12 @@ export function withKey(init, key) {
  * @returns {{ events: string[], rest: string }}
  */
 export function sseFrames(buffer) {
-  var text = String(buffer || '').replace(/\r\n?/g, '\n');
+  var raw = String(buffer || '');
+  // A chunk can end between the CR and LF of one CRLF: hold a trailing CR back
+  // until the next chunk says which it was, or it would count as two newlines.
+  var held = raw.charAt(raw.length - 1) === '\r' ? '\r' : '';
+  if (held) raw = raw.slice(0, -1);
+  var text = raw.replace(/\r\n?/g, '\n');
   /** @type {string[]} */
   var events = [];
   var idx;
@@ -281,7 +290,7 @@ export function sseFrames(buffer) {
     });
     if (data.length) events.push(data.join('\n'));
   }
-  return { events: events, rest: text };
+  return { events: events, rest: text + held };
 }
 
 // What to tell the operator afterwards. The endpoint answers `ok` for the choice

@@ -265,18 +265,32 @@ test('sseFrames parses complete events and keeps the partial tail', () => {
     buf = p.rest; got.push(...p.events);
   }
   assert.deepEqual(got, ['"one"', '"two"', '"three"']);
+  // CRLF framing split at every possible point — including between the CR and
+  // the LF of one line ending — yields the same events, and never an extra one.
+  const crlf = 'data: {"a":1}\r\ndata: {"b":2}\r\n\r\ndata: "z"\r\n\r\n';
+  for (let cut = 0; cut <= crlf.length; cut++) {
+    const p1 = sseFrames(crlf.slice(0, cut));
+    const p2 = sseFrames(p1.rest + crlf.slice(cut));
+    assert.deepEqual([...p1.events, ...p2.events], ['{"a":1}\n{"b":2}', '"z"'], `cut at ${cut}`);
+    assert.equal(p2.rest, '');
+  }
 });
 
-test('the /ui script sends no key on loopback, prompts on 401, then sends the key on every call', async () => {
-  const html = injectUiHelpers(await readFile(UI, 'utf8'));
-  // The page never builds a URL with a key in it, and has no EventSource left.
-  assert.doesNotMatch(html, /new EventSource/);
-  assert.doesNotMatch(html, /[?&](api_?key|key|token)=/i);
-  // Every network call in the page script goes through api() (one raw fetch: api's own).
-  const pageScript = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)][1][1];
-  assert.equal(pageScript.match(/\bfetch\(/g).length, 1);
-  assert.match(pageScript, /await fetch\(path, withKey\(init, storedKey\(\)\)\)/);
+test('script hashes are taken over LF-normalised text, as a browser computes them', () => {
+  const lf = '<script>\nvar a = 1;\nvar b = 2;\n</script>';
+  const crlf = lf.replace(/\n/g, '\r\n');
+  const cr = lf.replace(/\n/g, '\r');
+  assert.equal(uiCsp(crlf), uiCsp(lf));
+  assert.equal(uiCsp(cr), uiCsp(lf));
+  const browser = createHash('sha256').update('\nvar a = 1;\nvar b = 2;\n', 'utf8').digest('base64');
+  assert.ok(uiCsp(crlf).includes(`'sha256-${browser}'`));
+});
 
+// Runs the real /ui scripts in a vm with a stub DOM, storage and fetch. Every
+// fetch is recorded with the key it carried; `auto401` answers each with a 401
+// at once, otherwise the call stays pending until the test settles it.
+async function bootPage({ storageThrows = false } = {}) {
+  const html = injectUiHelpers(await readFile(UI, 'utf8'));
   const elements = new Map();
   const makeEl = (id) => {
     const handlers = {};
@@ -298,51 +312,108 @@ test('the /ui script sends no key on loopback, prompts on 401, then sends the ke
     activeElement: null,
   };
   const store = new Map();
-  const localStorage = {
-    getItem: (k) => (store.has(k) ? store.get(k) : null),
-    setItem: (k, v) => store.set(k, String(v)),
-    removeItem: (k) => store.delete(k),
-  };
-  const fetches = [];
-  let answer = 401;
+  const blocked = () => { throw new Error('SecurityError: storage blocked'); };
+  const localStorage = storageThrows
+    ? { getItem: blocked, setItem: blocked, removeItem: blocked }
+    : {
+        getItem: (k) => (store.has(k) ? store.get(k) : null),
+        setItem: (k, v) => store.set(k, String(v)),
+        removeItem: (k) => store.delete(k),
+      };
+  const page = { elements, store, fetches: [], auto401: true };
   const fetchStub = (url, init) => {
-    fetches.push({ url, key: init?.headers?.['x-api-key'] ?? null });
-    if (answer === 401) return Promise.resolve({ status: 401, ok: false, json: async () => ({}), body: null });
-    return new Promise(() => {}); // after unlock: leave every call pending
+    const call = { url, key: init?.headers?.['x-api-key'] ?? null };
+    page.fetches.push(call);
+    if (page.auto401) return Promise.resolve({ status: 401, ok: false, json: async () => ({}), body: null });
+    return new Promise((resolve) => {
+      call.answer = (status) => resolve({ status, ok: status < 300, json: async () => ({}), body: null });
+    });
   };
   const ctx = vm.createContext({
     document, localStorage, fetch: fetchStub, window: { open: () => null },
     setInterval: () => 0, clearInterval() {}, setTimeout: () => 0, clearTimeout() {},
     AbortController, TextDecoder, console, Date, Math, JSON, Map, Set, Promise, Error, Number, String, Object, Array, RegExp,
   });
-  const blocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
-  for (const b of blocks) vm.runInContext(b, ctx);
-  const settle = async () => { for (let i = 0; i < 10; i++) await new Promise(r => setImmediate(r)); };
-  await settle();
+  for (const m of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) vm.runInContext(m[1], ctx);
+  page.settle = async () => { for (let i = 0; i < 10; i++) await new Promise(r => setImmediate(r)); };
+  page.unlock = async (key) => {
+    elements.get('keyInput').value = key;
+    elements.get('keyGo').fire('click');
+    await page.settle();
+  };
+  page.take = () => page.fetches.splice(0);
+  await page.settle();
+  return page;
+}
 
+const BOOT_URLS = ['/teamclaude/activity', '/teamclaude/logs', '/teamclaude/status'];
+
+test('the /ui script sends no key on loopback, prompts on 401, then sends the key on every call', async () => {
+  const html = injectUiHelpers(await readFile(UI, 'utf8'));
+  // The page never builds a URL with a key in it, and has no EventSource left.
+  assert.doesNotMatch(html, /new EventSource/);
+  assert.doesNotMatch(html, /[?&](api_?key|key|token)=/i);
+  // Every network call in the page script goes through api() (one raw fetch: api's own).
+  const pageScript = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)][1][1];
+  assert.equal(pageScript.match(/\bfetch\(/g).length, 1);
+  assert.match(pageScript, /await fetch\(path, withKey\(init, sent\)\)/);
+
+  const page = await bootPage();
   // Boot: status + both streams, all keyless (a loopback page needs none).
-  const boot = fetches.splice(0);
-  assert.deepEqual(boot.map(f => f.url).sort(), ['/teamclaude/activity', '/teamclaude/logs', '/teamclaude/status']);
+  const boot = page.take();
+  assert.deepEqual(boot.map(f => f.url).sort(), BOOT_URLS);
   assert.ok(boot.every(f => f.key === null), 'no key stored → no header');
   // The 401 brought up the prompt and hid the app.
-  assert.equal(elements.get('keybox').style.display, 'block');
-  assert.equal(elements.get('app').style.display, 'none');
+  assert.equal(page.elements.get('keybox').style.display, 'block');
+  assert.equal(page.elements.get('app').style.display, 'none');
 
   // Unlock: the key is stored in the shared slot and rides on every call.
-  answer = 200;
-  elements.get('keyInput').value = '  the-key  ';
-  elements.get('keyGo').fire('click');
-  await settle();
-  assert.equal(store.get(KEY_STORAGE), 'the-key');
-  assert.equal(elements.get('keybox').style.display, 'none');
-  const after = fetches.splice(0);
-  assert.deepEqual(after.map(f => f.url).sort(), ['/teamclaude/activity', '/teamclaude/logs', '/teamclaude/status']);
+  page.auto401 = false;
+  await page.unlock('  the-key  ');
+  assert.equal(page.store.get(KEY_STORAGE), 'the-key');
+  assert.equal(page.elements.get('keybox').style.display, 'none');
+  const after = page.take();
+  assert.deepEqual(after.map(f => f.url).sort(), BOOT_URLS);
   assert.ok(after.every(f => f.key === 'the-key'), JSON.stringify(after));
   // A control action carries it too.
-  elements.get('probeBtn').fire('click');
-  await settle();
-  assert.deepEqual(fetches.splice(0), [{ url: '/teamclaude/probe', key: 'the-key' }]);
+  page.elements.get('probeBtn').fire('click');
+  await page.settle();
+  assert.deepEqual(page.take().map(({ url, key }) => ({ url, key })), [{ url: '/teamclaude/probe', key: 'the-key' }]);
 });
+
+test('a late 401 for an old key does not erase the key entered since', async () => {
+  const page = await bootPage();
+  page.take();
+  page.auto401 = false;
+  await page.unlock('old-key');
+  const oldCalls = page.take();
+  assert.ok(oldCalls.every(f => f.key === 'old-key'));
+  // The operator rotates: a 401 on one call brings the prompt back…
+  oldCalls[0].answer(401);
+  await page.settle();
+  assert.equal(page.elements.get('keybox').style.display, 'block');
+  assert.equal(page.store.has(KEY_STORAGE), false);
+  await page.unlock('new-key');
+  page.take();
+  // …and the other calls made with the old key now come back 401 as well.
+  for (const c of oldCalls.slice(1)) c.answer(401);
+  await page.settle();
+  assert.equal(page.store.get(KEY_STORAGE), 'new-key', 'a refusal of the old key leaves the new one');
+  assert.equal(page.elements.get('keybox').style.display, 'none');
+});
+
+test('with localStorage blocked the entered key still works for the page', async () => {
+  const page = await bootPage({ storageThrows: true });
+  assert.equal(page.elements.get('keybox').style.display, 'block');
+  page.take();
+  page.auto401 = false;
+  await page.unlock('mem-key');
+  const after = page.take();
+  assert.deepEqual(after.map(f => f.url).sort(), BOOT_URLS);
+  assert.ok(after.every(f => f.key === 'mem-key'), JSON.stringify(after));
+  assert.equal(page.elements.get('keybox').style.display, 'none');
+});
+
 
 test('both dashboards keep the key in the same localStorage slot', () => {
   assert.match(renderDashboardHtml(), new RegExp(`var KEY = ${JSON.stringify(KEY_STORAGE)};`));

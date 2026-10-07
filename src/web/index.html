@@ -654,11 +654,19 @@
   const appEl = document.getElementById('app');
   const keyInputEl = document.getElementById('keyInput');
   let needKey = false;
+  // The key as entered this page load: the fallback when localStorage is
+  // blocked (private windows, site-data policies), so unlocking still works.
+  let pageKey = '';
 
   function storedKey() {
-    try { return localStorage.getItem(KEY_STORAGE) || ''; } catch { return ''; }
+    try { return localStorage.getItem(KEY_STORAGE) || pageKey; } catch { return pageKey; }
   }
-  function onUnauthorized() {
+  // `sentKey` is the key the refused request carried. Requests are concurrent,
+  // so a 401 can arrive after the operator has already entered a new key; only
+  // a refusal of the key still in use may clear it.
+  function onUnauthorized(sentKey) {
+    if (sentKey !== storedKey()) return;
+    pageKey = '';
     try { localStorage.removeItem(KEY_STORAGE); } catch { /* storage blocked */ }
     if (needKey) return;
     needKey = true;
@@ -667,9 +675,10 @@
     keyInputEl.focus();
   }
   async function api(path, init) {
-    const res = await fetch(path, withKey(init, storedKey()));
+    const sent = storedKey();
+    const res = await fetch(path, withKey(init, sent));
     if (res.status === 401) {
-      onUnauthorized();
+      onUnauthorized(sent);
       throw new Error('proxy key required');
     }
     return res;
@@ -677,7 +686,8 @@
   function unlock() {
     const v = keyInputEl.value.trim();
     if (!v) return;
-    try { localStorage.setItem(KEY_STORAGE, v); } catch { /* storage blocked: the key lasts this page */ }
+    pageKey = v;
+    try { localStorage.setItem(KEY_STORAGE, v); } catch { /* storage blocked: pageKey carries it for this page */ }
     keyInputEl.value = '';
     needKey = false;
     keyboxEl.style.display = 'none';

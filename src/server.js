@@ -1014,13 +1014,21 @@ export function relayHttpForward(req, res, proxyConfig = undefined) {
  *   - `x-api-key`: always. On this path it is the proxy key the gate just
  *     checked (a remote caller cannot reach here without one). A loopback tool
  *     with an x-api-key of its own for a plain-HTTP third party loses it — an
- *     accepted cost, since the proxy cannot tell the two apart by name and the
- *     failure is loud (the target refuses) while the leak would be silent.
+ *     accepted compatibility cost: the proxy cannot tell the two apart by name,
+ *     and a missing header is a visible failure at worst while the leak was a
+ *     silent one. Plain-HTTP APIs keyed by x-api-key are not supported through
+ *     HTTP_PROXY.
  *   - `proxy-authorization`: always (the CONNECT gate's channel; in
  *     HOP_BY_HOP_HEADERS).
- *   - `authorization`: only when it carries one of this proxy's keys (bare or
- *     as `Bearer <key>`). Any other value is the client's own credential for
- *     the target, which a transparent forward proxy passes through.
+ *   - `authorization`: when any part of it carries one of this proxy's keys —
+ *     bare, `Bearer <key>`, or Basic with the key as user or password; in any
+ *     element of an array value or any comma-joined part. Any other value is
+ *     the client's own credential for the target, which a transparent forward
+ *     proxy passes through. (A key re-encoded some other way cannot be told
+ *     from a target credential and is not recognised: the gate on this path
+ *     reads x-api-key, so a client has no reason to put it there.)
+ *   - headers the client's `Connection` header nominates (hop-by-hop by
+ *     definition).
  * Nothing is ever added: no account credential is injected on this path.
  *
  * @param {import('node:http').IncomingHttpHeaders} incoming
@@ -1030,17 +1038,42 @@ export function relayHttpForward(req, res, proxyConfig = undefined) {
 export function forwardHeaders(incoming, proxyConfig) {
   const keys = [proxyConfig?.apiKey, ...(Array.isArray(proxyConfig?.clientKeys) ? proxyConfig.clientKeys.map((/** @type {any} */ e) => e?.key) : [])]
     .filter((k) => typeof k === 'string' && k.length > 0);
+  // One credential: bare, `Bearer <key>`, or `Basic base64(user:pass)` with the
+  // key in either slot (the forms the proxy's own gates accept).
+  /** @param {string} cred */
+  const isProxyKey = (cred) => {
+    const v = cred.trim();
+    const m = /^(bearer|basic)\s+(.*)$/i.exec(v);
+    /** @type {string[]} */
+    const candidates = [v];
+    if (m) {
+      candidates.push(m[2].trim());
+      if (m[1].toLowerCase() === 'basic') {
+        const dec = Buffer.from(m[2].trim(), 'base64').toString('utf8');
+        const i = dec.indexOf(':');
+        candidates.push(dec, i >= 0 ? dec.slice(0, i) : dec, i >= 0 ? dec.slice(i + 1) : '');
+      }
+    }
+    return candidates.some((c) => keys.some((k) => safeKeyEqual(c, k)));
+  };
+  // Any element of an array value, and any comma-separated part of a joined
+  // one, carrying a proxy key condemns the whole header.
   /** @param {unknown} value */
   const carriesProxyKey = (value) => {
-    const v = String(value ?? '').trim();
-    const token = /^bearer\s+/i.test(v) ? v.replace(/^bearer\s+/i, '').trim() : v;
-    return keys.some((k) => safeKeyEqual(token, k));
+    if (keys.length === 0) return false;
+    const values = Array.isArray(value) ? value : [value];
+    return values.some((one) => {
+      const s = String(one ?? '');
+      return isProxyKey(s) || s.split(',').some((part) => isProxyKey(part));
+    });
   };
+  // Headers the client's own Connection header nominates are hop-by-hop too.
+  const nominated = new Set(String(incoming?.connection ?? '').split(',').map((t) => t.trim().toLowerCase()).filter(Boolean));
   /** @type {import('node:http').OutgoingHttpHeaders} */
   const headers = {};
   for (const [key, value] of Object.entries(incoming || {})) {
     const lk = key.toLowerCase();
-    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection') continue;
+    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection' || nominated.has(lk)) continue;
     if (lk === 'x-api-key') continue;
     if (lk === 'authorization' && carriesProxyKey(value)) continue;
     headers[key] = value;

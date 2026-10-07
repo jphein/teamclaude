@@ -97,3 +97,43 @@ test('forwardHeaders: strips proxy credentials case-insensitively, keeps the res
   assert.deepEqual(forwardHeaders({ authorization: 'Bearer t', 'x-api-key': 'k' }, {}), { authorization: 'Bearer t' });
   assert.deepEqual(forwardHeaders({ authorization: '' }, PROXY), { authorization: '' });
 });
+
+test('forwardHeaders: a proxy key hidden in Basic, a joined value, an array, or tab-separated Bearer is caught', () => {
+  const b64 = (s) => Buffer.from(s).toString('base64');
+  for (const value of [
+    `Basic ${b64(`${CLIENT}:`)}`,
+    `Basic ${b64(`user:${SHARED}`)}`,
+    `basic ${b64(CLIENT)}`,
+    `Bearer\t${CLIENT}`,
+    `Bearer ${SHARED}, Bearer target-token`,
+    `Bearer target-token, ${CLIENT}`,
+    ['Bearer target-token', `Bearer ${CLIENT}`],
+  ]) {
+    assert.deepEqual(forwardHeaders({ authorization: value, accept: 'a' }, PROXY), { accept: 'a' }, JSON.stringify(value));
+  }
+  // The client's own Basic/Bearer for the target is untouched.
+  for (const value of [`Basic ${b64('me:target-pass')}`, 'Bearer target-token, Bearer other']) {
+    assert.deepEqual(forwardHeaders({ authorization: value }, PROXY), { authorization: value });
+  }
+});
+
+test('forwardHeaders: headers the Connection header nominates are dropped', () => {
+  assert.deepEqual(
+    forwardHeaders({ connection: 'keep-alive, X-Internal-Control', 'x-internal-control': '1', accept: 'a' }, PROXY),
+    { accept: 'a' },
+  );
+});
+
+test('end to end: Basic and joined forms are dropped before the target sees them', async () => {
+  await withCanary(async ({ proxyPort, url, seen }) => {
+    for (const authorization of [
+      `Basic ${Buffer.from(`u:${CLIENT}`).toString('base64')}`,
+      `Bearer ${SHARED}, Bearer target-token`,
+    ]) {
+      seen.length = 0;
+      assert.equal(await proxyGet(proxyPort, url, { 'x-api-key': CLIENT, authorization }), 200);
+      assert.equal(seen[0].authorization, undefined, authorization);
+      assert.deepEqual(secretsIn(seen[0]), []);
+    }
+  });
+});

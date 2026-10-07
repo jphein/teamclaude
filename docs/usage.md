@@ -219,6 +219,14 @@ http://localhost:3456/teamclaude/dashboard
 
 The page is a static asset and loads without a key; the data does not — its script fetches `/teamclaude/status` with the proxy key, which it asks for once and keeps in the browser's localStorage (a 401 after a key rotation brings the prompt back). Loopback browsers are key-exempt as everywhere else. On deployments that put the proxy behind TLS this works remotely too: `https://your-proxy.example.com/teamclaude/dashboard`.
 
+### Full dashboard (`/ui`) from another machine
+
+`/ui` (accounts, activity and log streams, threshold, enable/disable, probe, reload, restart, reauth) follows the same model. The page is served without a key, with the same `no-store`, `nosniff` and hash-only Content-Security-Policy as the status dashboard plus `img-src data:` for its inline favicon. Every call its script makes — including the activity and log streams, which it reads with `fetch` because `EventSource` cannot send a header — carries the key as `x-api-key`; the key is never put in a URL. On loopback nothing is asked. A remote browser gets the key prompt on its first 401, and the key is stored in the same localStorage slot as `/teamclaude/dashboard`, so entering it on one page unlocks the other on the same origin.
+
+Behind a reverse proxy (Caddy, nginx): the loopback exemption is refused for any request carrying `X-Forwarded-For`, `X-Real-IP` or `Forwarded`, and those headers are never read as the caller's address, so a proxied browser always needs the key wherever the reverse proxy runs. Mutating calls from a page on another origin are refused (`403`) even when it holds a key.
+
+Any configured key — `proxy.apiKey` or any `proxy.clientKeys` entry — can use every control on the page. There is no admin-only key; give a client key only to callers you would let switch accounts and restart the service.
+
 ## Auto-update
 
 When TeamClaude is installed globally via npm, it self-updates in the background: it checks the npm registry at most once a day, and when a newer version is published it runs `npm install -g @karpeleslab/teamclaude@latest` and applies it on the next launch. The check runs after a `teamclaude run` session ends and when a headless server starts. In a headless server the install runs as a background child process, so the proxy keeps serving requests while npm works (a synchronous install used to stall it for the duration). A git checkout is never touched — update that with `git pull`. Run `teamclaude update` to update on demand.

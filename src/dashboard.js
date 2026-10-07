@@ -34,18 +34,68 @@ export function renderDashboardHtml() {
  * another site's iframe, where a click on "switch" could be overlaid.
  */
 export function dashboardCsp(html = PAGE) {
-  const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));
-  const hash = createHash('sha256').update(script, 'utf8').digest('base64');
+  return pageCsp(html);
+}
+
+/**
+ * sha256 CSP sources for every inline `<script>` block in a page, in order.
+ * Both dashboards are static, so the hashes are stable for a running process;
+ * /ui has two blocks (the injected shared helpers, then its own script).
+ * @param {string} html
+ */
+export function inlineScriptHashes(html) {
+  const hashes = [];
+  let from = 0;
+  for (;;) {
+    const open = html.indexOf('<script>', from);
+    if (open < 0) break;
+    const close = html.indexOf('</script>', open + 8);
+    if (close < 0) break;
+    hashes.push(`'sha256-${createHash('sha256').update(html.slice(open + 8, close), 'utf8').digest('base64')}'`);
+    from = close + 9;
+  }
+  return hashes;
+}
+
+/**
+ * The policy both dashboards share. `extra` adds directives a page needs on
+ * top of the baseline; the baseline itself is never loosened per page.
+ * @param {string} html
+ * @param {string[]} [extra]
+ */
+export function pageCsp(html, extra = []) {
   return [
     "default-src 'none'",
-    `script-src 'sha256-${hash}'`,
+    `script-src ${inlineScriptHashes(html).join(' ')}`,
     "style-src 'unsafe-inline'",
+    ...extra,
     "connect-src 'self'",
     "base-uri 'none'",
     "form-action 'none'",
     "frame-ancestors 'none'",
   ].join('; ');
 }
+
+/**
+ * Content-Security-Policy for /ui (src/web/index.html, helpers injected).
+ *
+ * The same baseline as the key-gated dashboard — /ui now keeps the same key in
+ * the same localStorage slot — plus one allowance: `img-src data:` for the
+ * page's inline SVG favicon. A data: image cannot run script (an SVG loaded as
+ * an image is inert) and nothing else on the page loads an image. The rest of
+ * what /ui does already fits the baseline: its fetches and its two event
+ * streams are same-origin (`connect-src 'self'`); the reauth flow opens the
+ * OAuth page with window.open plus a navigation, which CSP does not govern;
+ * `style=` attributes are why styles need 'unsafe-inline', as on the dashboard.
+ * @param {string} html
+ */
+export function uiCsp(html) {
+  return pageCsp(html, ["img-src data:"]);
+}
+
+/** localStorage slot for the proxy key, shared by /ui and /teamclaude/dashboard
+ * (same origin, same key: entering it on one page unlocks the other). */
+export const KEY_STORAGE = 'teamclaude-dashboard-key';
 
 // The page's pure logic lives here, not in the script string: these functions
 // close over nothing and touch no DOM, so they are serialized into the page
@@ -181,6 +231,57 @@ export function switchRequest(name, key) {
       body: JSON.stringify({ account: name }),
     },
   };
+}
+
+// A fetch init with the proxy key attached, the way every /ui call is made.
+// The key rides in a header, never the URL (which lands in access logs and
+// browser history), and an empty key sends no header at all, so a loopback
+// page with nothing stored is admitted by the exemption exactly as before.
+/**
+ * @param {Record<string, any> | null | undefined} init
+ * @param {string | null | undefined} key
+ * @returns {Record<string, any>}
+ */
+export function withKey(init, key) {
+  /** @type {Record<string, any>} */
+  var out = {};
+  /** @type {Record<string, any>} */
+  var src = init || {};
+  Object.keys(src).forEach(function (k) { out[k] = src[k]; });
+  /** @type {Record<string, string>} */
+  var headers = {};
+  /** @type {Record<string, string>} */
+  var h = src.headers || {};
+  Object.keys(h).forEach(function (k) { headers[k] = h[k]; });
+  if (key) headers['x-api-key'] = key;
+  out.headers = headers;
+  return out;
+}
+
+// Incremental text/event-stream parser for a fetch() body. EventSource cannot
+// send a header, so /ui reads its activity and log streams with fetch and the
+// key in x-api-key instead. Feed it the buffered text; it returns the `data`
+// payload of every complete event, and the unconsumed tail to keep buffering.
+/**
+ * @param {string | null | undefined} buffer
+ * @returns {{ events: string[], rest: string }}
+ */
+export function sseFrames(buffer) {
+  var text = String(buffer || '').replace(/\r\n?/g, '\n');
+  /** @type {string[]} */
+  var events = [];
+  var idx;
+  while ((idx = text.indexOf('\n\n')) >= 0) {
+    var block = text.slice(0, idx);
+    text = text.slice(idx + 2);
+    /** @type {string[]} */
+    var data = [];
+    block.split('\n').forEach(function (line) {
+      if (line.indexOf('data:') === 0) data.push(line.slice(line.charAt(5) === ' ' ? 6 : 5));
+    });
+    if (data.length) events.push(data.join('\n'));
+  }
+  return { events: events, rest: text };
 }
 
 // What to tell the operator afterwards. The endpoint answers `ok` for the choice
@@ -340,12 +441,13 @@ export function problems(status) {
 
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows, problems,
+  switchRequest, switchOutcome, routeRows, problems, withKey, sseFrames,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The threshold rides along: `problems` closes over it, so a page without it
-// would ReferenceError on first render.
-const SHARED_CONSTS = `var STARVED_MIN = ${STARVED_MIN};\nvar STARVED_LIST_MAX = ${STARVED_LIST_MAX};`;
+// would ReferenceError on first render. The key slot rides along so both pages
+// read and write the one localStorage entry.
+const SHARED_CONSTS = `var STARVED_MIN = ${STARVED_MIN};\nvar STARVED_LIST_MAX = ${STARVED_LIST_MAX};\nvar KEY_STORAGE = ${JSON.stringify(KEY_STORAGE)};`;
 
 /**
  * The page-side helpers both dashboards run: the pure functions above plus the
@@ -494,7 +596,7 @@ const PAGE = `<!doctype html>
 <script>
 (function () {
   'use strict';
-  var KEY = 'teamclaude-dashboard-key';
+  var KEY = ${JSON.stringify(KEY_STORAGE)};
   var POLL_MS = 5000;
   var timer = null;
   var lastStatus = null;

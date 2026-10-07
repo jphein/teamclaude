@@ -513,10 +513,30 @@
     font-size: 0.8rem;
     text-align: center;
   }
+
+  /* ── Proxy key prompt (remote browsers; loopback never sees it) ── */
+  #keybox { display: none; max-width: 420px; margin: 4rem auto; padding: 0 1rem; text-align: center; }
+  #keybox h1 { font-size: 1.2rem; margin-bottom: 0.5rem; }
+  #keybox p { color: var(--text-dim); font-size: 0.9rem; }
+  #keybox input {
+    width: 100%; padding: 0.6rem 0.75rem; margin: 0.9rem 0; box-sizing: border-box;
+    background: var(--panel); border: 1px solid var(--panel-border); border-radius: 6px;
+    color: var(--text); font: inherit;
+  }
+  #keybox button {
+    padding: 0.5rem 1.4rem; background: var(--accent); border: 0; border-radius: 6px;
+    color: #fff; font: inherit; font-weight: 600; cursor: pointer;
+  }
 </style>
 </head>
 <body>
-<div class="wrap">
+<div id="keybox">
+  <h1>TeamClaude</h1>
+  <p>This proxy needs its API key (a <code>proxy.apiKey</code> or <code>proxy.clientKeys</code> key). It is kept in this browser's local storage for this address only.</p>
+  <input type="password" id="keyInput" autocomplete="off" spellcheck="false" placeholder="proxy key">
+  <button id="keyGo">Unlock</button>
+</div>
+<div class="wrap" id="app">
   <header>
     <h1>TeamClaude<span class="sub">multi-account proxy</span></h1>
     <div class="header-right">
@@ -622,6 +642,95 @@
   let saveTimer = null;
   let restartPending = false;
   let wasDisconnected = false;
+
+  // ── Proxy key ────────────────────────────────────────────────
+  // Every call this page makes goes through api(), which attaches the stored
+  // key as x-api-key (withKey, a shared helper). Loopback callers are exempt
+  // from the key gate, so on the proxy's own host nothing is stored, nothing is
+  // asked, and the page behaves as it always did. A remote browser gets a 401
+  // on its first call, which brings up the prompt; a 401 later (key rotated or
+  // removed) drops the stored key and asks again. The key never goes in a URL.
+  const keyboxEl = document.getElementById('keybox');
+  const appEl = document.getElementById('app');
+  const keyInputEl = document.getElementById('keyInput');
+  let needKey = false;
+
+  function storedKey() {
+    try { return localStorage.getItem(KEY_STORAGE) || ''; } catch { return ''; }
+  }
+  function onUnauthorized() {
+    try { localStorage.removeItem(KEY_STORAGE); } catch { /* storage blocked */ }
+    if (needKey) return;
+    needKey = true;
+    appEl.style.display = 'none';
+    keyboxEl.style.display = 'block';
+    keyInputEl.focus();
+  }
+  async function api(path, init) {
+    const res = await fetch(path, withKey(init, storedKey()));
+    if (res.status === 401) {
+      onUnauthorized();
+      throw new Error('proxy key required');
+    }
+    return res;
+  }
+  function unlock() {
+    const v = keyInputEl.value.trim();
+    if (!v) return;
+    try { localStorage.setItem(KEY_STORAGE, v); } catch { /* storage blocked: the key lasts this page */ }
+    keyInputEl.value = '';
+    needKey = false;
+    keyboxEl.style.display = 'none';
+    appEl.style.display = '';
+    refresh();
+    connectActivity();
+    connectLogs();
+  }
+  document.getElementById('keyGo').addEventListener('click', unlock);
+  keyInputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock(); });
+
+  // An event stream read with fetch, since EventSource cannot send x-api-key.
+  // Reconnects like EventSource does (a few seconds after the stream ends or
+  // the network drops), stops on 401 until the key is entered (unlock()
+  // reconnects), and stops for good on 501 — the server's "this host cannot
+  // serve the stream" answer — rather than respawning a doomed request.
+  // Returns { stop }; reconnecting a stream stops the previous one first, so
+  // unlock() never leaves two readers on one feed.
+  function openStream(path, { onOpen, onData }) {
+    let stopped = false;
+    const ctl = new AbortController();
+    const retry = (ms) => { if (!stopped) setTimeout(run, ms); };
+    async function run() {
+      if (stopped || needKey) return;
+      let res;
+      try {
+        res = await api(path, { cache: 'no-store', headers: { accept: 'text/event-stream' }, signal: ctl.signal });
+      } catch {
+        if (!needKey) retry(3000);
+        return;
+      }
+      if (res.status === 501) { stopped = true; return; }
+      if (!res.ok || !res.body) { retry(10000); return; }
+      onOpen?.();
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          const parsed = sseFrames(buf + decoder.decode(value, { stream: true }));
+          buf = parsed.rest;
+          for (const data of parsed.events) {
+            try { onData(JSON.parse(data)); } catch { /* one bad frame must not end the stream */ }
+          }
+        }
+      } catch { /* dropped mid-stream, or stopped: reconnect below unless stopped */ }
+      retry(3000);
+    }
+    run();
+    return { stop() { stopped = true; ctl.abort(); } };
+  }
 
   // ── DOM builder ──────────────────────────────────────────────
   function el(tag, attrs = {}, children = []) {
@@ -943,7 +1052,7 @@
   // ── Status poll ──────────────────────────────────────────────
   async function refresh() {
     try {
-      const res = await fetch('/teamclaude/status', { cache: 'no-store' });
+      const res = await api('/teamclaude/status', { cache: 'no-store' });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
 
@@ -1026,12 +1135,12 @@
     btn.disabled = true;
     try {
       const res = isToggle
-        ? await fetch('/teamclaude/account', {
+        ? await api('/teamclaude/account', {
             method: 'POST',
             headers: { 'content-type': 'application/json', 'x-teamclaude-control': '1' },
             body: JSON.stringify({ name, disabled: !btn.getAttribute('data-disabled') }),
           })
-        : await fetch('/teamclaude/switch', {
+        : await api('/teamclaude/switch', {
             method: 'POST',
             headers: { 'content-type': 'application/json', 'x-teamclaude-control': '1' },
             body: JSON.stringify({ account: name }),
@@ -1095,7 +1204,7 @@
   async function pollReauth() {
     if (!reauthCtl.account) return;
     try {
-      const res = await fetch('/teamclaude/reauth', { cache: 'no-store' });
+      const res = await api('/teamclaude/reauth', { cache: 'no-store' });
       if (res.ok) handleReauthStatus(await res.json());
     } catch { /* transient — keep polling */ }
   }
@@ -1106,7 +1215,7 @@
     const tab = window.open('about:blank', '_blank');
     btn.disabled = true;
     try {
-      const res = await fetch('/teamclaude/reauth', {
+      const res = await api('/teamclaude/reauth', {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-teamclaude-control': '1' },
         body: JSON.stringify({ name }),
@@ -1138,7 +1247,7 @@
     if (!code) return;
     reauthSubmitEl.disabled = true;
     try {
-      const res = await fetch('/teamclaude/reauth/code', {
+      const res = await api('/teamclaude/reauth/code', {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-teamclaude-control': '1' },
         body: JSON.stringify({ code }),
@@ -1157,7 +1266,7 @@
   reauthCodeEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitReauthCode(); });
   reauthCancelEl.addEventListener('click', async () => {
     try {
-      await fetch('/teamclaude/reauth/cancel', { method: 'POST', headers: { 'x-teamclaude-control': '1' } });
+      await api('/teamclaude/reauth/cancel', { method: 'POST', headers: { 'x-teamclaude-control': '1' } });
     } catch { /* the server may be gone; reset the UI regardless */ }
     stopReauth();
   });
@@ -1176,7 +1285,7 @@
   async function svcAction(btn, url, describe) {
     btn.disabled = true;
     try {
-      const res = await fetch(url, { method: 'POST', headers: { 'x-teamclaude-control': '1' } });
+      const res = await api(url, { method: 'POST', headers: { 'x-teamclaude-control': '1' } });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
       await refresh();
@@ -1199,7 +1308,7 @@
     const value = Number(thr.value) / 100;
     saveTimer = setTimeout(async () => {
       try {
-        const res = await fetch('/teamclaude/threshold', {
+        const res = await api('/teamclaude/threshold', {
           method: 'POST',
           headers: { 'content-type': 'application/json', 'x-teamclaude-control': '1' },
           body: JSON.stringify({ value }),
@@ -1221,9 +1330,16 @@
     restartStatusEl.textContent = 'Restarting…';
     restartPending = true;
     try {
-      await fetch('/teamclaude/restart', { method: 'POST', headers: { 'x-teamclaude-control': '1' } });
-    } catch {
-      // Expected — the service is going down
+      const res = await api('/teamclaude/restart', { method: 'POST', headers: { 'x-teamclaude-control': '1' } });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+    } catch (err) {
+      // A dropped connection is expected — the service is going down. A refusal
+      // (no key, or the server said no) means nothing is restarting.
+      if (needKey || /^HTTP /.test(err.message)) {
+        restartPending = false;
+        restartBtn.disabled = false;
+        restartStatusEl.textContent = needKey ? '' : 'Restart refused: ' + err.message;
+      }
     }
   });
 
@@ -1293,14 +1409,15 @@
     while (completedLogEl.children.length > 150) completedLogEl.removeChild(completedLogEl.lastChild);
   }
 
+  let activityStream = null;
   function connectActivity() {
-    const es = new EventSource('/teamclaude/activity');
+    activityStream?.stop();
+    activityStream = openStream('/teamclaude/activity', {
     // On (re)connect, drop any active entries: their req_end may have fired while
     // we were disconnected and won't be in the terminal-event replay, so they'd
     // otherwise stick forever. The replay repopulates the completed log.
-    es.onopen = () => { activityMap.clear(); renderActiveReqs(); };
-    es.onmessage = (e) => {
-      const evt = JSON.parse(e.data);
+    onOpen: () => { activityMap.clear(); renderActiveReqs(); },
+    onData: (evt) => {
       if (evt.type === 'req_start') {
         activityMap.set(evt.id, { method: evt.method, path: evt.path, account: null, ts: evt.ts });
       } else if (evt.type === 'req_routed') {
@@ -1313,8 +1430,8 @@
         prependCompleted(evt);
       }
       renderActiveReqs();
-    };
-    // EventSource auto-reconnects on disconnect
+    },
+    });
   }
 
   setInterval(renderActiveReqs, 1000);
@@ -1344,17 +1461,18 @@
     if (logAutoScroll) logBoxEl.scrollTop = logBoxEl.scrollHeight;
   }
 
+  let logStream = null;
   function connectLogs() {
-    const es = new EventSource('/teamclaude/logs');
-    es.onmessage = (e) => appendLog(JSON.parse(e.data));
-    // EventSource auto-reconnects, so no manual reconnect needed
+    logStream?.stop();
+    logStream = openStream('/teamclaude/logs', { onData: (line) => appendLog(String(line)) });
   }
 
   connectLogs();
 
   // ── Boot ─────────────────────────────────────────────────────
   refresh();
-  setInterval(refresh, 2000);
+  // No polling behind the key prompt: every poll would only 401 again.
+  setInterval(() => { if (!needKey) refresh(); }, 2000);
 </script>
 </body>
 </html>

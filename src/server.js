@@ -19,7 +19,7 @@ import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { safeLine } from './safe-text.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
-import { renderDashboardHtml, dashboardCsp, injectUiHelpers } from './dashboard.js';
+import { renderDashboardHtml, dashboardCsp, injectUiHelpers, uiCsp } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
 import { classificationPath } from './classification-path.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
@@ -252,8 +252,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     }
   }
 
-  let dashboardHtml = null;
-  let journalctlBroken = false; // set once journalctl is found missing (stops the EventSource respawn spin)
+  /** @type {{ html: string, csp: string } | null} */
+  let uiPage = null;
+  let journalctlBroken = false; // set once journalctl is found missing (stops the stream's reconnect spin)
   let logStreams = 0;           // concurrent /teamclaude/logs subprocesses, capped below
 
   // Activity feed: a ring buffer of recent lifecycle/control events plus the set
@@ -326,6 +327,35 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           'X-Content-Type-Options': 'nosniff',
         });
         res.end(renderDashboardHtml());
+        return;
+      }
+
+      // GET /ui — the full single-page dashboard, served BEFORE the auth gate
+      // for the same reason as the page above: it is a static asset with no
+      // data in it (src/web/index.html plus the shared helpers), and its script
+      // fetches every byte it shows from the gated /teamclaude/* endpoints with
+      // the key it keeps in localStorage. Gated, a remote browser could never
+      // load it at all. Same headers as the dashboard; uiCsp() says why /ui
+      // needs one allowance more. Cached with its policy after the first read.
+      if (req.method === 'GET' && (req.url === '/ui' || req.url === '/ui/' || req.url === '/ui/index.html')) {
+        try {
+          if (uiPage === null) {
+            const html = injectUiHelpers(await readFile(join(__dirname, 'web', 'index.html'), 'utf-8'));
+            uiPage = { html, csp: uiCsp(html) };
+          }
+          res.writeHead(200, {
+            'Content-Type': 'text/html; charset=utf-8',
+            'Cache-Control': 'no-store',
+            'Content-Security-Policy': uiPage.csp,
+            'X-Content-Type-Options': 'nosniff',
+          });
+          res.end(uiPage.html);
+        } catch (err) {
+          // Unauthenticated callers reach this branch: the reason (a file path)
+          // goes to the log, not the reply.
+          console.error('[TeamClaude] /ui page unavailable:', err.message);
+          json(res, 500, { error: 'dashboard page unavailable; see the proxy log' });
+        }
         return;
       }
 
@@ -462,20 +492,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
-      // ── Web dashboard (served over HTTP so it works on a TTY-less daemon,
-      //    which the in-process TUI cannot) ──────────────────────────────
-
-      // GET /ui — the single-page dashboard, cached after first read.
-      if (req.method === 'GET' && (req.url === '/ui' || req.url === '/ui/' || req.url === '/ui/index.html')) {
-        try {
-          if (dashboardHtml === null) dashboardHtml = injectUiHelpers(await readFile(join(__dirname, 'web', 'index.html'), 'utf-8'));
-          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-          res.end(dashboardHtml);
-        } catch (err) {
-          json(res, 500, { error: `Dashboard not found: ${err.message}` });
-        }
-        return;
-      }
+      // ── Web dashboard controls (the /ui page itself is served above the
+      //    gate; everything it calls is below it) ─────────────────────────
 
       // POST /teamclaude/threshold — change the rotation threshold (0..1), live.
       if (req.method === 'POST' && req.url === '/teamclaude/threshold') {
@@ -558,8 +576,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
 
       // GET /teamclaude/logs — SSE tail of this service's journald output.
       if (req.method === 'GET' && req.url === '/teamclaude/logs') {
-        // 501 is NOT an event-stream, so EventSource stops reconnecting instead
-        // of respawning journalctl every few seconds on a host that lacks it.
+        // 501 is the page's "stop for good" answer (its stream reader, like
+        // EventSource before it, gives up instead of respawning journalctl
+        // every few seconds on a host that lacks it).
         if (journalctlBroken) { json(res, 501, { error: 'journalctl unavailable' }); return; }
         if (logStreams >= 4) { json(res, 503, { error: 'too many concurrent log streams' }); return; }
         logStreams++;

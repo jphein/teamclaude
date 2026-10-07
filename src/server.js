@@ -1020,7 +1020,7 @@ export function relayHttpForward(req, res, proxyConfig = undefined) {
  *     HTTP_PROXY.
  *   - `proxy-authorization`: always (the CONNECT gate's channel; in
  *     HOP_BY_HOP_HEADERS).
- *   - ANY header whose value contains one of this proxy's keys — in plain text
+ *   - ANY header whose name or value contains one of this proxy's keys — in plain text
  *     (`Bearer <key>`, `Token <key>`, a Digest `username="<key>"`, a custom
  *     header) or inside a `Basic` payload once decoded — and in any element of
  *     an array value. Containment rather than matching known credential forms,
@@ -1033,9 +1033,14 @@ export function relayHttpForward(req, res, proxyConfig = undefined) {
  *     name what the proxy accounts by; a target that reads a header of the
  *     same name does not get it through this proxy — the operator chose it).
  * Nothing is ever added: no account credential is injected on this path.
- * The check runs only after the gate has admitted the request, i.e. for a
- * caller holding a key or on loopback, so a timing difference in it reveals
- * nothing that caller does not already have.
+ *
+ * Scope: this stops a proxy key the client sent in the clear (in a header's
+ * name or value, or in a Basic payload) from being passed on. It does not stop
+ * an admitted caller who deliberately re-encodes a key (plain base64,
+ * percent-encoding) to send it on: that caller is choosing to disclose it, and
+ * no header filter can recognise every encoding. The substring check is not
+ * constant-time; it runs only for admitted callers, and the keys are long
+ * random strings, so timing it gives no practical way to recover another key.
  *
  * @param {import('node:http').IncomingHttpHeaders} incoming
  * @param {any} proxyConfig
@@ -1071,7 +1076,7 @@ export function forwardHeaders(incoming, proxyConfig) {
     const lk = key.toLowerCase();
     if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection' || nominated.has(lk) || labels.has(lk)) continue;
     if (lk === 'x-api-key') continue;
-    if (carriesProxyKey(value)) continue;
+    if (carriesProxyKey(value) || carriesProxyKey(key)) continue;
     headers[key] = value;
   }
   return headers;

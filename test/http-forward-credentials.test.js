@@ -128,6 +128,8 @@ test('forwardHeaders: a proxy key in any scheme or any header is dropped, by con
   ]) {
     assert.deepEqual(forwardHeaders({ [name]: value, accept: 'a' }, PROXY), { accept: 'a' }, `${name}: ${value}`);
   }
+  // …or in a header's name.
+  assert.deepEqual(forwardHeaders({ [`x-${CLIENT}`]: '1', accept: 'a' }, PROXY), { accept: 'a' });
   // Headers without a key in them are untouched, whatever they look like.
   const own = { authorization: 'Digest username="me", realm="target"', 'x-custom-auth': 'key=target-key', cookie: 'session=abc' };
   assert.deepEqual(forwardHeaders(own, PROXY), own);

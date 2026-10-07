@@ -709,7 +709,7 @@
   // serve the stream" answer — rather than respawning a doomed request.
   // Returns { stop }; reconnecting a stream stops the previous one first, so
   // unlock() never leaves two readers on one feed.
-  function openStream(path, { onOpen, onData }) {
+  function openStream(path, { onOpen, onData, onUnavailable }) {
     let stopped = false;
     const ctl = new AbortController();
     const retry = (ms) => { if (!stopped) setTimeout(run, ms); };
@@ -722,7 +722,12 @@
         if (!needKey) retry(3000);
         return;
       }
-      if (res.status === 501) { stopped = true; return; }
+      if (res.status === 501) {
+        stopped = true;
+        const data = await res.json().catch(() => ({}));
+        onUnavailable?.(data.error || 'not available on this host');
+        return;
+      }
       if (!res.ok || !res.body) { retry(10000); return; }
       onOpen?.();
       const reader = res.body.getReader();
@@ -1345,17 +1350,25 @@
     restartBtn.disabled = true;
     restartStatusEl.textContent = 'Restarting…';
     restartPending = true;
+    const notRestarting = (text) => {
+      restartPending = false;
+      restartBtn.disabled = false;
+      restartStatusEl.textContent = text;
+    };
+    let res;
     try {
-      const res = await api('/teamclaude/restart', { method: 'POST', headers: { 'x-teamclaude-control': '1' } });
-      if (!res.ok) throw new Error('HTTP ' + res.status);
+      res = await api('/teamclaude/restart', { method: 'POST', headers: { 'x-teamclaude-control': '1' } });
     } catch (err) {
-      // A dropped connection is expected — the service is going down. A refusal
-      // (no key, or the server said no) means nothing is restarting.
-      if (needKey || /^HTTP /.test(err.message)) {
-        restartPending = false;
-        restartBtn.disabled = false;
-        restartStatusEl.textContent = needKey ? '' : 'Restart refused: ' + err.message;
-      }
+      // A dropped connection is expected — the service is going down. A 401
+      // (api() threw "proxy key required") means nothing is restarting.
+      if (needKey || err.message === 'proxy key required') notRestarting('');
+      return;
+    }
+    if (!res.ok) {
+      // The server says why (no systemctl here, restart turned off, …) and
+      // which setting changes it; show that rather than a status code.
+      const data = await res.json().catch(() => ({}));
+      notRestarting('Restart unavailable: ' + (data.error || 'HTTP ' + res.status));
     }
   });
 
@@ -1480,7 +1493,10 @@
   let logStream = null;
   function connectLogs() {
     logStream?.stop();
-    logStream = openStream('/teamclaude/logs', { onData: (line) => appendLog(String(line)) });
+    logStream = openStream('/teamclaude/logs', {
+      onData: (line) => appendLog(String(line)),
+      onUnavailable: (why) => appendLog('[TeamClaude] ' + why),
+    });
   }
 
   connectLogs();

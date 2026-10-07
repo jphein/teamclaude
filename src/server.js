@@ -22,6 +22,7 @@ import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-targ
 import { renderDashboardHtml, dashboardCsp, injectUiHelpers, uiCsp } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
 import { classificationPath } from './classification-path.js';
+import { resolveLogSource, resolveRestartMethod, startRestartCommand, tailFile, EXIT_FOR_RESTART } from './service-control.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -574,15 +575,39 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
-      // GET /teamclaude/logs — SSE tail of this service's journald output.
+      // GET /teamclaude/logs — SSE tail of this service's log: journald by
+      // default, or a file (`service.logs: { file }`) on a host without
+      // systemd. See service-control.js.
       if (req.method === 'GET' && req.url === '/teamclaude/logs') {
         // 501 is the page's "stop for good" answer (its stream reader, like
         // EventSource before it, gives up instead of respawning journalctl
         // every few seconds on a host that lacks it).
-        if (journalctlBroken) { json(res, 501, { error: 'journalctl unavailable' }); return; }
+        const source = resolveLogSource(config);
+        if (source.kind === 'off') { json(res, 501, { error: `logs unavailable: ${source.reason}` }); return; }
+        if (source.kind === 'journald' && journalctlBroken) {
+          json(res, 501, { error: 'logs unavailable: journalctl is not installed here; set service.logs to { "file": "<path>" }' });
+          return;
+        }
         if (logStreams >= 4) { json(res, 503, { error: 'too many concurrent log streams' }); return; }
         logStreams++;
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+        if (source.kind === 'file') {
+          let closed = false;
+          const stop = tailFile(source.path, {
+            onLine: (line) => {
+              res.write(`data: ${JSON.stringify(line)}\n\n`);
+              // A reader that has stopped reading is dropped rather than
+              // buffered for: the page reconnects and starts from the tail.
+              if (res.writableLength > 1024 * 1024) res.end();
+            },
+            // Said once in the stream itself, so the page shows why it is empty.
+            onError: (err) => res.write(`data: ${JSON.stringify(`[TeamClaude] cannot read ${source.path}: ${err?.code || err?.message}`)}\n\n`),
+          });
+          const done = () => { if (closed) return; closed = true; logStreams--; stop(); };
+          req.on('close', done);
+          res.on('close', done);
+          return;
+        }
         // stderr ignored so a chatty journalctl can't block on an unread pipe.
         const child = spawn('journalctl',
           ['--user', '-u', 'teamclaude.service', '-n', '100', '-f', '--no-pager', '--output=short-iso'],
@@ -602,13 +627,26 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
-      // POST /teamclaude/restart — fire-and-forget systemd restart of this unit.
+      // POST /teamclaude/restart — restart the service the way `service.restart`
+      // says (default: the systemd user unit). Answers 200 only once the
+      // restart is actually under way; a host that cannot do it gets 501 with
+      // the setting that fixes it, instead of a "restarting" that never happens.
       if (req.method === 'POST' && req.url === '/teamclaude/restart') {
+        const method = resolveRestartMethod(config);
+        if (method.kind === 'off') { json(res, 501, { restarting: false, error: `restart unavailable: ${method.reason}` }); return; }
+        if (method.kind === 'exit') {
+          console.log(`[TeamClaude] Restart requested via UI: exiting with status ${EXIT_FOR_RESTART} for the supervisor to restart`);
+          json(res, 200, { restarting: true });
+          res.on('finish', () => setTimeout(() => (/** @type {any} */ (hooks).exitProcess || process.exit)(EXIT_FOR_RESTART), 250));
+          return;
+        }
+        const started = await startRestartCommand(method.argv, { spawnFn: /** @type {any} */ (hooks).spawnFn });
+        if (!started.ok) {
+          console.error(`[TeamClaude] Restart via UI failed: ${started.error}`);
+          json(res, started.status || 500, { restarting: false, error: started.error });
+          return;
+        }
         json(res, 200, { restarting: true });
-        setImmediate(() => {
-          const child = spawn('systemctl', ['--user', 'restart', 'teamclaude.service'], { detached: true, stdio: 'ignore' });
-          child.unref();
-        });
         return;
       }
 

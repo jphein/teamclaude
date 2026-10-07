@@ -410,7 +410,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // Dispatched BEFORE the loopback-only checks below: a page cannot make a
       // browser emit an absolute-form request line, the relay injects no fleet
       // credential, and its Host header names the TARGET, not this proxy.
-      if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res); return; }
+      if (/^https?:\/\//i.test(req.url || '')) { relayHttpForward(req, res, config.proxy); return; }
 
       // A request admitted ONLY by the loopback exemption — no valid key — is
       // held to two more conditions. Both target the same actor: a web page in
@@ -951,7 +951,11 @@ export function describeConnectError(err) {
 // client's own headers — no account selection, no token injection,
 // content-encoding passed through (a transparent forward proxy). Anthropic is
 // HTTPS-only, so in practice this only ever sees third-party hosts.
-export function relayHttpForward(req, res) {
+//
+// "The client's own headers" excludes the credentials the client presented to
+// THIS proxy (forwardHeaders below): those authenticate to us, and relaying
+// them would hand the proxy key to whichever third-party host the request names.
+export function relayHttpForward(req, res, proxyConfig = undefined) {
   let target;
   try { target = new URL(req.url); } catch {
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -977,14 +981,7 @@ export function relayHttpForward(req, res) {
   if (refused) { refuse(refused); return; }
 
   const transport = target.protocol === 'http:' ? http : https;
-  /** @type {import('node:http').OutgoingHttpHeaders} */
-  const headers = {};
-  for (const [key, value] of Object.entries(req.headers)) {
-    const lk = key.toLowerCase();
-    // Drop hop-by-hop + proxy-control headers; `host` is reset from the target.
-    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection') continue;
-    headers[key] = value;
-  }
+  const headers = forwardHeaders(req.headers, proxyConfig);
 
   const upstreamReq = transport.request(target, { method: req.method, headers, lookup: guardedLookup(req.socket) }, (upstreamRes) => {
     const responseHeaders = {};
@@ -1006,6 +1003,49 @@ export function relayHttpForward(req, res) {
   res.on('close', () => upstreamReq.destroy());
   if (['GET', 'HEAD'].includes(req.method)) upstreamReq.end();
   else req.pipe(upstreamReq);
+}
+
+/**
+ * The headers a plain-HTTP forward sends to its third-party target.
+ *
+ * Dropped: hop-by-hop and proxy-control headers (`host` is reset from the
+ * target), and every credential that authenticates to this proxy rather than
+ * to the target:
+ *   - `x-api-key`: always. On this path it is the proxy key the gate just
+ *     checked (a remote caller cannot reach here without one). A loopback tool
+ *     with an x-api-key of its own for a plain-HTTP third party loses it — an
+ *     accepted cost, since the proxy cannot tell the two apart by name and the
+ *     failure is loud (the target refuses) while the leak would be silent.
+ *   - `proxy-authorization`: always (the CONNECT gate's channel; in
+ *     HOP_BY_HOP_HEADERS).
+ *   - `authorization`: only when it carries one of this proxy's keys (bare or
+ *     as `Bearer <key>`). Any other value is the client's own credential for
+ *     the target, which a transparent forward proxy passes through.
+ * Nothing is ever added: no account credential is injected on this path.
+ *
+ * @param {import('node:http').IncomingHttpHeaders} incoming
+ * @param {any} proxyConfig
+ * @returns {import('node:http').OutgoingHttpHeaders}
+ */
+export function forwardHeaders(incoming, proxyConfig) {
+  const keys = [proxyConfig?.apiKey, ...(Array.isArray(proxyConfig?.clientKeys) ? proxyConfig.clientKeys.map((/** @type {any} */ e) => e?.key) : [])]
+    .filter((k) => typeof k === 'string' && k.length > 0);
+  /** @param {unknown} value */
+  const carriesProxyKey = (value) => {
+    const v = String(value ?? '').trim();
+    const token = /^bearer\s+/i.test(v) ? v.replace(/^bearer\s+/i, '').trim() : v;
+    return keys.some((k) => safeKeyEqual(token, k));
+  };
+  /** @type {import('node:http').OutgoingHttpHeaders} */
+  const headers = {};
+  for (const [key, value] of Object.entries(incoming || {})) {
+    const lk = key.toLowerCase();
+    if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection') continue;
+    if (lk === 'x-api-key') continue;
+    if (lk === 'authorization' && carriesProxyKey(value)) continue;
+    headers[key] = value;
+  }
+  return headers;
 }
 
 // Paths relayed with the CLIENT's own credential, never a rotated account token.

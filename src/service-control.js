@@ -27,6 +27,8 @@ export const EXIT_FOR_RESTART = 75;
 
 /** How much of a log file's tail is read for the initial lines. */
 const TAIL_BYTES = 64 * 1024;
+/** Most bytes one poll reads; more growth than this is skipped to the tail. */
+export const MAX_READ_BYTES = 256 * 1024;
 
 /**
  * @typedef {{ kind: 'journald' } | { kind: 'file', path: string } | { kind: 'off', reason: string }} LogSource
@@ -152,9 +154,21 @@ export function tailFile(path, { lines = 100, pollMs = 1000, onLine, onError = (
       } else {
         if (st.ino !== ino || st.size < offset) { offset = 0; rest = ''; ino = st.ino; }
         if (st.size > offset) {
-          const split = splitLines(rest + await readRange(offset, st.size));
+          // Bounded per poll: a log that grew by more than MAX_READ_BYTES since
+          // the last look (a burst, or a file replaced by something huge) is
+          // skipped to its tail with a marker, never read into one buffer.
+          let from = offset;
+          if (st.size - offset > MAX_READ_BYTES) {
+            from = st.size - TAIL_BYTES;
+            if (!stopped) onLine(`[TeamClaude] … ${from - offset} bytes of log skipped (grew faster than the viewer reads)`);
+            rest = '';
+          }
+          let text = await readRange(from, st.size);
+          if (from !== offset) text = text.slice(text.indexOf('\n') + 1);
+          const split = splitLines(rest + text);
           offset = st.size;
-          rest = split.rest;
+          // An unterminated line is buffered only up to a bound, then dropped.
+          rest = split.rest.length > TAIL_BYTES ? '' : split.rest;
           for (const l of split.lines) if (!stopped) onLine(l);
         }
       }

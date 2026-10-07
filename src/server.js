@@ -32,6 +32,11 @@ export const HOP_BY_HOP_HEADERS = new Set([
 ]);
 // Path prefix for the deprecated URL-based account pin (superseded by TC_ACCT).
 const PIN_PREFIX = '/tc-acct/';
+// How long a failed /ui page read is held before the next attempt.
+const UI_RETRY_MS = 60_000;
+// How long one /teamclaude/restart blocks another (the process normally dies
+// well inside it; if not, the restart did not happen and may be retried).
+const RESTART_RETRY_MS = 30_000;
 
 /**
  * Does the request path carry a dot-segment (`.` or `..`, in any percent-encoded
@@ -253,8 +258,25 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     }
   }
 
-  /** @type {{ html: string, csp: string } | null} */
-  let uiPage = null;
+  // The /ui page, read once and shared by every request (concurrent first
+  // requests included). A failed read is held for UI_RETRY_MS: the route is
+  // unauthenticated, so a missing file must not turn each request into a disk
+  // read and a log line.
+  /** @type {Promise<{ html: string, csp: string }> | null} */
+  let uiPagePromise = null;
+  const loadUiPage = () => {
+    if (!uiPagePromise) {
+      const p = readFile(/** @type {any} */ (hooks).uiPagePath || join(__dirname, 'web', 'index.html'), 'utf-8')
+        .then((raw) => { const html = injectUiHelpers(raw); return { html, csp: uiCsp(html) }; });
+      uiPagePromise = p;
+      p.catch((/** @type {any} */ err) => {
+        console.error(`[TeamClaude] /ui page unavailable (next attempt in ${UI_RETRY_MS / 1000}s):`, err?.message);
+        setTimeout(() => { if (uiPagePromise === p) uiPagePromise = null; }, UI_RETRY_MS).unref?.();
+      });
+    }
+    return uiPagePromise;
+  };
+  let restartInFlight = false;   // one /teamclaude/restart at a time
   let journalctlBroken = false; // set once journalctl is found missing (stops the stream's reconnect spin)
   let logStreams = 0;           // concurrent /teamclaude/logs subprocesses, capped below
 
@@ -340,10 +362,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // needs one allowance more. Cached with its policy after the first read.
       if (req.method === 'GET' && (req.url === '/ui' || req.url === '/ui/' || req.url === '/ui/index.html')) {
         try {
-          if (uiPage === null) {
-            const html = injectUiHelpers(await readFile(join(__dirname, 'web', 'index.html'), 'utf-8'));
-            uiPage = { html, csp: uiCsp(html) };
-          }
+          const uiPage = await loadUiPage();
           res.writeHead(200, {
             'Content-Type': 'text/html; charset=utf-8',
             'Cache-Control': 'no-store',
@@ -351,10 +370,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
             'X-Content-Type-Options': 'nosniff',
           });
           res.end(uiPage.html);
-        } catch (err) {
-          // Unauthenticated callers reach this branch: the reason (a file path)
-          // goes to the log, not the reply.
-          console.error('[TeamClaude] /ui page unavailable:', err.message);
+        } catch {
+          // Unauthenticated callers reach this branch, so it does no work of
+          // its own: loadUiPage logs the reason (a file path) once per attempt
+          // and holds the failure for UI_RETRY_MS.
           json(res, 500, { error: 'dashboard page unavailable; see the proxy log' });
         }
         return;
@@ -634,6 +653,13 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       if (req.method === 'POST' && req.url === '/teamclaude/restart') {
         const method = resolveRestartMethod(config);
         if (method.kind === 'off') { json(res, 501, { restarting: false, error: `restart unavailable: ${method.reason}` }); return; }
+        // One restart at a time: repeated clicks (or a looping client) must
+        // not fan out into a process per request.
+        if (restartInFlight) { json(res, 409, { restarting: true, error: 'a restart is already under way' }); return; }
+        restartInFlight = true;
+        // The process normally dies under it; if it is still here a while
+        // later the restart did not happen, so allow another try.
+        setTimeout(() => { restartInFlight = false; }, RESTART_RETRY_MS).unref?.();
         if (method.kind === 'exit') {
           console.log(`[TeamClaude] Restart requested via UI: exiting with status ${EXIT_FOR_RESTART} for the supervisor to restart`);
           json(res, 200, { restarting: true });
@@ -642,6 +668,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         }
         const started = await startRestartCommand(method.argv, { spawnFn: /** @type {any} */ (hooks).spawnFn });
         if (!started.ok) {
+          restartInFlight = false;
           console.error(`[TeamClaude] Restart via UI failed: ${started.error}`);
           json(res, started.status || 500, { restarting: false, error: started.error });
           return;

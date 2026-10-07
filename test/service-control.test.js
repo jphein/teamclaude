@@ -8,7 +8,7 @@ import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import { SessionTitles } from '../src/session-titles.js';
 import {
-  resolveLogSource, resolveRestartMethod, startRestartCommand, tailFile, splitLines, EXIT_FOR_RESTART,
+  resolveLogSource, resolveRestartMethod, startRestartCommand, tailFile, splitLines, EXIT_FOR_RESTART, MAX_READ_BYTES,
 } from '../src/service-control.js';
 
 // The dashboard's log viewer and Restart button on a host without systemd
@@ -250,4 +250,75 @@ test('session titles with no projects directory resolve to nothing, silently', a
     await titles.idle();
   } finally { Object.assign(console, orig); }
   assert.deepEqual(said, []);
+});
+
+// ── Resource bounds (background security review, 2026-10-07) ─
+
+test('tailFile reads at most MAX_READ_BYTES per poll: a burst is skipped to its tail with a marker', async () => {
+  await withDir(async (dir) => {
+    const path = join(dir, 'tc.log');
+    await writeFile(path, 'start\n');
+    const got = [];
+    const stop = tailFile(path, { pollMs: 20, onLine: l => got.push(l) });
+    try {
+      await until(() => got.includes('start'));
+      const burst = 4 * MAX_READ_BYTES;
+      const line = 'x'.repeat(99) + '\n';
+      await appendFile(path, line.repeat(Math.ceil(burst / line.length)) + 'last line\n');
+      await until(() => got.includes('last line'));
+      assert.ok(got.some(l => /bytes of log skipped/.test(l)), 'the skip is said, not silent');
+      const emittedBytes = got.reduce((n, l) => n + l.length + 1, 0);
+      assert.ok(emittedBytes < MAX_READ_BYTES, `emitted ${emittedBytes} bytes for a ${burst}-byte burst`);
+    } finally { stop(); }
+  });
+});
+
+test('tailFile drops an unterminated line that outgrows its bound instead of buffering it forever', async () => {
+  await withDir(async (dir) => {
+    const path = join(dir, 'tc.log');
+    await writeFile(path, 'a\n');
+    const got = [];
+    const stop = tailFile(path, { pollMs: 20, onLine: l => got.push(l) });
+    try {
+      await until(() => got.includes('a'));
+      await appendFile(path, 'y'.repeat(100 * 1024)); // no newline, under MAX_READ_BYTES
+      await new Promise(r => setTimeout(r, 80));
+      await appendFile(path, 'tail\nnext\n');
+      await until(() => got.includes('next'));
+      assert.ok(!got.some(l => l.length > 64 * 1024), 'the oversized partial line was not carried');
+    } finally { stop(); }
+  });
+});
+
+test('one restart at a time: a second request while one is under way is 409 and spawns nothing', async () => {
+  const spawned = fakeSpawn('spawn');
+  const server = makeServer({ restart: { command: ['rc-service', 'teamclaude', 'restart'] } }, { spawnFn: spawned.fn });
+  const port = await listen(server);
+  try {
+    const [a, b] = await Promise.all([1, 2].map(() => fetch(`http://127.0.0.1:${port}/teamclaude/restart`, { method: 'POST' })));
+    assert.deepEqual([a.status, b.status].sort(), [200, 409]);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/teamclaude/restart`, { method: 'POST' })).status, 409);
+    assert.equal(spawned.calls.length, 1);
+  } finally { server.close(); }
+  // A restart that failed to start does not block the next try.
+  const missing = makeServer({ restart: { command: ['teamclaude-test-no-such-binary-7f3a'] } });
+  const port2 = await listen(missing);
+  try {
+    for (let i = 0; i < 2; i++) assert.equal((await fetch(`http://127.0.0.1:${port2}/teamclaude/restart`, { method: 'POST' })).status, 501);
+  } finally { missing.close(); }
+});
+
+test('a missing /ui page costs one read and one log line, not one per (unauthenticated) request', async () => {
+  const said = [];
+  const orig = console.error;
+  console.error = (...a) => said.push(a.join(' '));
+  const am = new AccountManager([{ name: 'a', type: 'apikey', apiKey: 'k1' }], 0.98);
+  const server = createProxyServer(am, { proxy: {}, upstream: 'http://127.0.0.1:9' }, { uiPagePath: join(tmpdir(), 'tc-no-such-ui-3b7d.html') });
+  const port = await listen(server);
+  try {
+    const statuses = await Promise.all(Array.from({ length: 20 }, () => fetch(`http://127.0.0.1:${port}/ui`).then(r => r.status)));
+    for (let i = 0; i < 5; i++) statuses.push((await fetch(`http://127.0.0.1:${port}/ui`)).status);
+    assert.ok(statuses.every(s => s === 500));
+  } finally { server.close(); console.error = orig; }
+  assert.equal(said.filter(s => s.includes('/ui page unavailable')).length, 1, JSON.stringify(said));
 });

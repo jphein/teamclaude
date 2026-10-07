@@ -117,6 +117,22 @@ test('forwardHeaders: a proxy key hidden in Basic, a joined value, an array, or 
   }
 });
 
+test('forwardHeaders: a proxy key in any scheme or any header is dropped, by containment', () => {
+  const b64url = (s) => Buffer.from(s).toString('base64url');
+  for (const [name, value] of [
+    ['authorization', `Token ${CLIENT}`],
+    ['authorization', `Digest username="${SHARED}", realm="target", nonce="n"`],
+    ['authorization', `Basic ${b64url(`u:${CLIENT}`)}`],
+    ['x-custom-auth', `key=${CLIENT}`],
+    ['cookie', `session=abc; proxy=${SHARED}`],
+  ]) {
+    assert.deepEqual(forwardHeaders({ [name]: value, accept: 'a' }, PROXY), { accept: 'a' }, `${name}: ${value}`);
+  }
+  // Headers without a key in them are untouched, whatever they look like.
+  const own = { authorization: 'Digest username="me", realm="target"', 'x-custom-auth': 'key=target-key', cookie: 'session=abc' };
+  assert.deepEqual(forwardHeaders(own, PROXY), own);
+});
+
 test('forwardHeaders: headers the Connection header nominates are dropped', () => {
   assert.deepEqual(
     forwardHeaders({ connection: 'keep-alive, X-Internal-Control', 'x-internal-control': '1', accept: 'a' }, PROXY),

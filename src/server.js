@@ -1020,16 +1020,22 @@ export function relayHttpForward(req, res, proxyConfig = undefined) {
  *     HTTP_PROXY.
  *   - `proxy-authorization`: always (the CONNECT gate's channel; in
  *     HOP_BY_HOP_HEADERS).
- *   - `authorization`: when any part of it carries one of this proxy's keys —
- *     bare, `Bearer <key>`, or Basic with the key as user or password; in any
- *     element of an array value or any comma-joined part. Any other value is
- *     the client's own credential for the target, which a transparent forward
- *     proxy passes through. (A key re-encoded some other way cannot be told
- *     from a target credential and is not recognised: the gate on this path
- *     reads x-api-key, so a client has no reason to put it there.)
+ *   - ANY header whose value contains one of this proxy's keys — in plain text
+ *     (`Bearer <key>`, `Token <key>`, a Digest `username="<key>"`, a custom
+ *     header) or inside a `Basic` payload once decoded — and in any element of
+ *     an array value. Containment rather than matching known credential forms,
+ *     because no list of forms is complete. Keys are long random strings, so a
+ *     target credential that happens to contain one is not a real case; any
+ *     header without a key in it — the client's own credential for the target
+ *     included — passes through, as a transparent forward proxy should.
  *   - headers the client's `Connection` header nominates (hop-by-hop by
- *     definition).
+ *     definition), and the operator's usage-dimension label headers (they
+ *     name what the proxy accounts by; a target that reads a header of the
+ *     same name does not get it through this proxy — the operator chose it).
  * Nothing is ever added: no account credential is injected on this path.
+ * The check runs only after the gate has admitted the request, i.e. for a
+ * caller holding a key or on loopback, so a timing difference in it reveals
+ * nothing that caller does not already have.
  *
  * @param {import('node:http').IncomingHttpHeaders} incoming
  * @param {any} proxyConfig
@@ -1038,33 +1044,20 @@ export function relayHttpForward(req, res, proxyConfig = undefined) {
 export function forwardHeaders(incoming, proxyConfig) {
   const keys = [proxyConfig?.apiKey, ...(Array.isArray(proxyConfig?.clientKeys) ? proxyConfig.clientKeys.map((/** @type {any} */ e) => e?.key) : [])]
     .filter((k) => typeof k === 'string' && k.length > 0);
-  // One credential: bare, `Bearer <key>`, or `Basic base64(user:pass)` with the
-  // key in either slot (the forms the proxy's own gates accept).
-  /** @param {string} cred */
-  const isProxyKey = (cred) => {
-    const v = cred.trim();
-    const m = /^(bearer|basic)\s+(.*)$/i.exec(v);
-    /** @type {string[]} */
-    const candidates = [v];
-    if (m) {
-      candidates.push(m[2].trim());
-      if (m[1].toLowerCase() === 'basic') {
-        const dec = Buffer.from(m[2].trim(), 'base64').toString('utf8');
-        const i = dec.indexOf(':');
-        candidates.push(dec, i >= 0 ? dec.slice(0, i) : dec, i >= 0 ? dec.slice(i + 1) : '');
-      }
-    }
-    return candidates.some((c) => keys.some((k) => safeKeyEqual(c, k)));
-  };
-  // Any element of an array value, and any comma-separated part of a joined
-  // one, carrying a proxy key condemns the whole header.
+  // Every `Basic <payload>` in a value, decoded (base64 or base64url), so a key
+  // inside one is visible to the containment check below.
+  /** @param {string} s */
+  const decodedBasics = (s) => [...s.matchAll(/basic\s+([A-Za-z0-9+/_=-]+)/gi)]
+    .map((m) => Buffer.from(m[1], 'base64').toString('utf8'));
+  // Any element of an array value containing a proxy key — in plain text or
+  // in a decoded Basic payload — condemns the whole header.
   /** @param {unknown} value */
   const carriesProxyKey = (value) => {
     if (keys.length === 0) return false;
     const values = Array.isArray(value) ? value : [value];
     return values.some((one) => {
       const s = String(one ?? '');
-      return isProxyKey(s) || s.split(',').some((part) => isProxyKey(part));
+      return [s, ...decodedBasics(s)].some((text) => keys.some((k) => text.includes(k)));
     });
   };
   // Headers the client's own Connection header nominates are hop-by-hop too.
@@ -1078,7 +1071,7 @@ export function forwardHeaders(incoming, proxyConfig) {
     const lk = key.toLowerCase();
     if (lk.startsWith(':') || HOP_BY_HOP_HEADERS.has(lk) || lk === 'proxy-connection' || nominated.has(lk) || labels.has(lk)) continue;
     if (lk === 'x-api-key') continue;
-    if (lk === 'authorization' && carriesProxyKey(value)) continue;
+    if (carriesProxyKey(value)) continue;
     headers[key] = value;
   }
   return headers;

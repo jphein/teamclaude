@@ -346,7 +346,7 @@ async function bootPage({ storageThrows = false, readOnlyStorage = null } = {}) 
     page.fetches.push(call);
     if (page.auto401) return Promise.resolve({ status: 401, ok: false, json: async () => ({}), body: null });
     return new Promise((resolve) => {
-      call.answer = (status) => resolve({ status, ok: status < 300, json: async () => ({}), body: null });
+      call.answer = (status, payload = {}) => resolve({ status, ok: status < 300, json: async () => payload, body: null });
     });
   };
   const ctx = vm.createContext({
@@ -437,4 +437,43 @@ test('with localStorage blocked the entered key still works for the page', async
 
 test('both dashboards keep the key in the same localStorage slot', () => {
   assert.match(renderDashboardHtml(), new RegExp(`var KEY = ${JSON.stringify(KEY_STORAGE)};`));
+});
+
+test('a host that cannot restart or show logs says why on the page, and the button comes back', async () => {
+  const page = await bootPage();
+  page.take();
+  page.auto401 = false;
+  await page.unlock('k');
+  const logs = page.take().find(f => f.url === '/teamclaude/logs');
+  logs.answer(501, { error: 'logs unavailable: journalctl is not installed here; set service.logs to { "file": "<path>" }' });
+  await page.settle();
+  const logLines = page.elements.get('logBox').children.map(c => c.textContent);
+  assert.ok(logLines.some(t => /journalctl is not installed here/.test(t)), JSON.stringify(logLines));
+
+  page.elements.get('restartBtn').fire('click');
+  await page.settle();
+  const restart = page.take().find(f => f.url === '/teamclaude/restart');
+  restart.answer(501, { restarting: false, error: 'restart unavailable: "systemctl" is not installed here; set service.restart' });
+  await page.settle();
+  assert.match(page.elements.get('restartStatus').textContent, /^Restart unavailable: .*set service\.restart/);
+  assert.equal(page.elements.get('restartBtn').disabled, false);
+});
+
+test('a stale 401 after unlock does not leave the restart button stuck', async () => {
+  const page = await bootPage();
+  page.take();
+  page.auto401 = false;
+  await page.unlock('k2');
+  page.take();
+  page.elements.get('restartBtn').fire('click');
+  await page.settle();
+  const restart = page.take().find(f => f.url === '/teamclaude/restart');
+  // A 401 for a key that is no longer the one in use: no prompt, but no restart either.
+  page.elements.get('keyInput').value = 'k3';
+  page.elements.get('keyGo').fire('click');
+  await page.settle();
+  restart.answer(401);
+  await page.settle();
+  assert.equal(page.elements.get('restartBtn').disabled, false);
+  assert.notEqual(page.elements.get('restartStatus').textContent, 'Restarting…');
 });

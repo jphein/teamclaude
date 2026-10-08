@@ -22,6 +22,7 @@ import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-targ
 import { renderDashboardHtml, dashboardCsp, injectUiHelpers, uiCsp } from './dashboard.js';
 import { createUsageRecorder, resolveUsageDimensions, usageDimensionHeaderNames } from './client-usage.js';
 import { classificationPath } from './classification-path.js';
+import { resolveLogSource, resolveRestartMethod, startRestartCommand, tailFile, EXIT_FOR_RESTART } from './service-control.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -31,6 +32,11 @@ export const HOP_BY_HOP_HEADERS = new Set([
 ]);
 // Path prefix for the deprecated URL-based account pin (superseded by TC_ACCT).
 const PIN_PREFIX = '/tc-acct/';
+// How long a failed /ui page read is held before the next attempt.
+const UI_RETRY_MS = 60_000;
+// How long one /teamclaude/restart blocks another (the process normally dies
+// well inside it; if not, the restart did not happen and may be retried).
+const RESTART_RETRY_MS = 30_000;
 
 /**
  * Does the request path carry a dot-segment (`.` or `..`, in any percent-encoded
@@ -252,10 +258,29 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     }
   }
 
-  /** @type {{ html: string, csp: string } | null} */
-  let uiPage = null;
+  // The /ui page, read once and shared by every request (concurrent first
+  // requests included). A failed read is held for UI_RETRY_MS: the route is
+  // unauthenticated, so a missing file must not turn each request into a disk
+  // read and a log line.
+  /** @type {Promise<{ html: string, csp: string }> | null} */
+  let uiPagePromise = null;
+  const loadUiPage = () => {
+    if (!uiPagePromise) {
+      const p = readFile(/** @type {any} */ (hooks).uiPagePath || join(__dirname, 'web', 'index.html'), 'utf-8')
+        .then((raw) => { const html = injectUiHelpers(raw); return { html, csp: uiCsp(html) }; });
+      uiPagePromise = p;
+      p.catch((/** @type {any} */ err) => {
+        console.error(`[TeamClaude] /ui page unavailable (next attempt in ${UI_RETRY_MS / 1000}s):`, err?.message);
+        setTimeout(() => { if (uiPagePromise === p) uiPagePromise = null; }, UI_RETRY_MS).unref?.();
+      });
+    }
+    return uiPagePromise;
+  };
+  let restartInFlight = false;   // one /teamclaude/restart at a time
   let journalctlBroken = false; // set once journalctl is found missing (stops the stream's reconnect spin)
   let logStreams = 0;           // concurrent /teamclaude/logs subprocesses, capped below
+  // Bytes a log reader may leave unread before it is dropped (a hook lowers it in tests).
+  const logMaxBuffered = /** @type {any} */ (hooks).logStreamMaxBuffered ?? 1024 * 1024;
 
   // Activity feed: a ring buffer of recent lifecycle/control events plus the set
   // of SSE subscribers. Lives here (not in the TUI) so the browser dashboard
@@ -269,7 +294,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     if (activityBuf.length > 500) activityBuf.shift();
     const msg = `data: ${JSON.stringify(e)}\n\n`;
     for (const sub of activityClients) {
-      try { sub.write(msg); } catch { activityClients.delete(sub); }
+      // Same rules as the log stream: never write to a finished response, and
+      // drop a subscriber that has stopped reading instead of buffering for it.
+      if (sub.writableEnded || sub.destroyed) { activityClients.delete(sub); continue; }
+      try { sub.write(msg); } catch { activityClients.delete(sub); continue; }
+      if (sub.writableLength > logMaxBuffered) { activityClients.delete(sub); sub.destroy(); }
     }
   }
 
@@ -339,10 +368,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // needs one allowance more. Cached with its policy after the first read.
       if (req.method === 'GET' && (req.url === '/ui' || req.url === '/ui/' || req.url === '/ui/index.html')) {
         try {
-          if (uiPage === null) {
-            const html = injectUiHelpers(await readFile(join(__dirname, 'web', 'index.html'), 'utf-8'));
-            uiPage = { html, csp: uiCsp(html) };
-          }
+          const uiPage = await loadUiPage();
           res.writeHead(200, {
             'Content-Type': 'text/html; charset=utf-8',
             'Cache-Control': 'no-store',
@@ -350,10 +376,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
             'X-Content-Type-Options': 'nosniff',
           });
           res.end(uiPage.html);
-        } catch (err) {
-          // Unauthenticated callers reach this branch: the reason (a file path)
-          // goes to the log, not the reply.
-          console.error('[TeamClaude] /ui page unavailable:', err.message);
+        } catch {
+          // Unauthenticated callers reach this branch, so it does no work of
+          // its own: loadUiPage logs the reason (a file path) once per attempt
+          // and holds the failure for UI_RETRY_MS.
           json(res, 500, { error: 'dashboard page unavailable; see the proxy log' });
         }
         return;
@@ -574,20 +600,58 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
-      // GET /teamclaude/logs — SSE tail of this service's journald output.
+      // GET /teamclaude/logs — SSE tail of this service's log: journald by
+      // default, or a file (`service.logs: { file }`) on a host without
+      // systemd. See service-control.js.
       if (req.method === 'GET' && req.url === '/teamclaude/logs') {
         // 501 is the page's "stop for good" answer (its stream reader, like
         // EventSource before it, gives up instead of respawning journalctl
         // every few seconds on a host that lacks it).
-        if (journalctlBroken) { json(res, 501, { error: 'journalctl unavailable' }); return; }
+        const source = resolveLogSource(config);
+        if (source.kind === 'off') { json(res, 501, { error: `logs unavailable: ${source.reason}` }); return; }
+        if (source.kind === 'journald' && journalctlBroken) {
+          json(res, 501, { error: 'logs unavailable: journalctl is not installed here; set service.logs to { "file": "<path>" }' });
+          return;
+        }
         if (logStreams >= 4) { json(res, 503, { error: 'too many concurrent log streams' }); return; }
         logStreams++;
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+        if (source.kind === 'file') {
+          let closed = false;
+          let stop = () => {};
+          const done = () => { if (closed) return; closed = true; logStreams--; stop(); };
+          // Every write goes through here: nothing reaches a response that has
+          // ended or been destroyed (a write after end is an uncaught error that
+          // would take the whole proxy down).
+          const send = (/** @type {string} */ text) => {
+            if (closed || res.writableEnded || res.destroyed) return;
+            res.write(`data: ${JSON.stringify(text)}\n\n`);
+            // A reader that has fallen this far behind (the bound is on top of
+            // the kernel's socket buffers, so it has read nothing for a long
+            // while) is dropped rather than buffered for: the tail stops with
+            // it, the socket and its queued bytes are let go, and the page
+            // reconnects and starts again from the tail.
+            if (res.writableLength > logMaxBuffered) { done(); res.destroy(); }
+          };
+          stop = tailFile(source.path, {
+            onLine: send,
+            // Said once in the stream itself, so the page shows why it is empty.
+            onError: (err) => send(`[TeamClaude] cannot read ${source.path}: ${err?.code || err?.message}`),
+          });
+          // tailFile calls back only after its first await, but should a
+          // callback ever run before it returns and drop the reader, the real
+          // stop() must still run.
+          if (closed) stop();
+          req.on('close', done);
+          res.on('close', done);
+          return;
+        }
         // stderr ignored so a chatty journalctl can't block on an unread pipe.
         const child = spawn('journalctl',
           ['--user', '-u', 'teamclaude.service', '-n', '100', '-f', '--no-pager', '--output=short-iso'],
           { stdio: ['ignore', 'pipe', 'ignore'] });
         child.stdout.on('data', chunk => {
+          if (res.writableEnded || res.destroyed) return;
           for (const line of chunk.toString().split('\n')) {
             // Honor backpressure: if the socket buffer is full, pause the tail
             // until it drains so a slow/stalled reader can't balloon RSS.
@@ -596,19 +660,43 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         });
         res.on('drain', () => child.stdout.resume());
         child.on('error', () => { journalctlBroken = true; if (!res.writableEnded) res.end(); });
-        child.on('exit', () => { if (!res.writableEnded) res.end(); });
+        // 'close', not 'exit': exit can come before the last stdout chunk.
+        child.on('close', () => { if (!res.writableEnded) res.end(); });
         let closed = false;
-        req.on('close', () => { if (closed) return; closed = true; logStreams--; child.kill(); });
+        const done = () => { if (closed) return; closed = true; logStreams--; child.kill(); };
+        req.on('close', done);
+        res.on('close', done);
         return;
       }
 
-      // POST /teamclaude/restart — fire-and-forget systemd restart of this unit.
+      // POST /teamclaude/restart — restart the service the way `service.restart`
+      // says (default: the systemd user unit). Answers 200 only once the
+      // restart is actually under way; a host that cannot do it gets 501 with
+      // the setting that fixes it, instead of a "restarting" that never happens.
       if (req.method === 'POST' && req.url === '/teamclaude/restart') {
+        const method = resolveRestartMethod(config);
+        if (method.kind === 'off') { json(res, 501, { restarting: false, error: `restart unavailable: ${method.reason}` }); return; }
+        // One restart at a time: repeated clicks (or a looping client) must
+        // not fan out into a process per request.
+        if (restartInFlight) { json(res, 409, { restarting: true, error: 'a restart is already under way' }); return; }
+        restartInFlight = true;
+        // The process normally dies under it; if it is still here a while
+        // later the restart did not happen, so allow another try.
+        setTimeout(() => { restartInFlight = false; }, RESTART_RETRY_MS).unref?.();
+        if (method.kind === 'exit') {
+          console.log(`[TeamClaude] Restart requested via UI: exiting with status ${EXIT_FOR_RESTART} for the supervisor to restart`);
+          json(res, 200, { restarting: true });
+          res.on('finish', () => setTimeout(() => (/** @type {any} */ (hooks).exitProcess || process.exit)(EXIT_FOR_RESTART), 250));
+          return;
+        }
+        const started = await startRestartCommand(method.argv, { spawnFn: /** @type {any} */ (hooks).spawnFn });
+        if (!started.ok) {
+          restartInFlight = false;
+          console.error(`[TeamClaude] Restart via UI failed: ${started.error}`);
+          json(res, started.status || 500, { restarting: false, error: started.error });
+          return;
+        }
         json(res, 200, { restarting: true });
-        setImmediate(() => {
-          const child = spawn('systemctl', ['--user', 'restart', 'teamclaude.service'], { detached: true, stdio: 'ignore' });
-          child.unref();
-        });
         return;
       }
 

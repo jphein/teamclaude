@@ -29,12 +29,19 @@ import { generateCertChain } from './x509.js';
 import { leafCovers, keyMatchesCert, refreshCaBundle, CA_BUNDLE, LISTENER_CA } from './mitm.js';
 
 export const DEFAULT_TLS_PORT = 3443;
-// Must differ from the MITM CA's name ("TeamClaude Local CA"). The certs carry
-// no key identifiers, so a client trusting the bundle picks a CA by issuer
-// name; two CAs with one name made every listener handshake fail with
-// "certificate signature failure" — the first match was the MITM CA
-// (measured on familiar, 2026-10-02, OpenSSL and Claude Code alike).
+// The listener CA's name starts with this, and must differ from the MITM CA's
+// ("TeamClaude Local CA"). Each generation appends a short random tag so no two
+// listener CAs ever share a name either. The real fix for same-name CAs is the
+// key identifiers x509.js now writes (a leaf's AKI names its CA's key); the
+// unique name is for a human reading a trust store. History: two CAs with one
+// name made every listener handshake fail with "certificate signature failure"
+// (familiar, 2026-10-02).
 export const LISTENER_CA_CN = 'TeamClaude Listener CA';
+
+/** A fresh, unique listener-CA name: prefix + 8 hex chars. */
+export function listenerCaName() {
+  return `${LISTENER_CA_CN} ${randomBytes(4).toString('hex')}`;
+}
 const LISTENER_CERT = 'teamclaude-listener.pem';
 const LISTENER_KEY = 'teamclaude-listener.key';
 export { CA_BUNDLE };
@@ -92,11 +99,22 @@ export async function writeCaBundle(dir) {
   return /** @type {Promise<string>} */ (refreshCaBundle(dir));
 }
 
-/** Was this CA issued under the listener's own name? A chain from before the
- * rename shares the MITM CA's name and is regenerated.
- * @param {string} caPem */
-function hasListenerCaName(caPem) {
-  try { return new X509Certificate(caPem).subject.includes(`CN=${LISTENER_CA_CN}`); } catch { return false; }
+/** Is this a current-generation listener chain? The leaf must carry an
+ * Authority Key Identifier: that is what stops a same-name CA shadowing this
+ * one in a client's trust store, and every pre-SKI chain lacks it. The CA must
+ * also carry the listener name with a per-generation tag, so a human reading a
+ * trust store can tell generations apart. Either missing means reissue.
+ * @param {string} caPem @param {string} certPem */
+function isCurrentListenerChain(caPem, certPem) {
+  try {
+    const subject = new X509Certificate(caPem).subject;
+    const named = new RegExp(`CN=${LISTENER_CA_CN} [0-9a-f]{8}(\\n|$)`).test(subject);
+    const leaf = new X509Certificate(certPem);
+    // Node does not expose extensions directly; the AKI's OID in the raw DER
+    // (2.5.29.35 = 06 03 55 1d 23) is the presence check.
+    const hasAki = leaf.raw.includes(Buffer.from([0x06, 0x03, 0x55, 0x1d, 0x23]));
+    return named && hasAki;
+  } catch { return false; }
 }
 
 /**
@@ -111,8 +129,8 @@ export async function ensureListenerCerts(hosts, dir = certDir()) {
   let regenerated = false;
   /** @type {{ caPem: string | null, certPem: string | null, keyPem: string | null }} */
   let chain = { caPem, certPem, keyPem };
-  if (!(caPem && certPem && keyPem && leafCovers(caPem, certPem, hosts) && keyMatchesCert(certPem, keyPem) && hasListenerCaName(caPem))) {
-    const g = generateCertChain(hosts, { caCn: LISTENER_CA_CN }); // CA key discarded, as for the MITM chain
+  if (!(caPem && certPem && keyPem && leafCovers(caPem, certPem, hosts) && keyMatchesCert(certPem, keyPem) && isCurrentListenerChain(caPem, certPem))) {
+    const g = generateCertChain(hosts, { caCn: listenerCaName() }); // CA key discarded, as for the MITM chain
     await mkdir(dir, { recursive: true });
     // Key first (see keyMatchesCert): a torn write regenerates next start.
     await atomicWrite(join(dir, LISTENER_KEY), String(g.leafKeyPem), 0o600);

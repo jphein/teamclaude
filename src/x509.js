@@ -7,7 +7,7 @@
 // general-purpose ASN.1 library — just what these two certs need.
 
 import { isIP } from 'node:net';
-import { generateKeyPairSync, sign as cryptoSign, randomBytes } from 'node:crypto';
+import { generateKeyPairSync, sign as cryptoSign, randomBytes, createHash } from 'node:crypto';
 
 // ── ASN.1 DER primitives ──────────────────────────────────────
 
@@ -117,13 +117,47 @@ export function ipSanBytes(s) {
   return null;
 }
 
-function buildCert({ subjectCN, issuerCN, spkiDer, signKey, isCA, altDnsNames = [], days }) {
+/**
+ * Subject Key Identifier for a SubjectPublicKeyInfo (RFC 5280 4.2.1.2, method 1):
+ * SHA-1 of the subjectPublicKey BIT STRING's value, without tag, length or the
+ * unused-bits byte. Clients match a leaf's Authority Key Identifier against it,
+ * so two CAs that share a name no longer shadow each other in one trust store
+ * (the 2026-10-02 "certificate signature failure"; Oracle, #15).
+ * @param {Buffer} spkiDer
+ */
+export function keyIdentifier(spkiDer) {
+  // SPKI = SEQUENCE { algorithm AlgorithmIdentifier, subjectPublicKey BIT STRING }.
+  let i = 1 + lenOfLen(spkiDer, 1);                 // into the outer SEQUENCE
+  i += 1 + lenOfLen(spkiDer, i + 1) + derContentLength(spkiDer, i + 1); // skip AlgorithmIdentifier
+  if (spkiDer[i] !== 0x03) throw new Error('SPKI: expected BIT STRING');
+  const bitsLen = derContentLength(spkiDer, i + 1);
+  const start = i + 1 + lenOfLen(spkiDer, i + 1) + 1; // + the unused-bits byte
+  return createHash('sha1').update(spkiDer.subarray(start, start + bitsLen - 1)).digest();
+}
+
+/** Number of bytes the DER length field at `at` occupies. @param {Buffer} der @param {number} at */
+function lenOfLen(der, at) {
+  return der[at] & 0x80 ? 1 + (der[at] & 0x7f) : 1;
+}
+
+/** The content length encoded by the DER length field at `at`. @param {Buffer} der @param {number} at */
+function derContentLength(der, at) {
+  if (!(der[at] & 0x80)) return der[at];
+  let n = 0;
+  for (let k = 1; k <= (der[at] & 0x7f); k++) n = (n * 256) + der[at + k];
+  return n;
+}
+
+function buildCert({ subjectCN, issuerCN, spkiDer, signKey, isCA, altDnsNames = [], days, issuerKeyId = null }) {
   const now = new Date();
   const notBefore = new Date(now.getTime() - 60 * 60 * 1000);          // 1h back for clock skew
   const notAfter = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
 
   const extList = [];
   extList.push(ext('2.5.29.19', true, isCA ? seq([bool(true)]) : seq([]))); // basicConstraints
+  extList.push(ext('2.5.29.14', false, octet(keyIdentifier(spkiDer))));       // subjectKeyIdentifier
+  // authorityKeyIdentifier { keyIdentifier [0] IMPLICIT } — the issuer's SKI.
+  if (issuerKeyId) extList.push(ext('2.5.29.35', false, seq([ctxPrim(0, issuerKeyId)])));
   extList.push(ext('2.5.29.15', true, isCA
     ? keyUsage([0, 5, 6])   // digitalSignature, keyCertSign, cRLSign
     : keyUsage([0, 2])));   // digitalSignature, keyEncipherment
@@ -176,7 +210,7 @@ export function createCA(cn = 'TeamClaude Local CA', { days = CA_DAYS } = {}) {
     subjectCN: cn, issuerCN: cn, spkiDer: key.spkiDer, signKey: key.privateKey,
     isCA: true, days,
   });
-  return { cn, certPem, keyPem: key.keyPem, privateKey: key.privateKey };
+  return { cn, certPem, keyPem: key.keyPem, privateKey: key.privateKey, keyId: keyIdentifier(key.spkiDer) };
 }
 
 export function createLeaf(hosts, ca, { days = LEAF_DAYS } = {}) {
@@ -184,7 +218,7 @@ export function createLeaf(hosts, ca, { days = LEAF_DAYS } = {}) {
   const key = newRsaKey();
   const certPem = buildCert({
     subjectCN: list[0], issuerCN: ca.cn, spkiDer: key.spkiDer, signKey: ca.privateKey,
-    isCA: false, altDnsNames: list, days,
+    isCA: false, altDnsNames: list, days, issuerKeyId: ca.keyId || null,
   });
   return { certPem, keyPem: key.keyPem };
 }

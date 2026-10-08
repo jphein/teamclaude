@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { X509Certificate } from 'node:crypto';
+import { X509Certificate, randomBytes } from 'node:crypto';
 import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -135,6 +135,18 @@ test('M2: authorityKeyId parses the AKI structurally and returns exactly the iss
   assert.equal(authorityKeyId(Buffer.alloc(0)), null);
 });
 
-// Note: a leaf whose AKI names ANOTHER CA's key cannot reach the AKI==SKI
-// clause in isCurrentListenerChain: leafCovers already rejects a leaf not signed
-// by the stored CA, and that alone reissues. The clause is defense in depth.
+test('a leaf signed by the right CA but carrying a WRONG AKI is reissued (AKI must equal the CA SKI)', async (t) => {
+  // leafCovers checks only the signature, so this leaf passes it: the AKI==SKI
+  // clause is what rejects it (Oracle re-verify of #19 refuted the claim that
+  // the clause was unreachable). Reachable when teamclaude itself writes a
+  // stale keyId, so it guards regressions rather than attacks.
+  const dir = await mkdtemp(join(tmpdir(), 'tc-ski-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const ca = createCA(`${LISTENER_CA_CN} 0123456789ab`);
+  ca.keyId = randomBytes(20);                 // wrong key id, right signing key
+  const leaf = createLeaf(['localhost'], ca);
+  await writeFile(join(dir, 'teamclaude-listener-ca.pem'), ca.certPem);
+  await writeFile(join(dir, 'teamclaude-listener.pem'), leaf.certPem);
+  await writeFile(join(dir, 'teamclaude-listener.key'), leaf.keyPem);
+  assert.equal((await ensureListenerCerts(['localhost'], dir)).regenerated, true);
+});

@@ -7,7 +7,7 @@
 // general-purpose ASN.1 library — just what these two certs need.
 
 import { isIP } from 'node:net';
-import { generateKeyPairSync, sign as cryptoSign, randomBytes } from 'node:crypto';
+import { generateKeyPairSync, sign as cryptoSign, randomBytes, createHash, createPublicKey } from 'node:crypto';
 
 // ── ASN.1 DER primitives ──────────────────────────────────────
 
@@ -117,13 +117,92 @@ export function ipSanBytes(s) {
   return null;
 }
 
-function buildCert({ subjectCN, issuerCN, spkiDer, signKey, isCA, altDnsNames = [], days }) {
+/**
+ * Subject Key Identifier for a SubjectPublicKeyInfo (RFC 5280 4.2.1.2, method 1):
+ * SHA-1 of the subjectPublicKey BIT STRING's value, without tag, length or the
+ * unused-bits byte. Clients match a leaf's Authority Key Identifier against it,
+ * so two CAs that share a name no longer shadow each other in one trust store
+ * (the 2026-10-02 "certificate signature failure"; Oracle, #15).
+ *
+ * Input contract: a well-formed SPKI from Node's own `KeyObject.export({ type:
+ * 'spki', format: 'der' })`. It is not a general DER parser and is never fed
+ * untrusted bytes; a malformed buffer throws or yields a wrong digest.
+ * @param {Buffer} spkiDer
+ */
+export function keyIdentifier(spkiDer) {
+  // SPKI = SEQUENCE { algorithm AlgorithmIdentifier, subjectPublicKey BIT STRING }.
+  let i = 1 + lenOfLen(spkiDer, 1);                 // into the outer SEQUENCE
+  i += 1 + lenOfLen(spkiDer, i + 1) + derContentLength(spkiDer, i + 1); // skip AlgorithmIdentifier
+  if (spkiDer[i] !== 0x03) throw new Error('SPKI: expected BIT STRING');
+  const bitsLen = derContentLength(spkiDer, i + 1);
+  const start = i + 1 + lenOfLen(spkiDer, i + 1) + 1; // + the unused-bits byte
+  return createHash('sha1').update(spkiDer.subarray(start, start + bitsLen - 1)).digest();
+}
+
+/**
+ * The keyIdentifier inside a certificate's Authority Key Identifier extension,
+ * or null. Walks the certificate's extensions structurally (no byte search):
+ * Certificate > TBSCertificate > [3] Extensions > Extension{2.5.29.35} >
+ * extnValue OCTET STRING > SEQUENCE > [0] keyIdentifier.
+ * @param {Buffer} certDer
+ * @returns {Buffer | null}
+ */
+export function authorityKeyId(certDer) {
+  /** children of the constructed TLV at `at`: [{ tag, start, end }] */
+  const kids = (/** @type {number} */ at) => {
+    const out = [];
+    let p = at + 1 + lenOfLen(certDer, at + 1);
+    const end = p + derContentLength(certDer, at + 1);
+    while (p < end) {
+      const len = derContentLength(certDer, p + 1);
+      const start = p + 1 + lenOfLen(certDer, p + 1);
+      out.push({ tag: certDer[p], at: p, start, end: start + len });
+      p = start + len;
+    }
+    return out;
+  };
+  try {
+    const tbs = kids(0)[0];
+    const exts = kids(tbs.at).find((k) => k.tag === 0xa3);
+    if (!exts) return null;
+    const seqOfExt = kids(exts.at)[0];
+    for (const e of kids(seqOfExt.at)) {
+      const parts = kids(e.at);
+      const oidTlv = certDer.subarray(parts[0].at, parts[0].end);
+      if (!oidTlv.equals(Buffer.from([0x06, 0x03, 0x55, 0x1d, 0x23]))) continue;
+      // extnValue is an OCTET STRING whose content is the AKI SEQUENCE; its
+      // [0] child (tag 0x80) is the keyIdentifier.
+      const value = parts[parts.length - 1];
+      const ki = kids(value.start).find((k) => k.tag === 0x80);
+      return ki ? Buffer.from(certDer.subarray(ki.start, ki.end)) : null;
+    }
+    return null;
+  } catch { return null; }
+}
+
+/** Number of bytes the DER length field at `at` occupies. @param {Buffer} der @param {number} at */
+function lenOfLen(der, at) {
+  return der[at] & 0x80 ? 1 + (der[at] & 0x7f) : 1;
+}
+
+/** The content length encoded by the DER length field at `at`. @param {Buffer} der @param {number} at */
+function derContentLength(der, at) {
+  if (!(der[at] & 0x80)) return der[at];
+  let n = 0;
+  for (let k = 1; k <= (der[at] & 0x7f); k++) n = (n * 256) + der[at + k];
+  return n;
+}
+
+function buildCert({ subjectCN, issuerCN, spkiDer, signKey, isCA, altDnsNames = [], days, issuerKeyId = null }) {
   const now = new Date();
   const notBefore = new Date(now.getTime() - 60 * 60 * 1000);          // 1h back for clock skew
   const notAfter = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
 
   const extList = [];
   extList.push(ext('2.5.29.19', true, isCA ? seq([bool(true)]) : seq([]))); // basicConstraints
+  extList.push(ext('2.5.29.14', false, octet(keyIdentifier(spkiDer))));       // subjectKeyIdentifier
+  // authorityKeyIdentifier { keyIdentifier [0] IMPLICIT } — the issuer's SKI.
+  if (issuerKeyId) extList.push(ext('2.5.29.35', false, seq([ctxPrim(0, issuerKeyId)])));
   extList.push(ext('2.5.29.15', true, isCA
     ? keyUsage([0, 5, 6])   // digitalSignature, keyCertSign, cRLSign
     : keyUsage([0, 2])));   // digitalSignature, keyEncipherment
@@ -176,7 +255,7 @@ export function createCA(cn = 'TeamClaude Local CA', { days = CA_DAYS } = {}) {
     subjectCN: cn, issuerCN: cn, spkiDer: key.spkiDer, signKey: key.privateKey,
     isCA: true, days,
   });
-  return { cn, certPem, keyPem: key.keyPem, privateKey: key.privateKey };
+  return { cn, certPem, keyPem: key.keyPem, privateKey: key.privateKey, keyId: keyIdentifier(key.spkiDer) };
 }
 
 export function createLeaf(hosts, ca, { days = LEAF_DAYS } = {}) {
@@ -184,7 +263,10 @@ export function createLeaf(hosts, ca, { days = LEAF_DAYS } = {}) {
   const key = newRsaKey();
   const certPem = buildCert({
     subjectCN: list[0], issuerCN: ca.cn, spkiDer: key.spkiDer, signKey: ca.privateKey,
+    // Derived from the CA's own public key, so every leaf carries an AKI even
+    // when a caller hands in a CA object built before keyId existed.
     isCA: false, altDnsNames: list, days,
+    issuerKeyId: ca.keyId || keyIdentifier(/** @type {Buffer} */ (createPublicKey(ca.privateKey).export({ type: 'spki', format: 'der' }))),
   });
   return { certPem, keyPem: key.keyPem };
 }

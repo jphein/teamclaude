@@ -279,6 +279,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   let restartInFlight = false;   // one /teamclaude/restart at a time
   let journalctlBroken = false; // set once journalctl is found missing (stops the stream's reconnect spin)
   let logStreams = 0;           // concurrent /teamclaude/logs subprocesses, capped below
+  // Bytes a log reader may leave unread before it is dropped (a hook lowers it in tests).
+  const logMaxBuffered = /** @type {any} */ (hooks).logStreamMaxBuffered ?? 1024 * 1024;
 
   // Activity feed: a ring buffer of recent lifecycle/control events plus the set
   // of SSE subscribers. Lives here (not in the TUI) so the browser dashboard
@@ -292,7 +294,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     if (activityBuf.length > 500) activityBuf.shift();
     const msg = `data: ${JSON.stringify(e)}\n\n`;
     for (const sub of activityClients) {
-      try { sub.write(msg); } catch { activityClients.delete(sub); }
+      // Same rules as the log stream: never write to a finished response, and
+      // drop a subscriber that has stopped reading instead of buffering for it.
+      if (sub.writableEnded || sub.destroyed) { activityClients.delete(sub); continue; }
+      try { sub.write(msg); } catch { activityClients.delete(sub); continue; }
+      if (sub.writableLength > logMaxBuffered) { activityClients.delete(sub); sub.destroy(); }
     }
   }
 
@@ -612,17 +618,24 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
         if (source.kind === 'file') {
           let closed = false;
-          const stop = tailFile(source.path, {
-            onLine: (line) => {
-              res.write(`data: ${JSON.stringify(line)}\n\n`);
-              // A reader that has stopped reading is dropped rather than
-              // buffered for: the page reconnects and starts from the tail.
-              if (res.writableLength > 1024 * 1024) res.end();
-            },
-            // Said once in the stream itself, so the page shows why it is empty.
-            onError: (err) => res.write(`data: ${JSON.stringify(`[TeamClaude] cannot read ${source.path}: ${err?.code || err?.message}`)}\n\n`),
-          });
+          let stop = () => {};
           const done = () => { if (closed) return; closed = true; logStreams--; stop(); };
+          // Every write goes through here: nothing reaches a response that has
+          // ended or been destroyed (a write after end is an uncaught error that
+          // would take the whole proxy down).
+          const send = (/** @type {string} */ text) => {
+            if (closed || res.writableEnded || res.destroyed) return;
+            res.write(`data: ${JSON.stringify(text)}\n\n`);
+            // A reader that has stopped reading is dropped rather than buffered
+            // for: the tail stops with it, the socket is let go, and the page
+            // reconnects and starts again from the tail.
+            if (res.writableLength > logMaxBuffered) { done(); res.destroy(); }
+          };
+          stop = tailFile(source.path, {
+            onLine: send,
+            // Said once in the stream itself, so the page shows why it is empty.
+            onError: (err) => send(`[TeamClaude] cannot read ${source.path}: ${err?.code || err?.message}`),
+          });
           req.on('close', done);
           res.on('close', done);
           return;
@@ -632,6 +645,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           ['--user', '-u', 'teamclaude.service', '-n', '100', '-f', '--no-pager', '--output=short-iso'],
           { stdio: ['ignore', 'pipe', 'ignore'] });
         child.stdout.on('data', chunk => {
+          // 'exit' (which ends the response) can fire before stdout is drained.
+          if (res.writableEnded || res.destroyed) return;
           for (const line of chunk.toString().split('\n')) {
             // Honor backpressure: if the socket buffer is full, pause the tail
             // until it drains so a slow/stalled reader can't balloon RSS.
@@ -642,7 +657,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         child.on('error', () => { journalctlBroken = true; if (!res.writableEnded) res.end(); });
         child.on('exit', () => { if (!res.writableEnded) res.end(); });
         let closed = false;
-        req.on('close', () => { if (closed) return; closed = true; logStreams--; child.kill(); });
+        const done = () => { if (closed) return; closed = true; logStreams--; child.kill(); };
+        req.on('close', done);
+        res.on('close', done);
         return;
       }
 

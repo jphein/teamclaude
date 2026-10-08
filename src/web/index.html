@@ -1367,6 +1367,8 @@
     if (!res.ok) {
       // The server says why (no systemctl here, restart turned off, …) and
       // which setting changes it; show that rather than a status code.
+      // 409 is not "unavailable": one is already running, so say that.
+      if (res.status === 409) { notRestarting('A restart is already in progress.'); return; }
       const data = await res.json().catch(() => ({}));
       notRestarting('Restart unavailable: ' + (data.error || 'HTTP ' + res.status));
     }

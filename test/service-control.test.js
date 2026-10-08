@@ -322,3 +322,56 @@ test('a missing /ui page costs one read and one log line, not one per (unauthent
   } finally { server.close(); console.error = orig; }
   assert.equal(said.filter(s => s.includes('/ui page unavailable')).length, 1, JSON.stringify(said));
 });
+
+// A reader that stops reading is cut off once its buffer passes the bound. The
+// tail must stop with it: before this was fixed, onLine (and onError) kept
+// writing to the ended response, and the ERR_STREAM_WRITE_AFTER_END that
+// followed reached uncaughtException and took the whole proxy down. The bound
+// is lowered through a hook so the cut happens on the first line instead of
+// after megabytes of kernel socket buffer.
+test('GET /teamclaude/logs: a paused reader is dropped without a write-after-end crash, and its slot is freed', async () => {
+  const { connect } = await import('node:net');
+  await withDir(async (dir) => {
+    const path = join(dir, 'tc.log');
+    await writeFile(path, Array.from({ length: 50 }, (_, i) => `line ${i}`).join('\n') + '\n');
+    const server = makeServer({ logs: { file: path } }, { logStreamMaxBuffered: -1 });
+    const port = await listen(server);
+    const crashes = [];
+    const onCrash = (err) => crashes.push(err);
+    process.on('uncaughtException', onCrash);
+    const sockets = [];
+    try {
+      // Four paused readers: as many as the stream cap allows at once.
+      for (let i = 0; i < 4; i++) {
+        const s = connect(port, '127.0.0.1');
+        s.on('error', () => {});
+        await new Promise(r => s.on('connect', r));
+        s.write('GET /teamclaude/logs HTTP/1.1\r\nHost: x\r\n\r\n');
+        s.pause();
+        sockets.push(s);
+      }
+      await new Promise(r => setTimeout(r, 300));
+      // More lines, then the file vanishes: neither may write to an ended response.
+      await appendFile(path, 'after the cut\n');
+      await new Promise(r => setTimeout(r, 1200));
+      await rm(path);
+      await new Promise(r => setTimeout(r, 1200));
+      assert.deepEqual(crashes.map(e => e.code || e.message), []);
+      // Their slots are back: a fifth reader is not refused as one too many
+      // (it is cut at once too, by the lowered bound, so read raw bytes).
+      const fifth = connect(port, '127.0.0.1');
+      fifth.on('error', () => {});
+      sockets.push(fifth);
+      let raw = '';
+      fifth.on('data', d => { raw += d; });
+      await new Promise(r => fifth.on('connect', r));
+      fifth.write('GET /teamclaude/logs HTTP/1.1\r\nHost: x\r\n\r\n');
+      await new Promise(r => { fifth.on('close', r); setTimeout(r, 1500); });
+      assert.doesNotMatch(raw, /503|too many/);
+    } finally {
+      process.off('uncaughtException', onCrash);
+      for (const s of sockets) s.destroy();
+      server.close();
+    }
+  });
+});

@@ -25,22 +25,23 @@ import { randomBytes, X509Certificate } from 'node:crypto';
 import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { getConfigPath } from './config.js';
-import { generateCertChain } from './x509.js';
+import { generateCertChain, authorityKeyId, keyIdentifier } from './x509.js';
 import { leafCovers, keyMatchesCert, refreshCaBundle, CA_BUNDLE, LISTENER_CA } from './mitm.js';
 
 export const DEFAULT_TLS_PORT = 3443;
 // The listener CA's name starts with this, and must differ from the MITM CA's
-// ("TeamClaude Local CA"). Each generation appends a short random tag so no two
-// listener CAs ever share a name either. The real fix for same-name CAs is the
+// ("TeamClaude Local CA"). Each generation appends a 48-bit random tag, so two
+// listener CAs sharing a name is vanishingly unlikely (not impossible: the key
+// identifiers below are what make a shared name harmless). The real fix for same-name CAs is the
 // key identifiers x509.js now writes (a leaf's AKI names its CA's key); the
 // unique name is for a human reading a trust store. History: two CAs with one
 // name made every listener handshake fail with "certificate signature failure"
 // (familiar, 2026-10-02).
 export const LISTENER_CA_CN = 'TeamClaude Listener CA';
 
-/** A fresh, unique listener-CA name: prefix + 8 hex chars. */
+/** A fresh listener-CA name: prefix + 12 hex chars (48 random bits). */
 export function listenerCaName() {
-  return `${LISTENER_CA_CN} ${randomBytes(4).toString('hex')}`;
+  return `${LISTENER_CA_CN} ${randomBytes(6).toString('hex')}`;
 }
 const LISTENER_CERT = 'teamclaude-listener.pem';
 const LISTENER_KEY = 'teamclaude-listener.key';
@@ -108,12 +109,12 @@ export async function writeCaBundle(dir) {
 function isCurrentListenerChain(caPem, certPem) {
   try {
     const subject = new X509Certificate(caPem).subject;
-    const named = new RegExp(`CN=${LISTENER_CA_CN} [0-9a-f]{8}(\\n|$)`).test(subject);
-    const leaf = new X509Certificate(certPem);
-    // Node does not expose extensions directly; the AKI's OID in the raw DER
-    // (2.5.29.35 = 06 03 55 1d 23) is the presence check.
-    const hasAki = leaf.raw.includes(Buffer.from([0x06, 0x03, 0x55, 0x1d, 0x23]));
-    return named && hasAki;
+    const named = new RegExp(`CN=${LISTENER_CA_CN} [0-9a-f]{12}(\\n|$)`).test(subject);
+    // The leaf's AKI, parsed from its extensions, must name THIS CA's key:
+    // presence alone would accept a leaf pointing at some other key.
+    const aki = authorityKeyId(new X509Certificate(certPem).raw);
+    const caKeyId = keyIdentifier(/** @type {Buffer} */ (new X509Certificate(caPem).publicKey.export({ type: 'spki', format: 'der' })));
+    return named && aki !== null && aki.equals(caKeyId);
   } catch { return false; }
 }
 

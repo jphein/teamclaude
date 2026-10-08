@@ -1,0 +1,4 @@
+# Throwaway TLS keys committed as test fixtures (see test/fixtures/README.md).
+# They sign nothing anyone trusts; listed so secret scans stop flagging them.
+test/fixtures/pre-ski-listener/leaf.TEST-ONLY-key.pem:private-key:1
+test/fixtures/pre-ski-listener-named/leaf.TEST-ONLY-key.pem:private-key:1

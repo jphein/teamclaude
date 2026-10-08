@@ -5,7 +5,7 @@ import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import tls from 'node:tls';
-import { generateCertChain, keyIdentifier } from '../src/x509.js';
+import { generateCertChain, keyIdentifier, authorityKeyId, createCA, createLeaf } from '../src/x509.js';
 import { ensureCerts } from '../src/mitm.js';
 import { ensureListenerCerts, LISTENER_CA_CN } from '../src/tls-listener.js';
 
@@ -65,7 +65,7 @@ test('listener CAs get a unique per-generation name; a pre-SKI chain is reissued
   const c = await ensureListenerCerts(['localhost'], dir);
   assert.equal(c.regenerated, true, 'the fixed-name chain is reissued');
   const subject = new X509Certificate(await readFile(c.caPath, 'utf8')).subject;
-  assert.match(subject, new RegExp(`CN=${LISTENER_CA_CN} [0-9a-f]{8}`));
+  assert.match(subject, new RegExp(`CN=${LISTENER_CA_CN} [0-9a-f]{12}`));
   assert.ok(has(c.cert, AKI_OID));
   // Two generations never share a name.
   const dir2 = await mkdtemp(join(tmpdir(), 'tc-ski-'));
@@ -100,3 +100,41 @@ test('a chain with a unique name but NO key identifiers is still reissued', asyn
   await writeFile(join(dir, 'teamclaude-listener.key'), await fx('leaf.TEST-ONLY-key.pem'));
   assert.equal((await ensureListenerCerts(['localhost'], dir)).regenerated, true);
 });
+
+test('a chain WITH key identifiers but the old fixed name is still reissued (name rule, Oracle #19)', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-ski-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  // Current generator (so the leaf HAS an AKI), but the pre-#19 fixed CA name.
+  const c = generateCertChain(['localhost'], { caCn: LISTENER_CA_CN });
+  assert.ok(has(c.leafCertPem, AKI_OID), 'precondition: the leaf carries an AKI');
+  await writeFile(join(dir, 'teamclaude-listener-ca.pem'), c.caCertPem);
+  await writeFile(join(dir, 'teamclaude-listener.pem'), c.leafCertPem);
+  await writeFile(join(dir, 'teamclaude-listener.key'), c.leafKeyPem);
+  assert.equal((await ensureListenerCerts(['localhost'], dir)).regenerated, true);
+});
+
+// ── cross-model review (gpt-6.1-sol) findings on #19 ─────────────────────────
+
+test('M1: a leaf always carries an AKI, even from a CA object that has no keyId', () => {
+  const ca = createCA('Legacy-shaped CA');
+  delete ca.keyId; // the shape a pre-SKI caller would hand in
+  const leaf = createLeaf(['a.test'], ca);
+  const aki = authorityKeyId(new X509Certificate(leaf.certPem).raw);
+  const caSki = keyIdentifier(/** @type {Buffer} */ (new X509Certificate(ca.certPem).publicKey.export({ type: 'spki', format: 'der' })));
+  assert.ok(aki && aki.equals(caSki), 'AKI derived from the CA key');
+});
+
+test('M2: authorityKeyId parses the AKI structurally and returns exactly the issuer\'s key id', () => {
+  const c = generateCertChain(['localhost']);
+  assert.equal(authorityKeyId(new X509Certificate(c.caCertPem).raw), null, 'a self-signed CA has no AKI');
+  const aki = authorityKeyId(new X509Certificate(c.leafCertPem).raw);
+  const caSki = keyIdentifier(/** @type {Buffer} */ (new X509Certificate(c.caCertPem).publicKey.export({ type: 'spki', format: 'der' })));
+  assert.ok(aki && aki.equals(caSki));
+  // Garbage never throws, it just has no AKI.
+  assert.equal(authorityKeyId(Buffer.from([0x30, 0x03, 0x02, 0x01, 0x00])), null);
+  assert.equal(authorityKeyId(Buffer.alloc(0)), null);
+});
+
+// Note: a leaf whose AKI names ANOTHER CA's key cannot reach the AKI==SKI
+// clause in isCurrentListenerChain: leafCovers already rejects a leaf not signed
+// by the stored CA, and that alone reissues. The clause is defense in depth.

@@ -39,6 +39,9 @@ export const MASK = '••••••••';
  * @property {any[]} [options]  enum values
  * @property {number} [min]
  * @property {number} [max]
+ * @property {boolean} [clearToDefault] clearing writes the default (the reload path ignores an absent value)
+ * @property {boolean} [required] cannot be cleared
+ * @property {boolean} [allowFalse] the literal false is a value ("never"), typed as the text false
  * @property {boolean} [credUrl] a URL whose userinfo (user:password@) is masked like a secret
  * @property {boolean} [danger] changes where traffic or tokens go, or runs a program
  * @property {(v: any, cfg: any) => string|null} [check] extra validation; returns a problem or null
@@ -58,7 +61,7 @@ const thresholdCheck = (v) => {
 /** @type {Field[]} */
 export const FIELDS = [
   // ── Rotation & quota ─────────────────────────────────────────────────────
-  { key: 'switchThreshold', group: 'Rotation & quota', label: 'Switch threshold', type: 'json', apply: 'hot', def: 0.98,
+  { key: 'switchThreshold', group: 'Rotation & quota', label: 'Switch threshold', type: 'json', apply: 'hot', def: 0.98, clearToDefault: true,
     help: 'Quota use (0–1) at which an account counts as spent and traffic moves on. A number, or a per-bucket table.', check: thresholdCheck },
   { key: 'quotaProbeSeconds', group: 'Rotation & quota', label: 'Quota probe interval (s)', type: 'int', apply: 'hot', def: 0, min: 0, max: 7 * 24 * 3600,
     help: 'Re-read every account\'s quota from the zero-cost usage endpoint this often. 0 = off.',
@@ -123,7 +126,7 @@ export const FIELDS = [
   { key: 'upstream', group: 'Upstream & network', label: 'Upstream API', type: 'text', credUrl: true, apply: 'restart', def: 'https://api.anthropic.com', danger: true,
     help: 'Where requests (and account tokens) are sent. Change only for a compatible backend.',
     check: (v) => { try { const u = new URL(v); return u.protocol === 'https:' || u.protocol === 'http:' ? null : 'must be an http(s) URL'; } catch { return 'must be a URL'; } } },
-  { key: 'upstreamProxy', group: 'Upstream & network', label: 'Outbound proxy', type: 'text', credUrl: true, apply: 'restart', def: null, danger: true,
+  { key: 'upstreamProxy', group: 'Upstream & network', label: 'Outbound proxy', type: 'text', credUrl: true, allowFalse: true, apply: 'restart', def: null, danger: true,
     help: 'Proxy for everything sent to Anthropic, e.g. http://host:3128. A password in it is write-only. false = never use one.',
     check: (v) => { if (v === false || v == null || v === '') return null; try { parseProxyUrl(String(v)); return null; } catch (e) { return /** @type {Error} */ (e).message; } } },
   { key: 'noProxy', group: 'Upstream & network', label: 'No-proxy hosts', type: 'list', apply: 'restart', def: [],
@@ -173,7 +176,7 @@ export const FIELDS = [
 /** Per-account fields the Settings view edits. Tokens and identity are not here. */
 /** @type {Field[]} */
 export const ACCOUNT_FIELDS = [
-  { key: 'priority', label: 'Priority', type: 'int', apply: 'hot', def: 0, min: 0, help: 'Lower = used first. The list order sets this.' },
+  { key: 'priority', label: 'Priority', type: 'int', apply: 'hot', def: 0, min: 0, required: true, help: 'Lower = used first. The list order sets this.' },
   { key: 'disabled', label: 'Disabled', type: 'bool', apply: 'hot', def: false, help: 'Keep this account out of rotation.' },
   { key: 'maxUsage', label: 'Usage cap', type: 'json', apply: 'hot', def: null, help: 'Hard cap: a number, or a per-bucket table. Empty = none.', check: (v) => (v == null ? null : thresholdCheck(v)) },
   { key: 'upstream', label: 'Account upstream', type: 'text', credUrl: true, apply: 'hot', def: null, danger: true, help: 'Alternative backend URL for this account only. Empty = the global upstream.' },
@@ -281,6 +284,19 @@ export function publicSettings(config) {
  * @param {string} v @param {any} stored
  */
 function restoreUrlCredentials(v, stored) {
+  return restoreUrl(v, stored);
+}
+/**
+ * A validator message for a URL setting with its credentials masked: the
+ * loader quotes the whole value back, which after a MASK restore would be the
+ * stored password. @param {string} msg @param {any} v
+ */
+function scrubCredentials(msg, v) {
+  const p = splitUserinfo(v);
+  return p && p.userinfo ? msg.split(p.userinfo).join(MASK) : msg;
+}
+/** @param {string} v @param {any} stored */
+function restoreUrl(v, stored) {
   const p = splitUserinfo(v);
   if (!p || p.userinfo !== MASK || p.head.includes(MASK) || p.tail.includes(MASK)) return { problem: "retype the credentials (the masked value can only stand for the whole user:password part)" };
   const old = splitUserinfo(stored);
@@ -288,19 +304,38 @@ function restoreUrlCredentials(v, stored) {
   return { value: p.head + old.userinfo + p.tail };
 }
 
+/**
+ * Shape a submitted value the way the file stores it, before validation.
+ * @param {Field} f @param {any} v
+ */
+function normalise(f, v) {
+  if (f.type === 'list' && typeof v === 'string') v = v.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
+  if (f.type === 'text' && typeof v === 'string') {
+    v = v.trim();
+    if (v === '') v = null;
+    else if (f.allowFalse && v === 'false') v = false;
+  }
+  if (f.type === 'secretList' && Array.isArray(v)) v = v.map((e) => (isObj(e) ? { name: typeof e.name === 'string' ? e.name.trim() : e.name, key: e.key } : e));
+  if (v === null && f.clearToDefault) v = f.def;
+  return v;
+}
+
 // ── validation ───────────────────────────────────────────────────────────
 /** @param {Field|any} f @param {any} v @param {any} cfg @returns {string|null} */
 function problemFor(f, v, cfg) {
-  if (v === null) return null; // null = unset: the default applies
+  if (v === null) return f.required ? 'cannot be empty' : null; // null = unset: the default applies
   switch (f.type) {
     case 'bool': if (typeof v !== 'boolean') return 'must be true or false'; break;
     case 'int': if (!Number.isInteger(v)) return 'must be a whole number'; break;
     case 'number': if (typeof v !== 'number' || !Number.isFinite(v)) return 'must be a number'; break;
     case 'enum': if (!(f.options || []).some((/** @type {any} */ o) => o === v)) return `must be one of ${(f.options || []).map((/** @type {any} */ o) => JSON.stringify(o)).join(', ')}`; break;
-    case 'text': if (typeof v !== 'string' && v !== false) return 'must be text'; break;
+    case 'text': if (typeof v !== 'string' && !(v === false && f.allowFalse)) return 'must be text'; break;
     case 'list': if (!(Array.isArray(v) && v.every((s) => typeof s === 'string')) && typeof v !== 'string') return 'must be a list of text'; break;
     case 'secret': if (typeof v !== 'string') return 'must be text'; break;
-    case 'secretList': if (!Array.isArray(v) || !v.every((e) => isObj(e) && typeof e.name === 'string' && e.name.trim() && typeof e.key === 'string' && e.key)) return 'must be a list of { name, key }'; break;
+    case 'secretList':
+      if (!Array.isArray(v) || !v.every((/** @type {any} */ e) => isObj(e) && typeof e.name === 'string' && e.name.trim() && typeof e.key === 'string' && e.key)) return 'must be a list of { name, key }';
+      if (new Set(v.map((/** @type {any} */ e) => e.name)).size !== v.length) return 'each name may appear once';
+      break;
     default: break;
   }
   if ((f.type === 'int' || f.type === 'number') && f.min != null && v < f.min) return `must be at least ${f.min}`;
@@ -337,6 +372,7 @@ export function applySettingsChanges(config, changes) {
       if (key === 'proxy.apiKey' && (v == null || v === '')) { problems.push('proxy.apiKey: cannot be cleared from the dashboard (it would open the proxy to anyone)'); continue; }
       if (v === '') v = null;
     }
+    v = normalise(f, v);
     if (f.type === 'secretList' && Array.isArray(v)) {
       const old = new Map((getPath(config, key) || []).map((/** @type {any} */ e) => [e?.name, e?.key]));
       v = v.map((/** @type {any} */ e) => (isObj(e) && e.key === MASK ? { ...e, key: old.get(e.name) } : e));
@@ -348,11 +384,9 @@ export function applySettingsChanges(config, changes) {
       if (r.problem) { problems.push(`${key}: ${r.problem}`); continue; }
       v = r.value;
     }
-    if (f.type === 'list' && typeof v === 'string') v = v.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
-    if (f.type === 'text' && v === '') v = null;
     if (JSON.stringify(v ?? null) === JSON.stringify(getPath(config, key) ?? null)) continue; // unchanged
     const p = problemFor(f, v, config);
-    if (p) problems.push(`${key}: ${p}`);
+    if (p) problems.push(`${key}: ${f.credUrl ? scrubCredentials(p, v) : p}`);
     else plan.push([f, v]);
   }
 
@@ -360,7 +394,7 @@ export function applySettingsChanges(config, changes) {
   const findAcct = (/** @type {any} */ id) => accounts.find((/** @type {any} */ a) => a.id === id);
   const acctPlan = [];
   for (const ch of changes?.accounts || []) {
-    const a = findAcct(ch?.id);
+    const a = typeof ch?.id === 'string' && ch.id ? findAcct(ch.id) : null;
     if (!a) { problems.push(`account ${ch?.id}: not found`); continue; }
     for (const [k, raw] of Object.entries(ch)) {
       if (k === 'id') continue;
@@ -372,11 +406,10 @@ export function applySettingsChanges(config, changes) {
         if (r.problem) { problems.push(`account ${a.name}: ${k} ${r.problem}`); continue; }
         v = r.value;
       }
-      if (f.type === 'list' && typeof v === 'string') v = v.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
-      if (f.type === 'text' && v === '') v = null;
+      v = normalise(f, v);
       if (JSON.stringify(v ?? null) === JSON.stringify(a[k] ?? null)) continue;
       const p = problemFor(f, v, config);
-      if (p) problems.push(`account ${a.name}: ${k} ${p}`); else acctPlan.push([a, f, v]);
+      if (p) problems.push(`account ${a.name}: ${k} ${f.credUrl ? scrubCredentials(p, v) : p}`); else acctPlan.push([a, f, v]);
     }
   }
   let order = null;

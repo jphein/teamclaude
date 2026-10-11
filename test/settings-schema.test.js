@@ -243,7 +243,7 @@ test('URL credentials are masked wherever the loader would find them', async () 
     // And the masked value round-trips to the original.
     const c = { upstreamProxy: raw, accounts: [] };
     applySettingsChanges(c, { set: { upstreamProxy: shown } });
-    assert.equal(c.upstreamProxy, raw);
+    assert.equal(c.upstreamProxy, raw.trim(), "round-trips (trimmed, as the loader trims)");
   }
 });
 
@@ -268,4 +268,47 @@ test('the mask cannot be moved out of the userinfo position', () => {
   }
   // No stored credentials: a mask stands for nothing.
   assert.throws(() => applySettingsChanges({ upstreamProxy: 'http://squid:3128', accounts: [] }, { set: { upstreamProxy: `http://${MASK}@squid:3128` } }), /no stored credentials/);
+});
+
+test('a refused URL change never quotes the stored credentials back', () => {
+  const c = { upstreamProxy: 'http://user:zzPWzz9@squid:3128', accounts: [{ id: 'a', name: 'acct', upstream: 'https://k:zzACCTzz8@be.example' }] };
+  let err;
+  try {
+    applySettingsChanges(c, {
+      set: { upstreamProxy: `socks5://${MASK}@squid:3128` },
+      accounts: [{ id: 'a', upstream: `ftp://${MASK}@be.example` }],
+    });
+  } catch (e) { err = e; }
+  assert.ok(err instanceof SettingsError, 'refused');
+  const text = err.problems.join(' | ');
+  assert.ok(!text.includes('zzPWzz9') && !text.includes('zzACCTzz8'), text);
+});
+
+test('clearing switchThreshold writes its default; priority cannot be emptied', () => {
+  const c = { switchThreshold: 0.9, accounts: [{ id: 'a', name: 'a', priority: 2 }] };
+  const r = applySettingsChanges(c, { set: { switchThreshold: null } });
+  assert.equal(c.switchThreshold, 0.98, 'the reload path ignores an absent value, so the default is written');
+  assert.deepEqual(r.applied, ['switchThreshold']);
+  assert.throws(() => applySettingsChanges(c, { accounts: [{ id: 'a', priority: null }] }), /cannot be empty/);
+});
+
+test('typing false for the outbound proxy stores false, not the text "false"', () => {
+  const c = { accounts: [] };
+  applySettingsChanges(c, { set: { upstreamProxy: 'false' } });
+  assert.equal(c.upstreamProxy, false);
+  assert.equal(publicSettings(c).fields.find(f => f.key === 'upstreamProxy').value, false);
+  assert.throws(() => applySettingsChanges({ accounts: [] }, { set: { upstream: 'false' } }), /upstream:/, 'only fields that accept false do');
+});
+
+test('client keys: duplicate names are refused, extra properties are dropped', () => {
+  const c = { proxy: { clientKeys: [{ name: 'x', key: 'k1' }, { name: 'y', key: 'k2' }] }, accounts: [] };
+  assert.throws(() => applySettingsChanges(c, { set: { 'proxy.clientKeys': [{ name: 'x', key: MASK }, { name: 'x', key: MASK }] } }), /each name may appear once/);
+  applySettingsChanges(c, { set: { 'proxy.clientKeys': [{ name: ' x ', key: MASK, admin: true }, { name: 'y', key: MASK }, { name: 'z', key: 'k3' }] } });
+  assert.deepEqual(c.proxy.clientKeys, [{ name: 'x', key: 'k1' }, { name: 'y', key: 'k2' }, { name: 'z', key: 'k3' }]);
+});
+
+test('an account change without an id matches nothing', () => {
+  const c = { accounts: [{ name: 'legacy', priority: 0 }] };
+  assert.throws(() => applySettingsChanges(c, { accounts: [{ disabled: true }] }), /not found/);
+  assert.equal(c.accounts[0].disabled, undefined);
 });

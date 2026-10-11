@@ -168,3 +168,33 @@ test('saveSettings: backs up the replaced version, writes, reloads; a refused sa
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// Oracle (PR #21 review): with NO key configured, auth.ok is true for every
+// caller and the key-less block (cross-origin + Host checks) never runs. A
+// DNS-rebinding page — loopback-sourced, "same-origin", Host = its own name —
+// must still not become admin: it could save accounts[].upstream and receive
+// OAuth tokens.
+test('POST: with no keys configured, a rebinding page is refused', async () => {
+  const { hooks, saves } = spyHooks();
+  const am = new AccountManager([{ name: 'a', type: 'apikey', apiKey: 'k1' }], 0.98);
+  const open = createProxyServer(am, { proxy: {}, upstream: 'http://127.0.0.1:9' }, hooks);
+  const rebind = { host: 'attacker.example', 'sec-fetch-site': 'same-origin' };
+  const post = await request(open, { method: 'POST', from: '127.0.0.1', headers: rebind, body: SAVE });
+  assert.equal(post.status, 403);
+  const get = await request(open, { from: '127.0.0.1', headers: rebind });
+  assert.equal(get.body?.canEdit, false);
+  // A caller on another host is not admin either, with no key to prove itself.
+  assert.equal((await request(open, { method: 'POST', from: REMOTE, headers: { host: '10.0.6.145:3456' }, body: SAVE })).status, 403);
+  assert.equal(saves.length, 0);
+  // The proxy's own host, naming itself, still is.
+  const local = await request(open, { method: 'POST', from: '127.0.0.1', headers: { host: 'localhost:3456' }, body: SAVE });
+  assert.equal(local.status, 200);
+  assert.equal(saves.length, 1);
+});
+
+test('POST: a body over 1 MiB is refused', async () => {
+  const { hooks, saves } = spyHooks();
+  const r = await request(makeServer(hooks), { method: 'POST', headers: { 'x-api-key': SHARED }, body: JSON.stringify({ set: { blockedModels: ['x'.repeat(1.1 * 1024 * 1024)] } }) });
+  assert.equal(r.status, 400);
+  assert.equal(saves.length, 0);
+});

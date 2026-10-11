@@ -1454,7 +1454,7 @@
       }
       default:
         input = el('input', { type: 'text', placeholder: showDef(f.def), disabled: dis, spellcheck: 'false' });
-        input.value = value == null || value === false ? '' : String(value);
+        input.value = value == null ? '' : String(value);   // false shows as "false" (e.g. never use a proxy)
         read = () => input.value.trim() || null;
     }
     if (f.type !== 'secretList') input.addEventListener(f.type === 'bool' || f.type === 'enum' ? 'change' : 'input', onChange);
@@ -1487,6 +1487,10 @@
     // Account order — the list IS the priority.
     settingsBody.appendChild(el('div', { class: 'set-group', text: 'Account order' }));
     settingsBody.appendChild(el('div', { class: 'set-intro', text: d.orderHelp }));
+    const prios = d.accounts.map(a => a.priority);
+    if (new Set(prios).size < prios.length) {
+      settingsBody.appendChild(el('div', { class: 'set-intro', text: 'Some accounts share a priority today (sessions can spread across them). Saving a new order gives each account its own place in the list.' }));
+    }
     const byId = new Map(d.accounts.map(a => [a.id, a]));
     const list = el('ol', { class: 'order-list' });
     const drawOrder = () => {

@@ -525,20 +525,26 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       //    command, logDir) decide where tokens go or what program runs, so a
       //    per-client key — handed to every machine in the fleet — may read
       //    them but not change them. Admin = the shared proxy key, or a
-      //    key-less caller on this host (already held to same-origin and the
-      //    Host check above), or any caller when no key is configured at all.
+      //    key-less caller on this host that is same-origin and names this
+      //    host in its Host header. The last two are checked HERE, not left to
+      //    the key-less block above: with no key configured at all, auth.ok is
+      //    true for everyone and that block never runs — and a DNS-rebinding
+      //    page that could save accounts[].upstream would receive OAuth tokens.
       if (req.url === '/teamclaude/settings' && (req.method === 'GET' || req.method === 'POST')) {
         const sh = /** @type {any} */ (hooks);
         if (!sh.getSettings || !sh.saveSettings) { json(res, 501, { error: 'settings not supported' }); return; }
-        const admin = auth.ok ? auth.client == null : isLocal;
+        const keysConfigured = !resolveClientAuth(config.proxy, undefined).ok;
+        const admin = keysConfigured && auth.ok
+          ? auth.client == null
+          : isLocal && isSameOriginControlRequest(req) && isLocalHostHeader(req.headers.host ?? req.headers[':authority'], config.proxy?.host);
         if (req.method === 'GET') {
           try { json(res, 200, { ...(await sh.getSettings()), canEdit: admin }); }
           catch (err) { console.error('[TeamClaude] Settings read failed:', /** @type {Error} */ (err).message); json(res, 500, { error: 'settings unavailable; see the proxy log' }); }
           return;
         }
-        if (!admin) { json(res, 403, { error: 'saving settings needs the shared proxy key; a client key can only view them' }); return; }
+        if (!admin) { json(res, 403, { error: 'saving settings needs the shared proxy key (or the dashboard opened on the proxy\'s own host); a client key can only view them' }); return; }
         let changes;
-        try { changes = JSON.parse((await readBody(req)) || '{}'); } catch { json(res, 400, { error: 'body must be JSON' }); return; }
+        try { changes = JSON.parse((await readControlBody(req, 1024 * 1024)) || '{}'); } catch { json(res, 400, { error: 'body must be JSON (at most 1 MiB)' }); return; }
         try {
           const result = await sh.saveSettings(changes);
           console.log(`[TeamClaude] Settings saved via UI: ${[...result.applied, ...result.needsRestart].join(', ') || 'no changes'}`);

@@ -483,6 +483,40 @@
   .card .blocked { font-size: 0.8rem; color: var(--warn); margin: 0.1rem 0 0.35rem; }
 
   /* ── Status tables (routing, clients, dimensions, sessions) ── */
+
+  /* ── Settings ── */
+  details.settings > summary { cursor: pointer; list-style: none; }
+  details.settings > summary::-webkit-details-marker { display: none; }
+  details.settings > summary .panel-title::before { content: "▸ "; color: var(--text-dim); }
+  details.settings[open] > summary .panel-title::before { content: "▾ "; }
+  .set-intro { font-size: 0.82rem; color: var(--text-dim); margin: 0.25rem 0 0.75rem; }
+  .set-group { margin: 1rem 0 0.25rem; font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent); }
+  .set-row { display: grid; grid-template-columns: minmax(10rem, 15rem) 1fr; gap: 0.25rem 1rem; padding: 0.45rem 0; border-bottom: 1px solid var(--panel-border); align-items: start; }
+  .set-row label.k { font-size: 0.85rem; font-weight: 500; }
+  .set-row .help { grid-column: 2; font-size: 0.76rem; color: var(--text-dim); }
+  .set-row input[type=text], .set-row input[type=number], .set-row input[type=password], .set-row select, .set-row textarea {
+    width: 100%; max-width: 32rem; box-sizing: border-box; font: inherit; font-size: 0.82rem; padding: 0.25rem 0.4rem;
+    background: var(--log-bg); color: var(--text); border: 1px solid var(--panel-border); border-radius: 4px; }
+  .set-row textarea { font-family: ui-monospace, monospace; min-height: 2.2rem; resize: vertical; }
+  .set-row input[type=checkbox] { justify-self: start; margin: 0.3rem 0; }
+  .set-row.dirty label.k::after { content: " •"; color: var(--accent); }
+  .badge { display: inline-block; font-size: 0.66rem; padding: 0 0.35rem; margin-left: 0.35rem; border-radius: 3px; border: 1px solid var(--panel-border); color: var(--text-dim); vertical-align: middle; font-weight: 500; }
+  .badge.restart { border-color: var(--warn); color: var(--warn); }
+  .badge.danger { border-color: var(--bad); color: var(--bad); }
+  .order-list { list-style: none; margin: 0; padding: 0; max-width: 40rem; }
+  .order-list li { display: flex; align-items: center; gap: 0.5rem; padding: 0.3rem 0.4rem; border: 1px solid var(--panel-border); border-radius: 6px; margin-bottom: 0.3rem; background: var(--log-bg); font-size: 0.85rem; }
+  .order-list li .pos { color: var(--text-dim); width: 1.4rem; text-align: right; font-variant-numeric: tabular-nums; }
+  .order-list li .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .order-list li.off .nm { color: var(--text-dim); text-decoration: line-through; }
+  .order-list details { width: 100%; }
+  .acct-adv { padding: 0.25rem 0 0.25rem 1.9rem; }
+  .ck-list .ck { display: flex; gap: 0.4rem; margin-bottom: 0.25rem; max-width: 32rem; }
+  .ck-list .ck input { flex: 1; }
+  .set-actions { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin-top: 1rem; position: sticky; bottom: 0; background: var(--panel); padding: 0.5rem 0; }
+  .set-msg { font-size: 0.82rem; }
+  .set-msg.bad { color: var(--bad); } .set-msg.good { color: var(--good); }
+  .set-msg ul { margin: 0.25rem 0 0 1.1rem; padding: 0; }
+  @media (max-width: 640px) { .set-row { grid-template-columns: 1fr; } .set-row .help { grid-column: 1; } }
   .tables { display: grid; gap: 0.875rem; margin-top: 0.875rem; }
   .tables .panel { overflow-x: auto; }
   table.st { width: 100%; border-collapse: collapse; font-size: 0.82rem; font-variant-numeric: tabular-nums; }
@@ -566,6 +600,11 @@
   <div class="svc-stats" id="fleetLine" style="margin:-0.35rem 0 0.875rem 0.25rem"></div>
 
   <div class="cards" id="cards"></div>
+
+  <details class="panel settings" id="settingsWrap" style="margin-top:0.875rem">
+    <summary class="panel-hdr"><span class="panel-title">Settings</span><span class="active-count" id="settingsNote"></span></summary>
+    <div id="settingsBody"><div class="set-intro">Loading…</div></div>
+  </details>
 
   <div class="tables">
     <div class="panel" id="routesWrap" style="display:none">
@@ -1097,14 +1136,11 @@
       // re-attached afterwards so a half-typed code (and focus) survives.
       const reauthHadFocus = document.activeElement === reauthCodeEl;
       cardsEl.textContent = '';
-      // Sort so the account whose 7-day window resets SOONEST is on top (spend
-      // the soonest-expiring weekly quota first), tie-broken by soonest 5h reset.
-      // A missing/already-cleared reset (null) sorts last — it isn't "expiring".
-      const reset7 = a => a.quota?.unified7dReset ?? Infinity;
-      const reset5 = a => a.quota?.unified5hReset ?? a.quota?.resetsAt ?? Infinity;
-      const cmp = (x, y) => (x === y ? 0 : x < y ? -1 : 1);
-      const ordered = [...data.accounts].sort((a, b) =>
-        cmp(reset7(a), reset7(b)) || cmp(reset5(a), reset5(b)));
+      // Cards follow the rotation order: priority first (lower = used first,
+      // and the Settings view's account order sets it), then list position —
+      // so the top card is the account traffic goes to whenever it has quota.
+      const ordered = data.accounts.map((a, i) => ({ a, i }))
+        .sort((x, y) => (x.a.priority || 0) - (y.a.priority || 0) || x.i - y.i).map(x => x.a);
       // A mixed Claude/Codex fleet has one current account per provider.
       const currents = data.currentAccounts || null;
       const isCurrent = a => currents ? currents[a.provider] === a.name : a.name === data.currentAccount;
@@ -1344,6 +1380,246 @@
       }
     }, 100);
   });
+
+  // ── Settings view ────────────────────────────────────────────
+  // Built from GET /teamclaude/settings, which describes every config key
+  // (group, help, default, hot or restart). Rendered when the panel opens and
+  // after a save — never on the status poll, so a half-typed value survives.
+  // Only changed fields are sent. Secrets arrive masked and a masked value
+  // sent back means "keep it", so the page can replace a secret, never read it.
+  const settingsWrap = document.getElementById('settingsWrap');
+  const settingsBody = document.getElementById('settingsBody');
+  const settingsNote = document.getElementById('settingsNote');
+  let settingsData = null;
+  let settingsOrder = null;     // account ids, top = priority 0
+  let settingsAcctDirty = {};   // id → { field: value }
+  let settingsConfirm = false;  // second click needed to save a danger change
+
+  const showDef = (v) => v === null || v === undefined ? 'none' : typeof v === 'object' ? JSON.stringify(v) : String(v);
+
+  function settingsInput(f, value, canEdit, onChange) {
+    const dis = !canEdit;
+    const mask = settingsData.mask;
+    let input; let read;
+    switch (f.type) {
+      case 'bool':
+        input = el('input', { type: 'checkbox', disabled: dis });
+        input.checked = value ?? f.def ?? false;
+        read = () => input.checked;
+        break;
+      case 'int': case 'number':
+        input = el('input', { type: 'number', step: f.type === 'int' ? '1' : 'any', min: f.min, max: f.max, placeholder: showDef(f.def), disabled: dis });
+        input.value = value ?? '';
+        read = () => input.value === '' ? null : Number(input.value);
+        break;
+      case 'enum':
+        input = el('select', { disabled: dis }, f.options.map(o => el('option', { value: JSON.stringify(o), text: String(o) })));
+        input.value = JSON.stringify(value ?? f.def);
+        read = () => JSON.parse(input.value);
+        break;
+      case 'secret':
+        input = el('input', { type: 'password', autocomplete: 'new-password', placeholder: value ? 'set — type to replace' : 'not set', disabled: dis });
+        input.value = value ? mask : '';
+        read = () => input.value;
+        break;
+      case 'list':
+        input = el('textarea', { rows: 2, placeholder: 'one per line', disabled: dis });
+        input.value = Array.isArray(value) ? value.join('\n') : (value ?? '');
+        read = () => input.value.split(/\n/).map(s => s.trim()).filter(Boolean);
+        break;
+      case 'json':
+        input = el('textarea', { rows: 2, placeholder: 'default: ' + showDef(f.def), disabled: dis, spellcheck: 'false' });
+        input.value = value == null ? '' : JSON.stringify(value, null, 1).replace(/\n\s*/g, ' ');
+        read = () => { const t = input.value.trim(); if (!t) return null; return JSON.parse(t); };
+        break;
+      case 'secretList': {
+        input = el('div', { class: 'ck-list' });
+        const rows = [];
+        const addRow = (e) => {
+          const nm = el('input', { type: 'text', placeholder: 'client name', disabled: dis }); nm.value = e?.name ?? '';
+          const k = el('input', { type: 'password', autocomplete: 'new-password', placeholder: 'key', disabled: dis }); k.value = e?.key ?? '';
+          const rm = el('button', { class: 'btn-ghost', text: '✕', title: 'Remove this client key', disabled: dis });
+          const row = el('div', { class: 'ck' }, [nm, k, rm]);
+          const entry = { nm, k, row };
+          rm.addEventListener('click', () => { rows.splice(rows.indexOf(entry), 1); row.remove(); onChange(); });
+          for (const x of [nm, k]) x.addEventListener('input', onChange);
+          rows.push(entry); input.insertBefore(row, addBtn);
+        };
+        const addBtn = el('button', { class: 'btn-ghost', text: '+ client key', disabled: dis });
+        addBtn.addEventListener('click', () => { addRow(null); onChange(); });
+        input.appendChild(addBtn);
+        for (const e of (value || [])) addRow(e);
+        read = () => rows.map(r => ({ name: r.nm.value.trim(), key: r.k.value }));
+        break;
+      }
+      default:
+        input = el('input', { type: 'text', placeholder: showDef(f.def), disabled: dis, spellcheck: 'false' });
+        input.value = value == null ? '' : String(value);   // false shows as "false" (e.g. never use a proxy)
+        read = () => input.value.trim() || null;
+    }
+    if (f.type !== 'secretList') input.addEventListener(f.type === 'bool' || f.type === 'enum' ? 'change' : 'input', onChange);
+    return { input, read };
+  }
+
+  function settingsBadges(f) {
+    return [
+      f.apply === 'restart' ? el('span', { class: 'badge restart', text: 'needs restart', title: 'Saved at once, applied on the next restart' }) : null,
+      f.danger ? el('span', { class: 'badge danger', text: '⚠ sensitive', title: 'Changes where traffic or tokens go, who can connect, or what runs' }) : null,
+    ];
+  }
+
+  function renderSettings() {
+    const d = settingsData;
+    settingsBody.textContent = '';
+    settingsConfirm = false;
+    const editors = [];
+    const markDirty = (row, ed) => () => {
+      let dirty;
+      try { dirty = JSON.stringify(ed.read()) !== ed.initial; } catch { dirty = true; }
+      row.classList.toggle('dirty', dirty);
+      settingsConfirm = false;
+    };
+
+    settingsBody.appendChild(el('div', { class: 'set-intro', text: d.canEdit
+      ? 'Changes are validated, the config is backed up, then saved. Hot settings apply at once; ones marked "needs restart" wait for Restart.'
+      : 'Read-only: saving settings needs the shared proxy key (a client key can only view them).' }));
+
+    // Account order — the list IS the priority.
+    settingsBody.appendChild(el('div', { class: 'set-group', text: 'Account order' }));
+    settingsBody.appendChild(el('div', { class: 'set-intro', text: d.orderHelp }));
+    const prios = d.accounts.map(a => a.priority);
+    if (new Set(prios).size < prios.length) {
+      settingsBody.appendChild(el('div', { class: 'set-intro', text: 'Some accounts share a priority today (sessions can spread across them). Saving a new order gives each account its own place in the list.' }));
+    }
+    const byId = new Map(d.accounts.map(a => [a.id, a]));
+    const list = el('ol', { class: 'order-list' });
+    const drawOrder = () => {
+      list.textContent = '';
+      settingsOrder.forEach((id, i) => {
+        const a = byId.get(id);
+        const up = el('button', { class: 'btn-ghost', text: '▲', title: 'Move up (used sooner)', disabled: !d.canEdit || i === 0 });
+        const dn = el('button', { class: 'btn-ghost', text: '▼', title: 'Move down (used later)', disabled: !d.canEdit || i === settingsOrder.length - 1 });
+        const swap = (j) => { [settingsOrder[i], settingsOrder[j]] = [settingsOrder[j], settingsOrder[i]]; settingsConfirm = false; drawOrder(); };
+        up.addEventListener('click', () => swap(i - 1));
+        dn.addEventListener('click', () => swap(i + 1));
+        const off = (settingsAcctDirty[id]?.disabled ?? a.disabled);
+        const adv = el('details', {}, [el('summary', { class: 'nm', text: a.name + (off ? ' (disabled)' : '') })]);
+        const advBody = el('div', { class: 'acct-adv' });
+        for (const f of d.accountFields) {
+          if (f.key === 'priority') continue;
+          const row = el('div', { class: 'set-row' });
+          const cur = settingsAcctDirty[id]?.[f.key] ?? a[f.key];
+          const ed = settingsInput(f, cur, d.canEdit, () => {
+            try { (settingsAcctDirty[id] ||= {})[f.key] = ed.read(); } catch { /* bad JSON: caught on save */ (settingsAcctDirty[id] ||= {})[f.key] = undefined; }
+            row.classList.add('dirty'); settingsConfirm = false;
+          });
+          row.append(el('label', { class: 'k' }, [f.label, ...settingsBadges(f)]), ed.input, el('div', { class: 'help', text: f.help + ' Default: ' + showDef(f.def) + '.' }));
+          advBody.appendChild(row);
+        }
+        adv.appendChild(advBody);
+        const li = el('li', { class: off ? 'off' : '' }, [el('span', { class: 'pos', text: String(i + 1) }), up, dn, adv]);
+        list.appendChild(li);
+      });
+    };
+    drawOrder();
+    settingsBody.appendChild(list);
+
+    let group = null;
+    for (const f of d.fields) {
+      if (f.group !== group) { group = f.group; settingsBody.appendChild(el('div', { class: 'set-group', text: group })); }
+      const row = el('div', { class: 'set-row', 'data-key': f.key });
+      const ed = { f };
+      const made = settingsInput(f, f.value, d.canEdit, () => markDirty(row, ed)());
+      ed.read = made.read;
+      try { ed.initial = JSON.stringify(made.read()); } catch { ed.initial = null; }
+      editors.push(ed);
+      const id = 'set-' + f.key.replace(/\W/g, '-');
+      made.input.id = id;
+      row.append(el('label', { class: 'k', for: id }, [f.label, ...settingsBadges(f)]), made.input,
+        el('div', { class: 'help', text: f.help + ' Default: ' + showDef(f.def) + '.' }));
+      settingsBody.appendChild(row);
+    }
+    if (d.unknown?.length) {
+      settingsBody.appendChild(el('div', { class: 'set-intro', text: 'In the config file but not used by this version (left as is): ' + d.unknown.join(', ') }));
+    }
+
+    const saveBtn = el('button', { class: 'btn-svc', text: 'Save settings', disabled: !d.canEdit });
+    const resetBtn = el('button', { class: 'btn-ghost', text: 'Discard changes' });
+    const msg = el('div', { class: 'set-msg' });
+    resetBtn.addEventListener('click', () => loadSettings());
+    saveBtn.addEventListener('click', () => saveSettings(editors, msg, saveBtn));
+    settingsBody.appendChild(el('div', { class: 'set-actions' }, [saveBtn, resetBtn, msg]));
+  }
+
+  async function saveSettings(editors, msg, saveBtn) {
+    const set = {}; const problems = [];
+    for (const ed of editors) {
+      let v;
+      try { v = ed.read(); } catch { problems.push(`${ed.f.label}: not valid JSON`); continue; }
+      if (JSON.stringify(v) !== ed.initial) set[ed.f.key] = v;
+    }
+    const accounts = [];
+    for (const [id, ch] of Object.entries(settingsAcctDirty)) {
+      if (Object.values(ch).some(v => v === undefined)) { problems.push(`${settingsData.accounts.find(a => a.id === id)?.name}: a field is not valid JSON`); continue; }
+      accounts.push({ id, ...ch });
+    }
+    const origOrder = [...settingsData.accounts].sort((a, b) => a.priority - b.priority || a.index - b.index).map(a => a.id);
+    const order = settingsOrder.join() !== origOrder.join() ? settingsOrder : undefined;
+    msg.className = 'set-msg';
+    if (problems.length) { msg.className = 'set-msg bad'; msg.textContent = ''; msg.appendChild(el('ul', {}, problems.map(p => el('li', { text: p })))); return; }
+    if (!Object.keys(set).length && !accounts.length && !order) { msg.textContent = 'Nothing changed.'; return; }
+    const dangerous = editors.filter(ed => ed.f.danger && ed.f.key in set).map(ed => ed.f.label)
+      .concat(accounts.some(a => 'upstream' in a) ? ['Account upstream'] : []);
+    if (dangerous.length && !settingsConfirm) {
+      settingsConfirm = true;
+      msg.className = 'set-msg bad';
+      msg.textContent = `⚠ ${dangerous.join(', ')} change where traffic or tokens go or who can connect. Click Save again to confirm.`;
+      return;
+    }
+    saveBtn.disabled = true;
+    msg.textContent = 'Saving…';
+    try {
+      const res = await api('/teamclaude/settings', { method: 'POST', headers: { 'content-type': 'application/json', 'x-teamclaude-control': '1' }, body: JSON.stringify({ set, accounts, order }) });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        msg.className = 'set-msg bad'; msg.textContent = '';
+        const list = body.problems || [body.error || `HTTP ${res.status}`];
+        msg.appendChild(el('ul', {}, list.map(p => el('li', { text: p }))));
+        saveBtn.disabled = false;
+        return;
+      }
+      await loadSettings();
+      refresh();
+      const note = el('div', { class: 'set-msg good' }, [`Saved (backup ${body.backup}). `,
+        body.applied.length ? `Applied now: ${body.applied.join(', ')}. ` : '']);
+      if (body.needsRestart.length) {
+        const rb = el('button', { class: 'btn-restart', text: 'Restart now' });
+        rb.addEventListener('click', () => restartBtn.click());
+        note.append(el('span', { class: 'badge restart', text: 'needs restart' }), ` ${body.needsRestart.join(', ')} `, rb);
+      }
+      settingsBody.querySelector('.set-actions .set-msg')?.replaceWith(note);
+    } catch (err) {
+      msg.className = 'set-msg bad'; msg.textContent = 'Save failed: ' + err.message;
+      saveBtn.disabled = false;
+    }
+  }
+
+  async function loadSettings() {
+    try {
+      const res = await api('/teamclaude/settings', { cache: 'no-store' });
+      if (!res.ok) { settingsBody.textContent = ''; settingsBody.appendChild(el('div', { class: 'set-intro', text: res.status === 501 ? 'Settings are not available on this host.' : `Could not load settings (HTTP ${res.status}).` })); return; }
+      settingsData = await res.json();
+      settingsOrder = [...settingsData.accounts].sort((a, b) => a.priority - b.priority || a.index - b.index).map(a => a.id);
+      settingsAcctDirty = {};
+      settingsNote.textContent = settingsData.canEdit ? '' : 'read-only';
+      renderSettings();
+    } catch (err) {
+      settingsBody.textContent = ''; settingsBody.appendChild(el('div', { class: 'set-intro', text: 'Could not load settings: ' + err.message }));
+    }
+  }
+  settingsWrap.addEventListener('toggle', () => { if (settingsWrap.open) loadSettings(); });
+  // /ui#settings opens straight to this panel (a bookmark for the operator).
+  if (globalThis.location?.hash === '#settings') settingsWrap.open = true;
 
   // ── Service restart ──────────────────────────────────────────
   restartBtn.addEventListener('click', async () => {

@@ -25,6 +25,7 @@ import { createReauthManager } from './reauth.js';
 import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex } from './codex-auth.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
+import { publicSettings, saveSettings } from './settings.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
 import * as alias from './alias.js';
@@ -619,6 +620,16 @@ async function serverCommand() {
     config.switchThreshold = value; // keep in-memory config in sync with the live rotation
     return atomicConfigUpdate(async diskConfig => { diskConfig.switchThreshold = value; });
   };
+  // Settings view (GET/POST /teamclaude/settings). Reads the file, not the live
+  // object, so the view shows what a restart would load. A save validates every
+  // change first (nothing is written on a bad one), backs up the version it
+  // replaces, writes under the config lock, then runs the normal reload so the
+  // hot keys apply at once; settings.js reports which keys wait for a restart.
+  Object.assign(hooks, {
+    getSettings: async () => publicSettings(await loadConfig() || {}),
+    /** @param {any} changes */
+    saveSettings: (changes) => saveSettings(changes, reloadAccounts),
+  });
   hooks.persistAccountDisabled = (name, disabled) =>
     atomicConfigUpdate(async diskConfig => {
       const acct = diskConfig.accounts?.find(a => a.name === name);

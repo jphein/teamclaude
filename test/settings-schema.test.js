@@ -128,10 +128,17 @@ test('a masked secret sent back keeps the stored value', () => {
   assert.equal(c.sx.apiKey, SECRETS.sx);
 });
 
-test('a masked proxy password survives a host change', () => {
+// Cross-model review (gpt-6.1-sol): a masked credential that may follow the
+// URL to a new host lets a caller who cannot read it deliver it to a server
+// they chose. Reuse needs the same scheme and host; a port or path change is
+// a new destination only when the host:port changes.
+test('a masked proxy password stays with its host; moving it needs retyping', () => {
   const c = fixture();
-  applySettingsChanges(c, { set: { upstreamProxy: `http://${MASK}@squid2:3128` } });
-  assert.equal(c.upstreamProxy, `http://user:${SECRETS.proxyPw}@squid2:3128`);
+  assert.throws(() => applySettingsChanges(c, { set: { upstreamProxy: `http://${MASK}@squid2:3128` } }), /destination changed/);
+  assert.throws(() => applySettingsChanges(c, { set: { upstreamProxy: `http://${MASK}@squid:3129` } }), /destination changed/);
+  assert.equal(c.upstreamProxy, `http://user:${SECRETS.proxyPw}@squid:3128`);
+  applySettingsChanges(c, { set: { upstreamProxy: `http://user:typedNew@squid2:3128` } });
+  assert.equal(c.upstreamProxy, 'http://user:typedNew@squid2:3128');
 });
 
 test('client keys: keep masked ones, add new ones, refuse a new name with a masked key', () => {
@@ -256,9 +263,10 @@ test('credentials in upstream, egress.checkUrl and an account upstream are maske
   const json = JSON.stringify(publicSettings(c));
   for (const s of ['zzUPzz1', 'zzIPTOKzz2', 'zzACCTzz3']) assert.ok(!json.includes(s), `${s} leaked`);
   const p = publicSettings(c);
-  // Moving the account to a new host keeps its stored credentials.
-  applySettingsChanges(c, { accounts: [{ id: 'd1', upstream: p.accounts[0].upstream.replace('api.deepseek.example', 'api2.deepseek.example') }] });
-  assert.equal(c.accounts[0].upstream, 'https://k:zzACCTzz3@api2.deepseek.example/anthropic');
+  // A path change on the same host keeps the stored credentials; a new host does not.
+  applySettingsChanges(c, { accounts: [{ id: 'd1', upstream: p.accounts[0].upstream.replace('/anthropic', '/v2') }] });
+  assert.equal(c.accounts[0].upstream, 'https://k:zzACCTzz3@api.deepseek.example/v2');
+  assert.throws(() => applySettingsChanges(c, { accounts: [{ id: 'd1', upstream: `https://${MASK}@evil.example/v2` }] }), /destination changed/);
 });
 
 test('the mask cannot be moved out of the userinfo position', () => {
@@ -311,4 +319,71 @@ test('an account change without an id matches nothing', () => {
   const c = { accounts: [{ name: 'legacy', priority: 0 }] };
   assert.throws(() => applySettingsChanges(c, { accounts: [{ disabled: true }] }), /not found/);
   assert.equal(c.accounts[0].disabled, undefined);
+});
+
+test('masking fails closed: a backslash or odd scheme never leaves part of a password showing', () => {
+  for (const raw of [
+    'socks5://alice:zzP@decoy\\zzSECRETzz@proxy.example:1080',  // backslash ends http authorities, not socks5
+    'http://alice:zzP\\zzSECRETzz@proxy.example:3128',
+    'http://alice:zz/zzSECRETzz@proxy.example:3128',           // a raw slash in the password
+  ]) {
+    const shown = publicSettings({ upstreamProxy: raw, accounts: [] }).fields.find(f => f.key === 'upstreamProxy').value;
+    assert.ok(!shown.includes('zzSECRET') && !shown.includes('zzP'), `${raw} → ${shown}`);
+  }
+});
+
+test('GET never echoes a stored value of the wrong shape', () => {
+  const p = publicSettings({
+    upstreamProxy: { host: 'x', password: 'zzOBJPWzz1' },
+    upstream: ['https://u:zzARRzz2@h'],
+    proxy: { apiKey: { nested: 'zzKEYOBJzz3' }, clientKeys: [{ name: { n: 'zzNAMEzz4' }, key: 'zzCKzz5' }] },
+    accounts: [{ id: 'a', name: 'a', upstream: { password: 'zzACCOBJzz6' } }],
+  });
+  const json = JSON.stringify(p);
+  for (const s of ['zzOBJPWzz1', 'zzARRzz2', 'zzKEYOBJzz3', 'zzNAMEzz4', 'zzCKzz5', 'zzACCOBJzz6']) assert.ok(!json.includes(s), `${s} leaked`);
+});
+
+test('a refused URL is explained without the credentials ever reaching the message', () => {
+  const c = { upstreamProxy: 'http://user:zzPWzz7@squid:3128', accounts: [] };
+  // The real value and the credential-free copy fail alike: the message is the copy's, masked.
+  let e1; try { applySettingsChanges(c, { set: { upstreamProxy: 'https://user:zzNEWzz8@squid:3128' } }); } catch (e) { e1 = e; }
+  assert.match(e1.problems[0], /unsupported proxy protocol "https"/);
+  assert.ok(!e1.problems[0].includes('zzNEWzz8'), e1.problems[0]);
+  // Only the credentials are invalid: a fixed message, no echo.
+  let e2; try { applySettingsChanges(c, { set: { upstreamProxy: 'http://user:zz%zzBADzz9@squid:3128' } }); } catch (e) { e2 = e; }
+  assert.ok(!e2.problems[0].includes('BADzz9'), e2.problems[0]);
+  assert.match(e2.problems[0], /user:password part is not valid/);
+});
+
+test('account upstream and the exit-IP check URL must be http(s) URLs', () => {
+  const c = { accounts: [{ id: 'a', name: 'a', upstream: 'https://k:zzS@be.example' }] };
+  assert.throws(() => applySettingsChanges(c, { accounts: [{ id: 'a', upstream: `ftp://${MASK}@be.example` }] }), /http\(s\) URL|destination changed/);
+  assert.throws(() => applySettingsChanges(c, { accounts: [{ id: 'a', upstream: 'not a url' }] }), /must be a URL/);
+  assert.throws(() => applySettingsChanges(c, { set: { 'egress.checkUrl': 'file:///etc/passwd' } }), /http\(s\) URL/);
+});
+
+test('a client key equal to the shared key is refused (it would lock the admin out)', () => {
+  const c = { proxy: { apiKey: 'shared1', clientKeys: [] }, accounts: [] };
+  assert.throws(() => applySettingsChanges(c, { set: { 'proxy.clientKeys': [{ name: 'x', key: 'shared1' }] } }), /same as the shared proxy key/);
+  const d = { accounts: [] };
+  applySettingsChanges(d, { set: { upstreamProxy: ' False ' } });
+  assert.equal(d.upstreamProxy, false);
+});
+
+test('backups never overwrite or write through something already at the name', async () => {
+  const { symlink } = await import('node:fs/promises');
+  const dir = await mkdtemp(join(tmpdir(), 'tc-settings-excl-'));
+  try {
+    const cfg = join(dir, 'teamclaude.json');
+    await writeFile(cfg, '{"v":1}', { mode: 0o600 });
+    const now = new Date(Date.UTC(2026, 9, 11, 13, 0, 0));
+    const victim = join(dir, 'victim.txt');
+    await writeFile(victim, 'untouched');
+    // Planted at exactly the name the next backup would take.
+    await symlink(victim, join(dir, 'teamclaude.json.bak-settings-20261011T130000'));
+    const name = await backupConfig(cfg, 20, now);
+    assert.equal(name, 'teamclaude.json.bak-settings-20261011T130000-2');
+    assert.equal(await readFile(victim, 'utf8'), 'untouched');
+    assert.equal(await readFile(join(dir, name), 'utf8'), '{"v":1}');
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

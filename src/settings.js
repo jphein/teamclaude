@@ -15,6 +15,7 @@
 //     because the running process would keep the old value.
 
 import { copyFile, chmod, readdir, unlink } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { atomicConfigUpdate, getConfigPath } from './config.js';
 import { resolveTlsConfig } from './tls-listener.js';
@@ -47,6 +48,9 @@ export const MASK = '••••••••';
  * @property {(v: any, cfg: any) => string|null} [check] extra validation; returns a problem or null
  */
 
+/** @param {any} v */
+/** @param {any} v */
+const httpUrlCheck = (v) => { try { const u = new URL(v); return u.protocol === 'https:' || u.protocol === 'http:' ? null : 'must be an http(s) URL'; } catch { return 'must be a URL'; } };
 /** @param {any} v */
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 /** @param {any} v */
@@ -125,7 +129,7 @@ export const FIELDS = [
   // ── Upstream & network ──────────────────────────────────────────────────
   { key: 'upstream', group: 'Upstream & network', label: 'Upstream API', type: 'text', credUrl: true, apply: 'restart', def: 'https://api.anthropic.com', danger: true,
     help: 'Where requests (and account tokens) are sent. Change only for a compatible backend.',
-    check: (v) => { try { const u = new URL(v); return u.protocol === 'https:' || u.protocol === 'http:' ? null : 'must be an http(s) URL'; } catch { return 'must be a URL'; } } },
+    check: httpUrlCheck },
   { key: 'upstreamProxy', group: 'Upstream & network', label: 'Outbound proxy', type: 'text', credUrl: true, allowFalse: true, apply: 'restart', def: null, danger: true,
     help: 'Proxy for everything sent to Anthropic, e.g. http://host:3128. A password in it is write-only. false = never use one.',
     check: (v) => { if (v === false || v == null || v === '') return null; try { parseProxyUrl(String(v)); return null; } catch (e) { return /** @type {Error} */ (e).message; } } },
@@ -136,7 +140,7 @@ export const FIELDS = [
   { key: "egress.pin", group: "Upstream & network", label: "Pinned exit IP", type: "json", apply: "restart", def: null, danger: true,
     help: "Hold requests while the public IP is not this one (a dropped VPN): \"auto\" pins the first address seen, or an IP or list of IPs. Empty = off.",
     check: (v) => (v == null || typeof v === "string" || (Array.isArray(v) && v.every((x) => typeof x === "string")) ? null : "must be \"auto\", an IP, or a list of IPs") },
-  { key: 'egress.checkUrl', group: 'Upstream & network', label: 'Exit-IP check URL', type: 'text', credUrl: true, apply: 'restart', def: 'https://api.ipify.org',
+  { key: 'egress.checkUrl', group: 'Upstream & network', label: 'Exit-IP check URL', type: 'text', credUrl: true, apply: 'restart', def: 'https://api.ipify.org', check: httpUrlCheck,
     help: 'Service that reports the current public IP.' },
   { key: 'egress.ttlSeconds', group: 'Upstream & network', label: 'Exit-IP recheck (s)', type: 'int', apply: 'restart', def: 30, min: 1,
     help: 'How long a confirmed exit IP is trusted before checking again.' },
@@ -179,7 +183,7 @@ export const ACCOUNT_FIELDS = [
   { key: 'priority', label: 'Priority', type: 'int', apply: 'hot', def: 0, min: 0, required: true, help: 'Lower = used first. The list order sets this.' },
   { key: 'disabled', label: 'Disabled', type: 'bool', apply: 'hot', def: false, help: 'Keep this account out of rotation.' },
   { key: 'maxUsage', label: 'Usage cap', type: 'json', apply: 'hot', def: null, help: 'Hard cap: a number, or a per-bucket table. Empty = none.', check: (v) => (v == null ? null : thresholdCheck(v)) },
-  { key: 'upstream', label: 'Account upstream', type: 'text', credUrl: true, apply: 'hot', def: null, danger: true, help: 'Alternative backend URL for this account only. Empty = the global upstream.' },
+  { key: 'upstream', label: 'Account upstream', type: 'text', credUrl: true, apply: 'hot', def: null, danger: true, help: 'Alternative backend URL for this account only. Empty = the global upstream.', check: httpUrlCheck },
   { key: 'modelMap', label: 'Model map', type: 'json', apply: 'hot', def: null, help: 'Rename models for this account\'s backend. Empty = none.', check: (v) => (v == null || isObj(v) ? null : 'must be an object') },
   { key: 'stripRequestFields', label: 'Strip request fields', type: 'list', apply: 'restart', def: [], help: 'Top-level request fields dropped before sending to this account; "cache_control.<subfield>" drops that subfield.' },
 ];
@@ -211,34 +215,37 @@ const withoutCheck = (f) => Object.fromEntries(Object.entries(f).filter(([k]) =>
 
 // ── masking ──────────────────────────────────────────────────────────────
 // Credentials inside a URL-valued setting ("scheme://user:pass@host", a bare
-// "user:pass@host:3128", a token-only "http://tok@host"). Found the way the
-// WHATWG URL parser — and so parseProxyUrl — finds them: the authority runs to
-// the first / ? # or \\, and its userinfo to the LAST "@" inside it, so an
-// unencoded "@" in a password is still all userinfo. With no "@" in the
-// authority but one later (a value the parser would reject), everything up to
-// the last "@" counts: over-masking a broken value is the safe direction. The
-// whole userinfo is replaced, username included — a token-only form has no
-// password part, and the username is the credential.
+// "user:pass@host:3128", a token-only "http://tok@host"). Fail-closed: the
+// userinfo is everything after the scheme up to the LAST "@" in the value. The
+// WHATWG parser (and so parseProxyUrl) ends userinfo at the last "@" of the
+// authority, and where the authority ends depends on the scheme (a backslash
+// ends it for http, not for socks5) — so stopping anywhere earlier can leave
+// part of a password showing, while running to the last "@" can only
+// over-mask (a path containing "@"), which is the safe direction. The whole
+// userinfo is replaced, username included: in a token-only form it IS the
+// credential.
 /** @param {any} v @returns {{ head: string, userinfo: string, tail: string } | null} */
 function splitUserinfo(v) {
   if (typeof v !== "string") return null;
   const start = (v.match(/^\s*[a-z0-9+.-]+:\/\//i) || v.match(/^\s*/))?.[0].length ?? 0;
   const rest = v.slice(start);
-  const end = rest.search(/[/?#\\]/);
-  let at = (end < 0 ? rest : rest.slice(0, end)).lastIndexOf("@");
-  if (at < 0) at = rest.lastIndexOf("@");
+  const at = rest.lastIndexOf("@");
   if (at < 0) return null;
   return { head: v.slice(0, start), userinfo: rest.slice(0, at), tail: rest.slice(at) };
 }
+/** Scheme + host[:port] of a split URL, for "is this the same destination". @param {{ head: string, tail: string }} p */
+const destination = (p) => (p.head.trim() + p.tail.slice(1).split(/[/?#\\]/)[0]).toLowerCase();
 /** @param {any} v */
 function maskUrlCredentials(v) {
+  if (v == null || v === false) return v;
+  if (typeof v !== 'string') return MASK;   // a hand-edited non-URL: never echo its contents
   const p = splitUserinfo(v);
   return p ? p.head + MASK + p.tail : v;
 }
 /** @param {Field} f @param {any} v */
 function displayValue(f, v) {
-  if (f.type === 'secret') return v ? MASK : null;
-  if (f.type === 'secretList') return Array.isArray(v) ? v.map((e) => ({ name: e?.name ?? '', key: e?.key ? MASK : '' })) : [];
+  if (f.type === 'secret') return v ? MASK : null;   // any shape: only set / not set
+  if (f.type === 'secretList') return Array.isArray(v) ? v.map((e) => ({ name: typeof e?.name === 'string' ? e.name : '', key: e?.key ? MASK : '' })) : [];
   if (f.credUrl) return maskUrlCredentials(v);
   return v;
 }
@@ -279,21 +286,27 @@ export function publicSettings(config) {
 
 /**
  * A URL setting sent back with its masked userinfo: put the stored userinfo
- * back. MASK anywhere other than the whole userinfo is refused, so the stored
- * credentials can only return to the position they were shown in.
+ * back — only as the whole userinfo, and only for the same scheme and host:
+ * a masked value that moved to another destination would carry a credential
+ * the caller cannot read to a server the caller chose.
  * @param {string} v @param {any} stored
  */
 function restoreUrlCredentials(v, stored) {
   return restoreUrl(v, stored);
 }
 /**
- * A validator message for a URL setting with its credentials masked: the
- * loader quotes the whole value back, which after a MASK restore would be the
- * stored password. @param {string} msg @param {any} v
+ * The problem to report for a URL setting that failed validation. Loader
+ * messages quote the whole value back — after a MASK restore, the stored
+ * password. So the message comes from validating a copy whose userinfo is a
+ * placeholder: the credentials never reach the text. If only the real value
+ * fails, the credentials themselves are what is invalid.
+ * @param {Field} f @param {any} v @param {any} cfg @param {string} p
  */
-function scrubCredentials(msg, v) {
-  const p = splitUserinfo(v);
-  return p && p.userinfo ? msg.split(p.userinfo).join(MASK) : msg;
+function credentialFreeProblem(f, v, cfg, p) {
+  const s = splitUserinfo(v);
+  if (!s) return p;
+  const probe = problemFor(f, `${s.head}user:x${s.tail}`, cfg);
+  return probe ? probe.split("user:x").join(MASK) : "the user:password part is not valid in a URL (percent-encode special characters such as @ / : #)";
 }
 /** @param {string} v @param {any} stored */
 function restoreUrl(v, stored) {
@@ -301,6 +314,7 @@ function restoreUrl(v, stored) {
   if (!p || p.userinfo !== MASK || p.head.includes(MASK) || p.tail.includes(MASK)) return { problem: "retype the credentials (the masked value can only stand for the whole user:password part)" };
   const old = splitUserinfo(stored);
   if (!old) return { problem: "no stored credentials to keep; type them" };
+  if (destination(old) !== destination(p)) return { problem: "the destination changed, so retype the credentials (stored ones only stay with the host they were set for)" };
   return { value: p.head + old.userinfo + p.tail };
 }
 
@@ -313,7 +327,7 @@ function normalise(f, v) {
   if (f.type === 'text' && typeof v === 'string') {
     v = v.trim();
     if (v === '') v = null;
-    else if (f.allowFalse && v === 'false') v = false;
+    else if (f.allowFalse && v.toLowerCase() === 'false') v = false;
   }
   if (f.type === 'secretList' && Array.isArray(v)) v = v.map((e) => (isObj(e) ? { name: typeof e.name === 'string' ? e.name.trim() : e.name, key: e.key } : e));
   if (v === null && f.clearToDefault) v = f.def;
@@ -335,6 +349,9 @@ function problemFor(f, v, cfg) {
     case 'secretList':
       if (!Array.isArray(v) || !v.every((/** @type {any} */ e) => isObj(e) && typeof e.name === 'string' && e.name.trim() && typeof e.key === 'string' && e.key)) return 'must be a list of { name, key }';
       if (new Set(v.map((/** @type {any} */ e) => e.name)).size !== v.length) return 'each name may appear once';
+      // Client keys are matched first, so one equal to the shared key would turn
+      // the admin into that client and lock the Settings view.
+      if (cfg?.proxy?.apiKey && v.some((/** @type {any} */ e) => e.key === cfg.proxy.apiKey)) return 'a client key cannot be the same as the shared proxy key';
       break;
     default: break;
   }
@@ -386,7 +403,7 @@ export function applySettingsChanges(config, changes) {
     }
     if (JSON.stringify(v ?? null) === JSON.stringify(getPath(config, key) ?? null)) continue; // unchanged
     const p = problemFor(f, v, config);
-    if (p) problems.push(`${key}: ${f.credUrl ? scrubCredentials(p, v) : p}`);
+    if (p) problems.push(`${key}: ${f.credUrl ? credentialFreeProblem(f, v, config, p) : p}`);
     else plan.push([f, v]);
   }
 
@@ -409,7 +426,7 @@ export function applySettingsChanges(config, changes) {
       v = normalise(f, v);
       if (JSON.stringify(v ?? null) === JSON.stringify(a[k] ?? null)) continue;
       const p = problemFor(f, v, config);
-      if (p) problems.push(`account ${a.name}: ${k} ${f.credUrl ? scrubCredentials(p, v) : p}`); else acctPlan.push([a, f, v]);
+      if (p) problems.push(`account ${a.name}: ${k} ${f.credUrl ? credentialFreeProblem(f, v, config, p) : p}`); else acctPlan.push([a, f, v]);
     }
   }
   let order = null;
@@ -455,8 +472,16 @@ export async function backupConfig(configPath, keep = BACKUP_KEEP, now = new Dat
   const dir = dirname(configPath);
   const existing = (await readdir(dir)).filter((f) => f.startsWith(prefix));
   for (let n = 2; existing.includes(name); n++) name = `${prefix}${stamp}-${n}`;
-  const dest = join(dir, name);
-  await copyFile(configPath, dest);
+  // COPYFILE_EXCL: never overwrite, or write through, anything already at the
+  // name (a file or symlink created after the listing) — take the next name.
+  let dest = join(dir, name);
+  for (let n = 2; ; n++) {
+    try { await copyFile(configPath, dest, fsConstants.COPYFILE_EXCL); break; }
+    catch (e) {
+      if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'EEXIST' || n > 99) throw e;
+      name = `${prefix}${stamp}-${n}`; dest = join(dir, name);
+    }
+  }
   await chmod(dest, 0o600);
   const all = [...existing, name].sort();
   for (const old of all.slice(0, Math.max(0, all.length - keep))) await unlink(join(dir, old)).catch(() => {});

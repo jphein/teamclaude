@@ -387,3 +387,10 @@ test('backups never overwrite or write through something already at the name', a
     assert.equal(await readFile(join(dir, name), 'utf8'), '{"v":1}');
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test('same-destination check uses the URL parser (backslash quirks cannot fake a host)', () => {
+  const c = { upstreamProxy: 'socks5://user:zzS@proxy.example\\old', accounts: [] };
+  assert.throws(() => applySettingsChanges(c, { set: { upstreamProxy: `socks5://${MASK}@proxy.example\\relay.attacker.example` } }), /destination changed/);
+  const h = { upstreamProxy: 'http://user:zzS@squid:3128/a', accounts: [] };
+  assert.throws(() => applySettingsChanges(h, { set: { upstreamProxy: `http://${MASK}@squid:3128\\@evil.example` } }), /destination changed|retype/);
+});

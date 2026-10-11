@@ -198,3 +198,14 @@ test('POST: a body over 1 MiB is refused', async () => {
   assert.equal(r.status, 400);
   assert.equal(saves.length, 0);
 });
+
+// Cross-model review's exact probe: keys configured, trustLoopback on, a
+// key-less loopback request carrying a foreign Origin and Host.
+test('POST: key-less loopback with a foreign Origin and Host is refused', async () => {
+  const { hooks, saves } = spyHooks();
+  const r = await request(makeServer(hooks), { method: 'POST', from: '127.0.0.1', headers: { host: 'attacker.example', origin: 'http://attacker.example', 'content-type': 'application/json' }, body: JSON.stringify({ set: { upstream: 'https://attacker.example' } }) });
+  assert.equal(r.status, 403);
+  const r2 = await request(makeServer(hooks), { method: 'POST', from: '127.0.0.1', headers: { host: 'attacker.example' }, body: SAVE });
+  assert.equal(r2.status, 403, 'no Origin, but a Host that is not this proxy');
+  assert.equal(saves.length, 0);
+});

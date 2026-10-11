@@ -14,8 +14,7 @@
 //     reloadAccounts, sync-accounts.js). Everything else says "needs restart",
 //     because the running process would keep the old value.
 
-import { copyFile, chmod, readdir, unlink } from 'node:fs/promises';
-import { constants as fsConstants } from 'node:fs';
+import { open, readFile, readdir, unlink } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { atomicConfigUpdate, getConfigPath } from './config.js';
 import { resolveTlsConfig } from './tls-listener.js';
@@ -233,8 +232,18 @@ function splitUserinfo(v) {
   if (at < 0) return null;
   return { head: v.slice(0, start), userinfo: rest.slice(0, at), tail: rest.slice(at) };
 }
-/** Scheme + host[:port] of a split URL, for "is this the same destination". @param {{ head: string, tail: string }} p */
-const destination = (p) => (p.head.trim() + p.tail.slice(1).split(/[/?#\\]/)[0]).toLowerCase();
+/**
+ * Scheme + host[:port] as the URL parser reads them — the same parser the
+ * consumers use, so a backslash or other per-scheme quirk cannot make two
+ * different hosts compare equal. null when it does not parse (then nothing is
+ * restored). The userinfo is swapped for a placeholder first, so the stored
+ * credential's own characters cannot change the parse.
+ * @param {{ head: string, tail: string }} p
+ */
+function destination(p) {
+  const raw = (p.head.trim() || 'http://') + 'u' + p.tail;
+  try { const u = new URL(raw); return u.host ? `${u.protocol}//${u.host}` : null; } catch { return null; }
+}
 /** @param {any} v */
 function maskUrlCredentials(v) {
   if (v == null || v === false) return v;
@@ -314,7 +323,8 @@ function restoreUrl(v, stored) {
   if (!p || p.userinfo !== MASK || p.head.includes(MASK) || p.tail.includes(MASK)) return { problem: "retype the credentials (the masked value can only stand for the whole user:password part)" };
   const old = splitUserinfo(stored);
   if (!old) return { problem: "no stored credentials to keep; type them" };
-  if (destination(old) !== destination(p)) return { problem: "the destination changed, so retype the credentials (stored ones only stay with the host they were set for)" };
+  const was = destination(old);
+  if (was === null || was !== destination(p)) return { problem: "the destination changed, so retype the credentials (stored ones only stay with the host they were set for)" };
   return { value: p.head + old.userinfo + p.tail };
 }
 
@@ -472,17 +482,23 @@ export async function backupConfig(configPath, keep = BACKUP_KEEP, now = new Dat
   const dir = dirname(configPath);
   const existing = (await readdir(dir)).filter((f) => f.startsWith(prefix));
   for (let n = 2; existing.includes(name); n++) name = `${prefix}${stamp}-${n}`;
-  // COPYFILE_EXCL: never overwrite, or write through, anything already at the
-  // name (a file or symlink created after the listing) — take the next name.
+  // Created exclusively ("wx": fails on anything already at the name, a file
+  // or a symlink planted after the listing) with mode 0600 from the start, and
+  // written through the descriptor — no later chmod or path lookup that a
+  // swapped-in symlink could redirect.
+  const content = await readFile(configPath);
   let dest = join(dir, name);
   for (let n = 2; ; n++) {
-    try { await copyFile(configPath, dest, fsConstants.COPYFILE_EXCL); break; }
+    let fh;
+    try { fh = await open(dest, 'wx', 0o600); }
     catch (e) {
       if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'EEXIST' || n > 99) throw e;
       name = `${prefix}${stamp}-${n}`; dest = join(dir, name);
+      continue;
     }
+    try { await fh.writeFile(content); } finally { await fh.close(); }
+    break;
   }
-  await chmod(dest, 0o600);
   const all = [...existing, name].sort();
   for (const old of all.slice(0, Math.max(0, all.length - keep))) await unlink(join(dir, old)).catch(() => {});
   return name;

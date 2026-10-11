@@ -1615,7 +1615,7 @@
   }
   settingsWrap.addEventListener('toggle', () => { if (settingsWrap.open) loadSettings(); });
   // /ui#settings opens straight to this panel (a bookmark for the operator).
-  if (location.hash === '#settings') settingsWrap.open = true;
+  if (globalThis.location?.hash === '#settings') settingsWrap.open = true;
 
   // ── Service restart ──────────────────────────────────────────
   restartBtn.addEventListener('click', async () => {

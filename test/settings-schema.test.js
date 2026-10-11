@@ -103,7 +103,7 @@ test('no secret value ever appears in the public settings', () => {
   const val = (k) => p.fields.find(f => f.key === k).value;
   assert.equal(val('proxy.apiKey'), MASK);
   assert.deepEqual(val('proxy.clientKeys'), [{ name: 'katana', key: MASK }]);
-  assert.equal(val('upstreamProxy'), `http://user:${MASK}@squid:3128`);
+  assert.equal(val('upstreamProxy'), `http://${MASK}@squid:3128`);
   assert.equal(val('sx.apiKey'), MASK);
   assert.equal(publicSettings({ accounts: [] }).fields.find(f => f.key === 'proxy.apiKey').value, null, 'unset secret reads as not set');
 });
@@ -130,7 +130,7 @@ test('a masked secret sent back keeps the stored value', () => {
 
 test('a masked proxy password survives a host change', () => {
   const c = fixture();
-  applySettingsChanges(c, { set: { upstreamProxy: `http://user:${MASK}@squid2:3128` } });
+  applySettingsChanges(c, { set: { upstreamProxy: `http://${MASK}@squid2:3128` } });
   assert.equal(c.upstreamProxy, `http://user:${SECRETS.proxyPw}@squid2:3128`);
 });
 
@@ -217,4 +217,55 @@ test('backups: 0600, one per save, newest 20 kept', async () => {
     const b = await backupConfig(cfg, 20, new Date(t0 + 99000));
     assert.notEqual(a, b);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+// Masking must find credentials exactly where the loader does. parseProxyUrl
+// (WHATWG URL) accepts a scheme-less "user:pass@host", ends the userinfo at
+// the LAST "@", and treats a token-only userinfo as the username — a regex that
+// disagreed with it showed passwords to every client-key holder.
+test('URL credentials are masked wherever the loader would find them', async () => {
+  const { parseProxyUrl } = await import('../src/upstream-proxy.js');
+  const cases = [
+    'http://user:zzPWzz1@squid:3128',
+    'user:zzPWzz2@squid:3128',                 // scheme-less, as the docs allow
+    'http://user:zz@PWzz3@squid:3128',         // unencoded "@" in the password
+    'http://zzTOKENzz4@squid:3128',            // token-only userinfo
+    '  http://user:zzPWzz5@squid:3128',        // leading space (the loader trims)
+    'http://user:zz%40PWzz6@squid:3128',       // percent-encoded
+  ];
+  for (const raw of cases) {
+    const parsed = parseProxyUrl(raw);
+    const secret = parsed.password ?? parsed.username;
+    assert.ok(secret, `fixture ${raw} has credentials per the loader`);
+    const shown = publicSettings({ upstreamProxy: raw, accounts: [] }).fields.find(f => f.key === 'upstreamProxy').value;
+    for (const piece of [secret, encodeURIComponent(secret), 'zzPW', 'zzTOKEN', 'PWzz']) assert.ok(!shown.includes(piece), `${raw} → ${shown} leaks ${piece}`);
+    assert.ok(shown.includes(MASK), `${raw} → ${shown} is masked`);
+    // And the masked value round-trips to the original.
+    const c = { upstreamProxy: raw, accounts: [] };
+    applySettingsChanges(c, { set: { upstreamProxy: shown } });
+    assert.equal(c.upstreamProxy, raw);
+  }
+});
+
+test('credentials in upstream, egress.checkUrl and an account upstream are masked too', () => {
+  const c = {
+    upstream: 'https://ak:zzUPzz1@gateway.example/anthropic',
+    egress: { checkUrl: 'https://zzIPTOKzz2@ip.example/' },
+    accounts: [{ id: 'd1', name: 'deepseek', upstream: 'https://k:zzACCTzz3@api.deepseek.example/anthropic' }],
+  };
+  const json = JSON.stringify(publicSettings(c));
+  for (const s of ['zzUPzz1', 'zzIPTOKzz2', 'zzACCTzz3']) assert.ok(!json.includes(s), `${s} leaked`);
+  const p = publicSettings(c);
+  // Moving the account to a new host keeps its stored credentials.
+  applySettingsChanges(c, { accounts: [{ id: 'd1', upstream: p.accounts[0].upstream.replace('api.deepseek.example', 'api2.deepseek.example') }] });
+  assert.equal(c.accounts[0].upstream, 'https://k:zzACCTzz3@api2.deepseek.example/anthropic');
+});
+
+test('the mask cannot be moved out of the userinfo position', () => {
+  const c = { upstreamProxy: 'http://user:zzPWzz1@squid:3128', accounts: [] };
+  for (const v of [`http://evil.example/${MASK}@x`, `http://squid:3128/?p=${MASK}`, `http://user:${MASK}@squid:3128`]) {
+    assert.throws(() => applySettingsChanges(JSON.parse(JSON.stringify(c)), { set: { upstreamProxy: v } }), /retype the credentials/, v);
+  }
+  // No stored credentials: a mask stands for nothing.
+  assert.throws(() => applySettingsChanges({ upstreamProxy: 'http://squid:3128', accounts: [] }, { set: { upstreamProxy: `http://${MASK}@squid:3128` } }), /no stored credentials/);
 });

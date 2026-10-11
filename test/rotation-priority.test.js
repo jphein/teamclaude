@@ -141,3 +141,60 @@ test('selectActiveAccount leaves current account when none are available', () =>
   assert.equal(chosen.name, 'b');   // falls back to the existing current account
   assert.equal(am.currentIndex, 1); // unchanged
 });
+
+// ── strict list order: a renewed higher account takes traffic back (JP, 2026-10-11) ──
+// "Always use the top-most account that has quota; when a higher one renews
+// (its 5h OR its 7d window resets), the next request goes back to it."
+// priority = list position; a spent window keeps the account out until its
+// reset passes, then _clearExpiredQuotas clears it and _preemptedBy moves the
+// fleet back up on the very next selection.
+
+const OPUS = 'claude-opus-5';
+
+test('a higher-priority account whose 5h window renews takes traffic back on the next request', () => {
+  const am = new AccountManager([oauth('top', { priority: 0 }), oauth('next', { priority: 1 })], 0.98);
+  am.accounts[0].quota.unified5h = 1;                       // top spent its 5h window...
+  am.accounts[0].quota.unified5hReset = Date.now() + 60_000; // ...resetting in a minute
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'next', 'spent top account is skipped');
+  assert.equal(am.currentIndex, 1);
+
+  am.accounts[0].quota.unified5hReset = Date.now() - 1;     // the 5h window renews
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'top', 'renewed top account wins again');
+  assert.equal(am.currentIndex, 0, 'and the fleet stays there (sticky on the top)');
+});
+
+test('a higher-priority account whose 7d window renews takes traffic back on the next request', () => {
+  const am = new AccountManager([oauth('top', { priority: 0 }), oauth('next', { priority: 1 })], 0.98);
+  am.accounts[0].quota.unified7d = 1;
+  am.accounts[0].quota.unified7dReset = Date.now() + 3600_000;
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'next');
+
+  am.accounts[0].quota.unified7dReset = Date.now() - 1;     // the weekly window renews
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'top');
+  assert.equal(am.currentIndex, 0);
+});
+
+test('with three accounts, traffic always lands on the top-most one with quota', () => {
+  const am = new AccountManager([
+    oauth('p0', { priority: 0 }), oauth('p1', { priority: 1 }), oauth('p2', { priority: 2 }),
+  ], 0.98);
+  const spend5h = (i, ms) => { am.accounts[i].quota.unified5h = 1; am.accounts[i].quota.unified5hReset = Date.now() + ms; };
+  spend5h(0, 60_000); spend5h(1, 120_000);
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'p2');
+  am.accounts[1].quota.unified5hReset = Date.now() - 1;     // the middle one renews first
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'p1', 'moves up to the renewed middle, not stuck at the bottom');
+  am.accounts[0].quota.unified5hReset = Date.now() - 1;     // then the top renews
+  assert.equal(am.getActiveAccount(null, OPUS).name, 'p0');
+});
+
+test('a session pinned to a lower account moves back to the renewed higher one (distributeSessions on)', () => {
+  const am = new AccountManager([oauth('top', { priority: 0 }), oauth('next', { priority: 1 })], 0.98, { distributeSessions: true });
+  am.accounts[0].quota.unified5h = 1;
+  am.accounts[0].quota.unified5hReset = Date.now() + 60_000;
+  const first = am.getActiveAccount(null, OPUS, null, 'sess-1');
+  assert.equal(first.name, 'next');
+  am.recordSession('sess-1', first.index, OPUS);            // the session is now pinned to "next"
+
+  am.accounts[0].quota.unified5hReset = Date.now() - 1;
+  assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-1').name, 'top', 'the pin yields to the renewed higher account');
+});

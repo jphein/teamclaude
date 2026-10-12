@@ -91,6 +91,14 @@ export const FIELDS = [
     help: 'Rules that send model patterns to specific accounts.',
     check: (v) => (Array.isArray(v) && v.every(isObj) ? null : 'must be an array of route objects') },
 
+  // ── Fable ───────────────────────────────────────────────────────────────
+  { key: 'fable.allow', group: 'Fable', label: 'Allowed clients', type: 'list', apply: 'hot', def: null,
+    help: 'Client key names that may use Fable; every other Fable request is served as the fallback model, never refused. "(shared key)" admits the shared key. Unset = no rationing; empty = nobody.',
+    check: (v) => (Array.isArray(v) && v.every((n) => typeof n === 'string' && n.trim()) ? null : 'must be a list of client names') },
+  { key: 'fable.model', group: 'Fable', label: 'Fallback model', type: 'text', apply: 'hot', def: 'claude-opus-5-5',
+    help: 'What a rationed Fable request is served as, and what an allowed one falls back to when no account has Fable left or Fable is at capacity.',
+    check: (v) => (/fable/i.test(String(v)) ? 'must not be a Fable model' : null) },
+
   // ── Keep-warm ───────────────────────────────────────────────────────────
   { key: 'warmOnExhaustion', group: 'Keep-warm', label: 'Align 5h windows', type: 'bool', apply: 'hot', def: false,
     help: 'When any account starts or uses up its 5h window, start every cold account\'s window too, so they refresh together.' },
@@ -280,7 +288,7 @@ export function publicSettings(config) {
   const known = new Set(FIELDS.map((f) => f.key));
   const tops = new Set([...known].map((k) => k.split(".")[0]).concat("accounts"));
   const unknown = Object.keys(config || {}).filter((k) => !tops.has(k));
-  for (const parent of ["proxy", "egress", "sx", "service", "mitm"]) {
+  for (const parent of ["proxy", "egress", "sx", "service", "mitm", "fable"]) {
     for (const k of Object.keys(isObj(config?.[parent]) ? config[parent] : {})) if (!known.has(`${parent}.${k}`)) unknown.push(`${parent}.${k}`);
   }
   return {

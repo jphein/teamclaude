@@ -453,13 +453,59 @@ export function problems(status) {
 
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, providerLabel, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows, problems, withKey, sseFrames,
+  switchRequest, switchOutcome, routeRows, problems, withKey, sseFrames, rotationView, orderControls,
 ].map(fn => fn.toString()).join('\n\n');
+
+/** JP's rule for expiry routing, shown wherever the order is (2026-10-11). */
+export const EXPIRY_RULE = 'Uses the account whose weekly allowance resets soonest (most to lose first); skips any whose 5-hour window is full; re-ranks for each new session; running sessions stay put unless their account runs out or renews.';
+/** JP's rule for strict priority order (2026-10-11). */
+export const PRIORITY_RULE = 'Requests always go to the highest account with quota left; when a higher one renews, traffic moves back to it.';
+
+/**
+ * The order traffic actually follows, for the account cards and the Settings
+ * list. With expiry routing on that is live pressure (weekly allowance left per
+ * hour until it resets), highest first, accounts that cannot serve last; with
+ * it off it is priority, then list position. Each entry carries
+ * pressurePerHour (a fraction, e.g. 0.0058) or null when unknown.
+ * @param {any} status
+ */
+export function rotationView(status) {
+  const expiry = !!(status && status.expiryRouting && status.expiryRouting.enabled);
+  const list = ((status && status.accounts) || []).map(/** @param {any} a @param {number} i */ function (a, i) {
+    const p = typeof a.pressure === 'number' && isFinite(a.pressure) ? a.pressure * 3600 : null;   // status reports per second
+    const serves = !a.disabled && a.status !== 'error' && a.status !== 'exhausted' && (p == null || p > 0);
+    return { account: a, index: i, pressurePerHour: p, serves: serves };
+  });
+  list.sort(/** @param {any} x @param {any} y */ function (x, y) {
+    if (expiry) {
+      if (x.serves !== y.serves) return x.serves ? -1 : 1;
+      const px = x.pressurePerHour == null ? -1 : x.pressurePerHour;
+      const py = y.pressurePerHour == null ? -1 : y.pressurePerHour;
+      if (px !== py) return py - px;
+    }
+    return ((x.account.priority || 0) - (y.account.priority || 0)) || (x.index - y.index);
+  });
+  return { mode: expiry ? 'expiry' : 'priority', rule: expiry ? EXPIRY_RULE : PRIORITY_RULE, accounts: list };
+}
+
+/**
+ * Whether the Settings view's up/down arrows mean anything. They write
+ * priority, which strict order follows; expiry routing ranks by pressure and
+ * the arrows would only pretend to reorder, so they are hidden and the reason
+ * is given in one line.
+ * @param {any} expiryRouting  the config value (or status echo)
+ */
+export function orderControls(expiryRouting) {
+  const on = !!(expiryRouting && expiryRouting.enabled === true);
+  return on
+    ? { arrows: false, note: 'Expiry routing is on, so this list follows live pressure and priority is not used; the arrows return when expiry routing is turned off.' }
+    : { arrows: true, note: null };
+}
 
 // The threshold rides along: `problems` closes over it, so a page without it
 // would ReferenceError on first render. The key slot rides along so both pages
 // read and write the one localStorage entry.
-const SHARED_CONSTS = `var STARVED_MIN = ${STARVED_MIN};\nvar STARVED_LIST_MAX = ${STARVED_LIST_MAX};\nvar KEY_STORAGE = ${JSON.stringify(KEY_STORAGE)};`;
+const SHARED_CONSTS = `var STARVED_MIN = ${STARVED_MIN};\nvar STARVED_LIST_MAX = ${STARVED_LIST_MAX};\nvar KEY_STORAGE = ${JSON.stringify(KEY_STORAGE)};\nvar EXPIRY_RULE = ${JSON.stringify(EXPIRY_RULE)};\nvar PRIORITY_RULE = ${JSON.stringify(PRIORITY_RULE)};`;
 
 /**
  * The page-side helpers both dashboards run: the pure functions above plus the

@@ -408,3 +408,13 @@ test('a "Model" key in any case is rewritten too', async () => {
     noFableUpstream(t);
   } finally { t.close(); }
 });
+
+test('a model field in a place this code does not know about is still rewritten (fail-safe), history still untouched', async () => {
+  const t = await setup();
+  try {
+    let deep = { model: FABLE };
+    for (let i = 0; i < 2000; i++) deep = { x: deep };
+    await (await t.post('k-fam', OPUS, { advisor: { model: FABLE }, mcp_servers: [{ name: 'm', config: { model: FABLE } }], future: deep })).text();
+    noFableUpstream(t);
+  } finally { t.close(); }
+});

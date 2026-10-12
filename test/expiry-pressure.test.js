@@ -1579,3 +1579,24 @@ test('the five-hour bucket gates availability and never enters the score', () =>
   am.accounts[0].quota.unified5h = 0.99;
   assert.deepEqual(am._bandedCandidates().map(a => a.name), ['b']);
 });
+
+// JP, 2026-10-11 19:5x ("expires first", with stickiness): with expiry routing
+// and distributeSessions on, a NEW session goes to the top pressure band, and
+// a RUNNING session keeps its account when another account's pressure pulls
+// ahead (its prompt cache is worth more than the re-rank). Only running out
+// or a rollover moves it — rollover is covered in expiry-rollover.test.js.
+test('stickiness: a running session stays put when another account overtakes it; the next new session goes to the leader', () => {
+  const am = mgr(['a', 'b'], { expiry: { enabled: true, tolerance: 1.2, preempt: true }, distributeSessions: true });
+  bucket(am, 0, 'unified7d', 0.5, 20);   // a: 0.025/h
+  bucket(am, 1, 'unified7d', 0.9, 20);   // b: 0.005/h
+  const first = am.getActiveAccount(null, OPUS, null, 'sess-old');
+  assert.equal(first.name, 'a', 'new session → highest pressure');
+  am.recordSession('sess-old', first.index, OPUS);
+  // b pulls far ahead (well outside the 1.2 band): plenty left, resetting soon.
+  bucket(am, 1, 'unified7d', 0.1, 3);    // b: 0.3/h
+  assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-old').name, 'a', 'running session keeps its account');
+  assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-new').name, 'b', 'a new session re-ranks');
+  // Running out moves the running session too.
+  bucket(am, 0, 'unified7d', 0.99, 20);
+  assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-old').name, 'b', 'its account ran out');
+});

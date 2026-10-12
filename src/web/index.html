@@ -597,7 +597,8 @@
     </div>
   </div>
 
-  <div class="svc-stats" id="fleetLine" style="margin:-0.35rem 0 0.875rem 0.25rem"></div>
+  <div class="svc-stats" id="fleetLine" style="margin:-0.35rem 0 0.25rem 0.25rem"></div>
+  <div class="set-intro" id="ruleLine" style="margin:0 0 0.875rem 0.25rem"></div>
 
   <div class="cards" id="cards"></div>
 
@@ -900,7 +901,7 @@
     ];
   }
 
-  function renderAccount(acct, isActive, threshold, mixedProviders) {
+  function renderAccount(acct, isActive, threshold, mixedProviders, rank) {
     const q = acct.quota;
     const u5h = q.unified5h != null ? q.unified5h
       : (q.tokensLimit ? 1 - q.tokensRemaining / q.tokensLimit : null);
@@ -929,7 +930,9 @@
       })),
       el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', text: acct.type }),
       mixedProviders ? el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', text: providerLabel(acct.provider) }) : null,
-      el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', title: 'rotation priority (lower is preferred)', text: 'prio ' + (acct.priority || 0) }),
+      rank && rank.mode === 'expiry'
+        ? el('span', { class: 'badge', style: 'background:transparent;color:var(--accent);border:1px solid var(--accent);', title: 'expiry pressure: weekly allowance left per hour until it resets (higher = more to lose, used first)', text: rank.pressurePerHour == null ? 'pressure ?' : 'pressure ' + (rank.pressurePerHour * 100).toFixed(2) + '%/h' })
+        : el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', title: 'rotation priority (lower is preferred)', text: 'prio ' + (acct.priority || 0) }),
       recent ? el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', title: 'sessions that used this account recently', text: recent + ' recent' }) : null,
       known > recent ? el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', title: 'sessions pinned to this account', text: known + ' known' }) : null,
     ]);
@@ -990,6 +993,10 @@
     }
     const sess = s.sessions || {};
     line.appendChild(el('span', {}, ['sessions ', el('b', { text: (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known' })]));
+    const view = rotationView(s);
+    line.appendChild(el('span', { title: view.rule }, ['routing ', el('b', { text: view.mode === 'expiry' ? 'expires first' : 'strict list order' })]));
+    const ruleEl = document.getElementById('ruleLine');
+    if (ruleEl) ruleEl.textContent = view.rule;
     const w = s.warm || {};
     if (w.enabled) {
       const how = [w.intervalSeconds ? 'every ' + w.intervalSeconds + 's' : null, w.onExhaustion ? 'align' : null].filter(Boolean).join(' + ') || 'on';
@@ -1136,17 +1143,18 @@
       // re-attached afterwards so a half-typed code (and focus) survives.
       const reauthHadFocus = document.activeElement === reauthCodeEl;
       cardsEl.textContent = '';
-      // Cards follow the rotation order: priority first (lower = used first,
-      // and the Settings view's account order sets it), then list position —
-      // so the top card is the account traffic goes to whenever it has quota.
-      const ordered = data.accounts.map((a, i) => ({ a, i }))
-        .sort((x, y) => (x.a.priority || 0) - (y.a.priority || 0) || x.i - y.i).map(x => x.a);
+      // Cards follow the order traffic follows (shared rotationView): live
+      // expiry pressure when expiry routing is on, else priority then list
+      // position — so the top card is where the next new session goes.
+      const view = rotationView(data);
+      const ordered = view.accounts.map(x => x.account);
+      const rankOf = new Map(view.accounts.map(x => [x.account.name, { mode: view.mode, pressurePerHour: x.pressurePerHour }]));
       // A mixed Claude/Codex fleet has one current account per provider.
       const currents = data.currentAccounts || null;
       const isCurrent = a => currents ? currents[a.provider] === a.name : a.name === data.currentAccount;
       const mixed = new Set(data.accounts.map(a => a.provider || 'anthropic')).size > 1;
       for (const acct of ordered) {
-        cardsEl.appendChild(renderAccount(acct, isCurrent(acct), data.switchThreshold, mixed));
+        cardsEl.appendChild(renderAccount(acct, isCurrent(acct), data.switchThreshold, mixed, rankOf.get(acct.name)));
       }
       attachReauthPanel(reauthHadFocus);
       lastStatus = data;
@@ -1486,22 +1494,33 @@
 
     // Account order — the list IS the priority.
     settingsBody.appendChild(el('div', { class: 'set-group', text: 'Account order' }));
-    settingsBody.appendChild(el('div', { class: 'set-intro', text: d.orderHelp }));
+    const expiryField = d.fields.find(f => f.key === 'expiryRouting');
+    const ctl = orderControls(expiryField && expiryField.value);
+    settingsBody.appendChild(el('div', { class: 'set-intro', text: ctl.arrows ? d.orderHelp : EXPIRY_RULE }));
+    if (ctl.note) settingsBody.appendChild(el('div', { class: 'set-intro', text: ctl.note }));
     const prios = d.accounts.map(a => a.priority);
-    if (new Set(prios).size < prios.length) {
+    if (ctl.arrows && new Set(prios).size < prios.length) {
       settingsBody.appendChild(el('div', { class: 'set-intro', text: 'Some accounts share a priority today (sessions can spread across them). Saving a new order gives each account its own place in the list.' }));
     }
     const byId = new Map(d.accounts.map(a => [a.id, a]));
+    // Expiry mode: list in live pressure order (the last status poll), matched by name.
+    const rankById = new Map();
+    if (!ctl.arrows && lastStatus) {
+      const names = rotationView(lastStatus).accounts.map(x => x.account.name);
+      const idByName = new Map(d.accounts.map(a => [a.name, a.id]));
+      settingsOrder = names.map(n => idByName.get(n)).filter(Boolean).concat(settingsOrder.filter(id => !names.includes(byId.get(id)?.name)));
+      settingsOrder.forEach((id, i) => rankById.set(id, i));
+    }
     const list = el('ol', { class: 'order-list' });
     const drawOrder = () => {
       list.textContent = '';
       settingsOrder.forEach((id, i) => {
         const a = byId.get(id);
-        const up = el('button', { class: 'btn-ghost', text: '▲', title: 'Move up (used sooner)', disabled: !d.canEdit || i === 0 });
-        const dn = el('button', { class: 'btn-ghost', text: '▼', title: 'Move down (used later)', disabled: !d.canEdit || i === settingsOrder.length - 1 });
+        const up = ctl.arrows ? el('button', { class: 'btn-ghost', text: '▲', title: 'Move up (used sooner)', disabled: !d.canEdit || i === 0 }) : null;
+        const dn = ctl.arrows ? el('button', { class: 'btn-ghost', text: '▼', title: 'Move down (used later)', disabled: !d.canEdit || i === settingsOrder.length - 1 }) : null;
         const swap = (j) => { [settingsOrder[i], settingsOrder[j]] = [settingsOrder[j], settingsOrder[i]]; settingsConfirm = false; drawOrder(); };
-        up.addEventListener('click', () => swap(i - 1));
-        dn.addEventListener('click', () => swap(i + 1));
+        up?.addEventListener('click', () => swap(i - 1));
+        dn?.addEventListener('click', () => swap(i + 1));
         const off = (settingsAcctDirty[id]?.disabled ?? a.disabled);
         const adv = el('details', {}, [el('summary', { class: 'nm', text: a.name + (off ? ' (disabled)' : '') })]);
         const advBody = el('div', { class: 'acct-adv' });
@@ -1518,6 +1537,7 @@
         }
         adv.appendChild(advBody);
         const li = el('li', { class: off ? 'off' : '' }, [el('span', { class: 'pos', text: String(i + 1) }), up, dn, adv]);
+        if (!ctl.arrows && rankById.has(id)) li.querySelector('.pos').title = 'live rank by expiry pressure';
         list.appendChild(li);
       });
     };
@@ -1564,7 +1584,10 @@
       accounts.push({ id, ...ch });
     }
     const origOrder = [...settingsData.accounts].sort((a, b) => a.priority - b.priority || a.index - b.index).map(a => a.id);
-    const order = settingsOrder.join() !== origOrder.join() ? settingsOrder : undefined;
+    // In expiry mode the list shows live pressure order, not priority; saving it
+    // would silently rewrite every priority, so no order is sent then.
+    const arrowsOn = orderControls(settingsData.fields.find(f => f.key === 'expiryRouting')?.value).arrows;
+    const order = arrowsOn && settingsOrder.join() !== origOrder.join() ? settingsOrder : undefined;
     msg.className = 'set-msg';
     if (problems.length) { msg.className = 'set-msg bad'; msg.textContent = ''; msg.appendChild(el('ul', {}, problems.map(p => el('li', { text: p })))); return; }
     if (!Object.keys(set).length && !accounts.length && !order) { msg.textContent = 'Nothing changed.'; return; }

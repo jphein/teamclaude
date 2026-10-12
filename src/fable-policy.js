@@ -73,9 +73,10 @@ export function decideFable({ policy, model, advisorModel = null, client = null,
  * The request body with every Fable model replaced by `to` — the enforcement
  * point, run up front and again on the exact bytes of every upstream attempt.
  *
- * Every place the API reads a model is checked: the top level, advisor tools
- * (tools[].model) and batch items (requests[].params.model, and their tools),
- * with keys in any case. The conversation itself is not touched. Upstream must see exactly what was
+ * Every `model` key anywhere is checked (keys in any case) except inside the
+ * conversation (messages, system): the known places — advisor tools, batch
+ * items' params — and any place upstream reads a model that this code does
+ * not know about. Upstream must see exactly what was
  * checked, so a body that could hide a Fable model from this parser — a
  * duplicate "model" key (JSON.parse keeps the last; another parser may keep
  * the first), a \\u escape, or any literal "fable" in the text — is
@@ -118,35 +119,46 @@ export function rewriteFableBody(body, to, contentEncoding = null, maxBytes = DE
   if (!jsonish) return none;
   try { obj = JSON.parse(unbommed); } catch { return { ...none, refuse: true }; }
   if (!obj || typeof obj !== 'object') return none;
-  // Only where the API reads a model: the request itself, its tools (an
-  // advisor's model), and each batch item's params (and their tools). Not the
-  // conversation: a past tool_use input that mentions a model is history, and
-  // rewriting it would change what the client said. Keys match in any case.
+  // Every `model` key at any depth (keys in any case) — except inside the
+  // conversation (`messages`, `system`): a past tool_use input that names a
+  // model is history, and rewriting it would change what the client said.
+  // Everything else is checked, known places (tools[].model, a batch item's
+  // params) and unknown ones alike, so a model field upstream reads that this
+  // code has never heard of is still covered. Each batch item's params get the
+  // same rule. An explicit stack: no recursion limit to give up at.
   /** @type {string|null} */
   let found = null;
-  /** @param {any} o */
-  const fixModel = (o) => {
-    if (!o || typeof o !== 'object' || Array.isArray(o)) return;
-    for (const k of Object.keys(o)) {
-      if (k.toLowerCase() === 'model' && isFableModel(o[k])) { found ??= o[k]; o[k] = to; }
-    }
-  };
-  /** @param {any} o */
-  const fixRequest = (o) => {
-    if (!o || typeof o !== 'object' || Array.isArray(o)) return;
-    fixModel(o);
-    for (const k of Object.keys(o)) {
-      if (k.toLowerCase() === 'tools' && Array.isArray(o[k])) for (const t of o[k]) fixModel(t);
+  const CONVERSATION = new Set(['messages', 'system']);
+  /** @param {any} root */
+  const fixRequest = (root) => {
+    /** @type {Array<{ node: any, top: boolean }>} */
+    const stack = [{ node: root, top: true }];
+    while (stack.length) {
+      const { node, top } = /** @type {{ node: any, top: boolean }} */ (stack.pop());
+      if (!node || typeof node !== 'object') continue;
+      if (Array.isArray(node)) { for (const v of node) stack.push({ node: v, top: false }); continue; }
+      for (const k of Object.keys(node)) {
+        const lk = k.toLowerCase();
+        if (lk === 'model' && isFableModel(node[k])) { found ??= node[k]; node[k] = to; continue; }
+        if (top && CONVERSATION.has(lk)) continue;
+        if (top && lk === 'requests' && Array.isArray(node[k])) {
+          // Batch items: each one's params is a request of its own (same rule);
+          // anything else in the item is walked like any other field.
+          for (const item of node[k]) {
+            if (!item || typeof item !== 'object') continue;
+            for (const ik of Object.keys(item)) {
+              if (ik.toLowerCase() === 'params') stack.push({ node: item[ik], top: true });
+              else if (ik.toLowerCase() === 'model' && isFableModel(item[ik])) { found ??= item[ik]; item[ik] = to; }
+              else stack.push({ node: item[ik], top: false });
+            }
+          }
+          continue;
+        }
+        stack.push({ node: node[k], top: false });
+      }
     }
   };
   fixRequest(obj);
-  for (const k of Object.keys(obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : {})) {
-    if (k.toLowerCase() === 'requests' && Array.isArray(obj[k])) {
-      for (const item of obj[k]) {
-        if (item && typeof item === 'object') for (const pk of Object.keys(item)) if (pk.toLowerCase() === 'params') fixRequest(item[pk]);
-      }
-    }
-  }
   const canonical = Buffer.from(JSON.stringify(obj), 'utf8');
   const decodedAway = raw !== body;
   // Unchanged and nothing ambiguous: keep the client's exact bytes (and encoding).

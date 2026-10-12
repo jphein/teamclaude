@@ -599,6 +599,7 @@
 
   <div class="svc-stats" id="fleetLine" style="margin:-0.35rem 0 0.25rem 0.25rem"></div>
   <div class="set-intro" id="ruleLine" style="margin:0 0 0.875rem 0.25rem"></div>
+  <div class="set-intro" id="fableNote" style="display:none;margin:-0.6rem 0 0.875rem 0.25rem;color:var(--warn)"></div>
 
   <div class="cards" id="cards"></div>
 
@@ -997,6 +998,19 @@
     line.appendChild(el('span', { title: view.rule }, ['routing ', el('b', { text: view.mode === 'expiry' ? 'expires first' : 'strict list order' })]));
     const ruleEl = document.getElementById('ruleLine');
     if (ruleEl) ruleEl.textContent = view.rule;
+    // Fable rationing (fable.allow): today's rewrites and fallbacks, and the
+    // latest fallback in one line so JP sees when his own Fable became Opus.
+    const fb = s.fable || {};
+    if (fb.enabled) {
+      line.appendChild(el('span', { title: 'Fable allowed for: ' + ((fb.allow || []).join(', ') || 'nobody') + '. Everyone else is served as ' + fb.model + '.' },
+        ['Fable ', el('b', { text: (fb.rewritten || 0) + ' rewritten to Opus today · ' + (fb.fallbacks || 0) + ' fallbacks' })]));
+    }
+    const fbNote = document.getElementById('fableNote');
+    if (fbNote) {
+      const lf = fb.enabled ? fb.lastFallback : null;
+      fbNote.textContent = lf ? 'Fable fell back to ' + lf.to + ' at ' + new Date(lf.at).toLocaleTimeString() + ' for ' + (lf.client || '(shared key)') + ': ' + lf.reason + '.' : '';
+      fbNote.style.display = lf ? '' : 'none';
+    }
     const w = s.warm || {};
     if (w.enabled) {
       const how = [w.intervalSeconds ? 'every ' + w.intervalSeconds + 's' : null, w.onExhaustion ? 'align' : null].filter(Boolean).join(' + ') || 'on';

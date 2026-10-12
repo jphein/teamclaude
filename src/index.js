@@ -424,6 +424,9 @@ async function serverCommand() {
     // Pick up expiry-routing edits the same way, so the knob hot-applies.
     config.expiryRouting = diskConfig.expiryRouting;
     accountManager.setExpiryRouting(config.expiryRouting);
+    // Fable rationing is read per request off this object (server.js), so
+    // a reload applies an allow-list or fallback-model change at once.
+    config.fable = diskConfig.fable;
     config.sessionTitles = diskConfig.sessionTitles;
     sessionTitles.configure(config.sessionTitles);
     // Both are read per request off this object (server.js) and the TUI already

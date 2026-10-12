@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { fablePolicy, rewriteFableBody, isFableModel, clientAllowed, FableStats } from './fable-policy.js';
+import { fablePolicy, rewriteFableBody, bodyWantsFable, isFableModel, clientAllowed, FableStats } from './fable-policy.js';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
@@ -1483,16 +1483,24 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       let fableCapacityFallback = null;
       if (fp.enabled) {
         const allowed = clientAllowed(fp, fableClient);
-        const wantsFable = isFableModel(model) || isFableModel(advisorModel);
+        // The decoded body's own say, not only the streaming top-level finder:
+        // a compressed, escaped or nested Fable request counts as one.
+        const fableCap = Math.min(resolveMaxBodyBytes(config), 2 ** 31 - 1);
+        const wantsFable = isFableModel(model) || isFableModel(advisorModel) || bodyWantsFable(body, req.headers['content-encoding'], fableCap);
         const am = /** @type {any} */ (accountManager);
-        const fallback = allowed && wantsFable && !am.accounts.some((/** @type {any} */ a) => am._isAvailable(a, model, advisorModel));
+        // Fall back only when Fable is what cannot be served: if no account can
+        // take the fallback model either, the normal no-account answer stands
+        // (a fleet-wide throttle is not "out of Fable").
+        const fallback = allowed && wantsFable
+          && !am.accounts.some((/** @type {any} */ a) => am._isAvailable(a, model, advisorModel))
+          && am.accounts.some((/** @type {any} */ a) => am._isAvailable(a, fp.model, null));
         if (allowed && wantsFable && !fallback) fableCapacityFallback = fp.model;
         if (!allowed || fallback) {
-          const out = rewriteFableBody(body, fp.model, req.headers['content-encoding']);
+          const out = rewriteFableBody(body, fp.model, req.headers['content-encoding'], fableCap);
           if (out.refuse) {
             if (!res.headersSent) {
               res.writeHead(415, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'teamclaude cannot read this Content-Encoding to apply its Fable policy; send the body uncompressed or gzip/deflate/br.' } }));
+              res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'teamclaude could not inspect this request body for its Fable policy (an unsupported Content-Encoding, larger than the proxy limit once decoded, nested too deeply, or not valid JSON).' } }));
             }
             recordEarlyOutcome(accountManager, sessionId, req.url, true);
             openEntry = null;
@@ -1511,7 +1519,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
             fableStats.record(kind, { client: fableClient, from: out.found, to: fp.model, reason });
             console.log(`[TeamClaude] Fable ${allowed ? 'fallback' : 'rewritten'}: ${safeLine(out.found, 64)} → ${safeLine(fp.model, 64)} for ${fableClient ? `"${safeLine(fableClient, 64)}"` : '(shared key)'} — ${reason}`);
           }
-          if (!allowed) fableForbidden = fp.model;
+          // Once committed to Opus — rationed or fallen back — no later rewrite
+          // (an account modelMap included) may turn it back into Fable.
+          fableForbidden = fp.model;
         }
       }
 
@@ -1554,7 +1564,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), fableCapacityFallback, fableForbidden, fableDropEncoding, fableStats, model, advisorModel, pinnedIndex, provider: providerForPath(req.url), holdBudgetMs: holdMs, sessionId, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), fableCapacityFallback, fableForbidden, fableDropEncoding, fableCap: Math.min(resolveMaxBodyBytes(config), 2 ** 31 - 1), fableStats, model, advisorModel, pinnedIndex, provider: providerForPath(req.url), holdBudgetMs: holdMs, sessionId, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -2651,7 +2661,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Fable policy, final gate: the exact bytes this attempt sends, after every
   // other rewrite (a modelMap that maps TO Fable included), on every retry.
   if (ctx.fableForbidden) {
-    const g = rewriteFableBody(sendBody, ctx.fableForbidden, ctx.fableDropEncoding ? null : req.headers['content-encoding']);
+    const g = rewriteFableBody(sendBody, ctx.fableForbidden, ctx.fableDropEncoding ? null : req.headers['content-encoding'], ctx.fableCap);
     if (g.refuse) throw new Error('Fable policy: undecodable request body');
     if (g.changed) { sendBody = g.body; if (g.dropEncoding) ctx.fableDropEncoding = true; }
   }
@@ -2960,13 +2970,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Fable at capacity (529) for an allowed client: serve it as Opus instead
     // of the error, once per request (JP: "and ii for sure"). Ahead of the
     // generic 5xx hop, which would only try Fable again on another account.
-    if (upstreamRes.status === 529 && !res.headersSent && ctx.fableCapacityFallback && !ctx.fableFellBack && (isFableModel(ctx.model) || isFableModel(ctx.advisorModel))) {
-      const out = rewriteFableBody(body, ctx.fableCapacityFallback, ctx.fableDropEncoding ? null : req.headers['content-encoding']);
+    if (upstreamRes.status === 529 && !res.headersSent && ctx.fableCapacityFallback && !ctx.fableFellBack) {
+      const out = rewriteFableBody(body, ctx.fableCapacityFallback, ctx.fableDropEncoding ? null : req.headers['content-encoding'], ctx.fableCap);
       if (out.changed && !out.refuse) {
         if (out.dropEncoding) ctx.fableDropEncoding = true;
         await upstreamRes.body?.cancel();
         const from = String(out.found ?? ctx.model);
         ctx.fableFellBack = true;
+        ctx.fableForbidden = ctx.fableCapacityFallback;   // and it stays Opus on every later attempt
         if (isFableModel(ctx.model)) ctx.model = ctx.fableCapacityFallback;
         if (isFableModel(ctx.advisorModel)) ctx.advisorModel = ctx.fableCapacityFallback;
         ctx.fableStats?.record('fallback', { client: ctx.client ?? null, from, to: ctx.fableCapacityFallback, reason: 'Fable at capacity (529)' });

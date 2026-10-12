@@ -18,6 +18,15 @@ import zlib from 'node:zlib';
 /** The list entry that admits the shared proxy key / key-less callers. */
 export const SHARED_KEY_ENTRY = '(shared key)';
 export const DEFAULT_FABLE_MODEL = 'claude-opus-5-5';
+/** Deeper than any real request; past it inspection would give up, so the body is refused. */
+export const MAX_DEPTH = 256;
+/** Default cap on a decoded body (the proxy's own default request limit). */
+export const DEFAULT_DECODED_MAX = 64 * 1024 * 1024;
+
+/** Whether a body asks for a Fable model anywhere (decoded, parsed, every `model` key). @param {Buffer} body @param {string|string[]|undefined|null} [contentEncoding] @param {number} [maxBytes] */
+export function bodyWantsFable(body, contentEncoding = null, maxBytes = DEFAULT_DECODED_MAX) {
+  return rewriteFableBody(body, DEFAULT_FABLE_MODEL, contentEncoding, maxBytes).found != null;
+}
 
 /** @param {unknown} model */
 export function isFableModel(model) {
@@ -25,15 +34,18 @@ export function isFableModel(model) {
 }
 
 /**
- * The policy as configured. With no `fable` block at all, rationing is off and
- * everything passes — the behaviour before this feature. A `fable` block with
- * an empty `allow` list allows nobody (fail closed).
+ * The policy as configured. With no `fable.allow` list, rationing is off and
+ * everything passes — the behaviour before this feature. An empty list allows
+ * nobody (fail closed).
  * @param {any} config
  * @returns {{ enabled: boolean, allow: Set<string>, model: string }}
  */
 export function fablePolicy(config) {
   const f = config?.fable;
-  if (!f || typeof f !== 'object') return { enabled: false, allow: new Set(), model: DEFAULT_FABLE_MODEL };
+  // Rationing is on only when an allow LIST is configured: clearing the list in
+  // Settings (leaving `fable: {}`), or setting only fable.model, must turn it
+  // off, not silently deny Fable to everyone.
+  if (!f || typeof f !== 'object' || !Array.isArray(f.allow)) return { enabled: false, allow: new Set(), model: DEFAULT_FABLE_MODEL };
   const allow = new Set((Array.isArray(f.allow) ? f.allow : []).filter((/** @type {unknown} */ n) => typeof n === 'string').map((/** @type {string} */ n) => n.trim()));
   const model = typeof f.model === 'string' && f.model.trim() && !isFableModel(f.model) ? f.model.trim() : DEFAULT_FABLE_MODEL;
   return { enabled: true, allow, model };
@@ -77,28 +89,38 @@ export function decideFable({ policy, model, advisorModel = null, client = null,
  * rewrite it is sent decoded, and dropEncoding tells the caller to remove
  * Content-Encoding. An encoding this cannot decode is `refuse`: the caller
  * answers 415 rather than forward a body nobody inspected.
+ * A body that may carry a Fable model but cannot be inspected — undecodable,
+ * larger than `maxBytes` once decoded (a compression bomb), not parseable
+ * JSON, or nested deeper than MAX_DEPTH — is `refuse` too: inspection that
+ * gives up must not let the request through.
  * @param {Buffer} body @param {string} to @param {string|string[]|undefined|null} [contentEncoding]
+ * @param {number} [maxBytes]  cap on the decoded size (the proxy's body limit)
  * @returns {{ body: Buffer, changed: boolean, found: string|null, dropEncoding: boolean, refuse: boolean }}
  */
-export function rewriteFableBody(body, to, contentEncoding = null) {
+export function rewriteFableBody(body, to, contentEncoding = null, maxBytes = DEFAULT_DECODED_MAX) {
   const enc = String(Array.isArray(contentEncoding) ? contentEncoding.join(',') : contentEncoding ?? '').trim().toLowerCase();
   const none = { body, changed: false, found: null, dropEncoding: false, refuse: false };
   let raw = body;
   if (enc && enc !== 'identity') {
-    const decoded = decodeBody(body, enc);
+    const decoded = decodeBody(body, enc, maxBytes);
     if (!decoded) return { ...none, refuse: true };
     raw = decoded;
   }
   const text = raw.toString('utf8');
   if (!/fable|\\u[0-9a-f]{4}/i.test(text)) return none;      // no parser can read a Fable model here
   let obj;
-  try { obj = JSON.parse(text); } catch { return none; }        // not JSON: no model field to carry it
+  // A leading BOM is legal JSON to some parsers and not to JSON.parse; it is
+  // dropped (the canonical body carries none). Any other parse failure on a
+  // body that could spell a Fable model is refused rather than forwarded.
+  try { obj = JSON.parse(text.replace(/^\uFEFF/, '')); } catch { return { ...none, refuse: true }; }
   if (!obj || typeof obj !== 'object') return none;
   /** @type {string|null} */
   let found = null;
+  let tooDeep = false;
   /** @param {any} node @param {number} depth */
   const walk = (node, depth) => {
-    if (!node || typeof node !== 'object' || depth > 64) return;
+    if (!node || typeof node !== 'object' || tooDeep) return;
+    if (depth > MAX_DEPTH) { tooDeep = true; return; }
     if (Array.isArray(node)) { for (const v of node) walk(v, depth + 1); return; }
     for (const k of Object.keys(node)) {
       if (k === 'model' && isFableModel(node[k])) { found ??= node[k]; node[k] = to; }
@@ -106,6 +128,7 @@ export function rewriteFableBody(body, to, contentEncoding = null) {
     }
   };
   walk(obj, 0);
+  if (tooDeep) return { ...none, refuse: true };
   const canonical = Buffer.from(JSON.stringify(obj), 'utf8');
   const decodedAway = raw !== body;
   // Unchanged and nothing ambiguous: keep the client's exact bytes (and encoding).
@@ -113,18 +136,21 @@ export function rewriteFableBody(body, to, contentEncoding = null) {
   return { body: canonical, changed: true, found, dropEncoding: decodedAway, refuse: false };
 }
 
-/** @param {Buffer} body @param {string} enc */
-function decodeBody(body, enc) {
+/** Bounded: each stage stops at maxBytes (maxOutputLength), so a small
+ * compressed body cannot expand past the size the proxy accepts uncompressed.
+ * @param {Buffer} body @param {string} enc @param {number} maxBytes */
+function decodeBody(body, enc, maxBytes) {
   try {
     const z = /** @type {any} */ (zlib);
     let out = body;
     // Applied in reverse of the order listed ("gzip, br" = gzip first, then br).
     for (const e of enc.split(',').map((x) => x.trim()).filter(Boolean).reverse()) {
       if (e === 'identity') continue;
-      if (e === 'gzip' || e === 'x-gzip') out = zlib.gunzipSync(out);
-      else if (e === 'deflate') out = zlib.inflateSync(out);
-      else if (e === 'br') out = zlib.brotliDecompressSync(out);
-      else if (e === 'zstd' && typeof z.zstdDecompressSync === 'function') out = z.zstdDecompressSync(out);
+      const opts = { maxOutputLength: maxBytes };
+      if (e === 'gzip' || e === 'x-gzip') out = zlib.gunzipSync(out, opts);
+      else if (e === 'deflate') out = zlib.inflateSync(out, opts);
+      else if (e === 'br') out = zlib.brotliDecompressSync(out, opts);
+      else if (e === 'zstd' && typeof z.zstdDecompressSync === 'function') out = z.zstdDecompressSync(out, opts);
       else return null;
     }
     return out;

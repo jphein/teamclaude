@@ -88,17 +88,20 @@ test('FableStats: counts today, remembers the last fallback, resets at the local
 // ── through the real proxy ───────────────────────────────────────────────
 const listen = (s) => new Promise((r) => s.listen(0, '127.0.0.1', () => r(s.address().port)));
 
-async function setup({ fable = { allow: ALLOW }, fableSpent = false, fable529 = false, blockedModels, modelMap } = {}) {
+async function setup({ fable = { allow: ALLOW }, fableSpent = false, fable529 = false, all529 = false, blockedModels, modelMap } = {}) {
   const seen = [];
   const raws = [];
   const upstream = http.createServer((req, res) => {
-    let raw = '';
-    req.on('data', (c) => { raw += c; });
+    const chunks = [];
+    req.on('data', (c) => { chunks.push(c); });
     req.on('end', () => {
+      // Decoded like a real upstream would, so the stub sees what it would serve.
+      const bytes = Buffer.concat(chunks);
+      const raw = (req.headers['content-encoding'] === 'gzip' ? zlib.gunzipSync(bytes) : bytes).toString('utf8');
       let m = null; let adv = null; try { const o = JSON.parse(raw); m = o.model; adv = o.tools?.[0]?.model ?? null; } catch { /* */ }
       seen.push(m);
-      raws.push({ raw, encoding: req.headers['content-encoding'] ?? null, length: req.headers['content-length'] });
-      if (fable529 && (isFableModel(m) || isFableModel(adv))) {
+      raws.push({ raw, encoding: req.headers['content-encoding'] ?? null, length: req.headers['content-length'], bytes: bytes.length });
+      if (all529 || (fable529 && (isFableModel(m) || isFableModel(adv)))) {
         res.writeHead(529, { 'content-type': 'application/json' });
         res.end('{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}');
         return;
@@ -218,12 +221,13 @@ test('fallback (ii): Fable at capacity (529) for an allowed client is retried on
 });
 
 test('a non-Fable 529 is not turned into a model change', async () => {
-  const t = await setup({ fable529: true });
+  const t = await setup({ all529: true });
   try {
     const res = await t.post('k-92', OPUS);
     await res.text();
-    assert.equal(res.status, 200);
-    assert.deepEqual(t.seen, [OPUS]);
+    assert.equal(res.status, 529, 'the overload reaches the client as before');
+    assert.ok(t.seen.length >= 1 && t.seen.every((m) => m === OPUS), JSON.stringify(t.seen));
+    assert.ok(!t.logs.some((l) => /Fable fallback/.test(l)));
   } finally { t.close(); }
 });
 
@@ -260,7 +264,7 @@ test('a gzip body from a lane is decoded, rewritten and sent uncompressed with a
     assert.equal(res.status, 200);
     assert.equal(t.raws[0].encoding, null, 'Content-Encoding removed');
     assert.equal(JSON.parse(t.raws[0].raw).model, OPUS);
-    assert.equal(Number(t.raws[0].length), Buffer.byteLength(t.raws[0].raw));
+    assert.equal(Number(t.raws[0].length), t.raws[0].bytes);
   } finally { t.close(); }
 });
 
@@ -304,5 +308,58 @@ test('an allowed client\'s advisor-only Fable falls back on 529 too', async () =
     assert.equal(res.status, 200);
     assert.equal(t.raws.length, 2, 'one Fable attempt, then the fallback');
     assert.equal(JSON.parse(t.raws[1].raw).tools[0].model, OPUS);
+  } finally { t.close(); }
+});
+
+// ── round 3 (cross-model pass 2, Oracle, security scan) ───────────────────
+test('uninspectable bodies from a lane are refused, never forwarded: too deep, broken JSON naming Fable, a compression bomb', async () => {
+  const t = await setup();
+  try {
+    let deep = { model: FABLE };
+    for (let i = 0; i < 300; i++) deep = { x: deep };
+    const bomb = zlib.gzipSync(Buffer.concat([Buffer.from('{"model":"' + FABLE + '","pad":"'), Buffer.alloc(80 * 1024 * 1024, 0x61), Buffer.from('"}')]));
+    for (const [what, buf, h] of [['deep', JSON.stringify(deep), {}], ['broken', `{"model":"${FABLE}",}`, {}], ['bomb', bomb, { 'content-encoding': 'gzip' }]]) {
+      const res = await t.postRaw('k-fam', buf, h);
+      await res.text();
+      assert.equal(res.status, 415, what);
+    }
+    assert.equal(t.raws.length, 0);
+  } finally { t.close(); }
+});
+
+test('a leading BOM cannot hide Fable', async () => {
+  const t = await setup();
+  try {
+    await (await t.postRaw('k-fam', Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(`{"model":"${FABLE}","messages":[]}`)]))).text();
+    noFableUpstream(t);
+  } finally { t.close(); }
+});
+
+test('clearing the allow list (fable: {}) or setting only fable.model turns rationing OFF, not on for everyone', async () => {
+  for (const fable of [{}, { model: 'claude-sonnet-5-5' }]) {
+    const t = await setup({ fable });
+    try {
+      await (await t.post('k-fam', FABLE)).text();
+      assert.deepEqual(t.seen, [FABLE], JSON.stringify(fable));
+    } finally { t.close(); }
+  }
+});
+
+test('an allowed client\'s gzip Fable still gets the 529 fallback', async () => {
+  const t = await setup({ fable529: true });
+  try {
+    const res = await t.postRaw('k-92', zlib.gzipSync(JSON.stringify({ model: FABLE, messages: [] })), { 'content-encoding': 'gzip' });
+    await res.text();
+    assert.equal(res.status, 200);
+    assert.equal(t.raws.length, 2);
+    assert.equal(JSON.parse(t.raws[1].raw).model, OPUS);
+  } finally { t.close(); }
+});
+
+test('a fallback cannot be mapped back to Fable by an account modelMap', async () => {
+  const t = await setup({ fableSpent: true, modelMap: { [OPUS]: FABLE } });
+  try {
+    await (await t.post('k-92', FABLE)).text();
+    noFableUpstream(t);
   } finally { t.close(); }
 });

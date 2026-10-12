@@ -472,7 +472,7 @@ export const PRIORITY_RULE = 'Requests always go to the highest account with quo
 export function rotationView(status) {
   const expiry = !!(status && status.expiryRouting && status.expiryRouting.enabled);
   const list = ((status && status.accounts) || []).map(/** @param {any} a @param {number} i */ function (a, i) {
-    const p = typeof a.pressure === 'number' && isFinite(a.pressure) ? a.pressure * 3600000 : null;
+    const p = typeof a.pressure === 'number' && isFinite(a.pressure) ? a.pressure * 3600 : null;   // status reports per second
     const serves = !a.disabled && a.status !== 'error' && a.status !== 'exhausted' && (p == null || p > 0);
     return { account: a, index: i, pressurePerHour: p, serves: serves };
   });

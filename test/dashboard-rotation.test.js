@@ -10,15 +10,15 @@ import { rotationView, orderControls, EXPIRY_RULE, PRIORITY_RULE, sharedHelpersS
 // and the priority arrows would only pretend to reorder — so the page shows
 // pressure order and hides them. With it off, strict list order and arrows.
 
-const PER_MS = 1 / 3_600_000; // pressure arrives per ms; the page shows per hour
+const PER_S = 1 / 3600; // status reports pressure per second (band-decision.js pressureOf); the page shows per hour
 const live = (expiry) => ({
   expiryRouting: { enabled: expiry, tolerance: 1.2, preempt: true },
   accounts: [
-    { name: 'claude3', priority: 0, status: 'active', pressure: 0.0025 * PER_MS },
-    { name: 'jp', priority: 1, status: 'active', pressure: 0.0035 * PER_MS },
-    { name: 'claude', priority: 2, status: 'active', pressure: 0.0026 * PER_MS },
+    { name: 'claude3', priority: 0, status: 'active', pressure: 0.0025 * PER_S },
+    { name: 'jp', priority: 1, status: 'active', pressure: 0.0035 * PER_S },
+    { name: 'claude', priority: 2, status: 'active', pressure: 0.0026 * PER_S },
     { name: 'claude2', priority: 3, status: 'active', pressure: 0 },          // weekly spent
-    { name: 'claude4', priority: 4, status: 'active', pressure: 0.0058 * PER_MS },
+    { name: 'claude4', priority: 4, status: 'active', pressure: 0.0058 * PER_S },
   ],
 });
 
@@ -69,4 +69,11 @@ test('the page gets the helpers and uses them for cards, arrows and save', async
   // Saving while the list shows pressure order must not send an order, which
   // would rewrite every priority behind the operator's back.
   assert.match(html, /const order = arrowsOn && /, 'save sends an order only when the arrows are on');
+});
+
+test('pressure is shown per hour from the per-second value status reports', () => {
+  // Live claude4 at 19:41: 13% of its weekly window left, resetting in 22.3 h.
+  // status.pressure = 0.13 / (22.3 * 3600) s ≈ 1.619e-6 → 0.0058 per hour.
+  const v = rotationView({ expiryRouting: { enabled: true }, accounts: [{ name: 'claude4', status: 'active', pressure: 0.0000016190240607649124 }] });
+  assert.ok(Math.abs(v.accounts[0].pressurePerHour - 0.0058) < 0.0001, String(v.accounts[0].pressurePerHour));
 });

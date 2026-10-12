@@ -19,6 +19,23 @@ function makeAccounts() {
 }
 
 // Read the single log file the proxy wrote for one request.
+// The request log is finished asynchronously after the client has its
+// response (a streamed body is closed when the relay ends), so a fixed sleep
+// races a slow runner — CI node 20 read an empty file once (PR #22). Poll
+// until the response section is there and the file has stopped growing.
+async function settledLog(dir, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = -1;
+  for (;;) {
+    const file = readdirSync(dir).find(f => f.endsWith('.log'));
+    const content = file ? readFileSync(join(dir, file), 'utf8') : '';
+    if (content.includes('=== RESPONSE') && content.length === last) return content;
+    last = content.length;
+    if (Date.now() > deadline) return readOnlyLog(dir);
+    await new Promise(r => setTimeout(r, 25));
+  }
+}
+
 function readOnlyLog(dir) {
   const file = readdirSync(dir).find(f => f.endsWith('.log'));
   assert.ok(file, 'a log file was written');
@@ -46,9 +63,7 @@ test('logLevel "headers" logs both heads and neither body', { timeout: 20000 }, 
       body: JSON.stringify({ marker: REQ_MARKER }),
     });
     assert.match(await res.text(), new RegExp(RES_MARKER));
-    await new Promise(r => setTimeout(r, 150));
-
-    const content = readOnlyLog(dir);
+    const content = await settledLog(dir);
     assert.match(content, /=== REQUEST \(account: a/);
     assert.match(content, /=== RESPONSE 200 ===/);
     assert.doesNotMatch(content, /=== REQUEST BODY ===/);
@@ -85,9 +100,7 @@ test('logMaxBodyBytes keeps the head and the tail of a complete body, drops the 
     });
     const relayed = await res.text();
     assert.equal(relayed, payload, 'the client still receives the whole body');
-    await new Promise(r => setTimeout(r, 150));
-
-    const content = readOnlyLog(dir);
+    const content = await settledLog(dir);
     assert.ok(content.includes(HEAD), 'head of the body is kept');
     assert.ok(content.includes(TAIL), 'tail of the body is kept');
     assert.ok(!content.includes(MID), 'middle of the body is dropped');
@@ -120,9 +133,7 @@ test('logMaxBodyBytes truncates a streamed body from the head only', { timeout: 
       method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"stream":true}',
     });
     assert.match(await res.text(), new RegExp(TAIL), 'the client still receives the whole stream');
-    await new Promise(r => setTimeout(r, 150));
-
-    const content = readOnlyLog(dir);
+    const content = await settledLog(dir);
     assert.match(content, /=== RESPONSE BODY \(streamed\) ===/);
     assert.match(content, /event: message_start/, 'head of the stream is kept');
     assert.ok(!content.includes(TAIL), 'tail of a streamed body is not buffered to be kept');
@@ -153,9 +164,7 @@ test('a config with only logDir still logs both bodies in full', { timeout: 2000
       body: JSON.stringify({ marker: REQ_MARKER }),
     });
     await res.text();
-    await new Promise(r => setTimeout(r, 150));
-
-    const content = readOnlyLog(dir);
+    const content = await settledLog(dir);
     assert.match(content, /=== REQUEST BODY ===/);
     assert.match(content, /=== RESPONSE BODY ===/);
     assert.ok(content.includes(REQ_MARKER));
@@ -218,9 +227,7 @@ test('logLevel "headers" writes no section for a streamed body', { timeout: 2000
       method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"stream":true}',
     });
     assert.match(await res.text(), new RegExp(RES_MARKER), 'the client still receives the stream');
-    await new Promise(r => setTimeout(r, 150));
-
-    const content = readOnlyLog(dir);
+    const content = await settledLog(dir);
     assert.match(content, /=== RESPONSE 200 ===/);
     // The state this level introduces: the log file is open while the body
     // writer is null, a pairing that previously meant no log file at all.

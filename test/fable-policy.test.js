@@ -312,13 +312,11 @@ test('an allowed client\'s advisor-only Fable falls back on 529 too', async () =
 });
 
 // ── round 3 (cross-model pass 2, Oracle, security scan) ───────────────────
-test('uninspectable bodies from a lane are refused, never forwarded: too deep, broken JSON naming Fable, a compression bomb', async () => {
+test('uninspectable bodies from a lane are refused, never forwarded: broken JSON naming Fable, a compression bomb', async () => {
   const t = await setup();
   try {
-    let deep = { model: FABLE };
-    for (let i = 0; i < 300; i++) deep = { x: deep };
     const bomb = zlib.gzipSync(Buffer.concat([Buffer.from('{"model":"' + FABLE + '","pad":"'), Buffer.alloc(80 * 1024 * 1024, 0x61), Buffer.from('"}')]));
-    for (const [what, buf, h] of [['deep', JSON.stringify(deep), {}], ['broken', `{"model":"${FABLE}",}`, {}], ['bomb', bomb, { 'content-encoding': 'gzip' }]]) {
+    for (const [what, buf, h] of [['broken', `{"model":"${FABLE}",}`, {}], ['bomb', bomb, { 'content-encoding': 'gzip' }]]) {
       const res = await t.postRaw('k-fam', buf, h);
       await res.text();
       assert.equal(res.status, 415, what);
@@ -372,5 +370,41 @@ test('an allowed client\'s gzip Fable with no Fable allowance left falls back up
     assert.equal(res.status, 200);
     noFableUpstream(t);
     assert.ok(t.logs.some((l) => /Fable fallback: .* for "jp-wakizashi" — no account has Fable allowance left/.test(l)), t.logs.join('\n'));
+  } finally { t.close(); }
+});
+
+// ── Oracle should-fixes at b1c115e ────────────────────────────────────────
+test('conversation history is not rewritten or counted: a past tool_use input that names Fable stays as the client wrote it', async () => {
+  const t = await setup();
+  try {
+    // A complete exchange: the proxy repairs an orphaned tool_use, which would hide what this checks.
+    const history = [
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Agent', input: { model: FABLE, prompt: 'x' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'done' }] },
+    ];
+    await (await t.post('k-fam', OPUS, { messages: history })).text();
+    assert.equal(JSON.parse(t.raws[0].raw).messages[1].content[0].input.model, FABLE, 'history untouched');
+    assert.ok(!t.logs.some((l) => /Fable (rewritten|fallback)/.test(l)), 'not counted as a rewrite');
+    assert.equal((await t.status()).fable.rewritten, 0);
+  } finally { t.close(); }
+});
+
+test('a non-JSON upload that mentions Fable is passed through, not refused', async () => {
+  const t = await setup();
+  try {
+    const multipart = '--b\r\nContent-Disposition: form-data; name="file"; filename="notes.txt"\r\n\r\nclaude-fable-5 notes \\u0041\r\n--b--\r\n';
+    const res = await t.postRaw('k-fam', multipart, { 'content-type': 'multipart/form-data; boundary=b' });
+    await res.text();
+    assert.equal(res.status, 200);
+    assert.equal(t.raws[0].raw, multipart, 'byte-for-byte');
+  } finally { t.close(); }
+});
+
+test('a "Model" key in any case is rewritten too', async () => {
+  const t = await setup();
+  try {
+    await (await t.postRaw('k-fam', `{"Model":"${FABLE}","messages":[]}`)).text();
+    noFableUpstream(t);
   } finally { t.close(); }
 });

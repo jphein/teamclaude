@@ -1487,7 +1487,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // a compressed, escaped or nested Fable request counts as one.
         const fableCap = Math.min(resolveMaxBodyBytes(config), 2 ** 31 - 1);
         const streamed = isFableModel(model) || isFableModel(advisorModel);
-        const decodedFable = streamed ? null : fableModelIn(body, req.headers['content-encoding'], fableCap);
+        const decodedFable = streamed ? null : fableModelIn(body, req.headers['content-encoding'], fableCap, req.headers['content-type']);
         const wantsFable = streamed || decodedFable != null;
         // Availability is asked for the model actually requested: a Fable id
         // found only after decoding (gzip, an escape, nesting) stands in for
@@ -1502,7 +1502,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           && am.accounts.some((/** @type {any} */ a) => am._isAvailable(a, fp.model, null));
         if (allowed && wantsFable && !fallback) fableCapacityFallback = fp.model;
         if (!allowed || fallback) {
-          const out = rewriteFableBody(body, fp.model, req.headers['content-encoding'], fableCap);
+          const out = rewriteFableBody(body, fp.model, req.headers['content-encoding'], fableCap, req.headers['content-type']);
           if (out.refuse) {
             if (!res.headersSent) {
               res.writeHead(415, { 'Content-Type': 'application/json' });
@@ -2667,7 +2667,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Fable policy, final gate: the exact bytes this attempt sends, after every
   // other rewrite (a modelMap that maps TO Fable included), on every retry.
   if (ctx.fableForbidden) {
-    const g = rewriteFableBody(sendBody, ctx.fableForbidden, ctx.fableDropEncoding ? null : req.headers['content-encoding'], ctx.fableCap);
+    const g = rewriteFableBody(sendBody, ctx.fableForbidden, ctx.fableDropEncoding ? null : req.headers['content-encoding'], ctx.fableCap, req.headers['content-type']);
     if (g.refuse) throw new Error('Fable policy: undecodable request body');
     if (g.changed) { sendBody = g.body; if (g.dropEncoding) ctx.fableDropEncoding = true; }
   }
@@ -2978,7 +2978,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // generic 5xx hop, which would only try Fable again on another account.
     if (upstreamRes.status === 529 && !res.headersSent && ctx.fableCapacityFallback && !ctx.fableFellBack
       && accountManager.accounts.some((/** @type {any} */ a) => /** @type {any} */ (accountManager)._isAvailable(a, ctx.fableCapacityFallback, null))) {
-      const out = rewriteFableBody(body, ctx.fableCapacityFallback, ctx.fableDropEncoding ? null : req.headers['content-encoding'], ctx.fableCap);
+      const out = rewriteFableBody(body, ctx.fableCapacityFallback, ctx.fableDropEncoding ? null : req.headers['content-encoding'], ctx.fableCap, req.headers['content-type']);
       if (out.changed && !out.refuse) {
         if (out.dropEncoding) ctx.fableDropEncoding = true;
         await upstreamRes.body?.cancel();

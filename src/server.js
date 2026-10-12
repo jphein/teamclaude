@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { fablePolicy, rewriteFableBody, bodyWantsFable, isFableModel, clientAllowed, FableStats } from './fable-policy.js';
+import { fablePolicy, rewriteFableBody, fableModelIn, isFableModel, clientAllowed, FableStats } from './fable-policy.js';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
@@ -1486,13 +1486,19 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // The decoded body's own say, not only the streaming top-level finder:
         // a compressed, escaped or nested Fable request counts as one.
         const fableCap = Math.min(resolveMaxBodyBytes(config), 2 ** 31 - 1);
-        const wantsFable = isFableModel(model) || isFableModel(advisorModel) || bodyWantsFable(body, req.headers['content-encoding'], fableCap);
+        const streamed = isFableModel(model) || isFableModel(advisorModel);
+        const decodedFable = streamed ? null : fableModelIn(body, req.headers['content-encoding'], fableCap);
+        const wantsFable = streamed || decodedFable != null;
+        // Availability is asked for the model actually requested: a Fable id
+        // found only after decoding (gzip, an escape, nesting) stands in for
+        // the streamed one, which was null or not Fable.
+        const checkModel = decodedFable ?? model;
         const am = /** @type {any} */ (accountManager);
         // Fall back only when Fable is what cannot be served: if no account can
         // take the fallback model either, the normal no-account answer stands
         // (a fleet-wide throttle is not "out of Fable").
         const fallback = allowed && wantsFable
-          && !am.accounts.some((/** @type {any} */ a) => am._isAvailable(a, model, advisorModel))
+          && !am.accounts.some((/** @type {any} */ a) => am._isAvailable(a, checkModel, advisorModel))
           && am.accounts.some((/** @type {any} */ a) => am._isAvailable(a, fp.model, null));
         if (allowed && wantsFable && !fallback) fableCapacityFallback = fp.model;
         if (!allowed || fallback) {
@@ -2970,7 +2976,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Fable at capacity (529) for an allowed client: serve it as Opus instead
     // of the error, once per request (JP: "and ii for sure"). Ahead of the
     // generic 5xx hop, which would only try Fable again on another account.
-    if (upstreamRes.status === 529 && !res.headersSent && ctx.fableCapacityFallback && !ctx.fableFellBack) {
+    if (upstreamRes.status === 529 && !res.headersSent && ctx.fableCapacityFallback && !ctx.fableFellBack
+      && accountManager.accounts.some((/** @type {any} */ a) => /** @type {any} */ (accountManager)._isAvailable(a, ctx.fableCapacityFallback, null))) {
       const out = rewriteFableBody(body, ctx.fableCapacityFallback, ctx.fableDropEncoding ? null : req.headers['content-encoding'], ctx.fableCap);
       if (out.changed && !out.refuse) {
         if (out.dropEncoding) ctx.fableDropEncoding = true;

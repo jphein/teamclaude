@@ -23,9 +23,9 @@ export const MAX_DEPTH = 256;
 /** Default cap on a decoded body (the proxy's own default request limit). */
 export const DEFAULT_DECODED_MAX = 64 * 1024 * 1024;
 
-/** Whether a body asks for a Fable model anywhere (decoded, parsed, every `model` key). @param {Buffer} body @param {string|string[]|undefined|null} [contentEncoding] @param {number} [maxBytes] */
-export function bodyWantsFable(body, contentEncoding = null, maxBytes = DEFAULT_DECODED_MAX) {
-  return rewriteFableBody(body, DEFAULT_FABLE_MODEL, contentEncoding, maxBytes).found != null;
+/** The first Fable model a body asks for anywhere (decoded, parsed, every `model` key), or null. @param {Buffer} body @param {string|string[]|undefined|null} [contentEncoding] @param {number} [maxBytes] */
+export function fableModelIn(body, contentEncoding = null, maxBytes = DEFAULT_DECODED_MAX) {
+  return rewriteFableBody(body, DEFAULT_FABLE_MODEL, contentEncoding, maxBytes).found;
 }
 
 /** @param {unknown} model */

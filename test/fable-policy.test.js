@@ -363,3 +363,14 @@ test('a fallback cannot be mapped back to Fable by an account modelMap', async (
     noFableUpstream(t);
   } finally { t.close(); }
 });
+
+test('an allowed client\'s gzip Fable with no Fable allowance left falls back up front', async () => {
+  const t = await setup({ fableSpent: true });
+  try {
+    const res = await t.postRaw('k-wz', zlib.gzipSync(JSON.stringify({ model: FABLE, messages: [] })), { 'content-encoding': 'gzip' });
+    await res.text();
+    assert.equal(res.status, 200);
+    noFableUpstream(t);
+    assert.ok(t.logs.some((l) => /Fable fallback: .* for "jp-wakizashi" — no account has Fable allowance left/.test(l)), t.logs.join('\n'));
+  } finally { t.close(); }
+});

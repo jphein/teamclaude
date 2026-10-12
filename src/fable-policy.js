@@ -1,3 +1,5 @@
+import zlib from 'node:zlib';
+
 // Fable rationing (JP, 2026-10-11): "you and my claudes should use fable".
 //
 // Only clients named in `fable.allow` — per-client key names from
@@ -58,24 +60,75 @@ export function decideFable({ policy, model, advisorModel = null, client = null,
 }
 
 /**
- * The request body with every Fable model replaced by `to`: the top-level
- * `model` and an advisor tool's nested `model` (tools[].model). Anything that
- * is not a JSON object is returned unchanged.
- * @param {Buffer} body @param {string} to
- * @returns {{ body: Buffer, changed: boolean }}
+ * The request body with every Fable model replaced by `to` — the enforcement
+ * point, run up front and again on the exact bytes of every upstream attempt.
+ *
+ * Every property named `model` anywhere in the JSON is checked, not only the
+ * top-level one: advisor tools (tools[].model), batch items
+ * (requests[].params.model), anything. Upstream must see exactly what was
+ * checked, so a body that could hide a Fable model from this parser — a
+ * duplicate "model" key (JSON.parse keeps the last; another parser may keep
+ * the first), a \\u escape, or any literal "fable" in the text — is
+ * re-serialised from the parsed object, which leaves one canonical model per
+ * object. A body with neither can spell no Fable model in any parser and is
+ * passed through byte-for-byte (re-serialising would round large numbers).
+ *
+ * A compressed body (gzip, deflate, br, zstd) is decoded first; when it needs a
+ * rewrite it is sent decoded, and dropEncoding tells the caller to remove
+ * Content-Encoding. An encoding this cannot decode is `refuse`: the caller
+ * answers 415 rather than forward a body nobody inspected.
+ * @param {Buffer} body @param {string} to @param {string|string[]|undefined|null} [contentEncoding]
+ * @returns {{ body: Buffer, changed: boolean, found: string|null, dropEncoding: boolean, refuse: boolean }}
  */
-export function rewriteFableBody(body, to) {
-  let obj;
-  try { obj = JSON.parse(body.toString('utf8')); } catch { return { body, changed: false }; }
-  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return { body, changed: false };
-  let changed = false;
-  if (isFableModel(obj.model)) { obj.model = to; changed = true; }
-  if (Array.isArray(obj.tools)) {
-    for (const t of obj.tools) {
-      if (t && typeof t === 'object' && isFableModel(t.model)) { t.model = to; changed = true; }
-    }
+export function rewriteFableBody(body, to, contentEncoding = null) {
+  const enc = String(Array.isArray(contentEncoding) ? contentEncoding.join(',') : contentEncoding ?? '').trim().toLowerCase();
+  const none = { body, changed: false, found: null, dropEncoding: false, refuse: false };
+  let raw = body;
+  if (enc && enc !== 'identity') {
+    const decoded = decodeBody(body, enc);
+    if (!decoded) return { ...none, refuse: true };
+    raw = decoded;
   }
-  return changed ? { body: Buffer.from(JSON.stringify(obj), 'utf8'), changed } : { body, changed: false };
+  const text = raw.toString('utf8');
+  if (!/fable|\\u[0-9a-f]{4}/i.test(text)) return none;      // no parser can read a Fable model here
+  let obj;
+  try { obj = JSON.parse(text); } catch { return none; }        // not JSON: no model field to carry it
+  if (!obj || typeof obj !== 'object') return none;
+  /** @type {string|null} */
+  let found = null;
+  /** @param {any} node @param {number} depth */
+  const walk = (node, depth) => {
+    if (!node || typeof node !== 'object' || depth > 64) return;
+    if (Array.isArray(node)) { for (const v of node) walk(v, depth + 1); return; }
+    for (const k of Object.keys(node)) {
+      if (k === 'model' && isFableModel(node[k])) { found ??= node[k]; node[k] = to; }
+      else walk(node[k], depth + 1);
+    }
+  };
+  walk(obj, 0);
+  const canonical = Buffer.from(JSON.stringify(obj), 'utf8');
+  const decodedAway = raw !== body;
+  // Unchanged and nothing ambiguous: keep the client's exact bytes (and encoding).
+  if (!found && canonical.equals(Buffer.from(text, 'utf8'))) return none;
+  return { body: canonical, changed: true, found, dropEncoding: decodedAway, refuse: false };
+}
+
+/** @param {Buffer} body @param {string} enc */
+function decodeBody(body, enc) {
+  try {
+    const z = /** @type {any} */ (zlib);
+    let out = body;
+    // Applied in reverse of the order listed ("gzip, br" = gzip first, then br).
+    for (const e of enc.split(',').map((x) => x.trim()).filter(Boolean).reverse()) {
+      if (e === 'identity') continue;
+      if (e === 'gzip' || e === 'x-gzip') out = zlib.gunzipSync(out);
+      else if (e === 'deflate') out = zlib.inflateSync(out);
+      else if (e === 'br') out = zlib.brotliDecompressSync(out);
+      else if (e === 'zstd' && typeof z.zstdDecompressSync === 'function') out = z.zstdDecompressSync(out);
+      else return null;
+    }
+    return out;
+  } catch { return null; }
 }
 
 /**

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import zlib from 'node:zlib';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import {
@@ -87,15 +88,17 @@ test('FableStats: counts today, remembers the last fallback, resets at the local
 // ── through the real proxy ───────────────────────────────────────────────
 const listen = (s) => new Promise((r) => s.listen(0, '127.0.0.1', () => r(s.address().port)));
 
-async function setup({ fable = { allow: ALLOW }, fableSpent = false, fable529 = false } = {}) {
+async function setup({ fable = { allow: ALLOW }, fableSpent = false, fable529 = false, blockedModels, modelMap } = {}) {
   const seen = [];
+  const raws = [];
   const upstream = http.createServer((req, res) => {
     let raw = '';
     req.on('data', (c) => { raw += c; });
     req.on('end', () => {
-      let m = null; try { m = JSON.parse(raw).model; } catch { /* */ }
+      let m = null; let adv = null; try { const o = JSON.parse(raw); m = o.model; adv = o.tools?.[0]?.model ?? null; } catch { /* */ }
       seen.push(m);
-      if (fable529 && isFableModel(m)) {
+      raws.push({ raw, encoding: req.headers['content-encoding'] ?? null, length: req.headers['content-length'] });
+      if (fable529 && (isFableModel(m) || isFableModel(adv))) {
         res.writeHead(529, { 'content-type': 'application/json' });
         res.end('{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}');
         return;
@@ -106,7 +109,7 @@ async function setup({ fable = { allow: ALLOW }, fableSpent = false, fable529 = 
   });
   const upPort = await listen(upstream);
   const am = new AccountManager([
-    { name: 'a', type: 'oauth', accessToken: 't-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'a', type: 'oauth', accessToken: 't-a', refreshToken: 'r', expiresAt: Date.now() + 3600_000, ...(modelMap ? { modelMap } : {}) },
     { name: 'b', type: 'oauth', accessToken: 't-b', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
   ], 0.98);
   if (fableSpent) {
@@ -115,6 +118,7 @@ async function setup({ fable = { allow: ALLOW }, fableSpent = false, fable529 = 
   const config = {
     proxy: { apiKey: 'shared-k', clientKeys: [{ name: 'familiar', key: 'k-fam' }, { name: 'jp-92', key: 'k-92' }, { name: 'jp-wakizashi', key: 'k-wz' }] },
     upstream: `http://127.0.0.1:${upPort}`,
+    ...(blockedModels ? { blockedModels } : {}),
     ...(fable === null ? {} : { fable }),   // null = no fable block (rationing off)
   };
   const logs = [];
@@ -123,7 +127,8 @@ async function setup({ fable = { allow: ALLOW }, fableSpent = false, fable529 = 
   const proxy = createProxyServer(am, config, {});
   const port = await listen(proxy);
   return {
-    seen, logs,
+    seen, logs, raws,
+    postRaw: (key, buf, headers = {}) => fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': key, ...headers }, body: buf }),
     post: (key, model, extra = {}) => fetch(`http://127.0.0.1:${port}/v1/messages`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': key },
       body: JSON.stringify({ model, max_tokens: 5, messages: [{ role: 'user', content: 'hi' }], ...extra }),
@@ -219,5 +224,85 @@ test('a non-Fable 529 is not turned into a model change', async () => {
     await res.text();
     assert.equal(res.status, 200);
     assert.deepEqual(t.seen, [OPUS]);
+  } finally { t.close(); }
+});
+
+// ── hardening (security scan + cross-model review of PR #23) ──────────────
+const noFableUpstream = (t) => assert.ok(t.raws.every((r) => !/fable/i.test(r.raw)), 'upstream saw a Fable model: ' + t.raws.map((r) => r.raw).join(' | '));
+
+test('duplicate "model" keys cannot smuggle Fable past the check, in either order', async () => {
+  const t = await setup();
+  try {
+    for (const raw of [`{"model":"${OPUS}","model":"${FABLE}","messages":[]}`, `{"model":"${FABLE}","model":"${OPUS}","messages":[]}`]) {
+      const res = await t.postRaw('k-fam', raw);
+      await res.text();
+      assert.equal(res.status, 200, raw);
+    }
+    noFableUpstream(t);
+  } finally { t.close(); }
+});
+
+test('an escaped Fable id and a batch item\'s nested model are rewritten too', async () => {
+  const t = await setup();
+  try {
+    await (await t.postRaw('k-fam', `{"model":"claude-fabl\\u0065-5","messages":[]}`)).text();
+    await (await t.postRaw('k-fam', JSON.stringify({ requests: [{ custom_id: 'x', params: { model: FABLE, messages: [] } }] }))).text();
+    noFableUpstream(t);
+    assert.equal(JSON.parse(t.raws[1].raw).requests[0].params.model, OPUS);
+  } finally { t.close(); }
+});
+
+test('a gzip body from a lane is decoded, rewritten and sent uncompressed with a correct length', async () => {
+  const t = await setup();
+  try {
+    const res = await t.postRaw('k-fam', zlib.gzipSync(JSON.stringify({ model: FABLE, messages: [] })), { 'content-encoding': 'gzip' });
+    await res.text();
+    assert.equal(res.status, 200);
+    assert.equal(t.raws[0].encoding, null, 'Content-Encoding removed');
+    assert.equal(JSON.parse(t.raws[0].raw).model, OPUS);
+    assert.equal(Number(t.raws[0].length), Buffer.byteLength(t.raws[0].raw));
+  } finally { t.close(); }
+});
+
+test('an encoding the policy cannot read is refused for a lane (415), never forwarded', async () => {
+  const t = await setup();
+  try {
+    const res = await t.postRaw('k-fam', Buffer.from('opaque'), { 'content-encoding': 'compress' });
+    await res.text();
+    assert.equal(res.status, 415);
+    assert.equal(t.raws.length, 0);
+  } finally { t.close(); }
+});
+
+test('an account modelMap that maps TO Fable is caught by the final gate', async () => {
+  const t = await setup({ modelMap: { 'sneaky-alias': FABLE } });
+  try {
+    await (await t.post('k-fam', 'sneaky-alias')).text();
+    noFableUpstream(t);
+    assert.deepEqual(t.seen, [OPUS]);
+  } finally { t.close(); }
+});
+
+test('rationing runs before the blocklist: a lane\'s blocked Fable is served as Opus; an allowed client is still blocked', async () => {
+  const t = await setup({ blockedModels: ['*fable*'] });
+  try {
+    const lane = await t.post('k-fam', FABLE);
+    await lane.text();
+    assert.equal(lane.status, 200);
+    const jp = await t.post('k-92', FABLE);
+    await jp.text();
+    assert.equal(jp.status, 400, 'the operator\'s blocklist still applies to what would be sent');
+    assert.deepEqual(t.seen, [OPUS]);
+  } finally { t.close(); }
+});
+
+test('an allowed client\'s advisor-only Fable falls back on 529 too', async () => {
+  const t = await setup({ fable529: true });
+  try {
+    const res = await t.post('k-92', OPUS, { tools: [{ type: 'advisor_20260301', name: 'advisor', model: FABLE }] });
+    await res.text();
+    assert.equal(res.status, 200);
+    assert.equal(t.raws.length, 2, 'one Fable attempt, then the fallback');
+    assert.equal(JSON.parse(t.raws[1].raw).tools[0].model, OPUS);
   } finally { t.close(); }
 });

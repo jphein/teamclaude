@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { fablePolicy, decideFable, rewriteFableBody, isFableModel, clientAllowed, FableStats } from './fable-policy.js';
+import { fablePolicy, rewriteFableBody, isFableModel, clientAllowed, FableStats } from './fable-policy.js';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
@@ -1469,6 +1469,52 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // account, so selection must be eligible for it too (issue #98).
       let advisorModel = parseAdvisorModel(body);
 
+      // Fable rationing (fable-policy.js), ahead of the blocklist so a rationed
+      // request is judged as the model it will be sent as. A client not on
+      // fable.allow has every Fable model in its body rewritten to fable.model
+      // (never refused); an allowed client falls back the same way when no
+      // account can serve Fable right now. The identity is the authenticating
+      // key only. forwardRequest re-applies the same rewrite to the exact bytes
+      // of every upstream attempt (fableForbidden), after every other rewrite.
+      const fableClient = req.tcClient ?? forcedClient ?? null;
+      const fp = fablePolicy(config);
+      let fableForbidden = null;
+      let fableDropEncoding = false;
+      let fableCapacityFallback = null;
+      if (fp.enabled) {
+        const allowed = clientAllowed(fp, fableClient);
+        const wantsFable = isFableModel(model) || isFableModel(advisorModel);
+        const am = /** @type {any} */ (accountManager);
+        const fallback = allowed && wantsFable && !am.accounts.some((/** @type {any} */ a) => am._isAvailable(a, model, advisorModel));
+        if (allowed && wantsFable && !fallback) fableCapacityFallback = fp.model;
+        if (!allowed || fallback) {
+          const out = rewriteFableBody(body, fp.model, req.headers['content-encoding']);
+          if (out.refuse) {
+            if (!res.headersSent) {
+              res.writeHead(415, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'teamclaude cannot read this Content-Encoding to apply its Fable policy; send the body uncompressed or gzip/deflate/br.' } }));
+            }
+            recordEarlyOutcome(accountManager, sessionId, req.url, true);
+            openEntry = null;
+            /** @type {any} */ (hooks).onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(fable policy)', status: 415, model, sessionId });
+            return;
+          }
+          if (out.changed) {
+            body = out.body;
+            fableDropEncoding = out.dropEncoding;
+            model = parseRequestModel(body) ?? model;
+            advisorModel = parseAdvisorModel(body);
+          }
+          if (out.found) {
+            const kind = allowed ? 'fallback' : 'rewrite';
+            const reason = allowed ? 'no account has Fable allowance left' : 'not on fable.allow';
+            fableStats.record(kind, { client: fableClient, from: out.found, to: fp.model, reason });
+            console.log(`[TeamClaude] Fable ${allowed ? 'fallback' : 'rewritten'}: ${safeLine(out.found, 64)} → ${safeLine(fp.model, 64)} for ${fableClient ? `"${safeLine(fableClient, 64)}"` : '(shared key)'} — ${reason}`);
+          }
+          if (!allowed) fableForbidden = fp.model;
+        }
+      }
+
       // Model blocklist (issue #116): reject a request for a blocked model right
       // here instead of forwarding it. A model no account can serve (e.g. Fable
       // once it left base plans) otherwise gets rate-limited upstream and hangs
@@ -1498,29 +1544,6 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // tokens are booked against, so one CI key can still be split by project.
       const client = req.tcClient ?? forcedClient ?? null;
 
-      // Fable rationing (fable-policy.js): a client not on fable.allow is served
-      // as fable.model, and an allowed one falls back the same way when no
-      // account can serve Fable right now. Rewritten here, before routing, so
-      // selection, quota and logs all see the model actually sent.
-      const fp = fablePolicy(config);
-      const fableDecision = decideFable({
-        policy: fp, model, advisorModel, client,
-        fableAvailable: () => { const am = /** @type {any} */ (accountManager); return am.accounts.some((/** @type {any} */ a) => am._isAvailable(a, model, advisorModel)); },
-      });
-      if (fableDecision.action !== 'pass' && fableDecision.to) {
-        const from = String(isFableModel(model) ? model : advisorModel);
-        const out = rewriteFableBody(body, fableDecision.to);
-        if (out.changed) {
-          body = out.body;
-          if (isFableModel(model)) model = fableDecision.to;
-          if (isFableModel(advisorModel)) advisorModel = fableDecision.to;
-          const reason = fableDecision.action === 'rewrite' ? 'not on fable.allow' : 'no account has Fable allowance left';
-          fableStats.record(fableDecision.action, { client, from, to: fableDecision.to, reason });
-          console.log(`[TeamClaude] Fable ${fableDecision.action === 'rewrite' ? 'rewritten' : 'fallback'}: ${safeLine(from, 64)} → ${safeLine(fableDecision.to, 64)} for ${client ? `"${safeLine(client, 64)}"` : '(shared key)'} — ${reason}`);
-        }
-      }
-      // An allowed client still on Fable may fall back once if upstream answers 529.
-      const fableCapacityFallback = fp.enabled && isFableModel(model) && clientAllowed(fp, client) ? fp.model : null;
       const usageDimensions = resolveUsageDimensions(config.proxy, req.headers);
       const usageRecorder = createUsageRecorder({ client, clientUsage, dimensions: usageDimensions, dimensionUsage });
       usageRecorder.recordRequest();
@@ -1531,7 +1554,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), fableCapacityFallback, fableStats, model, advisorModel, pinnedIndex, provider: providerForPath(req.url), holdBudgetMs: holdMs, sessionId, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), fableCapacityFallback, fableForbidden, fableDropEncoding, fableStats, model, advisorModel, pinnedIndex, provider: providerForPath(req.url), holdBudgetMs: holdMs, sessionId, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -2625,6 +2648,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Every rewrite below runs inside rewriteRequestBody (exported for tests);
   // Content-Length is refreshed below because the body can shrink.
   let sendBody = rewriteRequestBody(body, account, req.url, req.headers['content-type']);
+  // Fable policy, final gate: the exact bytes this attempt sends, after every
+  // other rewrite (a modelMap that maps TO Fable included), on every retry.
+  if (ctx.fableForbidden) {
+    const g = rewriteFableBody(sendBody, ctx.fableForbidden, ctx.fableDropEncoding ? null : req.headers['content-encoding']);
+    if (g.refuse) throw new Error('Fable policy: undecodable request body');
+    if (g.changed) { sendBody = g.body; if (g.dropEncoding) ctx.fableDropEncoding = true; }
+  }
+  if (ctx.fableDropEncoding) for (const k of Object.keys(headers)) if (k.toLowerCase() === 'content-encoding') delete headers[k];
   // If the body changed length (sanitize, model rewrite, or field strip), update
   // Content-Length so the upstream doesn't receive a mismatched framing and
   // truncate or stall.
@@ -2929,13 +2960,14 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Fable at capacity (529) for an allowed client: serve it as Opus instead
     // of the error, once per request (JP: "and ii for sure"). Ahead of the
     // generic 5xx hop, which would only try Fable again on another account.
-    if (upstreamRes.status === 529 && !res.headersSent && ctx.fableCapacityFallback && !ctx.fableFellBack && isFableModel(ctx.model) && retryCount < maxRetries) {
-      const out = rewriteFableBody(body, ctx.fableCapacityFallback);
-      if (out.changed) {
+    if (upstreamRes.status === 529 && !res.headersSent && ctx.fableCapacityFallback && !ctx.fableFellBack && (isFableModel(ctx.model) || isFableModel(ctx.advisorModel))) {
+      const out = rewriteFableBody(body, ctx.fableCapacityFallback, ctx.fableDropEncoding ? null : req.headers['content-encoding']);
+      if (out.changed && !out.refuse) {
+        if (out.dropEncoding) ctx.fableDropEncoding = true;
         await upstreamRes.body?.cancel();
-        const from = String(ctx.model);
+        const from = String(out.found ?? ctx.model);
         ctx.fableFellBack = true;
-        ctx.model = ctx.fableCapacityFallback;
+        if (isFableModel(ctx.model)) ctx.model = ctx.fableCapacityFallback;
         if (isFableModel(ctx.advisorModel)) ctx.advisorModel = ctx.fableCapacityFallback;
         ctx.fableStats?.record('fallback', { client: ctx.client ?? null, from, to: ctx.fableCapacityFallback, reason: 'Fable at capacity (529)' });
         console.log(`[TeamClaude] Fable fallback: ${safeLine(from, 64)} → ${safeLine(ctx.fableCapacityFallback, 64)} for ${ctx.client ? `"${safeLine(ctx.client, 64)}"` : '(shared key)'} — upstream 529 on "${account.name}"`);

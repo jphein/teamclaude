@@ -39,9 +39,9 @@ test('every Settings entry is documented', async () => {
 });
 
 // Words after `config.` / `config.proxy.` etc. that are not config keys.
-const NOT_KEYS = new Set(['js', 'json', 'example', 'replace', 'endsWith', 'accounts', 'proxy', 'sx', 'service', 'egress', 'mitm', 'fable']);
+const NOT_KEYS = new Set(['js', 'json', 'example', 'replace', 'endsWith', 'accounts', 'proxy', 'sx', 'service', 'egress', 'mitm', 'fable', 'failover']);
 // Top-level keys of objects whose sub-keys are read under another variable name.
-const NESTED = ['proxy', 'egress', 'sx', 'service', 'mitm', 'fable'];
+const NESTED = ['proxy', 'egress', 'sx', 'service', 'mitm', 'fable', 'failover'];
 
 test('every config key the code reads has a Settings entry', async () => {
   const dir = join(ROOT, 'src');

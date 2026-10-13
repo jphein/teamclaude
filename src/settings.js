@@ -91,6 +91,26 @@ export const FIELDS = [
     help: 'Rules that send model patterns to specific accounts.',
     check: (v) => (Array.isArray(v) && v.every(isObj) ? null : 'must be an array of route objects') },
 
+  // ── Failover ────────────────────────────────────────────────────────────
+  { key: 'failover.enabled', group: 'Failover', label: 'Fail over to a local model', type: 'bool', apply: 'hot', def: false,
+    help: 'When no Claude account can serve a request, answer it from the local model instead of a 429; Claude takes over again as soon as an account can serve.' },
+  { key: 'failover.url', group: 'Failover', label: 'Local model URL', type: 'text', credUrl: true, apply: 'hot', def: null, danger: true,
+    help: 'Base URL of an Anthropic-compatible /v1/messages server (llama-server, LiteLLM), e.g. http://10.0.6.107:8091.', check: httpUrlCheck },
+  { key: 'failover.model', group: 'Failover', label: 'Local model name', type: 'text', apply: 'hot', def: 'qwen36-coder',
+    help: 'The model (or LiteLLM alias) failover requests are sent as; agents see it in the response.' },
+  { key: 'failover.apiKey', group: 'Failover', label: 'Local model key', type: 'secret', apply: 'hot', def: null,
+    help: 'Key for the local server (sent as x-api-key and Bearer). Write-only.' },
+  { key: 'failover.afterSeconds', group: 'Failover', label: 'Wait before failing over (s)', type: 'int', apply: 'hot', def: 20, min: 0,
+    help: 'How long no account must be able to serve before failover starts (skipped when every account is out of quota). Stops a brief 429 burst from switching models.' },
+  { key: 'failover.maxConcurrent', group: 'Failover', label: 'Local requests at once', type: 'int', apply: 'hot', def: 1, min: 1,
+    help: 'Failover requests sent to the local model at once; the rest get a 429 and retry. Leaves room for its other users.' },
+  { key: 'failover.contextTokens', group: 'Failover', label: 'Local context (tokens)', type: 'int', apply: 'hot', def: 131072, min: 1024,
+    help: 'The local model\'s context window; larger requests are not sent there (they get a 429).' },
+  { key: 'failover.templateTokens', group: 'Failover', label: 'Template allowance (tokens)', type: 'int', apply: 'hot', def: 2048, min: 0,
+    help: 'Tokens added to the local count for the chat template\'s framing when deciding whether a request fits the local window.' },
+  { key: 'failover.timeoutSeconds', group: 'Failover', label: 'Local timeout (s)', type: 'int', apply: 'hot', def: 600, min: 10,
+    help: 'Longest a failover request may take before it is abandoned and answered with a 429.' },
+
   // ── Fable ───────────────────────────────────────────────────────────────
   { key: 'fable.allow', group: 'Fable', label: 'Allowed clients', type: 'list', apply: 'hot', def: null,
     help: 'Client key names that may use Fable; every other Fable request is served as the fallback model, never refused. "(shared key)" admits the shared key. Unset = no rationing; empty = nobody.',
@@ -288,7 +308,7 @@ export function publicSettings(config) {
   const known = new Set(FIELDS.map((f) => f.key));
   const tops = new Set([...known].map((k) => k.split(".")[0]).concat("accounts"));
   const unknown = Object.keys(config || {}).filter((k) => !tops.has(k));
-  for (const parent of ["proxy", "egress", "sx", "service", "mitm", "fable"]) {
+  for (const parent of ["proxy", "egress", "sx", "service", "mitm", "fable", "failover"]) {
     for (const k of Object.keys(isObj(config?.[parent]) ? config[parent] : {})) if (!known.has(`${parent}.${k}`)) unknown.push(`${parent}.${k}`);
   }
   return {

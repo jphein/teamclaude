@@ -73,6 +73,8 @@ Control-plane **writes** (`reload`, `switch`) are refused when the request carri
 
 `GET /teamclaude/quota` is the compact read endpoint for status-line integrations. It returns tier-weighted fleet aggregates and the underlying per-account limits; see [Fleet quota endpoint](quota.md#fleet-quota-endpoint).
 
+`GET /teamclaude/failover` is the local-failover signal alone, for anything that shares the local model's slot (HA polls it to skip warming Ember's prompt cache while teamclaude is serving from that slot). It returns `{"local_failover_active": bool, "inFlight": n, "since": iso|null, "lastAt": iso|null}` and needs a key, like `/teamclaude/status`. `local_failover_active` is true while a failover request is in flight, and for up to 2 minutes after the last one while no Claude account can serve.
+
 Switching the account by hand has the same headless path — the equivalent of pressing **s** in the TUI and confirming with the default target selected:
 
 ```bash

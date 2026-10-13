@@ -80,7 +80,7 @@ test('prepareForClaude: removes unsigned thinking; turns thinking off when the l
 });
 
 // ── through the real proxy ───────────────────────────────────────────────
-async function setup({ failover = {}, exhausted = true, localStatus = 200, claudeHits = [], claude429 = false, localMode = 'ok', redirectTo = 'http://127.0.0.1:9/v1/messages', tokenizeCount = null, claudeRetryAfter = '3600', claudeBurst = false } = {}) {
+async function setup({ failover = {}, exhausted = true, localStatus = 200, claudeHits = [], claude429 = false, localMode = 'ok', redirectTo = 'http://127.0.0.1:9/v1/messages', tokenizeCount = null, claudeRetryAfter = '3600', claudeBurst = false, proxyConf = {} } = {}) {
   const localSeen = [];
   const local = http.createServer((req, res) => {
     let raw = ''; req.on('data', (c) => { raw += c; }); req.on('end', () => {
@@ -107,7 +107,7 @@ async function setup({ failover = {}, exhausted = true, localStatus = 200, claud
   // The exhausted-fleet probe would forward one request to Claude anyway; a
   // probe already spent this hour is the state a real stall is in.
   am._nextProbeAt = Date.now() + 3600_000;
-  const config = { proxy: { apiKey: 'k' }, upstream: `http://127.0.0.1:${cp}`, failover: { enabled: true, url: `http://127.0.0.1:${lp}`, afterSeconds: 20, ...failover } };
+  const config = { proxy: { apiKey: 'k', ...proxyConf }, upstream: `http://127.0.0.1:${cp}`, failover: { enabled: true, url: `http://127.0.0.1:${lp}`, afterSeconds: 20, ...failover } };
   const logs = []; const orig = console.log; console.log = (...a) => { logs.push(a.join(' ')); };
   const proxy = createProxyServer(am, config, {});
   const port = await listen(proxy);
@@ -116,6 +116,7 @@ async function setup({ failover = {}, exhausted = true, localStatus = 200, claud
     post: (body, session = null) => fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 'k', ...(session ? { 'x-claude-code-session-id': session } : {}) }, body: JSON.stringify(body) }),
     state: () => proxy,
     status: () => fetch(`http://127.0.0.1:${port}/teamclaude/status`, { headers: { 'x-api-key': 'k' } }).then((r) => r.json()),
+    signal: (key = 'k') => fetch(`http://127.0.0.1:${port}/teamclaude/failover`, { headers: key ? { 'x-api-key': key } : {} }),
     close() { console.log = orig; proxy.close(); local.close(); claude.close(); },
   };
 }
@@ -310,4 +311,19 @@ test('failover.maxPromptTokens: a 70K prompt is turned away with a 429 and one l
     await res.text();
     assert.equal(res.status, 200, 'raised cap serves it');
   } finally { u.close(); }
+});
+
+test('GET /teamclaude/failover: false until the local model serves, then true; keyed like status', async () => {
+  const t = await setup({ proxyConf: { trustLoopback: false } });
+  try {
+    assert.deepEqual(await (await t.signal()).json(), { local_failover_active: false, inFlight: 0, since: null, lastAt: null });
+    assert.equal((await t.post(MSG)).status, 200);
+    const on = await t.signal();
+    assert.equal(on.headers.get('cache-control'), 'no-store');
+    const body = await on.json();
+    assert.equal(body.local_failover_active, true);
+    assert.deepEqual(Object.keys(body).sort(), ['inFlight', 'lastAt', 'local_failover_active', 'since'], 'no account details');
+    assert.equal((await t.signal('wrong')).status, 401);
+    assert.equal((await t.signal(null)).status, 401);
+  } finally { t.close(); }
 });

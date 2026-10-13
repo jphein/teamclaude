@@ -493,6 +493,16 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // The local-failover signal alone, for whoever shares the local model's
+      // slot (HA warms Ember's prompt cache there and must skip while teamclaude
+      // is serving from it). Same auth as status; carries no account details.
+      if (req.method === 'GET' && req.url === '/teamclaude/failover') {
+        const f = failoverState.snapshot(failoverPolicy(config));
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ local_failover_active: f.enabled && (f.active || f.inFlight > 0), inFlight: f.inFlight, since: f.since, lastAt: f.lastAt }));
+        return;
+      }
+
       // Tier-weighted fleet quota for lightweight consumers such as a shell or
       // Claude Code status line. Unlike /teamclaude/status this omits routing,
       // usage counters and server diagnostics, and never reaches upstream.

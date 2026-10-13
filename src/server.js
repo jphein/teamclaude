@@ -1540,7 +1540,8 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // off for a turn whose last assistant tool_use came from the local model).
       // Only sessions failover actually served — every other body is untouched.
       const failover = failoverPolicy(config);
-      if (failover.enabled && !req.headers['content-encoding'] && failoverState.servedLocally(sessionId)) {
+      const reqEncoding = String(req.headers['content-encoding'] ?? 'identity').trim().toLowerCase();
+      if (failover.enabled && (reqEncoding === 'identity' || reqEncoding === '') && failoverState.servedLocally(sessionId)) {
         const fixed = prepareForClaude(body, (id) => failoverState.localToolIds.has(id));
         if (fixed.changed) {
           body = fixed.body;

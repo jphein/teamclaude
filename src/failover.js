@@ -88,10 +88,16 @@ export class FailoverState {
     if (trimmed.startsWith('{')) {
       try { fromObj(JSON.parse(trimmed)); } catch { /* not one JSON document: read it as SSE below */ }
     }
+    // SSE: an event's data may span several data: lines, joined with "\n" and
+    // ended by a blank line — parse per event, not per line.
+    /** @type {string[]} */
+    let data = [];
+    const flush = () => { if (data.length) { try { fromObj(JSON.parse(data.join('\n'))); } catch { /* not JSON */ } data = []; } };
     for (const line of text.split(/\r?\n/)) {
-      if (!line.startsWith('data:')) continue;
-      try { fromObj(JSON.parse(line.slice(5).trim())); } catch { /* a partial or non-JSON line */ }
+      if (line === '') { flush(); continue; }
+      if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
     }
+    flush();
     // Bounded: drop the oldest beyond 20000 (Set keeps insertion order).
     for (const id of this.localToolIds) { if (this.localToolIds.size <= 20000) break; this.localToolIds.delete(id); }
   }

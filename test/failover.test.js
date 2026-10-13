@@ -290,4 +290,7 @@ test('tool ids are recorded in any key order, from JSON and from SSE', () => {
   st.noteLocalToolIds('event: content_block_start\ndata: {"index":0,"content_block":{"name":"Read","input":{},"id":"call_2","type":"tool_use"},"type":"content_block_start"}\n\n');
   assert.ok(st.localToolIds.has('call_1'));
   assert.ok(st.localToolIds.has('call_2'));
+  // One SSE event whose data spans two data: lines.
+  st.noteLocalToolIds('event: content_block_start\ndata: {"type":"content_block_start","index":0,\ndata: "content_block":{"id":"local-1","name":"lookup","type":"tool_use","input":{}}}\n\n');
+  assert.ok(st.localToolIds.has('local-1'), 'multi-line data joined per event');
 });

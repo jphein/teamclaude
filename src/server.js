@@ -2491,6 +2491,11 @@ async function serveFromFailover(req, res, body, ctx) {
     // The local tokenizer's count where it answers; the byte estimate otherwise.
     const counted = await countLocalTokens(p, body.toString('utf8'), signal);
     const inputTokens = counted ?? estimateInputTokens(body.length) + p.templateTokens;
+    if (inputTokens > p.maxPromptTokens) {
+      // One line per rejection, with the size, so what is turned away is visible.
+      console.log(`[TeamClaude] Failover not used: prompt ~${inputTokens} tokens (${counted != null ? 'local count' : 'byte estimate'}) exceeds failover.maxPromptTokens (${p.maxPromptTokens}); answering 429`);
+      return false;
+    }
     if (inputTokens > p.contextTokens - MIN_ANSWER_TOKENS) {
       console.log(`[TeamClaude] Failover not used: ~${inputTokens} input tokens (${counted != null ? 'local count' : 'byte estimate'}) leaves no room in the local window (${p.contextTokens})`);
       return false;

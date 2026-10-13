@@ -31,6 +31,7 @@ export function failoverPolicy(config) {
     maxConcurrent: Number.isInteger(f?.maxConcurrent) && f.maxConcurrent >= 1 ? f.maxConcurrent : 1,
     contextTokens: Number.isInteger(f?.contextTokens) && f.contextTokens > 0 ? f.contextTokens : 131072,
     timeoutSeconds: Number.isFinite(f?.timeoutSeconds) && f.timeoutSeconds > 0 ? f.timeoutSeconds : 600,
+    templateTokens: Number.isInteger(f?.templateTokens) && f.templateTokens >= 0 ? f.templateTokens : 2048,
   };
 }
 
@@ -68,10 +69,29 @@ export class FailoverState {
      * @type {Set<string>} */
     this.localToolIds = new Set();
   }
-  /** Record the tool_use ids in a local response (its raw JSON or SSE text). @param {string} text */
+  /**
+   * Record the tool_use ids in a local response, read structurally (any key
+   * order): a JSON message's content blocks, or each SSE event's content block.
+   * @param {string} text
+   */
   noteLocalToolIds(text) {
-    const re = /"type"\s*:\s*"tool_use"\s*,\s*"id"\s*:\s*"([^"]+)"|"id"\s*:\s*"([^"]+)"\s*,\s*"type"\s*:\s*"tool_use"/g;
-    for (const m of text.matchAll(re)) this.localToolIds.add(m[1] ?? m[2]);
+    /** @param {any} block */
+    const take = (block) => { if (block && block.type === 'tool_use' && typeof block.id === 'string') this.localToolIds.add(block.id); };
+    /** @param {any} obj */
+    const fromObj = (obj) => {
+      if (!obj || typeof obj !== 'object') return;
+      take(obj.content_block);
+      if (Array.isArray(obj.content)) for (const b of obj.content) take(b);
+      if (obj.message && Array.isArray(obj.message.content)) for (const b of obj.message.content) take(b);
+    };
+    const trimmed = text.trimStart();
+    if (trimmed.startsWith('{')) {
+      try { fromObj(JSON.parse(trimmed)); } catch { /* not one JSON document: read it as SSE below */ }
+    }
+    for (const line of text.split(/\r?\n/)) {
+      if (!line.startsWith('data:')) continue;
+      try { fromObj(JSON.parse(line.slice(5).trim())); } catch { /* a partial or non-JSON line */ }
+    }
     // Bounded: drop the oldest beyond 20000 (Set keeps insertion order).
     for (const id of this.localToolIds) { if (this.localToolIds.size <= 20000) break; this.localToolIds.delete(id); }
   }
@@ -141,10 +161,8 @@ export function failoverEligibility(a) {
   // Best effort, not a guarantee (see estimateInputTokens). A request that
   // still overflows is rejected by the local server, which serveFromFailover
   // turns into a 429.
-  // The input must fit with room to answer; max_tokens is not charged in full
-  // here — bodyForFailover clamps it to the room that is left.
-  const estInput = estimateInputTokens(a.bodyBytes);
-  if (estInput > policy.contextTokens - MIN_ANSWER_TOKENS) return { ok: false, why: `~${estInput} input tokens leaves no room in the local window (${policy.contextTokens})` };
+  // Fit is decided by the local tokenizer in serveFromFailover (the byte
+  // estimate only when it cannot be asked), not here.
   if (a.state.inFlight >= policy.maxConcurrent) return { ok: false, why: `local model busy (${a.state.inFlight}/${policy.maxConcurrent})` };
   return { ok: true };
 }
@@ -230,9 +248,12 @@ export function prepareForClaude(body, isLocalToolId = () => false) {
 }
 
 /**
- * The local server's own token count for this request (llama-server
- * /tokenize), with a 5% allowance for its chat template. null when it cannot
- * be asked — the caller then falls back to the byte estimate.
+ * The input size for the local window: the local server's own count of the
+ * request JSON (llama-server /tokenize) plus 5%, plus a fixed allowance for
+ * its chat template's framing (failover.templateTokens). The JSON carries the
+ * tool schemas and content the template renders, so this bounds the prompt
+ * for the supported templates. null when it cannot be asked — the caller then
+ * uses the byte estimate plus the same allowance.
  * @param {ReturnType<typeof failoverPolicy>} policy @param {string} text @param {AbortSignal} [signal]
  * @returns {Promise<number|null>}
  */
@@ -246,6 +267,6 @@ export async function countLocalTokens(policy, text, signal) {
     const r = await fetch(`${policy.url}/tokenize`, { method: 'POST', headers, body: JSON.stringify({ content: text }), signal: AbortSignal.any(sigs), redirect: 'error' });
     if (!r.ok) { await r.body?.cancel().catch(() => {}); return null; }
     const j = /** @type {any} */ (await r.json());
-    return Array.isArray(j?.tokens) ? Math.ceil(j.tokens.length * 1.05) : null;
+    return Array.isArray(j?.tokens) ? Math.ceil(j.tokens.length * 1.05) + policy.templateTokens : null;
   } catch { return null; }
 }

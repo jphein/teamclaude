@@ -27,8 +27,7 @@ test('eligibility: every guard says why', () => {
   assert.match(failoverEligibility({ ...base, unservableMs: 5000 }).why, /5s < 20s/);
   assert.deepEqual(failoverEligibility({ ...base, unservableMs: 0, allQuota: true }), { ok: true }, 'all out of quota: no wait');
   assert.match(failoverEligibility({ ...base, url: '/v1/messages/count_tokens' }).why, /not a messages request/);
-  assert.match(failoverEligibility({ ...base, bodyBytes: 20_000 }).why, /leaves no room in the local window/);
-  assert.deepEqual(failoverEligibility({ ...base, policy: { ...policy, contextTokens: 131072 }, bodyBytes: 300_000, maxTokens: 64_000 }), { ok: true }, 'a big max_tokens is clamped, not refused');
+  assert.deepEqual(failoverEligibility({ ...base, bodyBytes: 20_000_000, maxTokens: 64_000 }), { ok: true }, 'fit is decided by the tokenizer, not a byte estimate here');
   assert.match(failoverEligibility({ ...base, contentEncoding: 'gzip' }).why, /compressed/);
   const busy = new FailoverState(); busy.inFlight = 1;
   assert.match(failoverEligibility({ ...base, state: busy }).why, /busy/);
@@ -283,4 +282,12 @@ test('short retries that merely ran out keep the hysteresis wait (no immediate f
     assert.equal(res.status, 429);
     assert.equal(t.localSeen.length, 0);
   } finally { t.close(); }
+});
+
+test('tool ids are recorded in any key order, from JSON and from SSE', () => {
+  const st = new FailoverState();
+  st.noteLocalToolIds(JSON.stringify({ content: [{ type: 'tool_use', name: 'lookup', id: 'call_1', input: {} }] }));
+  st.noteLocalToolIds('event: content_block_start\ndata: {"index":0,"content_block":{"name":"Read","input":{},"id":"call_2","type":"tool_use"},"type":"content_block_start"}\n\n');
+  assert.ok(st.localToolIds.has('call_1'));
+  assert.ok(st.localToolIds.has('call_2'));
 });

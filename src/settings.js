@@ -106,6 +106,8 @@ export const FIELDS = [
     help: 'Failover requests sent to the local model at once; the rest get a 429 and retry. Leaves room for its other users.' },
   { key: 'failover.contextTokens', group: 'Failover', label: 'Local context (tokens)', type: 'int', apply: 'hot', def: 131072, min: 1024,
     help: 'The local model\'s context window; larger requests are not sent there (they get a 429).' },
+  { key: 'failover.templateTokens', group: 'Failover', label: 'Template allowance (tokens)', type: 'int', apply: 'hot', def: 2048, min: 0,
+    help: 'Tokens added to the local count for the chat template\'s framing when deciding whether a request fits the local window.' },
   { key: 'failover.timeoutSeconds', group: 'Failover', label: 'Local timeout (s)', type: 'int', apply: 'hot', def: 600, min: 10,
     help: 'Longest a failover request may take before it is abandoned and answered with a 429.' },
 

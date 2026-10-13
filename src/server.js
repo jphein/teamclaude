@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, countLocalTokens, MIN_ANSWER_TOKENS, FailoverState } from './failover.js';
+import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, countLocalTokens, estimateInputTokens, MIN_ANSWER_TOKENS, FailoverState } from './failover.js';
 import { fablePolicy, rewriteFableBody, fableModelIn, isFableModel, clientAllowed, FableStats } from './fable-policy.js';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
@@ -2488,9 +2488,10 @@ async function serveFromFailover(req, res, body, ctx) {
     if (ctx.signal) signals.push(ctx.signal);
     const signal = AbortSignal.any(signals);
     // The local tokenizer's count where it answers; the byte estimate otherwise.
-    const inputTokens = await countLocalTokens(p, body.toString('utf8'), signal);
-    if (inputTokens != null && inputTokens > p.contextTokens - MIN_ANSWER_TOKENS) {
-      console.log(`[TeamClaude] Failover not used: ${inputTokens} input tokens (local count) leaves no room in the local window (${p.contextTokens})`);
+    const counted = await countLocalTokens(p, body.toString('utf8'), signal);
+    const inputTokens = counted ?? estimateInputTokens(body.length) + p.templateTokens;
+    if (inputTokens > p.contextTokens - MIN_ANSWER_TOKENS) {
+      console.log(`[TeamClaude] Failover not used: ~${inputTokens} input tokens (${counted != null ? 'local count' : 'byte estimate'}) leaves no room in the local window (${p.contextTokens})`);
       return false;
     }
     const out = bodyForFailover(body, p.model, p.contextTokens, inputTokens);

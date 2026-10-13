@@ -34,7 +34,8 @@ export function failoverPolicy(config) {
     templateTokens: Number.isInteger(f?.templateTokens) && f.templateTokens >= 0 ? f.templateTokens : 2048,
     // Largest prompt failover will serve. A cold prefill of a long prompt holds
     // the local GPU's single slot for minutes and stalls its other users (HA
-    // voice); 64000 for now — raise to 120000 once HA has its own model (gpu1).
+    // voice). 64000 while HA shares the B60's single slot; raise only if HA gets a
+    // dedicated lane that passes the HA safety gate (gpu1 failed it, 2026-10-12).
     maxPromptTokens: Number.isInteger(f?.maxPromptTokens) && f.maxPromptTokens > 0 ? f.maxPromptTokens : 64000,
   };
 }

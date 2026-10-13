@@ -106,6 +106,8 @@ export const FIELDS = [
     help: 'Failover requests sent to the local model at once; the rest get a 429 and retry. Leaves room for its other users.' },
   { key: 'failover.contextTokens', group: 'Failover', label: 'Local context (tokens)', type: 'int', apply: 'hot', def: 131072, min: 1024,
     help: 'The local model\'s context window; larger requests are not sent there (they get a 429).' },
+  { key: 'failover.maxPromptTokens', group: 'Failover', label: 'Largest prompt to serve (tokens)', type: 'int', apply: 'hot', def: 64000, min: 1024,
+    help: 'Prompts larger than this get a 429 instead: a cold prefill would hold the shared GPU for minutes and stall HA voice. Raise to 120000 once HA has its own model (gpu1).' },
   { key: 'failover.templateTokens', group: 'Failover', label: 'Template allowance (tokens)', type: 'int', apply: 'hot', def: 2048, min: 0,
     help: 'Tokens added to the local count for the chat template\'s framing when deciding whether a request fits the local window.' },
   { key: 'failover.timeoutSeconds', group: 'Failover', label: 'Local timeout (s)', type: 'int', apply: 'hot', def: 600, min: 10,

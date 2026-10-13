@@ -263,7 +263,7 @@ test('a stale clock from an old blip restarts: a later momentary throttle is not
 });
 
 test('the local tokenizer decides fit: a request it counts too large is not sent', async () => {
-  const t = await setup({ tokenizeCount: 200_000 });
+  const t = await setup({ tokenizeCount: 200_000, failover: { maxPromptTokens: 300_000 } });
   try {
     const res = await t.post(MSG);
     await res.text();
@@ -293,4 +293,21 @@ test('tool ids are recorded in any key order, from JSON and from SSE', () => {
   // One SSE event whose data spans two data: lines.
   st.noteLocalToolIds('event: content_block_start\ndata: {"type":"content_block_start","index":0,\ndata: "content_block":{"id":"local-1","name":"lookup","type":"tool_use","input":{}}}\n\n');
   assert.ok(st.localToolIds.has('local-1'), 'multi-line data joined per event');
+});
+
+test('failover.maxPromptTokens: a 70K prompt is turned away with a 429 and one log line with its size', async () => {
+  const t = await setup({ tokenizeCount: 70_000 });
+  try {
+    const res = await t.post(MSG);
+    await res.text();
+    assert.equal(res.status, 429);
+    assert.equal(t.localSeen.length, 0);
+    assert.ok(t.logs.some((l) => /Failover not used: prompt ~\d+ tokens \(local count\) exceeds failover.maxPromptTokens \(64000\)/.test(l)), t.logs.join('\n'));
+  } finally { t.close(); }
+  const u = await setup({ tokenizeCount: 70_000, failover: { maxPromptTokens: 120_000 } });
+  try {
+    const res = await u.post(MSG);
+    await res.text();
+    assert.equal(res.status, 200, 'raised cap serves it');
+  } finally { u.close(); }
 });

@@ -1535,12 +1535,12 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         }
       }
 
-      // Local-model failover (failover.js): when it is on, a conversation that
-      // comes back from failover turns is repaired before Claude sees it
-      // (unsigned thinking removed; thinking off for a turn whose last assistant
-      // tool_use has none). Without failover on, bodies pass byte-for-byte.
+      // Local-model failover (failover.js): a session a local model answered is
+      // repaired before Claude sees it again (unsigned thinking removed; thinking
+      // off for a turn whose last assistant tool_use came from the local model).
+      // Only sessions failover actually served — every other body is untouched.
       const failover = failoverPolicy(config);
-      if (failover.enabled && !req.headers['content-encoding']) {
+      if (failover.enabled && !req.headers['content-encoding'] && failoverState.servedLocally(sessionId)) {
         const fixed = prepareForClaude(body);
         if (fixed.changed) {
           body = fixed.body;
@@ -2419,15 +2419,53 @@ export function isTransientUpstreamError(err, { otherHostAvailable = false } = {
 }
 
 /**
- * Serve one request from the local failover model. Returns false — and has
+ * Fail over when the WHOLE fleet cannot serve this request (not merely this
+ * request's tried set) and the guards in failover.js allow it. `immediate`
+ * skips the hysteresis wait: the caller already knows this is not a blip (a
+ * long retry-after with nowhere to hop). Returns true when the local model
+ * answered (the response is written); false leaves today's handling in place.
+ * @param {any} req @param {any} res @param {Buffer} body @param {any} ctx @param {any} accountManager
+ * @param {{ immediate: boolean }} opts
+ */
+async function maybeFailover(req, res, body, ctx, accountManager, { immediate }) {
+  if (!ctx.failover?.enabled || !ctx.failoverState || res.headersSent) return false;
+  const am = accountManager;
+  // A paused account (a long retry-after just landed) is not one that can serve.
+  if (am.accounts.some((/** @type {any} */ a) => am._isAvailable(a, ctx.model, ctx.advisorModel) && !am.isPaused?.(a.index))) return false;
+  const unservableMs = ctx.failoverState.noteUnservable(Math.max(2 * ctx.failover.afterSeconds * 1000, 60_000));
+  const live = am.getStatus().accounts.filter((/** @type {any} */ a) => !a.disabled);
+  // Nothing to wait for unless some account is merely throttled (a transient):
+  // out of quota, exhausted, capped, rejected or errored all mean a long outage.
+  const allQuota = live.length > 0 && live.every((/** @type {any} */ a) => a.unavailable && a.unavailable !== 'throttled');
+  let maxTokens;
+  try { maxTokens = JSON.parse(body.toString('utf8')).max_tokens; } catch { /* not JSON: eligibility refuses it */ }
+  const el = failoverEligibility({
+    policy: ctx.failover, state: ctx.failoverState, method: req.method, url: req.url, provider: ctx.provider,
+    pinned: ctx.pinnedIndex != null, allQuota: allQuota || immediate, unservableMs, bodyBytes: body.length, maxTokens: Number(maxTokens) || 0,
+    contentEncoding: /** @type {string|undefined} */ (req.headers['content-encoding']) ?? null,
+  });
+  if (!el.ok) {
+    if (Date.now() - (ctx.failoverState.lastSkipLogAt || 0) > 30_000) {
+      ctx.failoverState.lastSkipLogAt = Date.now();
+      console.log(`[TeamClaude] No account can serve; failover not used: ${"why" in el ? el.why : ""}`);
+    }
+    return false;
+  }
+  return serveFromFailover(req, res, body, ctx);
+}
+
+/**
+ * Serve one request from the local failover model. Returns false — having
  * written nothing — when the local server cannot be reached or answers with an
- * error, so the caller falls back to today's 429: a client is better served by
- * "retry later" than by a local model's own error text.
+ * error, so the caller falls back to today's 429 (a client is better served by
+ * "retry later" than by a local model's own error). Once headers are sent it
+ * always returns true: a stream that fails midway is cut, never followed by a
+ * second response.
  * @param {any} req @param {any} res @param {Buffer} body @param {any} ctx
  */
 async function serveFromFailover(req, res, body, ctx) {
   const p = ctx.failover; const st = ctx.failoverState;
-  const out = bodyForFailover(body, p.model);
+  const out = bodyForFailover(body, p.model, p.contextTokens);
   if (!out) return false;
   st.inFlight++;
   try {
@@ -2437,38 +2475,54 @@ async function serveFromFailover(req, res, body, ctx) {
     if (p.apiKey) { headers['x-api-key'] = p.apiKey; headers.authorization = `Bearer ${p.apiKey}`; }
     const signals = [AbortSignal.timeout(p.timeoutSeconds * 1000)];
     if (ctx.signal) signals.push(ctx.signal);
+    const signal = AbortSignal.any(signals);
     let r;
     try {
-      r = await fetch(`${p.url}/v1/messages`, { method: 'POST', headers, body: /** @type {any} */ (out), signal: AbortSignal.any(signals) });
+      // redirect: 'error' — the conversation and the key go to the configured
+      // server only, never to wherever a redirect points.
+      r = await fetch(`${p.url}/v1/messages`, { method: 'POST', headers, body: /** @type {any} */ (out), signal, redirect: 'error' });
     } catch (err) {
       st.refused++;
-      console.error(`[TeamClaude] Failover to the local model failed: ${safeLine(/** @type {Error} */ (err).message, 200)}`);
+      console.error(`[TeamClaude] Failover: the local model could not be reached (${safeLine(String(/** @type {any} */ (err).cause?.code || /** @type {any} */ (err).cause?.message || /** @type {Error} */ (err).message || 'error'), 80)})`);
       return false;
     }
     if (!r.ok) {
-      const text = await r.text().catch(() => '');
+      await r.body?.cancel().catch(() => {});
       st.refused++;
-      console.error(`[TeamClaude] Failover: the local model answered ${r.status} (${safeLine(text, 200)}) — answering 429 instead`);
+      // Status only: the local server's error text can echo the request.
+      console.error(`[TeamClaude] Failover: the local model answered ${r.status}; answering 429 instead`);
       return false;
     }
     st.served++; st.lastAt = Date.now(); st.lastClient = ctx.client ?? null;
+    st.noteServedSession(ctx.sessionId);
     ctx.status = 200; ctx.account = `(failover: ${p.model})`; ctx.model = p.model;
     const who = ctx.client ? `"${safeLine(ctx.client, 64)}"` : '(shared key)';
     console.log(`[TeamClaude] FAILOVER: no Claude account can serve — served by local model "${safeLine(p.model, 64)}" for ${who}${ctx.fableAllowedClient ? ' (a Fable-allowed client: JP\'s own session is on the local model)' : ''}`);
-    if (!res.headersSent) {
-      res.writeHead(200, {
-        'Content-Type': r.headers.get('content-type') || 'application/json',
-        'x-teamclaude-failover': `local/${p.model}`,
-        'Cache-Control': 'no-cache',
-      });
-    }
-    if (r.body) {
-      for await (const chunk of r.body) {
-        if (clientGone(res)) { ctx.abandoned = true; break; }
-        res.write(chunk);
+    res.writeHead(200, {
+      'Content-Type': r.headers.get('content-type') || 'application/json',
+      'x-teamclaude-failover': `local/${p.model}`,
+      'Cache-Control': 'no-cache',
+    });
+    try {
+      if (r.body) {
+        for await (const chunk of r.body) {
+          if (clientGone(res)) { ctx.abandoned = true; break; }
+          // Backpressure: a slow client must not make this buffer the whole answer.
+          if (!res.write(chunk)) {
+            await new Promise((resolve) => { res.once('drain', resolve); res.once('close', resolve); });
+          }
+        }
       }
+      if (!res.writableEnded && !clientGone(res)) res.end();
+      if (!ctx.abandoned) ctx.delivered = true;   // a served session, not a starved one
+    } catch (err) {
+      // Headers are out: cut the response rather than write a second one.
+      ctx.status = 502;
+      console.error(`[TeamClaude] Failover: the local stream failed midway (${safeLine(String(/** @type {any} */ (err).cause?.code || /** @type {any} */ (err).cause?.message || /** @type {Error} */ (err).message || 'error'), 80)}); closing the response`);
+      res.destroy();
+    } finally {
+      if (ctx.abandoned) await r.body?.cancel().catch(() => {});
     }
-    if (!res.writableEnded) res.end();
     return true;
   } finally {
     st.inFlight--;
@@ -2646,24 +2700,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
     // Local-model failover: ahead of holding or answering 429, so agents
     // degrade instead of stopping. Guards and reasons live in failover.js.
-    if (ctx.failover?.enabled && ctx.failoverState) {
-      const unservableMs = ctx.failoverState.noteUnservable();
-      const live = accountManager.getStatus().accounts.filter((/** @type {any} */ a) => !a.disabled);
-      const allQuota = live.length > 0 && live.every((/** @type {any} */ a) => a.unavailable === 'quota');
-      let maxTokens;
-      try { maxTokens = JSON.parse(body.toString('utf8')).max_tokens; } catch { /* not JSON: eligibility refuses it */ }
-      const el = failoverEligibility({
-        policy: ctx.failover, state: ctx.failoverState, method: req.method, url: req.url, provider: ctx.provider,
-        pinned: false, allQuota, unservableMs, bodyBytes: body.length, maxTokens: Number(maxTokens) || 0,
-        contentEncoding: /** @type {string|undefined} */ (req.headers['content-encoding']) ?? null,
-      });
-      if (el.ok) {
-        if (await serveFromFailover(req, res, body, ctx)) return;
-      } else if (Date.now() - (ctx.failoverState.lastSkipLogAt || 0) > 30_000) {
-        ctx.failoverState.lastSkipLogAt = Date.now();
-        console.log(`[TeamClaude] No account can serve; failover not used: ${"why" in el ? el.why : ""}`);
-      }
-    }
+    if (await maybeFailover(req, res, body, ctx, accountManager, { immediate: false })) return;
     ctx.status = 429;
     ctx.account = '(none available)';
     const status = accountManager.getStatus();
@@ -2709,7 +2746,6 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
   // Track which account handles this request
   ctx.account = account.name;
-  ctx.failoverState?.noteServable();   // the fleet can serve again: failover's clock resets
   // Pin this session to the serving account for the model's weekly bucket (for
   // affinity) and keep it "active" in the running-sessions readout. Passive when
   // distribution is off.
@@ -2852,6 +2888,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // this is what lets a revalidation probe (a throttled account selected by
     // _selectProbe) clear its own hold and return the fleet to service.
     if (upstreamRes.status !== 429) accountManager.clearRateLimited(account.index);
+    // An account answered successfully: the fleet can serve, failover's clock resets.
+    if (upstreamRes.status < 400) ctx.failoverState?.noteServable();
 
     // Two kinds of 429 are handled differently below: a quota rejection rotates
     // to another account; a transient rate-limit throttle pauses + retries the
@@ -3036,6 +3074,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // Longer retry-after (or retries exhausted): don't hold the connection and
       // don't rotate — surface the 429 with retry-after so the client backs off.
       // The pause above keeps other requests off this account meanwhile.
+      // With failover on and no other account able to serve, this is the fleet
+      // being out, not a blip (a blip would have been absorbed above): answer
+      // from the local model now instead.
+      if (await maybeFailover(req, res, body, ctx, accountManager, { immediate: true })) return;
       console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — retry-after ${retryAfter}s over inline cap; returning 429 to client (no switch)`);
       ctx.status = 429;
       if (!res.headersSent && !clientGone(res)) {

@@ -34,12 +34,25 @@ export function failoverPolicy(config) {
   };
 }
 
+/** The least room an answer needs in the local window. */
+export const MIN_ANSWER_TOKENS = 1024;
+
+/**
+ * Rough input size of a request body in tokens. JSON with tool schemas and
+ * prose runs ~4 bytes per token; digit-heavy text is denser, so this is an
+ * estimate the local server's own refusal backs up, not a guarantee.
+ * @param {number} bytes
+ */
+export function estimateInputTokens(bytes) { return Math.ceil(bytes / 4); }
+
 /** Shared failover state for one proxy (plain, MITM and h2 listeners alike). */
 export class FailoverState {
   constructor(now = () => Date.now()) {
     this._now = now;
     /** @type {number|null} when the fleet was first seen unable to serve */
     this.unavailableSince = null;
+    /** @type {number|null} */
+    this.lastUnservableAt = null;
     this.inFlight = 0;
     this.served = 0;
     this.refused = 0;
@@ -47,12 +60,36 @@ export class FailoverState {
     this.lastAt = null;
     /** @type {string|null} */
     this.lastClient = null;
+    /** Sessions a local model answered, with when: the only conversations
+     * prepareForClaude may repair (provenance, not a guess from the body).
+     * @type {Map<string, number>} */
+    this.sessions = new Map();
   }
-  /** An account served (or was selected for) a request: the fleet is back. */
-  noteServable() { this.unavailableSince = null; }
-  /** No account could serve this request. @returns {number} ms the fleet has been unservable */
-  noteUnservable() {
+  /** @param {string|null|undefined} sessionId */
+  noteServedSession(sessionId) {
+    if (!sessionId) return;
     const now = this._now();
+    this.sessions.set(sessionId, now);
+    // Bounded: forget sessions older than a day, and keep at most 5000.
+    if (this.sessions.size > 5000) for (const [k, t] of this.sessions) { if (now - t > 86_400_000 || this.sessions.size > 5000) this.sessions.delete(k); else break; }
+  }
+  /** @param {string|null|undefined} sessionId */
+  servedLocally(sessionId) {
+    const t = sessionId ? this.sessions.get(sessionId) : undefined;
+    return t != null && this._now() - t < 86_400_000;
+  }
+  /** An account answered a request successfully: the fleet is back. */
+  noteServable() { this.unavailableSince = null; }
+  /**
+   * No account could serve this request. A clock left running by an old blip
+   * (nothing succeeded afterwards to reset it) restarts after a quiet gap, so a
+   * momentary throttle hours later is not mistaken for a long outage.
+   * @param {number} [quietGapMs] @returns {number} ms the fleet has been unservable
+   */
+  noteUnservable(quietGapMs = 60_000) {
+    const now = this._now();
+    if (this.lastUnservableAt != null && now - this.lastUnservableAt > quietGapMs) this.unavailableSince = null;
+    this.lastUnservableAt = now;
     this.unavailableSince ??= now;
     return now - this.unavailableSince;
   }
@@ -88,9 +125,13 @@ export function failoverEligibility(a) {
   if (a.pinned) return { ok: false, why: 'pinned to one account' };
   if (a.contentEncoding && a.contentEncoding !== 'identity') return { ok: false, why: 'compressed body' };
   if (!a.allQuota && a.unservableMs < policy.afterSeconds * 1000) return { ok: false, why: `fleet unservable for ${Math.round(a.unservableMs / 1000)}s < ${policy.afterSeconds}s` };
-  // ~3.5 bytes per token is a conservative (over-)estimate for English/code JSON.
-  const estTokens = Math.ceil(a.bodyBytes / 3.5) + (a.maxTokens || 0);
-  if (estTokens > policy.contextTokens) return { ok: false, why: `~${estTokens} tokens exceeds the local window (${policy.contextTokens})` };
+  // Best effort, not a guarantee (see estimateInputTokens). A request that
+  // still overflows is rejected by the local server, which serveFromFailover
+  // turns into a 429.
+  // The input must fit with room to answer; max_tokens is not charged in full
+  // here — bodyForFailover clamps it to the room that is left.
+  const estInput = estimateInputTokens(a.bodyBytes);
+  if (estInput > policy.contextTokens - MIN_ANSWER_TOKENS) return { ok: false, why: `~${estInput} input tokens leaves no room in the local window (${policy.contextTokens})` };
   if (a.state.inFlight >= policy.maxConcurrent) return { ok: false, why: `local model busy (${a.state.inFlight}/${policy.maxConcurrent})` };
   return { ok: true };
 }
@@ -98,14 +139,17 @@ export function failoverEligibility(a) {
 /**
  * The request body as the local model gets it: its model name, no thinking
  * (its blocks would be unsigned), and no unsigned thinking from earlier turns.
- * @param {Buffer} body @param {string} model
+ * max_tokens is clamped to the room the input leaves in the local window.
+ * @param {Buffer} body @param {string} model @param {number} [contextTokens]
  * @returns {Buffer|null} null when the body is not a JSON object
  */
-export function bodyForFailover(body, model) {
+export function bodyForFailover(body, model, contextTokens = 131072) {
   let obj;
   try { obj = JSON.parse(body.toString('utf8')); } catch { return null; }
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
   obj.model = model;
+  const room = contextTokens - estimateInputTokens(body.length);
+  if (Number.isFinite(obj.max_tokens) && obj.max_tokens > room) obj.max_tokens = Math.max(MIN_ANSWER_TOKENS, room);
   delete obj.thinking;
   obj.chat_template_kwargs = { ...(obj.chat_template_kwargs || {}), enable_thinking: false };
   stripUnsignedThinking(obj);
@@ -118,7 +162,12 @@ function stripUnsignedThinking(obj) {
   for (const m of Array.isArray(obj?.messages) ? obj.messages : []) {
     if (!Array.isArray(m?.content)) continue;
     const kept = m.content.filter((/** @type {any} */ b) => !(b && b.type === 'thinking' && !b.signature));
-    if (kept.length !== m.content.length) { m.content = kept; changed = true; }
+    if (kept.length !== m.content.length) {
+      // A message that held only unsigned thinking must not become empty: the
+      // API rejects empty content.
+      m.content = kept.length ? kept : [{ type: 'text', text: '(no content)' }];
+      changed = true;
+    }
   }
   return changed;
 }
@@ -129,9 +178,12 @@ function stripUnsignedThinking(obj) {
  *   * unsigned thinking blocks (from a local model) are removed — Claude
  *     rejects a thinking block whose signature it cannot verify;
  *   * with thinking enabled, the last assistant turn must open with a thinking
- *     block when it carries tool_use; a local turn never does, so for that one
- *     request thinking is switched off instead of answering 400.
- * Anything else — and any body that never saw failover — is left byte-for-byte.
+ *     block when it carries tool_use; a local turn never does, so when that
+ *     turn is provably local (a tool_use id without Claude's "toolu_" prefix)
+ *     thinking is switched off for that one request instead of answering 400.
+ * Called only for sessions FailoverState.servedLocally() knows a local model
+ * answered (provenance); every other conversation is never touched. Within
+ * such a session, anything that needs no repair is left byte-for-byte.
  * @param {Buffer} body
  * @returns {{ body: Buffer, changed: boolean, droppedThinking: boolean }}
  */
@@ -148,8 +200,11 @@ export function prepareForClaude(body) {
   if (thinkingOn) {
     const lastAssistant = [...obj.messages].reverse().find((/** @type {any} */ m) => m?.role === 'assistant');
     const blocks = Array.isArray(lastAssistant?.content) ? lastAssistant.content : null;
-    if (blocks && blocks.some((/** @type {any} */ b) => b?.type === 'tool_use')
-      && !(blocks[0]?.type === 'thinking' || blocks[0]?.type === 'redacted_thinking')) {
+    // Only on evidence the turn is the local model's: Claude's tool_use ids all
+    // start with "toolu_", llama-server's do not. Never because thinking is
+    // merely absent — under adaptive thinking Claude may skip it on a turn.
+    const localToolUse = blocks && blocks.some((/** @type {any} */ b) => b?.type === 'tool_use' && typeof b.id === 'string' && !b.id.startsWith('toolu_'));
+    if (localToolUse && !(blocks[0]?.type === 'thinking' || blocks[0]?.type === 'redacted_thinking')) {
       delete obj.thinking;
       droppedThinking = true;
       changed = true;

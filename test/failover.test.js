@@ -57,7 +57,7 @@ test('prepareForClaude: removes unsigned thinking; turns thinking off when the l
     model: 'claude-opus-5-5', thinking: { type: 'enabled', budget_tokens: 1000 },
     messages: [{ role: 'user', content: 'go' }, localTurn, { role: 'user', content: [{ type: 'tool_result', tool_use_id: '3NmpfhQ1nmy4qXWC', content: 'ok' }] }],
   }));
-  const r = prepareForClaude(back);
+  const r = prepareForClaude(back, (id) => id === '3NmpfhQ1nmy4qXWC');
   assert.equal(r.droppedThinking, true);
   assert.equal(JSON.parse(r.body.toString()).thinking, undefined);
   const signed = Buffer.from(JSON.stringify({
@@ -71,7 +71,9 @@ test('prepareForClaude: removes unsigned thinking; turns thinking off when the l
   // tool_use (id "toolu_…") is NOT touched.
   const adaptive = Buffer.from(JSON.stringify({ model: 'claude-opus-5-5', thinking: { type: 'adaptive' },
     messages: [{ role: 'user', content: 'go' }, { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_01AbC', name: 'Read', input: {} }] }, { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_01AbC', content: 'ok' }] }] }));
-  assert.equal(prepareForClaude(adaptive).body, adaptive);
+  assert.equal(prepareForClaude(adaptive, () => false).body, adaptive);
+  // A local-looking id the local model never emitted is not evidence either.
+  assert.equal(prepareForClaude(back, () => false).droppedThinking, false);
   const onlyThinking = Buffer.from(JSON.stringify({ model: 'm', messages: [{ role: 'assistant', content: [{ type: 'thinking', thinking: 'x', signature: '' }] }] }));
   assert.deepEqual(JSON.parse(prepareForClaude(onlyThinking).body.toString()).messages[0].content, [{ type: 'text', text: '(no content)' }], 'never left empty');
   const unsigned = Buffer.from(JSON.stringify({ model: 'm', messages: [{ role: 'assistant', content: [{ type: 'thinking', thinking: 'x', signature: '' }, { type: 'text', text: 'a' }] }] }));
@@ -79,22 +81,23 @@ test('prepareForClaude: removes unsigned thinking; turns thinking off when the l
 });
 
 // ── through the real proxy ───────────────────────────────────────────────
-async function setup({ failover = {}, exhausted = true, localStatus = 200, claudeHits = [], claude429 = false, localMode = 'ok', redirectTo = 'http://127.0.0.1:9/v1/messages' } = {}) {
+async function setup({ failover = {}, exhausted = true, localStatus = 200, claudeHits = [], claude429 = false, localMode = 'ok', redirectTo = 'http://127.0.0.1:9/v1/messages', tokenizeCount = null, claudeRetryAfter = '3600', claudeBurst = false } = {}) {
   const localSeen = [];
   const local = http.createServer((req, res) => {
     let raw = ''; req.on('data', (c) => { raw += c; }); req.on('end', () => {
+      if (req.url === '/tokenize') { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ tokens: new Array(tokenizeCount ?? Math.ceil(raw.length / 4)).fill(1) })); return; }
       localSeen.push({ body: JSON.parse(raw), auth: req.headers['x-api-key'] ?? null });
       if (localMode === 'redirect') { res.writeHead(307, { location: redirectTo }); res.end(); return; }
       if (localMode === 'cut') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write('event: message_start\ndata: {"type":"message_start"}\n\n'); setTimeout(() => res.socket.destroy(), 50); return; }
       if (localStatus !== 200) { res.writeHead(localStatus, { 'content-type': 'application/json' }); res.end('{"error":{"message":"context too long"}}'); return; }
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ id: 'l1', type: 'message', role: 'assistant', model: LOCAL, content: [{ type: 'text', text: 'local says hi' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } }));
+      res.end(JSON.stringify({ id: 'l1', type: 'message', role: 'assistant', model: LOCAL, content: [{ type: 'text', text: 'local says hi' }, { type: 'tool_use', id: 'LoCaL123', name: 'Read', input: { p: 'x' } }], stop_reason: 'tool_use', usage: { input_tokens: 1, output_tokens: 1 } }));
     });
   });
   const claude = http.createServer((req, res) => {
     let raw = ''; req.on('data', (c) => { raw += c; }); req.on('end', () => {
       claudeHits.push(JSON.parse(raw));
-      if (claude429) { res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '3600', 'anthropic-ratelimit-unified-status': 'rejected' }); res.end('{"type":"error","error":{"type":"rate_limit_error","message":"out"}}'); return; }
+      if (claude429) { res.writeHead(429, { 'content-type': 'application/json', 'retry-after': claudeRetryAfter, ...(claudeBurst ? { 'anthropic-ratelimit-requests-remaining': '0' } : { 'anthropic-ratelimit-unified-status': 'rejected' }) }); res.end('{"type":"error","error":{"type":"rate_limit_error","message":"out"}}'); return; }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ id: 'c1', type: 'message', role: 'assistant', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'claude' }], usage: { input_tokens: 1, output_tokens: 1 } }));
     });
@@ -258,4 +261,26 @@ test('a stale clock from an old blip restarts: a later momentary throttle is not
   assert.equal(st.noteUnservable(60_000), 0, 'restarted after the quiet gap');
   now += 5_000;
   assert.equal(st.noteUnservable(60_000), 5_000, 'a continuing outage keeps counting');
+});
+
+test('the local tokenizer decides fit: a request it counts too large is not sent', async () => {
+  const t = await setup({ tokenizeCount: 200_000 });
+  try {
+    const res = await t.post(MSG);
+    await res.text();
+    assert.equal(res.status, 429);
+    assert.equal(t.localSeen.length, 0);
+    assert.ok(t.logs.some((l) => /input tokens \(local count\) leaves no room/.test(l)), t.logs.join('\n'));
+  } finally { t.close(); }
+});
+
+test('short retries that merely ran out keep the hysteresis wait (no immediate failover)', async () => {
+  // A burst throttle (requests-remaining 0, retry-after 1), not a quota rejection.
+  const t = await setup({ exhausted: false, claude429: true, claudeRetryAfter: '1', claudeBurst: true });
+  try {
+    const res = await t.post(MSG);
+    await res.text();
+    assert.equal(res.status, 429);
+    assert.equal(t.localSeen.length, 0);
+  } finally { t.close(); }
 });

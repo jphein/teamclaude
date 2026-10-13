@@ -64,11 +64,24 @@ export class FailoverState {
      * prepareForClaude may repair (provenance, not a guess from the body).
      * @type {Map<string, number>} */
     this.sessions = new Map();
+    /** tool_use ids the local model emitted: per-turn evidence for the repair.
+     * @type {Set<string>} */
+    this.localToolIds = new Set();
+  }
+  /** Record the tool_use ids in a local response (its raw JSON or SSE text). @param {string} text */
+  noteLocalToolIds(text) {
+    const re = /"type"\s*:\s*"tool_use"\s*,\s*"id"\s*:\s*"([^"]+)"|"id"\s*:\s*"([^"]+)"\s*,\s*"type"\s*:\s*"tool_use"/g;
+    for (const m of text.matchAll(re)) this.localToolIds.add(m[1] ?? m[2]);
+    // Bounded: drop the oldest beyond 20000 (Set keeps insertion order).
+    for (const id of this.localToolIds) { if (this.localToolIds.size <= 20000) break; this.localToolIds.delete(id); }
   }
   /** @param {string|null|undefined} sessionId */
   noteServedSession(sessionId) {
+    // In memory: after a restart a returning conversation is not repaired (a
+    // turn mid tool-loop may then get one 400 from Claude before it moves on).
     if (!sessionId) return;
     const now = this._now();
+    this.sessions.delete(sessionId);   // re-insert: an active session is the newest, never the first evicted
     this.sessions.set(sessionId, now);
     // Bounded: forget sessions older than a day, and keep at most 5000.
     if (this.sessions.size > 5000) for (const [k, t] of this.sessions) { if (now - t > 86_400_000 || this.sessions.size > 5000) this.sessions.delete(k); else break; }
@@ -141,14 +154,15 @@ export function failoverEligibility(a) {
  * (its blocks would be unsigned), and no unsigned thinking from earlier turns.
  * max_tokens is clamped to the room the input leaves in the local window.
  * @param {Buffer} body @param {string} model @param {number} [contextTokens]
+ * @param {number|null} [inputTokens]  the local tokenizer's count, when known
  * @returns {Buffer|null} null when the body is not a JSON object
  */
-export function bodyForFailover(body, model, contextTokens = 131072) {
+export function bodyForFailover(body, model, contextTokens = 131072, inputTokens = null) {
   let obj;
   try { obj = JSON.parse(body.toString('utf8')); } catch { return null; }
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
   obj.model = model;
-  const room = contextTokens - estimateInputTokens(body.length);
+  const room = contextTokens - (inputTokens ?? estimateInputTokens(body.length));
   if (Number.isFinite(obj.max_tokens) && obj.max_tokens > room) obj.max_tokens = Math.max(MIN_ANSWER_TOKENS, room);
   delete obj.thinking;
   obj.chat_template_kwargs = { ...(obj.chat_template_kwargs || {}), enable_thinking: false };
@@ -179,15 +193,16 @@ function stripUnsignedThinking(obj) {
  *     rejects a thinking block whose signature it cannot verify;
  *   * with thinking enabled, the last assistant turn must open with a thinking
  *     block when it carries tool_use; a local turn never does, so when that
- *     turn is provably local (a tool_use id without Claude's "toolu_" prefix)
- *     thinking is switched off for that one request instead of answering 400.
+ *     turn is provably local (its tool_use id is one the local model was
+ *     recorded emitting) thinking is switched off for that one request instead
+ *     of answering 400.
  * Called only for sessions FailoverState.servedLocally() knows a local model
  * answered (provenance); every other conversation is never touched. Within
  * such a session, anything that needs no repair is left byte-for-byte.
- * @param {Buffer} body
+ * @param {Buffer} body @param {(id: string) => boolean} [isLocalToolId]
  * @returns {{ body: Buffer, changed: boolean, droppedThinking: boolean }}
  */
-export function prepareForClaude(body) {
+export function prepareForClaude(body, isLocalToolId = () => false) {
   const same = { body, changed: false, droppedThinking: false };
   const text = body.toString('utf8');
   if (!text.includes('"thinking"') && !text.includes('"tool_use"')) return same;
@@ -200,10 +215,11 @@ export function prepareForClaude(body) {
   if (thinkingOn) {
     const lastAssistant = [...obj.messages].reverse().find((/** @type {any} */ m) => m?.role === 'assistant');
     const blocks = Array.isArray(lastAssistant?.content) ? lastAssistant.content : null;
-    // Only on evidence the turn is the local model's: Claude's tool_use ids all
-    // start with "toolu_", llama-server's do not. Never because thinking is
-    // merely absent — under adaptive thinking Claude may skip it on a turn.
-    const localToolUse = blocks && blocks.some((/** @type {any} */ b) => b?.type === 'tool_use' && typeof b.id === 'string' && !b.id.startsWith('toolu_'));
+    // Only on evidence the turn is the local model's: a tool_use id the local
+    // model was recorded emitting (FailoverState.noteLocalToolIds). Never
+    // because thinking is merely absent — under adaptive thinking Claude may
+    // skip it on a turn — and never from an id's naming convention.
+    const localToolUse = blocks && blocks.some((/** @type {any} */ b) => b?.type === 'tool_use' && typeof b.id === 'string' && isLocalToolId(b.id));
     if (localToolUse && !(blocks[0]?.type === 'thinking' || blocks[0]?.type === 'redacted_thinking')) {
       delete obj.thinking;
       droppedThinking = true;
@@ -211,4 +227,25 @@ export function prepareForClaude(body) {
     }
   }
   return changed ? { body: Buffer.from(JSON.stringify(obj), 'utf8'), changed, droppedThinking } : same;
+}
+
+/**
+ * The local server's own token count for this request (llama-server
+ * /tokenize), with a 5% allowance for its chat template. null when it cannot
+ * be asked — the caller then falls back to the byte estimate.
+ * @param {ReturnType<typeof failoverPolicy>} policy @param {string} text @param {AbortSignal} [signal]
+ * @returns {Promise<number|null>}
+ */
+export async function countLocalTokens(policy, text, signal) {
+  try {
+    /** @type {Record<string, string>} */
+    const headers = { 'content-type': 'application/json' };
+    if (policy.apiKey) { headers['x-api-key'] = policy.apiKey; headers.authorization = `Bearer ${policy.apiKey}`; }
+    const sigs = [AbortSignal.timeout(15_000)];
+    if (signal) sigs.push(signal);
+    const r = await fetch(`${policy.url}/tokenize`, { method: 'POST', headers, body: JSON.stringify({ content: text }), signal: AbortSignal.any(sigs), redirect: 'error' });
+    if (!r.ok) { await r.body?.cancel().catch(() => {}); return null; }
+    const j = /** @type {any} */ (await r.json());
+    return Array.isArray(j?.tokens) ? Math.ceil(j.tokens.length * 1.05) : null;
+  } catch { return null; }
 }

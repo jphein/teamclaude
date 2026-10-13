@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, FailoverState } from './failover.js';
+import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, countLocalTokens, MIN_ANSWER_TOKENS, FailoverState } from './failover.js';
 import { fablePolicy, rewriteFableBody, fableModelIn, isFableModel, clientAllowed, FableStats } from './fable-policy.js';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
@@ -1541,7 +1541,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // Only sessions failover actually served — every other body is untouched.
       const failover = failoverPolicy(config);
       if (failover.enabled && !req.headers['content-encoding'] && failoverState.servedLocally(sessionId)) {
-        const fixed = prepareForClaude(body);
+        const fixed = prepareForClaude(body, (id) => failoverState.localToolIds.has(id));
         if (fixed.changed) {
           body = fixed.body;
           if (fixed.droppedThinking) console.log('[TeamClaude] Failover repair: thinking off for this turn (the last assistant tool_use came from the local model and has no thinking block)');
@@ -2419,6 +2419,23 @@ export function isTransientUpstreamError(err, { otherHostAvailable = false } = {
 }
 
 /**
+ * Resolve when `res` drains, closes or errors, or `signal` aborts — whichever
+ * comes first — removing every listener it added.
+ * @param {any} res @param {AbortSignal} signal
+ */
+function waitForDrain(res, signal) {
+  return new Promise((resolve) => {
+    const done = () => {
+      res.off('drain', done); res.off('close', done); res.off('error', done);
+      signal.removeEventListener('abort', done);
+      resolve(undefined);
+    };
+    res.on('drain', done); res.on('close', done); res.on('error', done);
+    if (signal.aborted) done(); else signal.addEventListener('abort', done, { once: true });
+  });
+}
+
+/**
  * Fail over when the WHOLE fleet cannot serve this request (not merely this
  * request's tried set) and the guards in failover.js allow it. `immediate`
  * skips the hysteresis wait: the caller already knows this is not a blip (a
@@ -2465,17 +2482,23 @@ async function maybeFailover(req, res, body, ctx, accountManager, { immediate })
  */
 async function serveFromFailover(req, res, body, ctx) {
   const p = ctx.failover; const st = ctx.failoverState;
-  const out = bodyForFailover(body, p.model, p.contextTokens);
-  if (!out) return false;
-  st.inFlight++;
+  st.inFlight++;   // before any await: eligibility's capacity check stays race-free
   try {
+    const signals = [AbortSignal.timeout(p.timeoutSeconds * 1000)];
+    if (ctx.signal) signals.push(ctx.signal);
+    const signal = AbortSignal.any(signals);
+    // The local tokenizer's count where it answers; the byte estimate otherwise.
+    const inputTokens = await countLocalTokens(p, body.toString('utf8'), signal);
+    if (inputTokens != null && inputTokens > p.contextTokens - MIN_ANSWER_TOKENS) {
+      console.log(`[TeamClaude] Failover not used: ${inputTokens} input tokens (local count) leaves no room in the local window (${p.contextTokens})`);
+      return false;
+    }
+    const out = bodyForFailover(body, p.model, p.contextTokens, inputTokens);
+    if (!out) return false;
     /** @type {Record<string, string>} */
     const headers = { 'content-type': 'application/json', 'anthropic-version': String(req.headers['anthropic-version'] || '2023-06-01') };
     if (req.headers.accept) headers.accept = String(req.headers.accept);
     if (p.apiKey) { headers['x-api-key'] = p.apiKey; headers.authorization = `Bearer ${p.apiKey}`; }
-    const signals = [AbortSignal.timeout(p.timeoutSeconds * 1000)];
-    if (ctx.signal) signals.push(ctx.signal);
-    const signal = AbortSignal.any(signals);
     let r;
     try {
       // redirect: 'error' — the conversation and the key go to the configured
@@ -2503,16 +2526,25 @@ async function serveFromFailover(req, res, body, ctx) {
       'x-teamclaude-failover': `local/${p.model}`,
       'Cache-Control': 'no-cache',
     });
+    // The local model's tool_use ids, recorded so a later fail-back repair acts
+    // only on turns it really wrote. Bounded; decoding is per chunk.
+    const decoder = new TextDecoder();
+    let seen = '';
     try {
       if (r.body) {
         for await (const chunk of r.body) {
           if (clientGone(res)) { ctx.abandoned = true; break; }
-          // Backpressure: a slow client must not make this buffer the whole answer.
+          if (seen.length < 8 * 1024 * 1024) seen += decoder.decode(chunk, { stream: true });
+          // Backpressure: a slow client must not make this buffer the whole
+          // answer — and a client that stops reading must not hold the slot
+          // past the timeout.
           if (!res.write(chunk)) {
-            await new Promise((resolve) => { res.once('drain', resolve); res.once('close', resolve); });
+            await waitForDrain(res, signal);
+            if (signal.aborted) throw new Error('the client stopped reading until the timeout');
           }
         }
       }
+      st.noteLocalToolIds(seen);
       if (!res.writableEnded && !clientGone(res)) res.end();
       if (!ctx.abandoned) ctx.delivered = true;   // a served session, not a starved one
     } catch (err) {
@@ -3074,10 +3106,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // Longer retry-after (or retries exhausted): don't hold the connection and
       // don't rotate — surface the 429 with retry-after so the client backs off.
       // The pause above keeps other requests off this account meanwhile.
-      // With failover on and no other account able to serve, this is the fleet
-      // being out, not a blip (a blip would have been absorbed above): answer
-      // from the local model now instead.
-      if (await maybeFailover(req, res, body, ctx, accountManager, { immediate: true })) return;
+      // With failover on and no other account able to serve, a long retry-after
+      // is the fleet being out, not a blip: answer from the local model now.
+      // Short retries that merely ran out keep the hysteresis wait.
+      if (await maybeFailover(req, res, body, ctx, accountManager, { immediate: retryAfter > RATE_LIMIT_ABSORB_MAX_SECONDS })) return;
       console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — retry-after ${retryAfter}s over inline cap; returning 429 to client (no switch)`);
       ctx.status = 429;
       if (!res.headersSent && !clientGone(res)) {

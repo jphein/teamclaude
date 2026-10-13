@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, FailoverState } from './failover.js';
 import { fablePolicy, rewriteFableBody, fableModelIn, isFableModel, clientAllowed, FableStats } from './fable-policy.js';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
@@ -244,6 +245,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // Fable rationing counters for the dashboard (fable-policy.js): one object on
   // hooks, so every listener built from them (plain, MITM, h2) counts into it.
   const fableStats = /** @type {any} */ (hooks).fableStats ||= new FableStats();
+  const failoverState = /** @type {any} */ (hooks).failoverState ||= new FailoverState();
   const holdMs = (config.holdSeconds || 0) * 1000;
 
   // The log directory is made up front and synchronously, so a path that
@@ -486,7 +488,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // upstream-fetch.js), never which origins or requests.
         const fp = fablePolicy(config);
         const fable = { enabled: fp.enabled, allow: [...fp.allow], model: fp.model, ...fableStats.snapshot() };
-        res.end(JSON.stringify({ ...extra, ...status, fable, upstreamPool: upstreamPoolStatus() }, null, 2));
+        const failover = failoverState.snapshot(failoverPolicy(config));
+        res.end(JSON.stringify({ ...extra, ...status, fable, failover, upstreamPool: upstreamPoolStatus() }, null, 2));
         return;
       }
 
@@ -1277,6 +1280,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
   // Shared with createProxyServer's status endpoint through hooks; a listener
   // built on its own (tests, embedders) keeps a private one.
   const fableStats = /** @type {any} */ (hooks).fableStats ||= new FableStats();
+  const failoverState = /** @type {any} */ (hooks).failoverState ||= new FailoverState();
   let counter = 0;
   return async (req, res) => {
     // The activity entry this request opened, while it is still open. Every
@@ -1531,6 +1535,19 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         }
       }
 
+      // Local-model failover (failover.js): when it is on, a conversation that
+      // comes back from failover turns is repaired before Claude sees it
+      // (unsigned thinking removed; thinking off for a turn whose last assistant
+      // tool_use has none). Without failover on, bodies pass byte-for-byte.
+      const failover = failoverPolicy(config);
+      if (failover.enabled && !req.headers['content-encoding']) {
+        const fixed = prepareForClaude(body);
+        if (fixed.changed) {
+          body = fixed.body;
+          if (fixed.droppedThinking) console.log('[TeamClaude] Failover repair: thinking off for this turn (the last assistant tool_use came from the local model and has no thinking block)');
+        }
+      }
+
       // Model blocklist (issue #116): reject a request for a blocked model right
       // here instead of forwarding it. A model no account can serve (e.g. Fable
       // once it left base plans) otherwise gets rate-limited upstream and hangs
@@ -1570,7 +1587,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), fableCapacityFallback, fableForbidden, fableDropEncoding, fableCap: Math.min(resolveMaxBodyBytes(config), 2 ** 31 - 1), fableStats, model, advisorModel, pinnedIndex, provider: providerForPath(req.url), holdBudgetMs: holdMs, sessionId, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), failover, failoverState, fableAllowedClient: fp.enabled && clientAllowed(fp, fableClient), fableCapacityFallback, fableForbidden, fableDropEncoding, fableCap: Math.min(resolveMaxBodyBytes(config), 2 ** 31 - 1), fableStats, model, advisorModel, pinnedIndex, provider: providerForPath(req.url), holdBudgetMs: holdMs, sessionId, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -2402,6 +2419,63 @@ export function isTransientUpstreamError(err, { otherHostAvailable = false } = {
 }
 
 /**
+ * Serve one request from the local failover model. Returns false — and has
+ * written nothing — when the local server cannot be reached or answers with an
+ * error, so the caller falls back to today's 429: a client is better served by
+ * "retry later" than by a local model's own error text.
+ * @param {any} req @param {any} res @param {Buffer} body @param {any} ctx
+ */
+async function serveFromFailover(req, res, body, ctx) {
+  const p = ctx.failover; const st = ctx.failoverState;
+  const out = bodyForFailover(body, p.model);
+  if (!out) return false;
+  st.inFlight++;
+  try {
+    /** @type {Record<string, string>} */
+    const headers = { 'content-type': 'application/json', 'anthropic-version': String(req.headers['anthropic-version'] || '2023-06-01') };
+    if (req.headers.accept) headers.accept = String(req.headers.accept);
+    if (p.apiKey) { headers['x-api-key'] = p.apiKey; headers.authorization = `Bearer ${p.apiKey}`; }
+    const signals = [AbortSignal.timeout(p.timeoutSeconds * 1000)];
+    if (ctx.signal) signals.push(ctx.signal);
+    let r;
+    try {
+      r = await fetch(`${p.url}/v1/messages`, { method: 'POST', headers, body: /** @type {any} */ (out), signal: AbortSignal.any(signals) });
+    } catch (err) {
+      st.refused++;
+      console.error(`[TeamClaude] Failover to the local model failed: ${safeLine(/** @type {Error} */ (err).message, 200)}`);
+      return false;
+    }
+    if (!r.ok) {
+      const text = await r.text().catch(() => '');
+      st.refused++;
+      console.error(`[TeamClaude] Failover: the local model answered ${r.status} (${safeLine(text, 200)}) — answering 429 instead`);
+      return false;
+    }
+    st.served++; st.lastAt = Date.now(); st.lastClient = ctx.client ?? null;
+    ctx.status = 200; ctx.account = `(failover: ${p.model})`; ctx.model = p.model;
+    const who = ctx.client ? `"${safeLine(ctx.client, 64)}"` : '(shared key)';
+    console.log(`[TeamClaude] FAILOVER: no Claude account can serve — served by local model "${safeLine(p.model, 64)}" for ${who}${ctx.fableAllowedClient ? ' (a Fable-allowed client: JP\'s own session is on the local model)' : ''}`);
+    if (!res.headersSent) {
+      res.writeHead(200, {
+        'Content-Type': r.headers.get('content-type') || 'application/json',
+        'x-teamclaude-failover': `local/${p.model}`,
+        'Cache-Control': 'no-cache',
+      });
+    }
+    if (r.body) {
+      for await (const chunk of r.body) {
+        if (clientGone(res)) { ctx.abandoned = true; break; }
+        res.write(chunk);
+      }
+    }
+    if (!res.writableEnded) res.end();
+    return true;
+  } finally {
+    st.inFlight--;
+  }
+}
+
+/**
  * The message behind the synthetic 429, when no account can serve the request.
  *
  * The old wording — `All N accounts exhausted. Retry in 60s.` — was wrong in
@@ -2570,6 +2644,26 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
       return;
     }
+    // Local-model failover: ahead of holding or answering 429, so agents
+    // degrade instead of stopping. Guards and reasons live in failover.js.
+    if (ctx.failover?.enabled && ctx.failoverState) {
+      const unservableMs = ctx.failoverState.noteUnservable();
+      const live = accountManager.getStatus().accounts.filter((/** @type {any} */ a) => !a.disabled);
+      const allQuota = live.length > 0 && live.every((/** @type {any} */ a) => a.unavailable === 'quota');
+      let maxTokens;
+      try { maxTokens = JSON.parse(body.toString('utf8')).max_tokens; } catch { /* not JSON: eligibility refuses it */ }
+      const el = failoverEligibility({
+        policy: ctx.failover, state: ctx.failoverState, method: req.method, url: req.url, provider: ctx.provider,
+        pinned: false, allQuota, unservableMs, bodyBytes: body.length, maxTokens: Number(maxTokens) || 0,
+        contentEncoding: /** @type {string|undefined} */ (req.headers['content-encoding']) ?? null,
+      });
+      if (el.ok) {
+        if (await serveFromFailover(req, res, body, ctx)) return;
+      } else if (Date.now() - (ctx.failoverState.lastSkipLogAt || 0) > 30_000) {
+        ctx.failoverState.lastSkipLogAt = Date.now();
+        console.log(`[TeamClaude] No account can serve; failover not used: ${"why" in el ? el.why : ""}`);
+      }
+    }
     ctx.status = 429;
     ctx.account = '(none available)';
     const status = accountManager.getStatus();
@@ -2615,6 +2709,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
   // Track which account handles this request
   ctx.account = account.name;
+  ctx.failoverState?.noteServable();   // the fleet can serve again: failover's clock resets
   // Pin this session to the serving account for the model's weekly bucket (for
   // affinity) and keep it "active" in the running-sessions readout. Passive when
   // distribution is off.

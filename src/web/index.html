@@ -598,6 +598,7 @@
   </div>
 
   <div class="svc-stats" id="fleetLine" style="margin:-0.35rem 0 0.25rem 0.25rem"></div>
+  <div id="failoverBanner" style="display:none;margin:0 0 0.875rem;padding:0.6rem 1rem;border-radius:8px;border:1px solid var(--bad);color:var(--bad);font-weight:600;background:var(--panel)"></div>
   <div class="set-intro" id="ruleLine" style="margin:0 0 0.875rem 0.25rem"></div>
   <div class="set-intro" id="fableNote" style="display:none;margin:-0.6rem 0 0.875rem 0.25rem;color:var(--warn)"></div>
 
@@ -1004,6 +1005,17 @@
     if (fb.enabled) {
       line.appendChild(el('span', { title: 'Fable allowed for: ' + ((fb.allow || []).join(', ') || 'nobody') + '. Everyone else is served as ' + fb.model + '.' },
         ['Fable ', el('b', { text: (fb.rewritten || 0) + ' rewritten to Opus today · ' + (fb.fallbacks || 0) + ' fallbacks' })]));
+    }
+    // Local-model failover: state on the fleet line, and a banner while active.
+    const fo = s.failover || {};
+    if (fo.enabled) {
+      line.appendChild(el('span', { title: 'When no Claude account can serve, requests go to the local model ' + fo.model + '.' },
+        ['failover ', el('b', { text: (fo.active ? 'ACTIVE' : 'ready') + ' · ' + (fo.served || 0) + ' served' })]));
+    }
+    const foBanner = document.getElementById('failoverBanner');
+    if (foBanner) {
+      foBanner.textContent = fo.active ? 'FAILOVER: no Claude account can serve — agents are on the local model (' + fo.model + '), slower and weaker. ' + (fo.served || 0) + ' requests served' + (fo.since ? ' since ' + new Date(fo.since).toLocaleTimeString() : '') + '. Claude takes over again as soon as an account can serve.' : '';
+      foBanner.style.display = fo.active ? '' : 'none';
     }
     const fbNote = document.getElementById('fableNote');
     if (fbNote) {

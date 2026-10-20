@@ -146,6 +146,26 @@ Only the export lines go to stdout (so `eval` is safe); a short summary and any 
 
 **Using an agent multiplexer or a tool that spawns `claude` itself?** Export this environment in the process that launches those `claude` instances — e.g. `eval "$(teamclaude env)"` in the shell you start the multiplexer from. Every spawned `claude` then gets the same routing (and MITM interception of hardcoded endpoints) without going through `teamclaude run`. The trade-off: `run`'s proxy-up/down guard only applies when you launch via `run`, so start the server before the multiplexer.
 
+### Presenting a client key (Fable/Mythos rationing)
+
+`fable.allow` and `mythos.allow` (see [configuration](configuration.md)) name **client keys**, so a session can use a rationed family only when its requests carry an allowed key. Two things on a shared host quietly replace a key you set in the environment:
+
+- **A global `env` block in `~/.claude/settings.json`.** Claude Code applies it over the process environment, so `HTTPS_PROXY=http://<key>@…` exported in the shell is overwritten by the global, key-less value. Measured 2026-10-20: the session was counted as the host's shared client, not its own.
+- **A forwarder that fills in its own key.** A local forwarder that adds the host's key when a caller sends none (familiar's does) fills the empty password of `http://<key>@…` with its own key. The proxy reads the password slot first, so the caller becomes the host again.
+
+What works, through such a forwarder too: a per-session settings file, passed with `--settings` (it outranks the user settings), with the key in **both** userinfo slots:
+
+```bash
+# once: a 0600 file next to the key (the key is read from its file, never typed on a command line)
+k=$(tr -d '\n' < ~/.config/teamclaude-client/<name>.key)
+umask 077; printf '{"env":{"HTTPS_PROXY":"http://%s:%s@127.0.0.1:3456","https_proxy":"http://%s:%s@127.0.0.1:3456"}}\n' "$k" "$k" "$k" "$k" \
+  > ~/.config/teamclaude-client/<name>.settings.json; unset k
+
+claude --settings ~/.config/teamclaude-client/<name>.settings.json   # add --resume … as usual
+```
+
+A username that is a valid client key is never read as an account pin, and a non-empty password is kept by the forwarder. Check it took: `clients.<name>.requests` in `/teamclaude/status` rises with the session's requests, and a rationed request from it logs no `rewritten` line.
+
 ### Routing plain `claude` automatically
 
 So you don't have to type `teamclaude run` every time, add a shell alias that sends plain `claude` through the proxy:

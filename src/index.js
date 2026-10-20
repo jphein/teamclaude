@@ -424,9 +424,11 @@ async function serverCommand() {
     // Pick up expiry-routing edits the same way, so the knob hot-applies.
     config.expiryRouting = diskConfig.expiryRouting;
     accountManager.setExpiryRouting(config.expiryRouting);
-    // Fable rationing is read per request off this object (server.js), so
-    // a reload applies an allow-list or fallback-model change at once.
+    // Fable and Mythos rationing are read per request off this object
+    // (server.js), so a reload applies an allow-list or fallback-model change
+    // at once.
     config.fable = diskConfig.fable;
+    config.mythos = diskConfig.mythos;
     // Failover is read per request too (failoverPolicy in server.js).
     config.failover = diskConfig.failover;
     config.sessionTitles = diskConfig.sessionTitles;

@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, countLocalTokens, estimateInputTokens, MIN_ANSWER_TOKENS, FailoverState } from './failover.js';
-import { fablePolicy, rewriteFableBody, fableModelIn, isFableModel, clientAllowed, FableStats } from './fable-policy.js';
+import { FableStats } from './fable-policy.js';
+import { FAMILIES, familyPolicy, rewriteFamilyBody, familyModelIn, isFamilyModel, clientAllowed, FamilyStats, isFamilyRefusal } from './family-policy.js';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
@@ -240,11 +241,25 @@ export function resolveClientAuth(proxyConfig, presented) {
   return { ok: false, client: null };
 }
 
+/** The per-family rationing counters shared through hooks (fable kept under its old name). @param {any} hooks @returns {Record<string, FamilyStats>} */
+function familyStatsOn(hooks) {
+  hooks.fableStats ||= new FableStats();
+  hooks.mythosStats ||= new FamilyStats();
+  return { fable: hooks.fableStats, mythos: hooks.mythosStats };
+}
+
+/** One family's rationing state for the status endpoint. @param {any} config @param {string} family @param {FamilyStats} stats */
+function familyStatus(config, family, stats) {
+  const fp = familyPolicy(config, family);
+  return { enabled: fp.enabled, allow: [...fp.allow], model: fp.model, fallbackOnCapacity: fp.fallbackOnCapacity, ...stats.snapshot(), byClient24h: stats.byClient24h() };
+}
+
 export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
-  // Fable rationing counters for the dashboard (fable-policy.js): one object on
-  // hooks, so every listener built from them (plain, MITM, h2) counts into it.
-  const fableStats = /** @type {any} */ (hooks).fableStats ||= new FableStats();
+  // Rationing counters for the dashboard (family-policy.js): one object per
+  // family on hooks, so every listener built from them (plain, MITM, h2) counts
+  // into it.
+  const familyStats = familyStatsOn(hooks);
   const failoverState = /** @type {any} */ (hooks).failoverState ||= new FailoverState();
   const holdMs = (config.holdSeconds || 0) * 1000;
 
@@ -486,10 +501,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
         // upstream-fetch.js), never which origins or requests.
-        const fp = fablePolicy(config);
-        const fable = { enabled: fp.enabled, allow: [...fp.allow], model: fp.model, ...fableStats.snapshot() };
+        const fable = familyStatus(config, 'fable', familyStats.fable);
+        const mythos = familyStatus(config, 'mythos', familyStats.mythos);
         const failover = failoverState.snapshot(failoverPolicy(config));
-        res.end(JSON.stringify({ ...extra, ...status, fable, failover, upstreamPool: upstreamPoolStatus() }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, fable, mythos, failover, upstreamPool: upstreamPoolStatus() }, null, 2));
         return;
       }
 
@@ -1289,7 +1304,7 @@ export function clientSessionId(headers) {
 export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null }) {
   // Shared with createProxyServer's status endpoint through hooks; a listener
   // built on its own (tests, embedders) keeps a private one.
-  const fableStats = /** @type {any} */ (hooks).fableStats ||= new FableStats();
+  const familyStats = familyStatsOn(hooks);
   const failoverState = /** @type {any} */ (hooks).failoverState ||= new FailoverState();
   let counter = 0;
   return async (req, res) => {
@@ -1483,66 +1498,81 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // account, so selection must be eligible for it too (issue #98).
       let advisorModel = parseAdvisorModel(body);
 
-      // Fable rationing (fable-policy.js), ahead of the blocklist so a rationed
-      // request is judged as the model it will be sent as. A client not on
-      // fable.allow has every Fable model in its body rewritten to fable.model
-      // (never refused); an allowed client falls back the same way when no
-      // account can serve Fable right now. The identity is the authenticating
-      // key only. forwardRequest re-applies the same rewrite to the exact bytes
-      // of every upstream attempt (fableForbidden), after every other rewrite.
-      const fableClient = req.tcClient ?? forcedClient ?? null;
-      const fp = fablePolicy(config);
-      let fableForbidden = null;
-      let fableDropEncoding = false;
-      let fableCapacityFallback = null;
-      if (fp.enabled) {
-        const allowed = clientAllowed(fp, fableClient);
+      // Model-family rationing (family-policy.js): Mythos, then Fable — ahead
+      // of the blocklist so a rationed request is judged as the model it will
+      // be sent as. A client not on <family>.allow has every model of that
+      // family in its body rewritten to <family>.model (never refused); an
+      // allowed client falls back the same way when no account can serve the
+      // family right now. Mythos runs first because its fallback may be a Fable
+      // model, which Fable's list must then judge. The identity is the
+      // authenticating key only. forwardRequest re-applies each rewrite to the
+      // exact bytes of every upstream attempt (families[f].forbidden), after
+      // every other rewrite.
+      const familyClient = req.tcClient ?? forcedClient ?? null;
+      const familyCap = Math.min(resolveMaxBodyBytes(config), 2 ** 31 - 1);
+      let familyDropEncoding = false;
+      /** @type {Record<string, { policy: any, allowedClient: boolean, forbidden: string|null, capacityFallback: string|null, fellBack: boolean, stats: FamilyStats }>} */
+      const families = {};
+      for (const def of FAMILIES) {
+        const fam = def.name;
+        const fp = familyPolicy(config, fam);
+        /** @type {{ policy: any, allowedClient: boolean, forbidden: string|null, capacityFallback: string|null, fellBack: boolean, stats: FamilyStats }} */
+        const st = { policy: fp, allowedClient: fp.enabled && clientAllowed(fp, familyClient), forbidden: null, capacityFallback: null, fellBack: false, stats: familyStats[fam] };
+        families[fam] = st;
+        if (!fp.enabled) continue;
+        const allowed = st.allowedClient;
         // The decoded body's own say, not only the streaming top-level finder:
-        // a compressed, escaped or nested Fable request counts as one.
-        const fableCap = Math.min(resolveMaxBodyBytes(config), 2 ** 31 - 1);
-        const streamed = isFableModel(model) || isFableModel(advisorModel);
-        const decodedFable = streamed ? null : fableModelIn(body, req.headers['content-encoding'], fableCap, req.headers['content-type']);
-        const wantsFable = streamed || decodedFable != null;
-        // Availability is asked for the model actually requested: a Fable id
-        // found only after decoding (gzip, an escape, nesting) stands in for
-        // the streamed one, which was null or not Fable.
-        const checkModel = decodedFable ?? model;
-        const am = /** @type {any} */ (accountManager);
-        // Fall back only when Fable is what cannot be served: if no account can
-        // take the fallback model either, the normal no-account answer stands
-        // (a fleet-wide throttle is not "out of Fable").
-        const fallback = allowed && wantsFable
-          && !am.accounts.some((/** @type {any} */ a) => am._isAvailable(a, checkModel, advisorModel))
-          && am.accounts.some((/** @type {any} */ a) => am._isAvailable(a, fp.model, null));
-        if (allowed && wantsFable && !fallback) fableCapacityFallback = fp.model;
-        if (!allowed || fallback) {
-          const out = rewriteFableBody(body, fp.model, req.headers['content-encoding'], fableCap, req.headers['content-type']);
-          if (out.refuse) {
-            if (!res.headersSent) {
-              res.writeHead(415, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'teamclaude could not inspect this request body for its Fable policy (an unsupported Content-Encoding, larger than the proxy limit once decoded, nested too deeply, or not valid JSON).' } }));
-            }
-            recordEarlyOutcome(accountManager, sessionId, req.url, true);
-            openEntry = null;
-            /** @type {any} */ (hooks).onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(fable policy)', status: 415, model, sessionId });
-            return;
-          }
-          if (out.changed) {
-            body = out.body;
-            fableDropEncoding = out.dropEncoding;
-            model = parseRequestModel(body) ?? model;
-            advisorModel = parseAdvisorModel(body);
-          }
-          if (out.found) {
-            const kind = allowed ? 'fallback' : 'rewrite';
-            const reason = allowed ? 'no account has Fable allowance left' : 'not on fable.allow';
-            fableStats.record(kind, { client: fableClient, from: out.found, to: fp.model, reason });
-            console.log(`[TeamClaude] Fable ${allowed ? 'fallback' : 'rewritten'}: ${safeLine(out.found, 64)} → ${safeLine(fp.model, 64)} for ${fableClient ? `"${safeLine(fableClient, 64)}"` : '(shared key)'} — ${reason}`);
-          }
-          // Once committed to Opus — rationed or fallen back — no later rewrite
-          // (an account modelMap included) may turn it back into Fable.
-          fableForbidden = fp.model;
+        // a compressed, escaped or nested request for the family counts as one.
+        // An earlier family's rewrite already dropped the encoding when it
+        // decoded the body, so the client's header no longer describes it.
+        const enc = familyDropEncoding ? null : req.headers['content-encoding'];
+        let fallback = false;
+        if (allowed) {
+          const streamed = isFamilyModel(fam, model) || isFamilyModel(fam, advisorModel);
+          const decoded = streamed ? null : familyModelIn(fam, body, enc, familyCap, req.headers['content-type']);
+          if (!streamed && decoded == null) continue;   // an allowed client not asking for the family
+          // Availability is asked for the model actually requested: an id found
+          // only after decoding (gzip, an escape, nesting) stands in for the
+          // streamed one, which was null or not of this family.
+          const checkModel = decoded ?? model;
+          const am = /** @type {any} */ (accountManager);
+          // Fall back only when the family is what cannot be served: if no
+          // account can take the fallback model either, the normal no-account
+          // answer stands (a fleet-wide throttle is not "out of Fable").
+          fallback = !am.accounts.some((/** @type {any} */ a) => am._isAvailable(a, checkModel, advisorModel))
+            && am.accounts.some((/** @type {any} */ a) => am._isAvailable(a, fp.model, null));
+          if (!fallback) { if (fp.fallbackOnCapacity) st.capacityFallback = fp.model; continue; }
         }
+        // A client not on the list: every request is inspected and rewritten
+        // (an uninspectable body is refused), and the final gate stays armed
+        // even when this body names no family model — a later rewrite (an
+        // account modelMap) must not produce one either.
+        const out = rewriteFamilyBody(fam, body, fp.model, enc, familyCap, req.headers['content-type']);
+        if (out.refuse) {
+          if (!res.headersSent) {
+            res.writeHead(415, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: `teamclaude could not inspect this request body for its ${def.label} policy (an unsupported Content-Encoding, larger than the proxy limit once decoded, nested too deeply, or not valid JSON).` } }));
+          }
+          recordEarlyOutcome(accountManager, sessionId, req.url, true);
+          openEntry = null;
+          /** @type {any} */ (hooks).onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(${fam} policy)`, status: 415, model, sessionId });
+          return;
+        }
+        if (out.changed) {
+          body = out.body;
+          if (out.dropEncoding) familyDropEncoding = true;
+          model = parseRequestModel(body) ?? model;
+          advisorModel = parseAdvisorModel(body);
+        }
+        if (out.found) {
+          const kind = allowed ? 'fallback' : 'rewrite';
+          const reason = allowed ? `no account has ${def.label} allowance left` : `not on ${fam}.allow`;
+          st.stats.record(kind, { client: familyClient, from: out.found, to: fp.model, reason });
+          console.log(`[TeamClaude] ${def.label} ${allowed ? 'fallback' : 'rewritten'}: ${safeLine(out.found, 64)} → ${safeLine(fp.model, 64)} for ${familyClient ? `"${safeLine(familyClient, 64)}"` : '(shared key)'} — ${reason}`);
+        }
+        // Once committed to the fallback — rationed or fallen back — no later
+        // rewrite (an account modelMap included) may turn it back into this family.
+        st.forbidden = fp.model;
       }
 
       // Local-model failover (failover.js): a session a local model answered is
@@ -1598,7 +1628,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), failover, failoverState, fableAllowedClient: fp.enabled && clientAllowed(fp, fableClient), fableCapacityFallback, fableForbidden, fableDropEncoding, fableCap: Math.min(resolveMaxBodyBytes(config), 2 ** 31 - 1), fableStats, model, advisorModel, pinnedIndex, provider: providerForPath(req.url), holdBudgetMs: holdMs, sessionId, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), failover, failoverState, families, familyDropEncoding, familyCap, model, advisorModel, pinnedIndex, provider: providerForPath(req.url), holdBudgetMs: holdMs, sessionId, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -2537,7 +2567,7 @@ async function serveFromFailover(req, res, body, ctx) {
     st.noteServedSession(ctx.sessionId);
     ctx.status = 200; ctx.account = `(failover: ${p.model})`; ctx.model = p.model;
     const who = ctx.client ? `"${safeLine(ctx.client, 64)}"` : '(shared key)';
-    console.log(`[TeamClaude] FAILOVER: no Claude account can serve — served by local model "${safeLine(p.model, 64)}" for ${who}${ctx.fableAllowedClient ? ' (a Fable-allowed client: JP\'s own session is on the local model)' : ''}`);
+    console.log(`[TeamClaude] FAILOVER: no Claude account can serve — served by local model "${safeLine(p.model, 64)}" for ${who}${ctx.families?.fable?.allowedClient ? ' (a Fable-allowed client: JP\'s own session is on the local model)' : ''}`);
     res.writeHead(200, {
       'Content-Type': r.headers.get('content-type') || 'application/json',
       'x-teamclaude-failover': `local/${p.model}`,
@@ -2609,6 +2639,52 @@ export function exhaustedMessage(accountManager, model, retryAfter) {
     : ' Retry shortly.';
 
   return `No account can serve this request${scope}: all ${pool}${aside} are at their quota or rate limit.${when}`;
+}
+
+
+/**
+ * Serve an allowed client's family request as that family's fallback model,
+ * once per family per request: on 529 (`capacity`, only when the family's
+ * fallbackOnCapacity is on) or when the last account that could serve it
+ * refused the family (`refused`). Families in policy order, so a Mythos
+ * fallback to Fable is still judged by Fable on the next attempt. Returns true
+ * when it took over the request.
+ * @param {any} req @param {any} res @param {Buffer} body @param {any} accountManager @param {string} upstream
+ * @param {number} retryCount @param {any} hooks @param {any} reqId @param {any} ctx @param {string|null} logDir
+ * @param {any} sx @param {any} route @param {any} account @param {any} upstreamRes
+ * @param {'capacity'|'refused'} kind @param {string|null} [onlyFamily] the refused family, for `refused`
+ */
+async function familyFallback(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route, account, upstreamRes, kind, onlyFamily = null) {
+  const am = /** @type {any} */ (accountManager);
+  for (const def of FAMILIES) {
+    if (onlyFamily && def.name !== onlyFamily) continue;
+    const st = ctx.families?.[def.name];
+    if (!st || !st.policy.enabled || !st.allowedClient || st.fellBack) continue;
+    // capacityFallback is set up front only for an allowed client whose body
+    // asks for this family (decoded, so a gzip body counts too).
+    const target = kind === 'capacity' ? st.capacityFallback : st.policy.model;
+    if (!target) continue;
+    if (!am.accounts.some((/** @type {any} */ a) => am._isAvailable(a, target, null))) continue;
+    const out = rewriteFamilyBody(def.name, body, target, ctx.familyDropEncoding ? null : req.headers['content-encoding'], ctx.familyCap, req.headers['content-type']);
+    if (!out.changed || out.refuse) continue;
+    if (out.dropEncoding) ctx.familyDropEncoding = true;
+    await upstreamRes?.body?.cancel();
+    // An account that refused only the family can serve the fallback model.
+    for (const i of ctx.familyRefusedTried ?? []) ctx.tried.delete(i);
+    const from = String(out.found ?? ctx.model);
+    st.fellBack = true;
+    st.forbidden = target;   // and it stays the fallback on every later attempt
+    if (isFamilyModel(def.name, ctx.model)) ctx.model = target;
+    if (isFamilyModel(def.name, ctx.advisorModel)) ctx.advisorModel = target;
+    const why = kind === 'capacity' ? `${def.label} at capacity (529)` : `${def.label} refused by every account that could serve it`;
+    st.stats.record('fallback', { client: ctx.client ?? null, from, to: target, reason: why });
+    const tail = kind === 'capacity' ? `upstream 529 on "${account.name}"` : why;
+    console.log(`[TeamClaude] ${def.label} fallback: ${safeLine(from, 64)} → ${safeLine(target, 64)} for ${ctx.client ? `"${safeLine(ctx.client, 64)}"` : '(shared key)'} — ${tail}`);
+    if (clientGone(res)) { ctx.abandoned = true; return true; }
+    await forwardRequest(req, res, out.body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    return true;
+  }
+  return false;
 }
 
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
@@ -2844,14 +2920,17 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // Every rewrite below runs inside rewriteRequestBody (exported for tests);
   // Content-Length is refreshed below because the body can shrink.
   let sendBody = rewriteRequestBody(body, account, req.url, req.headers['content-type']);
-  // Fable policy, final gate: the exact bytes this attempt sends, after every
-  // other rewrite (a modelMap that maps TO Fable included), on every retry.
-  if (ctx.fableForbidden) {
-    const g = rewriteFableBody(sendBody, ctx.fableForbidden, ctx.fableDropEncoding ? null : req.headers['content-encoding'], ctx.fableCap, req.headers['content-type']);
-    if (g.refuse) throw new Error('Fable policy: undecodable request body');
-    if (g.changed) { sendBody = g.body; if (g.dropEncoding) ctx.fableDropEncoding = true; }
+  // Family policy, final gate: the exact bytes this attempt sends, after every
+  // other rewrite (a modelMap that maps TO Fable or Mythos included), on every
+  // retry. Same order as the up-front pass: Mythos's fallback may be Fable.
+  for (const def of FAMILIES) {
+    const target = ctx.families?.[def.name]?.forbidden;
+    if (!target) continue;
+    const g = rewriteFamilyBody(def.name, sendBody, target, ctx.familyDropEncoding ? null : req.headers['content-encoding'], ctx.familyCap, req.headers['content-type']);
+    if (g.refuse) throw new Error(`${def.label} policy: undecodable request body`);
+    if (g.changed) { sendBody = g.body; if (g.dropEncoding) ctx.familyDropEncoding = true; }
   }
-  if (ctx.fableDropEncoding) for (const k of Object.keys(headers)) if (k.toLowerCase() === 'content-encoding') delete headers[k];
+  if (ctx.familyDropEncoding) for (const k of Object.keys(headers)) if (k.toLowerCase() === 'content-encoding') delete headers[k];
   // If the body changed length (sanitize, model rewrite, or field strip), update
   // Content-Length so the upstream doesn't receive a mismatched framing and
   // truncate or stall.
@@ -3159,25 +3238,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // overloaded, not the account, and walking the fleet would just spend every
     // account'"'"'s cache discovering that. After the hop the response goes to the
     // client as it does today, with its own retry-after intact.
-    // Fable at capacity (529) for an allowed client: serve it as Opus instead
-    // of the error, once per request (JP: "and ii for sure"). Ahead of the
-    // generic 5xx hop, which would only try Fable again on another account.
-    if (upstreamRes.status === 529 && !res.headersSent && ctx.fableCapacityFallback && !ctx.fableFellBack
-      && accountManager.accounts.some((/** @type {any} */ a) => /** @type {any} */ (accountManager)._isAvailable(a, ctx.fableCapacityFallback, null))) {
-      const out = rewriteFableBody(body, ctx.fableCapacityFallback, ctx.fableDropEncoding ? null : req.headers['content-encoding'], ctx.fableCap, req.headers['content-type']);
-      if (out.changed && !out.refuse) {
-        if (out.dropEncoding) ctx.fableDropEncoding = true;
-        await upstreamRes.body?.cancel();
-        const from = String(out.found ?? ctx.model);
-        ctx.fableFellBack = true;
-        ctx.fableForbidden = ctx.fableCapacityFallback;   // and it stays Opus on every later attempt
-        if (isFableModel(ctx.model)) ctx.model = ctx.fableCapacityFallback;
-        if (isFableModel(ctx.advisorModel)) ctx.advisorModel = ctx.fableCapacityFallback;
-        ctx.fableStats?.record('fallback', { client: ctx.client ?? null, from, to: ctx.fableCapacityFallback, reason: 'Fable at capacity (529)' });
-        console.log(`[TeamClaude] Fable fallback: ${safeLine(from, 64)} → ${safeLine(ctx.fableCapacityFallback, 64)} for ${ctx.client ? `"${safeLine(ctx.client, 64)}"` : '(shared key)'} — upstream 529 on "${account.name}"`);
-        if (clientGone(res)) { ctx.abandoned = true; return; }
-        return forwardRequest(req, res, out.body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
-      }
+    // A family at capacity (529) for an allowed client: serve it as the
+    // fallback model instead of the error, once per request (JP: "and ii for
+    // sure"). Ahead of the generic 5xx hop, which would only try the same
+    // model again on another account.
+    if (upstreamRes.status === 529 && !res.headersSent) {
+      const fell = await familyFallback(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route, account, upstreamRes, 'capacity');
+      if (fell) return;
     }
     if (upstreamRes.status >= 500 && !res.headersSent && !ctx.serverErrorHopped && retryCount < maxRetries) {
       // Same exclusion as the 429 hop, and the same cursor-preserving pick.
@@ -3193,6 +3260,44 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         console.log(`[TeamClaude] Upstream ${upstreamRes.status} on "${account.name}" — failing over once to "${alt.name}"`);
         if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+    }
+
+    // A family this account cannot serve (family-policy.js isFamilyRefusal): a
+    // 403 permission_error or 404 not_found_error that names the model, on a
+    // Mythos or Fable request. It benches the account for THAT family only —
+    // the account-wide entitlement cooldown below would stop it serving Opus
+    // too — and the request moves on: to another account that can serve the
+    // family, else (for a client allowed the family, with rationing on) to the
+    // family's fallback model, else the refusal goes to the client as it came.
+    if ((upstreamRes.status === 403 || upstreamRes.status === 404) && !res.headersSent) {
+      const fam = FAMILIES.find((d) => isFamilyModel(d.name, ctx.model) || isFamilyModel(d.name, ctx.advisorModel));
+      if (fam) {
+        const responseBody = await readErrorBody(upstreamRes.body).catch(() => null);
+        const famModel = isFamilyModel(fam.name, ctx.model) ? ctx.model : ctx.advisorModel;
+        if (isFamilyRefusal(upstreamRes.status, responseBody, famModel)) {
+          const until = /** @type {any} */ (accountManager).markFamilyDenied(account.index, fam.name);
+          ctx.tried.add(account.index);
+          // Tried for THIS family only: a fallback to another model may use it.
+          (ctx.familyRefusedTried ??= new Set()).add(account.index);
+          console.log(`[TeamClaude] ${fam.label} refused on "${account.name}" (${upstreamRes.status}) — skipping it for ${fam.label} until ${new Date(until).toISOString()}`);
+          const am = /** @type {any} */ (accountManager);
+          const another = am.accounts.some((/** @type {any} */ a) => !ctx.tried.has(a.index) && am._isAvailable(a, ctx.model, ctx.advisorModel));
+          if (another && retryCount < maxRetries) {
+            if (clientGone(res)) { ctx.abandoned = true; return; }
+            return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+          }
+          const fell = await familyFallback(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route, account, null, 'refused', fam.name);
+          if (fell) return;
+          // Nothing to move to: the client gets upstream's own answer.
+          logRequestHead();
+          ctx.status = upstreamRes.status;
+          res.writeHead(upstreamRes.status, { 'Content-Type': 'application/json' });
+          res.end(responseBody ?? '');
+          return;
+        }
+        // Not a family refusal: hand the already-read body to the paths below.
+        upstreamRes = new globalThis.Response(responseBody, { status: upstreamRes.status, headers: upstreamRes.headers });
       }
     }
 

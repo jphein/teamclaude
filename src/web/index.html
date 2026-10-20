@@ -1475,6 +1475,7 @@
         // Off = no list: everyone may use it. On with nothing ticked = nobody.
         // Names come from the server (client key NAMES only); a name already in
         // the config that is no longer a client key stays listed so it is visible.
+        // An entry that is not a configured name arrives masked as "(not a client name)".
         const names = [...new Set([...(f.options || []), ...(Array.isArray(value) ? value : [])])];
         const on = el('input', { type: 'checkbox', disabled: dis });
         on.checked = Array.isArray(value);
@@ -1542,7 +1543,8 @@
       let u = null; let r = null;
       if (family === 'fable' && q.unified7dFable != null) { u = q.unified7dFable; r = q.unified7dFableReset; }
       else if (q.scopedWeekly?.[family]?.utilization != null) { u = q.scopedWeekly[family].utilization; r = q.scopedWeekly[family].resetAt; }
-      const denied = a.familyDenied?.[family];
+      const deniedAt = Object.entries(a.modelDenied || {}).filter(([m]) => m.includes(family)).map(([, t]) => t).sort().pop();
+      const denied = deniedAt;
       const left = u == null ? el('span', { class: 'dim', text: family === 'mythos' ? 'shares the weekly bucket' : 'not reported yet' }) : fmtPct(Math.max(0, 1 - u)) + ' left';
       const rs = r ? fmtReset(r) : null;
       return el('tr', {}, [el('td', { text: a.name }), el('td', {}, left), el('td', { class: 'dim', text: rs ? '↺ ' + rs.when : '' }),

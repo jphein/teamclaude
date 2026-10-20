@@ -2662,8 +2662,22 @@ async function familyFallback(req, res, body, accountManager, upstream, retryCou
     if (!st || !st.policy.enabled || !st.allowedClient || st.fellBack) continue;
     // capacityFallback is set up front only for an allowed client whose body
     // asks for this family (decoded, so a gzip body counts too).
-    const target = kind === 'capacity' ? st.capacityFallback : st.policy.model;
+    let target = kind === 'capacity' ? st.capacityFallback : st.policy.model;
     if (!target) continue;
+    // The fallback may land in a LATER family (Mythos → Fable): apply that
+    // family's own rules now — a client it does not allow, or a family no
+    // account can serve, goes straight on to that family's fallback — and arm
+    // its 529 fallback, which its up-front pass never saw a reason to set.
+    for (const later of FAMILIES.slice(FAMILIES.indexOf(def) + 1)) {
+      const ls = ctx.families?.[later.name];
+      if (!ls?.policy.enabled || !isFamilyModel(later.name, target)) continue;
+      if (!ls.allowedClient || !am.accounts.some((/** @type {any} */ a) => am._isAvailable(a, target, null))) {
+        ls.forbidden = ls.policy.model;
+        target = ls.policy.model;
+      } else if (ls.policy.fallbackOnCapacity) {
+        ls.capacityFallback = ls.policy.model;
+      }
+    }
     if (!am.accounts.some((/** @type {any} */ a) => am._isAvailable(a, target, null))) continue;
     const out = rewriteFamilyBody(def.name, body, target, ctx.familyDropEncoding ? null : req.headers['content-encoding'], ctx.familyCap, req.headers['content-type']);
     if (!out.changed || out.refuse) continue;
@@ -2983,6 +2997,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.tried.add(account.index);
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
+    /** @type {any} */
     let upstreamRes;
     let admittedLoad = 0;
     try {
@@ -3263,24 +3278,34 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
     }
 
-    // A family this account cannot serve (family-policy.js isFamilyRefusal): a
-    // 403 permission_error or 404 not_found_error that names the model, on a
-    // Mythos or Fable request. It benches the account for THAT family only —
-    // the account-wide entitlement cooldown below would stop it serving Opus
-    // too — and the request moves on: to another account that can serve the
-    // family, else (for a client allowed the family, with rationing on) to the
-    // family's fallback model, else the refusal goes to the client as it came.
-    if ((upstreamRes.status === 403 || upstreamRes.status === 404) && !res.headersSent) {
-      const fam = FAMILIES.find((d) => isFamilyModel(d.name, ctx.model) || isFamilyModel(d.name, ctx.advisorModel));
-      if (fam) {
+    // A model this account cannot serve (family-policy.js isFamilyRefusal): a
+    // 403 permission_error that names the model, on a Mythos or Fable request.
+    // It benches THAT exact model on this account — never the family, so a
+    // made-up id cannot take a real one out, and never the account-wide
+    // entitlement cooldown below, which would stop it serving Opus too — and
+    // the request moves on: to another account that can serve it, else (for a
+    // client allowed the family, with rationing on) to the family's fallback
+    // model, else the refusal goes to the client as it came.
+    if (upstreamRes.status === 403 && !res.headersSent) {
+      // The family models this attempt actually SENT (after the account's
+      // modelMap and every gate), main and advisor, plus what the client asked.
+      const sentIds = [...new Set([parseRequestModel(sendBody), parseAdvisorModel(sendBody), ctx.model, ctx.advisorModel])]
+        .filter((m) => typeof m === 'string' && FAMILIES.some((d) => isFamilyModel(d.name, m)));
+      if (sentIds.length) {
         const responseBody = await readErrorBody(upstreamRes.body).catch(() => null);
-        const famModel = isFamilyModel(fam.name, ctx.model) ? ctx.model : ctx.advisorModel;
-        if (isFamilyRefusal(upstreamRes.status, responseBody, famModel)) {
-          const until = /** @type {any} */ (accountManager).markFamilyDenied(account.index, fam.name);
+        // The refused model is the one upstream NAMES — so a Fable advisor's
+        // refusal never benches the Mythos main model, or the other way round.
+        // An organisation-policy refusal is about the account, not the model:
+        // it keeps its own path (the entitlement cooldown) below.
+        const famModel = isOAuthEntitlementDenied(responseBody) ? null
+          : sentIds.find((m) => isFamilyRefusal(upstreamRes.status, responseBody, m)) ?? null;
+        const fam = famModel ? FAMILIES.find((d) => isFamilyModel(d.name, famModel)) : null;
+        if (fam && famModel) {
+          const until = /** @type {any} */ (accountManager).markModelDenied(account.index, famModel);
           ctx.tried.add(account.index);
           // Tried for THIS family only: a fallback to another model may use it.
           (ctx.familyRefusedTried ??= new Set()).add(account.index);
-          console.log(`[TeamClaude] ${fam.label} refused on "${account.name}" (${upstreamRes.status}) — skipping it for ${fam.label} until ${new Date(until).toISOString()}`);
+          console.log(`[TeamClaude] ${fam.label} model ${safeLine(famModel, 64)} refused on "${account.name}" (403) — skipping it for that model until ${new Date(until).toISOString()}`);
           const am = /** @type {any} */ (accountManager);
           const another = am.accounts.some((/** @type {any} */ a) => !ctx.tried.has(a.index) && am._isAvailable(a, ctx.model, ctx.advisorModel));
           if (another && retryCount < maxRetries) {
@@ -3296,7 +3321,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           res.end(responseBody ?? '');
           return;
         }
-        // Not a family refusal: hand the already-read body to the paths below.
+        // Not a model refusal: hand the already-read body to the 403 path below.
         upstreamRes = new globalThis.Response(responseBody, { status: upstreamRes.status, headers: upstreamRes.headers });
       }
     }

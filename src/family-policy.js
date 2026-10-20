@@ -63,9 +63,21 @@ export function familyPolicy(config, family) {
     return { family, label: d.label, enabled: false, allow: new Set(), model: d.defaultModel, fallbackOnCapacity };
   }
   const allow = new Set(f.allow.filter((/** @type {unknown} */ n) => typeof n === 'string').map((/** @type {string} */ n) => n.trim()));
-  // The fallback must leave the family, or a rationed request would be served as itself.
-  const model = typeof f.model === 'string' && f.model.trim() && !d.test.test(f.model) ? f.model.trim() : d.defaultModel;
+  const model = typeof f.model === 'string' && f.model.trim() && fallbackAllowed(family, f.model) ? f.model.trim() : d.defaultModel;
   return { family, label: d.label, enabled: true, allow, model, fallbackOnCapacity };
+}
+
+/**
+ * May `family` fall back to `model`? Never to itself (a rationed request would
+ * be served as itself), and never to a family whose gate has already run:
+ * gates run in FAMILIES order, once, so a fallback into an EARLIER family
+ * (Fable → Mythos) would reach upstream unchecked. Mythos → Fable is fine.
+ * @param {string} family @param {unknown} model
+ */
+export function fallbackAllowed(family, model) {
+  if (typeof model !== 'string') return false;
+  const at = FAMILIES.findIndex((f) => f.name === family);
+  return !FAMILIES.some((f, i) => i <= at && f.test.test(model));
 }
 
 /** @param {{ allow: Set<string> }} policy @param {string|null|undefined} client */
@@ -221,21 +233,23 @@ function decodeBody(body, enc, maxBytes) {
 }
 
 /**
- * A family upstream refused on THIS account (not a quota, not a throttle): a
- * 403 permission_error or 404 not_found_error whose message names the model
- * or says the account cannot use it. A family refusal benches the account for
- * that family only; the account-wide entitlement cooldown would stop it
- * serving Opus too.
+ * A model upstream refused on THIS account (not a quota, not a throttle): a
+ * 403 permission_error whose message names the exact model id. A generic
+ * "does not have access to this model" is not enough: it may be the account
+ * itself that is refused, which the entitlement path handles. It benches that exact model on that account only; the
+ * account-wide entitlement cooldown would stop it serving Opus too.
+ *
+ * Only 403. A 404 not_found_error means the id itself is wrong, and any
+ * client can send a made-up id: treating it as a refusal would let one
+ * request for `claude-mythos-nonexistent` bench the family on every account.
  * @param {number} status @param {Buffer|string|null} body @param {string|null} model
  */
 export function isFamilyRefusal(status, body, model) {
-  if ((status !== 403 && status !== 404) || !body || !model) return false;
+  if (status !== 403 || !body || !model) return false;
   let err;
   try { err = JSON.parse(String(body))?.error; } catch { return false; }
-  const type = String(err?.type || '');
-  if (status === 403 ? type !== 'permission_error' : type !== 'not_found_error') return false;
-  const msg = String(err?.message || '').toLowerCase();
-  return msg.includes(model.toLowerCase()) || /\bmodel\b/.test(msg);
+  if (String(err?.type || '') !== 'permission_error') return false;
+  return String(err?.message || '').toLowerCase().includes(model.toLowerCase());
 }
 
 /**

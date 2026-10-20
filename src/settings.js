@@ -22,7 +22,7 @@ import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { resolveWarmupSchedule } from './warmup-schedule.js';
 import { parseProxyUrl } from './upstream-proxy.js';
 import { resolveLogSource, resolveRestartMethod } from './service-control.js';
-import { SHARED_KEY_ENTRY } from './family-policy.js';
+import { SHARED_KEY_ENTRY, fallbackAllowed } from './family-policy.js';
 
 /** Sent in place of a secret, and accepted back on a save as "unchanged". */
 export const MASK = '••••••••';
@@ -62,8 +62,18 @@ const thresholdCheck = (v) => {
   return 'must be a number above 0 and at most 1, or an object of bucket → number';
 };
 
-/** A list of client names: proxy.clientKeys names plus "(shared key)", offered as checkboxes. @param {any} v */
-const clientsCheck = (v) => (Array.isArray(v) && v.every((/** @type {unknown} */ n) => typeof n === 'string' && n.trim()) ? null : 'must be a list of client names');
+/**
+ * A list of client names: only names from proxy.clientKeys, plus "(shared
+ * key)". Anything else is refused, so a key pasted here by mistake is never
+ * stored where the (unmasked) settings payload would show it.
+ * @param {any} v @param {any} cfg
+ */
+const clientsCheck = (v, cfg) => {
+  if (!(Array.isArray(v) && v.every((/** @type {unknown} */ n) => typeof n === 'string' && n.trim()))) return 'must be a list of client names';
+  const known = new Set(clientNames(cfg));
+  const bad = v.filter((/** @type {string} */ n) => !known.has(n));
+  return bad.length ? `${bad.length === 1 ? 'is' : 'are'} not a configured client name: ${bad.length} entr${bad.length === 1 ? 'y' : 'ies'} (names come from Client keys)` : null;
+};
 
 /**
  * The settings of one rationed model family (family-policy.js): who may use it,
@@ -74,16 +84,17 @@ const clientsCheck = (v) => (Array.isArray(v) && v.every((/** @type {unknown} */
  */
 function familyFields(family, label) {
   const re = new RegExp(family, 'i');
-  return [
+  return /** @type {Field[]} */ ([
     { key: `${family}.allow`, group: label, label: 'Allowed clients', type: 'clients', apply: 'hot', def: null,
       help: `Clients that may use ${label}. Every other ${label} request is served as the fallback model, never refused. With Ration on and nothing ticked, nobody may; with Ration off, everyone may (no rationing).`,
       check: clientsCheck },
     { key: `${family}.model`, group: label, label: 'Fallback model', type: 'text', apply: 'hot', def: 'claude-opus-5-5',
       help: `What a rationed ${label} request is served as, and what an allowed one falls back to when no account can serve ${label}.`,
-      check: (/** @type {any} */ v) => (re.test(String(v)) ? `must not be a ${label} model` : null) },
+      check: (/** @type {any} */ v) => (fallbackAllowed(family, String(v)) ? null
+        : re.test(String(v)) ? `must not be a ${label} model` : 'must not be a model of a family whose rationing runs first (Mythos)') },
     { key: `${family}.fallbackOnCapacity`, group: label, label: 'Fall back when at capacity', type: 'bool', apply: 'hot', def: true,
       help: `When upstream answers ${label} with 529 "overloaded", serve an allowed client's request as the fallback model instead of the error.` },
-  ];
+  ]);
 }
 
 /** @type {Field[]} */
@@ -310,6 +321,9 @@ function displayValue(f, v) {
   return v;
 }
 
+/** Shown in place of an allow-list entry that is not a configured client name. */
+export const UNKNOWN_CLIENT = '(not a client name)';
+
 /** proxy.clientKeys names plus "(shared key)" — names only. @param {any} config @returns {string[]} */
 function clientNames(config) {
   const keys = Array.isArray(config?.proxy?.clientKeys) ? config.proxy.clientKeys : [];
@@ -329,7 +343,10 @@ export function publicSettings(config) {
     // A client picker offers the configured client NAMES (never their keys)
     // plus the shared-key entry.
     const options = f.type === 'clients' ? clientNames(config) : undefined;
-    return { ...meta, ...(options ? { options } : {}), value: displayValue(f, raw), set: raw !== undefined && raw !== null && raw !== '' };
+    // An allow entry that is not a configured name (a stale or mistyped one —
+    // or a key pasted in by hand) is shown masked, never verbatim.
+    const value = options && Array.isArray(raw) ? raw.map((/** @type {unknown} */ n) => (typeof n === 'string' && options.includes(n) ? n : UNKNOWN_CLIENT)) : displayValue(f, raw);
+    return { ...meta, ...(options ? { options } : {}), value, set: raw !== undefined && raw !== null && raw !== '' };
   });
   const accounts = (config?.accounts || []).map((/** @type {any} */ a, /** @type {number} */ i) => ({
     id: a.id ?? null, name: a.name, index: i, type: a.type,

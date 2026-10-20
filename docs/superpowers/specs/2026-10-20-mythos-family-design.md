@@ -32,16 +32,20 @@ Semantics are Fable's, unchanged, for both families:
 - The fallback model must not be of the same family. Mythos may fall back to a Fable model: policies run **Mythos first, then Fable**, so a Mythos request rewritten to Fable is then judged by Fable's list.
 - The per-attempt final gate checks the exact bytes of every upstream attempt for every family that was ruled out.
 
-### Entitlement: skip accounts that cannot serve a family
-All accounts can serve Mythos today. This is for the day one can't. Suppose a request for a rationed family (Mythos or Fable) gets a 403 `permission_error` or a 404 `not_found_error` whose message names the model, with no rate-limit headers. Then:
-- that account is marked `familyDenied[family]` for 6 h;
-- `unavailableReason` returns `'family-denied'` for that family only;
+### Entitlement: skip accounts that cannot serve a model
+All accounts can serve Mythos today. This is for the day one can't. Suppose a request for a rationed family (Mythos or Fable) gets a **403 `permission_error`** whose message names the model, with no rate-limit headers. Then:
+- that **exact model id** is marked in `modelDenied[<id>]` on that account for 6 h;
+- `unavailableReason` returns `'model-denied'` for that id only;
 - the request moves to another account.
 
-If no account is left and the family policy has a fallback, it falls back exactly like the 529 path. A family refusal never reaches the account-wide `entitlement` cooldown, which would bench an account for Opus too.
+If no account is left and the family policy has a fallback, it falls back exactly like the 529 path. A refusal never reaches the account-wide `entitlement` cooldown, which would bench an account for Opus too.
+
+Two choices here follow the commit security review (2026-10-20):
+- **404 is never a refusal.** A 404 `not_found_error` means the id is wrong, and any client can send a made-up one.
+- **Benching is per model id, never per family.** A request for `claude-mythos-nonexistent` can therefore never take real Mythos out on every account.
 
 ### Status JSON
-`GET /teamclaude/status` keeps `fable` in its current shape and adds `byClient24h: { <client>: n }`. It also adds `mythos` in the same shape. Per account, `quota.scopedWeekly` already carries any learned Mythos bucket, and `familyDenied` is added.
+`GET /teamclaude/status` keeps `fable` in its current shape and adds `byClient24h: { <client>: n }`. It also adds `mythos` in the same shape. Per account, `quota.scopedWeekly` already carries any learned Mythos bucket, and `modelDenied` (id → until) is added.
 
 ### Web GUI (Settings view, #21)
 - A new field type, `clients`: checkboxes for every `proxy.clientKeys` name plus `(shared key)`. The settings endpoint sends **names only, never keys**. Unknown names already in the config stay listed, checked.
@@ -63,7 +67,7 @@ No. "familiar" is every key-less lane on the host, about 10.7K Fable requests a 
 ## Tests (fake upstream, `node --test`)
 - `modelFamily('claude-mythos-5-1') === 'mythos'`; Mythos gates on a learned `scopedWeekly.mythos`.
 - Mythos rationing: a non-allowed client is rewritten (never refused), an allowed one passes. An allowed one falls back when every account is family-denied, and on 529 only when `fallbackOnCapacity` is true. Mythos → Fable fallback is then subject to Fable's list.
-- Family refusal: a 403 permission_error naming the model marks only that family on that account, the retry lands on another account, and an Opus request still uses the denied account.
+- Model refusal: a 403 permission_error naming the model benches only that id on that account, the retry lands on another account, and Opus and other Mythos ids still use the account. A 404 for a made-up id benches nothing.
 - Settings: `clients` options carry names only (no key material anywhere in the payload); validation; `docs/configuration.md` coverage.
 - One perturbation goes red: dropping the Mythos entry from the final per-attempt gate must fail the "modelMap maps back to Mythos" test.
 

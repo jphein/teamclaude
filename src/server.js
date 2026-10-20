@@ -3290,7 +3290,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // The family models this attempt actually SENT (after the account's
       // modelMap and every gate), main and advisor, plus what the client asked.
       const sentIds = [...new Set([parseRequestModel(sendBody), parseAdvisorModel(sendBody), ctx.model, ctx.advisorModel])]
-        .filter((m) => typeof m === 'string' && FAMILIES.some((d) => isFamilyModel(d.name, m)));
+        .filter((m) => typeof m === 'string' && FAMILIES.some((d) => isFamilyModel(d.name, m)))
+        .sort((x, y) => String(y).length - String(x).length);   // the most specific id first
       if (sentIds.length) {
         const responseBody = await readErrorBody(upstreamRes.body).catch(() => null);
         // The refused model is the one upstream NAMES — so a Fable advisor's

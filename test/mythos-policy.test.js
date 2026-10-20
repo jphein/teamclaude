@@ -47,6 +47,8 @@ test('isFamilyRefusal: only a 403 permission_error naming the model; a 404 (a wr
   assert.ok(!isFamilyRefusal(404, b('not_found_error', `model: ${MYTHOS}`), MYTHOS), 'any client can send a made-up id');
   assert.ok(!isFamilyRefusal(403, b('permission_error', 'Request not allowed'), MYTHOS), 'an account-wide 403 is not a model refusal');
   assert.ok(!isFamilyRefusal(403, b('permission_error', 'OAuth token does not have access to this model'), MYTHOS), 'the exact id must be named');
+  assert.ok(!isFamilyRefusal(403, b('permission_error', `no access to model ${MYTHOS}`), 'claude-mythos-5'), 'a shorter id inside a longer one is not named');
+  assert.ok(isFamilyRefusal(403, b('permission_error', `no access to model "claude-mythos-5".`), 'claude-mythos-5'), 'quoted / punctuated ids still match');
   assert.ok(!isFamilyRefusal(404, b('not_found_error', 'no such file'), MYTHOS));
   assert.ok(!isFamilyRefusal(429, b('rate_limit_error', MYTHOS), MYTHOS));
   assert.ok(!isFamilyRefusal(403, 'not json', MYTHOS));

@@ -249,7 +249,9 @@ export function isFamilyRefusal(status, body, model) {
   let err;
   try { err = JSON.parse(String(body))?.error; } catch { return false; }
   if (String(err?.type || '') !== 'permission_error') return false;
-  return String(err?.message || '').toLowerCase().includes(model.toLowerCase());
+  // As a whole id: "claude-mythos-5" must not match inside "claude-mythos-5-1".
+  const id = model.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^a-z0-9._-])${id}($|[^a-z0-9._-])`).test(String(err?.message || '').toLowerCase());
 }
 
 /**

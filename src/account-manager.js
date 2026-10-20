@@ -64,6 +64,10 @@ const FORCED_REFRESH_FLOOR_MS = 10_000;
 // members to serve, then re-admit it so an administrator's policy change is
 // discovered without a restart.
 const ENTITLEMENT_DENIAL_COOLDOWN_SECONDS = 5 * 60;
+// A refusal (a 403 permission_error naming the model) benches that model on
+// one account for this long: long enough not to re-ask on every request,
+// short enough that a grant upstream is picked up the same working session.
+const MODEL_DENIAL_COOLDOWN_SECONDS = 6 * 60 * 60;
 
 // Codex model-scoped weekly buckets are keyed by slugs taken from response
 // header NAMES, so the table needs a ceiling an upstream cannot talk past.
@@ -226,6 +230,12 @@ function makeAccount(acct, index) {
     // valid. This cross-request cooldown is intentionally ephemeral: unlike
     // quota, it is a live routing observation and is re-learned after restart.
     entitlementDeniedUntil: null,
+    // A model upstream refused on this account (a 403 permission_error naming
+    // it — family-policy.js isFamilyRefusal): lowercased model id → ms
+    // timestamp. Bars only that exact model, so a refusal can never bench a
+    // whole family; the account keeps serving everything else. Ephemeral like
+    // the entitlement cooldown: re-learned after a restart.
+    modelDenied: /** @type {Record<string, number>} */ ({}),
     // Storm control (see admit/release): in-flight upstream requests and the
     // time this account last became the current one (starts a ramp window).
     inFlight: 0,
@@ -659,6 +669,43 @@ export class AccountManager {
     const until = Date.now() + duration * 1000;
     account.entitlementDeniedUntil = Math.max(account.entitlementDeniedUntil || 0, until);
     return account.entitlementDeniedUntil;
+  }
+
+  /** Bench one exact model on an account (a refusal, not a quota and not the
+   * whole account). Extends, never shortens. Returns the expiry (ms).
+   * @param {number} index @param {string} model @param {number} [seconds] */
+  markModelDenied(index, model, seconds = MODEL_DENIAL_COOLDOWN_SECONDS) {
+    const account = this.accounts[index];
+    if (!account || !model) return null;
+    const key = String(model).toLowerCase();
+    const until = Date.now() + Math.max(1, Number(seconds) || MODEL_DENIAL_COOLDOWN_SECONDS) * 1000;
+    account.modelDenied ||= {};
+    account.modelDenied[key] = Math.max(account.modelDenied[key] || 0, until);
+    return account.modelDenied[key];
+  }
+
+  /** True while `model` (or the advisor's) is benched on this account.
+   * Expiry is consumed lazily, like the entitlement cooldown.
+   * @param {any} account @param {string|null} model @param {string|null} [advisorModel] @param {number} [now] */
+  _modelDenied(account, model, advisorModel = null, now = Date.now()) {
+    /** @type {Record<string, number>|undefined} */
+    const denied = account?.modelDenied;
+    if (!denied) return false;
+    // The bench is keyed by the id upstream refused, which is the id SENT:
+    // after this account's modelMap (an exact top-level rename).
+    const map = account.modelMap && typeof account.modelMap === 'object' ? account.modelMap : null;
+    for (const m of [model, advisorModel]) {
+      if (!m) continue;
+      const sent = map && Object.hasOwn(map, m) && typeof map[m] === 'string' ? map[m] : m;
+      for (const key of new Set([String(m).toLowerCase(), String(sent).toLowerCase()])) {
+        const until = denied[key];
+        if (!until) continue;
+        if (now < until) return true;
+        delete denied[key];
+        console.log(`[TeamClaude] Account "${account.name}" may serve ${key} again (model refusal expired)`);
+      }
+    }
+    return false;
   }
 
   /** True while an account is in its OAuth entitlement cooldown. Expiry is
@@ -1706,6 +1753,9 @@ export class AccountManager {
     // unavailableLine drop the row — so the one state added to make a refusal
     // explainable was the only one that printed no explanation (#258).
     if (this._entitlementDenied(account)) return 'entitlement';
+
+    // A model upstream refused on this account: that exact model only.
+    if (this._modelDenied(account, model, advisorModel)) return 'model-denied';
 
     // Check rate limit expiry
     if (account.status === 'throttled' && account.rateLimitedUntil) {
@@ -4115,6 +4165,8 @@ export class AccountManager {
         pausedUntil: a.pausedUntil && a.pausedUntil > Date.now()
           ? new Date(a.pausedUntil).toISOString()
           : null,
+        modelDenied: Object.fromEntries(Object.entries(a.modelDenied || {})
+          .filter(([, until]) => until > Date.now()).map(([m, until]) => [m, new Date(until).toISOString()])),
         entitlementDeniedUntil: a.entitlementDeniedUntil && a.entitlementDeniedUntil > Date.now()
           ? new Date(a.entitlementDeniedUntil).toISOString()
           : null,

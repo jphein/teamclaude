@@ -9,13 +9,27 @@ export function isFableModel(model) {
   return typeof model === 'string' && /fable/i.test(model);
 }
 
+// Mythos (claude-mythos-5, claude-mythos-5-1, …): its own family, rationed
+// like Fable (family-policy.js).
+/** @param {unknown} model */
+export function isMythosModel(model) {
+  return typeof model === 'string' && /mythos/i.test(model);
+}
+
 // The model "family" a request belongs to. Anthropic meters some families with
 // their own weekly quota bucket (Fable, Sonnet) on top of the shared 5-hour and
 // weekly buckets, so the family decides which bucket governs a given request —
 // letting an account whose Fable bucket is spent keep serving Opus/Sonnet.
 // Returns a stable lowercase tag; unknown ids fall back to 'other'.
+//
+// Mythos has no dedicated quota field: upstream reports no Mythos-specific
+// weekly bucket today (2026-10-20, measured: a Mythos response carries only the
+// shared 5h/7d headers). Naming the family is still what makes it metered the
+// day one appears — a learned `scopedWeekly.mythos` from the usage endpoint
+// gates Mythos requests by this tag (AccountManager._scopedWeekly).
 export function modelFamily(model) {
   if (typeof model !== 'string' || !model) return 'other';
+  if (/mythos/i.test(model)) return 'mythos';
   if (/fable/i.test(model)) return 'fable';
   if (/sonnet/i.test(model)) return 'sonnet';
   if (/opus/i.test(model)) return 'opus';

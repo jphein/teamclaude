@@ -22,11 +22,12 @@ import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { resolveWarmupSchedule } from './warmup-schedule.js';
 import { parseProxyUrl } from './upstream-proxy.js';
 import { resolveLogSource, resolveRestartMethod } from './service-control.js';
+import { SHARED_KEY_ENTRY, fallbackAllowed } from './family-policy.js';
 
 /** Sent in place of a secret, and accepted back on a save as "unchanged". */
 export const MASK = '••••••••';
 
-/** @typedef {'bool'|'int'|'number'|'enum'|'text'|'list'|'json'|'secret'|'secretList'} FieldType */
+/** @typedef {'bool'|'int'|'number'|'enum'|'text'|'list'|'clients'|'json'|'secret'|'secretList'} FieldType */
 /**
  * @typedef {Object} Field
  * @property {string} key       dot path into the config ("proxy.port")
@@ -60,6 +61,41 @@ const thresholdCheck = (v) => {
   if (isObj(v) && Object.keys(v).length && Object.values(v).every(ok)) return null;
   return 'must be a number above 0 and at most 1, or an object of bucket → number';
 };
+
+/**
+ * A list of client names: only names from proxy.clientKeys, plus "(shared
+ * key)". Anything else is refused, so a key pasted here by mistake is never
+ * stored where the (unmasked) settings payload would show it.
+ * @param {any} v @param {any} cfg
+ */
+const clientsCheck = (v, cfg) => {
+  if (!(Array.isArray(v) && v.every((/** @type {unknown} */ n) => typeof n === 'string' && n.trim()))) return 'must be a list of client names';
+  const known = new Set(clientNames(cfg));
+  const bad = v.filter((/** @type {string} */ n) => !known.has(n));
+  return bad.length ? `${bad.length === 1 ? 'is' : 'are'} not a configured client name: ${bad.length} entr${bad.length === 1 ? 'y' : 'ies'} (names come from Client keys)` : null;
+};
+
+/**
+ * The settings of one rationed model family (family-policy.js): who may use it,
+ * what everyone else gets instead, and whether an allowed client falls back
+ * when upstream is at capacity.
+ * @param {'fable'|'mythos'} family @param {string} label
+ * @returns {Field[]}
+ */
+function familyFields(family, label) {
+  const re = new RegExp(family, 'i');
+  return /** @type {Field[]} */ ([
+    { key: `${family}.allow`, group: label, label: 'Allowed clients', type: 'clients', apply: 'hot', def: null,
+      help: `Clients that may use ${label}. Every other ${label} request is served as the fallback model, never refused. With Ration on and nothing ticked, nobody may; with Ration off, everyone may (no rationing).`,
+      check: clientsCheck },
+    { key: `${family}.model`, group: label, label: 'Fallback model', type: 'text', apply: 'hot', def: 'claude-opus-5-5',
+      help: `What a rationed ${label} request is served as, and what an allowed one falls back to when no account can serve ${label}.`,
+      check: (/** @type {any} */ v) => (fallbackAllowed(family, String(v)) ? null
+        : re.test(String(v)) ? `must not be a ${label} model` : 'must not be a model of a family whose rationing runs first (Mythos)') },
+    { key: `${family}.fallbackOnCapacity`, group: label, label: 'Fall back when at capacity', type: 'bool', apply: 'hot', def: true,
+      help: `When upstream answers ${label} with 529 "overloaded", serve an allowed client's request as the fallback model instead of the error.` },
+  ]);
+}
 
 /** @type {Field[]} */
 export const FIELDS = [
@@ -113,13 +149,9 @@ export const FIELDS = [
   { key: 'failover.timeoutSeconds', group: 'Failover', label: 'Local timeout (s)', type: 'int', apply: 'hot', def: 600, min: 10,
     help: 'Longest a failover request may take before it is abandoned and answered with a 429.' },
 
-  // ── Fable ───────────────────────────────────────────────────────────────
-  { key: 'fable.allow', group: 'Fable', label: 'Allowed clients', type: 'list', apply: 'hot', def: null,
-    help: 'Client key names that may use Fable; every other Fable request is served as the fallback model, never refused. "(shared key)" admits the shared key. Unset = no rationing; empty = nobody.',
-    check: (v) => (Array.isArray(v) && v.every((n) => typeof n === 'string' && n.trim()) ? null : 'must be a list of client names') },
-  { key: 'fable.model', group: 'Fable', label: 'Fallback model', type: 'text', apply: 'hot', def: 'claude-opus-5-5',
-    help: 'What a rationed Fable request is served as, and what an allowed one falls back to when no account has Fable left or Fable is at capacity.',
-    check: (v) => (/fable/i.test(String(v)) ? 'must not be a Fable model' : null) },
+  // ── Fable / Mythos (family-policy.js) ───────────────────────────────────
+  ...familyFields('fable', 'Fable'),
+  ...familyFields('mythos', 'Mythos'),
 
   // ── Keep-warm ───────────────────────────────────────────────────────────
   { key: 'warmOnExhaustion', group: 'Keep-warm', label: 'Align 5h windows', type: 'bool', apply: 'hot', def: false,
@@ -289,6 +321,16 @@ function displayValue(f, v) {
   return v;
 }
 
+/** Shown in place of an allow-list entry that is not a configured client name. */
+export const UNKNOWN_CLIENT = '(not a client name)';
+
+/** proxy.clientKeys names plus "(shared key)" — names only. @param {any} config @returns {string[]} */
+function clientNames(config) {
+  const keys = Array.isArray(config?.proxy?.clientKeys) ? config.proxy.clientKeys : [];
+  const names = keys.map((/** @type {any} */ e) => (typeof e?.name === 'string' ? e.name.trim() : '')).filter(Boolean);
+  return [...new Set(names), SHARED_KEY_ENTRY];
+}
+
 /**
  * What GET /teamclaude/settings returns: every field with its current value
  * (secrets masked), default and metadata, plus the editable account fields.
@@ -298,7 +340,13 @@ export function publicSettings(config) {
   const fields = FIELDS.map((f) => {
     const raw = getPath(config, f.key);
     const meta = withoutCheck(f);
-    return { ...meta, value: displayValue(f, raw), set: raw !== undefined && raw !== null && raw !== '' };
+    // A client picker offers the configured client NAMES (never their keys)
+    // plus the shared-key entry.
+    const options = f.type === 'clients' ? clientNames(config) : undefined;
+    // An allow entry that is not a configured name (a stale or mistyped one —
+    // or a key pasted in by hand) is shown masked, never verbatim.
+    const value = options && Array.isArray(raw) ? raw.map((/** @type {unknown} */ n) => (typeof n === 'string' && options.includes(n) ? n : UNKNOWN_CLIENT)) : displayValue(f, raw);
+    return { ...meta, ...(options ? { options } : {}), value, set: raw !== undefined && raw !== null && raw !== '' };
   });
   const accounts = (config?.accounts || []).map((/** @type {any} */ a, /** @type {number} */ i) => ({
     id: a.id ?? null, name: a.name, index: i, type: a.type,
@@ -310,7 +358,7 @@ export function publicSettings(config) {
   const known = new Set(FIELDS.map((f) => f.key));
   const tops = new Set([...known].map((k) => k.split(".")[0]).concat("accounts"));
   const unknown = Object.keys(config || {}).filter((k) => !tops.has(k));
-  for (const parent of ["proxy", "egress", "sx", "service", "mitm", "fable", "failover"]) {
+  for (const parent of ["proxy", "egress", "sx", "service", "mitm", "fable", "mythos", "failover"]) {
     for (const k of Object.keys(isObj(config?.[parent]) ? config[parent] : {})) if (!known.has(`${parent}.${k}`)) unknown.push(`${parent}.${k}`);
   }
   return {
@@ -363,7 +411,8 @@ function restoreUrl(v, stored) {
  * @param {Field} f @param {any} v
  */
 function normalise(f, v) {
-  if (f.type === 'list' && typeof v === 'string') v = v.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
+  if ((f.type === 'list' || f.type === 'clients') && typeof v === 'string') v = v.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
+  if (f.type === 'clients' && Array.isArray(v)) v = v.map((x) => (typeof x === 'string' ? x.trim() : x));
   if (f.type === 'text' && typeof v === 'string') {
     v = v.trim();
     if (v === '') v = null;
@@ -385,6 +434,7 @@ function problemFor(f, v, cfg) {
     case 'enum': if (!(f.options || []).some((/** @type {any} */ o) => o === v)) return `must be one of ${(f.options || []).map((/** @type {any} */ o) => JSON.stringify(o)).join(', ')}`; break;
     case 'text': if (typeof v !== 'string' && !(v === false && f.allowFalse)) return 'must be text'; break;
     case 'list': if (!(Array.isArray(v) && v.every((s) => typeof s === 'string')) && typeof v !== 'string') return 'must be a list of text'; break;
+    case 'clients': if (!(Array.isArray(v) && v.every((s) => typeof s === 'string'))) return 'must be a list of client names'; break;
     case 'secret': if (typeof v !== 'string') return 'must be text'; break;
     case 'secretList':
       if (!Array.isArray(v) || !v.every((/** @type {any} */ e) => isObj(e) && typeof e.name === 'string' && e.name.trim() && typeof e.key === 'string' && e.key)) return 'must be a list of { name, key }';

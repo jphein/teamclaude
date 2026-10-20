@@ -512,6 +512,15 @@
   .acct-adv { padding: 0.25rem 0 0.25rem 1.9rem; }
   .ck-list .ck { display: flex; gap: 0.4rem; margin-bottom: 0.25rem; max-width: 32rem; }
   .ck-list .ck input { flex: 1; }
+  .cl-pick { display: flex; flex-direction: column; gap: 0.2rem; max-width: 32rem; font-size: 0.82rem; }
+  .cl-pick .cl-names { display: flex; flex-wrap: wrap; gap: 0.15rem 0.9rem; padding-left: 1.2rem; }
+  .cl-pick .cl-names.off { opacity: 0.45; }
+  .cl-pick label { display: inline-flex; align-items: center; gap: 0.3rem; cursor: pointer; }
+  .fam-panel { font-size: 0.8rem; margin: 0.2rem 0 0.6rem; max-width: 46rem; }
+  .fam-panel table { border-collapse: collapse; width: 100%; margin-bottom: 0.4rem; }
+  .fam-panel th, .fam-panel td { text-align: left; padding: 0.15rem 0.5rem 0.15rem 0; border-bottom: 1px solid var(--panel-border); font-variant-numeric: tabular-nums; }
+  .fam-panel th { color: var(--text-dim); font-weight: 500; }
+  .fam-panel .dim { color: var(--text-dim); }
   .set-actions { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin-top: 1rem; position: sticky; bottom: 0; background: var(--panel); padding: 0.5rem 0; }
   .set-msg { font-size: 0.82rem; }
   .set-msg.bad { color: var(--bad); } .set-msg.good { color: var(--good); }
@@ -999,12 +1008,12 @@
     line.appendChild(el('span', { title: view.rule }, ['routing ', el('b', { text: view.mode === 'expiry' ? 'expires first' : 'strict list order' })]));
     const ruleEl = document.getElementById('ruleLine');
     if (ruleEl) ruleEl.textContent = view.rule;
-    // Fable rationing (fable.allow): today's rewrites and fallbacks, and the
-    // latest fallback in one line so JP sees when his own Fable became Opus.
-    const fb = s.fable || {};
-    if (fb.enabled) {
-      line.appendChild(el('span', { title: 'Fable allowed for: ' + ((fb.allow || []).join(', ') || 'nobody') + '. Everyone else is served as ' + fb.model + '.' },
-        ['Fable ', el('b', { text: (fb.rewritten || 0) + ' rewritten to Opus today · ' + (fb.fallbacks || 0) + ' fallbacks' })]));
+    // Fable / Mythos rationing (<family>.allow): today's rewrites and fallbacks
+    // in one line each, so JP sees when his own Fable or Mythos became Opus.
+    for (const [name, fb] of [['Fable', s.fable || {}], ['Mythos', s.mythos || {}]]) {
+      if (!fb.enabled) continue;
+      line.appendChild(el('span', { title: name + ' allowed for: ' + ((fb.allow || []).join(', ') || 'nobody') + '. Everyone else is served as ' + fb.model + '.' },
+        [name + ' ', el('b', { text: (fb.rewritten || 0) + ' rewritten to ' + String(fb.model || 'Opus').replace(/^claude-/, '') + ' today · ' + (fb.fallbacks || 0) + ' fallbacks' })]));
     }
     // Local-model failover: state on the fleet line, and a banner while active.
     const fo = s.failover || {};
@@ -1461,6 +1470,26 @@
         input.value = Array.isArray(value) ? value.join('\n') : (value ?? '');
         read = () => input.value.split(/\n/).map(s => s.trim()).filter(Boolean);
         break;
+      case 'clients': {
+        // A switch ("ration this family") above one checkbox per client name.
+        // Off = no list: everyone may use it. On with nothing ticked = nobody.
+        // Names come from the server (client key NAMES only); a name already in
+        // the config that is no longer a client key stays listed so it is visible.
+        // An entry that is not a configured name arrives masked as "(not a client name)".
+        const names = [...new Set([...(f.options || []), ...(Array.isArray(value) ? value : [])])];
+        const on = el('input', { type: 'checkbox', disabled: dis });
+        on.checked = Array.isArray(value);
+        const boxes = names.map(n => {
+          const cb = el('input', { type: 'checkbox', disabled: dis, 'data-name': n });
+          cb.checked = Array.isArray(value) && value.includes(n);
+          return { n, cb, row: el('label', {}, [cb, n]) };
+        });
+        const list = el('div', { class: 'cl-names' + (on.checked ? '' : ' off') }, boxes.map(b => b.row));
+        on.addEventListener('change', () => { list.classList.toggle('off', !on.checked); });
+        input = el('div', { class: 'cl-pick' }, [el('label', {}, [on, 'Ration: only the ticked clients may use it']), list]);
+        read = () => on.checked ? boxes.filter(b => b.cb.checked).map(b => b.n) : null;
+        break;
+      }
       case 'json':
         input = el('textarea', { rows: 2, placeholder: 'default: ' + showDef(f.def), disabled: dis, spellcheck: 'false' });
         input.value = value == null ? '' : JSON.stringify(value, null, 1).replace(/\n\s*/g, ' ');
@@ -1500,6 +1529,36 @@
       f.apply === 'restart' ? el('span', { class: 'badge restart', text: 'needs restart', title: 'Saved at once, applied on the next restart' }) : null,
       f.danger ? el('span', { class: 'badge danger', text: '⚠ sensitive', title: 'Changes where traffic or tokens go, who can connect, or what runs' }) : null,
     ];
+  }
+
+  // Read-only: what each account has left of a rationed family, and who was
+  // rewritten or fell back in the last 24 hours (from the last status poll).
+  function familyPanel(family) {
+    const box = el('div', { class: 'fam-panel' });
+    const st = lastStatus;
+    if (!st) { box.appendChild(el('div', { class: 'dim', text: 'Allowance and rewrites appear once the status has loaded.' })); return box; }
+    const label = family === 'fable' ? 'Fable' : 'Mythos';
+    const rows = (st.accounts || []).map(a => {
+      const q = a.quota || {};
+      let u = null; let r = null;
+      if (family === 'fable' && q.unified7dFable != null) { u = q.unified7dFable; r = q.unified7dFableReset; }
+      else if (q.scopedWeekly?.[family]?.utilization != null) { u = q.scopedWeekly[family].utilization; r = q.scopedWeekly[family].resetAt; }
+      const deniedAt = Object.entries(a.modelDenied || {}).filter(([m]) => m.includes(family)).map(([, t]) => t).sort().pop();
+      const denied = deniedAt;
+      const left = u == null ? el('span', { class: 'dim', text: family === 'mythos' ? 'shares the weekly bucket' : 'not reported yet' }) : fmtPct(Math.max(0, 1 - u)) + ' left';
+      const rs = r ? fmtReset(r) : null;
+      return el('tr', {}, [el('td', { text: a.name }), el('td', {}, left), el('td', { class: 'dim', text: rs ? '↺ ' + rs.when : '' }),
+        el('td', { text: denied ? 'refused until ' + new Date(denied).toLocaleTimeString() : (a.status || '') })]);
+    });
+    box.appendChild(el('table', {}, [el('tr', {}, ['Account', label + ' weekly', 'Resets', 'State'].map(h => el('th', { text: h }))), ...rows]));
+    const fam = st[family] || {};
+    const by = fam.byClient24h || {};
+    const who = Object.keys(by).sort((x, y) => (by[y].rewritten + by[y].fallbacks) - (by[x].rewritten + by[x].fallbacks));
+    box.appendChild(who.length
+      ? el('table', {}, [el('tr', {}, ['Client (last 24 h)', 'Rewritten', 'Fell back'].map(h => el('th', { text: h }))),
+          ...who.map(n => el('tr', {}, [el('td', { text: n }), el('td', { text: String(by[n].rewritten) }), el('td', { text: String(by[n].fallbacks) })]))])
+      : el('div', { class: 'dim', text: `No ${label} request was rewritten or fell back in the last 24 hours.` }));
+    return box;
   }
 
   function renderSettings() {
@@ -1572,7 +1631,11 @@
 
     let group = null;
     for (const f of d.fields) {
-      if (f.group !== group) { group = f.group; settingsBody.appendChild(el('div', { class: 'set-group', text: group })); }
+      if (f.group !== group) {
+        group = f.group;
+        settingsBody.appendChild(el('div', { class: 'set-group', text: group }));
+        if (group === 'Fable' || group === 'Mythos') settingsBody.appendChild(familyPanel(group.toLowerCase()));
+      }
       const row = el('div', { class: 'set-row', 'data-key': f.key });
       const ed = { f };
       const made = settingsInput(f, f.value, d.canEdit, () => markDirty(row, ed)());

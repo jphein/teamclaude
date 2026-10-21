@@ -251,8 +251,9 @@ export function upgradeUpstreamFor(hostHeader, config, upstream) {
  * @param {Object|null} [opts.egress]
  * @param {Object|null} [opts.clientUsage]
  * @param {Object|null} [opts.dimensionUsage]
+ * @param {import('./tunnel-stats.js').TunnelStats|null} [opts.tunnelStats]  counts blind tunnels per client
  */
-export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null }) {
+export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null, tunnelStats = null }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
 
@@ -392,6 +393,9 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       // response" — so before the tunnel is live, surface failures as a real
       // proxy error status instead of a silent drop.
       let established = false, closed = false;
+      // Counted from the dial, not the 200: a burst that never connects (the
+      // EMFILE case) still holds a socket per attempt.
+      const tunnelClosed = tunnelStats ? tunnelStats.open(auth.client) : () => {};
       // Tear down BOTH sockets when either errors or closes, so a one-sided
       // failure can't leave the paired socket lingering (FD leak). The `closed`
       // guard makes it idempotent (error+close both fire) and ensures we write
@@ -399,6 +403,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       const teardown = (statusLine) => {
         if (closed) return;
         closed = true;
+        tunnelClosed();
         if (!established && statusLine) {
           try { clientSocket.write(`HTTP/1.1 ${statusLine}\r\nConnection: close\r\n\r\n`); } catch { /* client already gone */ }
         }

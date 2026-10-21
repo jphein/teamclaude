@@ -1026,10 +1026,14 @@
       foBanner.textContent = fo.active ? 'FAILOVER: no Claude account can serve — agents are on the local model (' + fo.model + '), slower and weaker. ' + (fo.served || 0) + ' requests served' + (fo.since ? ' since ' + new Date(fo.since).toLocaleTimeString() : '') + '. Claude takes over again as soon as an account can serve.' : '';
       foBanner.style.display = fo.active ? '' : 'none';
     }
+    // The latest fallback of either family (Fable or Mythos), named by family.
     const fbNote = document.getElementById('fableNote');
     if (fbNote) {
-      const lf = fb.enabled ? fb.lastFallback : null;
-      fbNote.textContent = lf ? 'Fable fell back to ' + lf.to + ' at ' + new Date(lf.at).toLocaleTimeString() + ' for ' + (lf.client || '(shared key)') + ': ' + lf.reason + '.' : '';
+      const lf = [['Fable', s.fable], ['Mythos', s.mythos]]
+        .filter(([, f]) => f && f.enabled && f.lastFallback)
+        .map(([family, f]) => ({ family, ...f.lastFallback }))
+        .sort((a, b) => String(b.at).localeCompare(String(a.at)))[0] || null;
+      fbNote.textContent = lf ? lf.family + ' fell back to ' + lf.to + ' at ' + new Date(lf.at).toLocaleTimeString() + ' for ' + (lf.client || '(shared key)') + ': ' + lf.reason + '.' : '';
       fbNote.style.display = lf ? '' : 'none';
     }
     const w = s.warm || {};

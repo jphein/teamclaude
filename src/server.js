@@ -1682,7 +1682,17 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId, pinned: ctx.pinnedIndex != null, client });
       }
     } catch (err) {
-      reportFailure('[TeamClaude] Unhandled error:', err);
+      // A client that hangs up mid-upload (Ctrl+C in Claude Code) is not a
+      // failure: Node rejects the body read with its own 'aborted' reset. One
+      // line says so; a stack under "Unhandled error" made watchers chase it as
+      // a bug (seven on the VM, 2026-10-20/21). Everything else still reports.
+      if (isClientAbort(err)) {
+        try {
+          console.log(`[TeamClaude] Client disconnected before sending its whole request (${safeLine(String(req.method), 10)} ${safeLine(String(req.url), 80)})`);
+        } catch { /* a broken console must not stop the recovery below */ }
+      } else {
+        reportFailure('[TeamClaude] Unhandled error:', err);
+      }
       // Close the activity entry. Only the inner path has a `finally`, so a
       // throw above it opens a row that nothing else will ever close, and every
       // consumer holds an open row indefinitely: the TUI keeps it in `active`
@@ -1738,6 +1748,12 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
  * see, and this daemon treats an uncaught EPIPE as fatal. `writeSync` throws
  * where it is called, so the catch below is real.
  */
+/** Node's own error for a request whose client went away mid-body
+ * (`abortIncoming`: an ECONNRESET with the message "aborted"). @param {any} err */
+export function isClientAbort(err) {
+  return err?.code === 'ECONNRESET' && err?.message === 'aborted';
+}
+
 function reportFailure(...args) {
   try {
     console.error(...args);

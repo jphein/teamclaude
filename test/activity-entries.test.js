@@ -341,3 +341,30 @@ test('a blocked model closes its activity entry exactly once', async () => {
   assert.equal(ends.length, 1,
     `one blocked request closed its activity entry ${ends.length} times (statuses ${ends.join(', ')})`);
 });
+
+
+test('a client hanging up mid-upload is one plain log line, not an "Unhandled error" stack', async () => {
+  const am = new AccountManager(ACCTS, 0.98);
+  let markOpened;
+  const opened = new Promise(resolve => { markOpened = resolve; });
+  const ended = [];
+  const proxy = createProxyServer(am, NO_UPSTREAM, {
+    onRequestStart: () => markOpened(),
+    onRequestEnd: (id, info) => ended.push(info.status),
+  });
+  const port = await listen(proxy);
+  const errors = []; const logs = [];
+  const realErr = console.error; const realLog = console.log;
+  console.error = (...a) => { errors.push(a.map(String).join(' ')); };
+  console.log = (...a) => { logs.push(a.map(String).join(' ')); };
+  try {
+    await abortMidBody(port, opened);
+    await until(() => ended.length >= 1);
+  } finally {
+    console.error = realErr; console.log = realLog;
+    proxy.close();
+  }
+  assert.deepEqual(ended, [499]);
+  assert.ok(!errors.some(l => /Unhandled error/.test(l)), `a client abort was reported as a failure: ${errors.join(' | ')}`);
+  assert.ok(logs.some(l => /Client disconnected before sending its whole request \(POST \/v1\/messages\)/.test(l)), logs.join(' | '));
+});

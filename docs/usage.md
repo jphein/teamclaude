@@ -166,6 +166,15 @@ claude --settings ~/.config/teamclaude-client/<name>.settings.json   # add --res
 
 A username that is a valid client key is never read as an account pin, and a non-empty password is kept by the forwarder. Check it took: `clients.<name>.requests` in `/teamclaude/status` rises with the session's requests, and a rationed request from it logs no `rewritten` line.
 
+**Keep it across restarts.** The key lives in the launch, not in the session. A lane relaunched with a plain `claude --resume …` is the shared host client again (that is how the spire lead lost its key on 2026-10-20). So put `--settings` in every place that starts the lane: the tmux launcher, a lane script, a systemd unit.
+
+```bash
+tmux new-session -d -s <lane> -c <dir> \
+  "claude --settings ~/.config/teamclaude-client/<name>.settings.json --resume <session-id>"
+```
+
+A relaunch by hand needs the flag too. `/status` inside Claude Code shows the proxy, not the client, so check with `clients.<name>` as above.
+
 ### Routing plain `claude` automatically
 
 So you don't have to type `teamclaude run` every time, add a shell alias that sends plain `claude` through the proxy:

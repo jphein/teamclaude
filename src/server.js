@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, countLocalTokens, estimateInputTokens, MIN_ANSWER_TOKENS, FailoverState } from './failover.js';
 import { FableStats } from './fable-policy.js';
+import { TunnelStats } from './tunnel-stats.js';
 import { FAMILIES, familyPolicy, rewriteFamilyBody, familyModelIn, isFamilyModel, clientAllowed, FamilyStats, isFamilyRefusal } from './family-policy.js';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
@@ -261,6 +262,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // into it.
   const familyStats = familyStatsOn(hooks);
   const failoverState = /** @type {any} */ (hooks).failoverState ||= new FailoverState();
+  // Blind third-party tunnels per client, open now and at peak (tunnel-stats.js).
+  const tunnelStats = /** @type {any} */ (hooks).tunnelStats ||= new TunnelStats();
   const holdMs = (config.holdSeconds || 0) * 1000;
 
   // The log directory is made up front and synchronously, so a path that
@@ -504,7 +507,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const fable = familyStatus(config, 'fable', familyStats.fable);
         const mythos = familyStatus(config, 'mythos', familyStats.mythos);
         const failover = failoverState.snapshot(failoverPolicy(config));
-        res.end(JSON.stringify({ ...extra, ...status, fable, mythos, failover, upstreamPool: upstreamPoolStatus() }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, fable, mythos, failover, tunnels: tunnelStats.snapshot(), upstreamPool: upstreamPoolStatus() }, null, 2));
         return;
       }
 
@@ -907,7 +910,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks: channelHooks('m'), log: console.error, sx, egress, clientUsage, dimensionUsage }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks: channelHooks('m'), log: console.error, sx, egress, clientUsage, dimensionUsage, tunnelStats }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the

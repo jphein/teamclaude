@@ -461,6 +461,13 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   // Not a config write, but it names a session and moves it: one tenant must
   // not be able to put another tenant's session on an account of its choosing.
   ['/teamclaude/session-pin', 'a client key cannot pin sessions'],
+  // Fork routes (Oracle, 2026-10-21): every lane on a host holds a client key
+  // (familiar's forwarder injects one), so a tenant must not be able to take an
+  // account out of rotation or restart the service. Reauth stays open to client
+  // keys: it needs a browser OAuth sign-in plus the identity check to change
+  // anything.
+  ['/teamclaude/account', 'a client key cannot change accounts'],
+  ['/teamclaude/restart', 'a client key cannot restart the service'],
 ]);
 
 /**

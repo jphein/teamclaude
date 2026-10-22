@@ -332,7 +332,7 @@ It speaks both the stateless 2026-07-28 revision of the protocol and the handsha
 
 Behind a reverse proxy (Caddy, nginx): the loopback exemption is refused for any request carrying `X-Forwarded-For`, `X-Real-IP` or `Forwarded`, and those headers are never read as the caller's address, so a proxied browser always needs the key wherever the reverse proxy runs. Mutating calls from a page on another origin are refused (`403`) even when it holds a key.
 
-Any configured key — `proxy.apiKey` or any `proxy.clientKeys` entry — can use every control on the page. There is no admin-only key; give a client key only to callers you would let switch accounts and restart the service.
+Any configured key — `proxy.apiKey` or any `proxy.clientKeys` entry — can read the page, switch the current account, refresh quotas, reload and re-login an account. Changes that hold for every tenant need the shared `proxy.apiKey`: saving Settings, the threshold slider, priority, enabling or disabling an account, and restarting the service. A client key is refused those with a 403, because every lane on a host can hold one.
 
 ## Auto-update
 

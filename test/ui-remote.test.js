@@ -176,11 +176,17 @@ test('every mutating endpoint /ui calls refuses a keyless remote caller, with no
 test('a remote caller with the key reaches each mutating endpoint (restart excluded: it would run systemctl)', async () => {
   const { calls, hooks } = spies();
   const { server, am } = makeServer(hooks);
+  // A client key is refused the account and restart controls (they retire or
+  // stop the fleet for every tenant); the shared key below still reaches them.
+  const OPERATOR_ONLY = new Set(['/teamclaude/account', '/teamclaude/restart']);
   for (const [url, body] of MUTATIONS.filter(([u]) => u !== '/teamclaude/restart')) {
     const res = await request(server, { method: 'POST', url, headers: { ...JSON_HEADERS, 'x-api-key': KEY }, body: body ? JSON.stringify(body) : '' });
-    assert.equal(res.status, 200, url + ' ' + res.chunks);
+    assert.equal(res.status, OPERATOR_ONLY.has(url) ? 403 : 200, url + ' ' + res.chunks);
   }
-  assert.deepEqual(calls.sort(), ['account', 'probe', 'reauth', 'reauth/cancel', 'reauth/code', 'reload']);
+  const shared = await request(server, { method: 'POST', url: '/teamclaude/account', headers: { ...JSON_HEADERS, 'x-api-key': PROXY.apiKey }, body: JSON.stringify({ name: 'a', disabled: true }) });
+  assert.equal(shared.status, 200, 'the shared key still reaches /account');
+  calls.splice(calls.indexOf('account'), 1);
+  assert.deepEqual(calls.sort(), ['probe', 'reauth', 'reauth/cancel', 'reauth/code', 'reload']);
   assert.equal(am.currentIndex, 1);
 });
 

@@ -1161,7 +1161,10 @@ export function parseAuthCodeInput(text, expectedState) {
     const code = url.searchParams.get('code');
     const state = url.searchParams.get('state');
     if (code) {
-      if (expectedState && state && state !== expectedState) {
+      // A pasted callback URL must carry THIS session's state: a missing one is
+      // not "unknown, so fine" (xreview 2026-10-21). A raw code is the separate
+      // manual path below.
+      if (expectedState && state !== expectedState) {
         throw new Error('OAuth state mismatch');
       }
       return code;

@@ -184,6 +184,18 @@ test('a remote caller with the key reaches each mutating endpoint (restart exclu
   assert.equal(am.currentIndex, 1);
 });
 
+test('the threshold endpoint (upstream\'s since the 2026-10 sync) refuses a client key and a key-less remote caller', async () => {
+  const { calls, hooks } = spies();
+  const { server, am } = makeServer(hooks);
+  const body = JSON.stringify({ percent: 70 });
+  const withClient = await request(server, { method: 'POST', url: '/teamclaude/threshold', headers: { ...JSON_HEADERS, 'x-api-key': KEY }, body });
+  assert.equal(withClient.status, 403, withClient.chunks);
+  const noKey = await request(server, { method: 'POST', url: '/teamclaude/threshold', headers: JSON_HEADERS, body });
+  assert.ok(noKey.status === 401 || noKey.status === 403, `key-less remote caller got ${noKey.status}`);
+  assert.equal(am.switchThreshold, 0.98, 'nothing changed');
+  assert.deepEqual(calls, []);
+});
+
 test('a page on another origin holding no key gets nothing; even with the key, a cross-site POST is refused', async () => {
   const { calls, hooks } = spies();
   const { server } = makeServer(hooks);

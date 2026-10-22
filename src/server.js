@@ -864,7 +864,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // so a restart doesn't undo it; re-enable also clears a stuck error state).
       if (req.method === 'POST' && req.url === '/teamclaude/account') {
         try {
-          const { name, disabled } = JSON.parse((await readBody(req)) || '{}');
+          const { name, disabled } = JSON.parse((await readControlBody(req)) || '{}');
           const idx = accountManager.accounts.findIndex(a => a.name === name);
           if (idx < 0) { json(res, 404, { error: `account "${name}" not found` }); return; }
           accountManager.setDisabled(idx, !!disabled);
@@ -887,7 +887,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       if (req.method === 'POST' && req.url === '/teamclaude/reauth') {
         if (!hooks.reauth) { json(res, 501, { error: 'reauth not supported' }); return; }
         try {
-          const { name } = JSON.parse((await readBody(req)) || '{}');
+          const { name } = JSON.parse((await readControlBody(req)) || '{}');
           if (!name) { json(res, 400, { error: 'Missing "name"' }); return; }
           const { authUrl } = await hooks.reauth.start(name);
           console.log(`[TeamClaude] Reauth started for "${name}" via UI`);
@@ -899,7 +899,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       if (req.method === 'POST' && req.url === '/teamclaude/reauth/code') {
         if (!hooks.reauth) { json(res, 501, { error: 'reauth not supported' }); return; }
         try {
-          const { code } = JSON.parse((await readBody(req)) || '{}');
+          const { code } = JSON.parse((await readControlBody(req)) || '{}');
           json(res, 200, await hooks.reauth.submitCode(code));
         } catch (err) { json(res, err.status || 500, { error: err.message }); }
         return;

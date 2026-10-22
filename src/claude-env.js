@@ -76,6 +76,66 @@ export function mergeNoProxy(...inherited) {
   return out.join(',');
 }
 
+/** The two ways a launched client can reach the proxy. */
+export const CLIENT_MODES = ['mitm', 'base-url'];
+
+/**
+ * Which mode `run` and `env` use: a `--mitm` or `--no-mitm` flag decides, else
+ * the config's `defaultClientMode`, else MITM.
+ *
+ * MITM routes every request of the launched client through the proxy, so the
+ * hard-coded api.anthropic.com endpoints and the Codex CLI (which honours only
+ * proxy variables) are covered. It is also the whole point of the setting: with
+ * `eval "$(teamclaude env)"` the proxy variables are shell-wide, and every other
+ * tool in that shell — gh, git, a package manager — follows them to a listener
+ * that only speaks to two hosts (#382). An operator who lives in such a shell
+ * sets `defaultClientMode: "base-url"` once and opts back in per launch.
+ *
+ * @param {{ defaultClientMode?: string }|null|undefined} config
+ * @param {string[]} flags  the invocation's own arguments
+ * @returns {'mitm'|'base-url'}
+ */
+export function resolveClientMode(config, flags) {
+  const mitm = flags.includes('--mitm');
+  const noMitm = flags.includes('--no-mitm');
+  if (mitm && noMitm) throw new Error('choose either --mitm or --no-mitm');
+  if (mitm) return 'mitm';
+  if (noMitm) return 'base-url';
+  return config?.defaultClientMode === 'base-url' ? 'base-url' : 'mitm';
+}
+
+const SHELL_PROXY_VARS = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'];
+
+/**
+ * @param {unknown} value
+ * @param {number} port
+ */
+function pointsAtLoopback(value, port) {
+  if (!value) return false;
+  try {
+    const url = new URL(String(value));
+    const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    return ['127.0.0.1', 'localhost', '::1'].includes(host) && Number(url.port || 80) === port;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `unset` lines for proxy variables a previous MITM-mode eval left in the
+ * shell, so re-evaluating in base-URL mode takes the proxy back out of it. Only
+ * a value naming THIS proxy's loopback port is touched: a real corporate proxy
+ * in the same variables is the operator's and stays.
+ *
+ * @param {unknown} port
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {string[]}
+ */
+export function clearSelfProxyEnvLines(port, env = process.env) {
+  const checkedPort = validPort(port);
+  return SHELL_PROXY_VARS.filter(name => pointsAtLoopback(env[name], checkedPort)).map(name => `unset ${name}`);
+}
+
 // Build the shell `export` lines that point Claude Code — or any tool that
 // spawns it, e.g. an agent multiplexer — at the proxy. This is the same
 // environment `teamclaude run` sets up, but emitted for `eval "$(teamclaude
@@ -149,4 +209,33 @@ export function buildClaudeEnvLines({ port, useMitm = true, caPath = null, holdS
   if (holdMs > 0) lines.push(`export API_TIMEOUT_MS=${holdMs + 60_000}`);
 
   return lines;
+}
+
+// A claude that died within this long of launch did not get to a prompt.
+export const LOCAL_LOGIN_HINT_WINDOW_MS = 20_000;
+
+const NO_LOGIN = 'Claude Code has no login of its own on this machine, and it needs one before it will talk to the proxy (the pool\'s accounts are separate). Run `claude auth login`, then try again.';
+const STALE_LOGIN = 'If claude reported an expired OAuth session: that is Claude Code\'s own login (~/.claude/.credentials.json), which it checks before it sends anything, not the proxy\'s accounts. Run `claude auth login`, then try again.';
+
+/**
+ * One line naming Claude Code's own login as the likely cause of a launch that
+ * failed straight away, or null when that login looks fine. Claude Code checks
+ * its local login before it sends anything, in either client mode: with that
+ * login expired and unrefreshable it exits at once with "OAuth session expired
+ * and could not be refreshed", and nothing reaches the proxy (#395). That reads
+ * like the pool being broken, so `run` says which login it was when the session
+ * ended that quickly and that badly. Only a hint: a fast non-zero exit with a
+ * stale local login is the shape of that failure, not proof of it. The pool's
+ * accounts are the proxy's; the client's own login expires independently.
+ * @param {{ read: (path: string) => Promise<Record<string, any>>, expired: (expiresAt: unknown) => boolean }} deps
+ *   the credentials reader (oauth.js importCredentials) and the expiry test
+ * @returns {Promise<string|null>}
+ */
+export async function localLoginHint({ read, expired }) {
+  let creds;
+  try { creds = await read('~/.claude/.credentials.json'); }
+  catch { return NO_LOGIN; }
+  if (!creds?.accessToken && !creds?.refreshToken) return NO_LOGIN;
+  if (expired(creds.expiresAt)) return STALE_LOGIN;
+  return null;
 }

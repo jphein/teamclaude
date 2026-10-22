@@ -21,8 +21,8 @@ import http2 from 'node:http2';
 import { getConfigPath } from './config.js';
 import { cachedLookup } from './dns-cache.js';
 import { generateCertChain } from './x509.js';
-import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolveAccountPin, describeConnectError } from './server.js';
-import { interceptHostsFor, isNeverIntercepted } from './provider.js';
+import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolveAccountPin, describeConnectError, KEEP_ALIVE_TIMEOUT_MS, shouldStripOverageHeaders } from './server.js';
+import { interceptHostsFor, isNeverIntercepted, providerForPath, DEFAULT_PROVIDER } from './provider.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { safeLine } from './safe-text.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
@@ -64,26 +64,46 @@ async function atomicWrite(path, data, mode) {
 const MIN_CERT_REMAINING_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
+ * How a stored chain measures up for `hosts` at `now`. `signed` is whether the
+ * leaf is signed by the CA at all; `shortfall` is null when the chain can be
+ * reused as it is, else why it cannot: a host the leaf does not name, or less
+ * than MIN_CERT_REMAINING_MS left on either cert. Exported for tests.
+ * @param {string} caCertPem
+ * @param {string} leafCertPem
+ * @param {string[]} hosts
+ * @returns {{ signed: boolean, shortfall: string|null }}
+ */
+export function chainShortfall(caCertPem, leafCertPem, hosts, now = Date.now()) {
+  try {
+    const ca = new X509Certificate(caCertPem);
+    const leaf = new X509Certificate(leafCertPem);
+    if (!leaf.verify(ca.publicKey)) return { signed: false, shortfall: 'is not signed by the stored CA' };
+    const names = (leaf.subjectAltName || '').split(',').map((s) => s.trim());
+    // An IP literal is checked against the iPAddress SANs (Node normalises the
+    // spelling); a name against the dNSName entries (fork, #19).
+    const missing = hosts.filter((h) => (net.isIP(h) ? leaf.checkIP(h) === undefined : !names.includes(`DNS:${h}`)));
+    if (missing.length) return { signed: true, shortfall: `does not name ${missing.join(', ')}` };
+    for (const cert of [ca, leaf]) {
+      const validTo = new Date(cert.validTo).getTime();
+      if (!Number.isFinite(validTo) || validTo - now < MIN_CERT_REMAINING_MS) {
+        const when = Number.isFinite(validTo) ? new Date(validTo).toISOString().slice(0, 10) : 'an unreadable date';
+        return { signed: true, shortfall: `${validTo <= now ? 'expired' : 'expires'} on ${when}` };
+      }
+    }
+    return { signed: true, shortfall: null };
+  } catch {
+    return { signed: false, shortfall: 'cannot be read' };
+  }
+}
+
+/**
  * Is the stored leaf signed by the stored CA, valid for every host in `hosts`,
  * and (both certs) good for at least MIN_CERT_REMAINING_MS past `now`?
  * Exported for tests.
  */
 export function leafCovers(caCertPem, leafCertPem, hosts, now = Date.now()) {
-  try {
-    const ca = new X509Certificate(caCertPem);
-    const leaf = new X509Certificate(leafCertPem);
-    if (!leaf.verify(ca.publicKey)) return false;
-    for (const cert of [ca, leaf]) {
-      const validTo = new Date(cert.validTo).getTime();
-      if (!Number.isFinite(validTo) || validTo - now < MIN_CERT_REMAINING_MS) return false;
-    }
-    const names = (leaf.subjectAltName || '').split(',').map((s) => s.trim());
-    // An IP literal is checked against the iPAddress SANs (Node normalises
-    // the spelling); a name against the dNSName entries.
-    return hosts.every((h) => (net.isIP(h) ? leaf.checkIP(h) !== undefined : names.includes(`DNS:${h}`)));
-  } catch {
-    return false;
-  }
+  const { signed, shortfall } = chainShortfall(caCertPem, leafCertPem, hosts, now);
+  return signed && !shortfall;
 }
 
 /**
@@ -131,9 +151,22 @@ export async function refreshCaBundle(dir = certDir()) {
  * if missing/mismatched. The CA *private* key is never persisted — we regenerate
  * the whole chain when needed, so the only on-disk secret is the leaf key (0600),
  * which only authenticates as `host` to a process that already trusts our CA.
- * Returns { caPath, caCertPem, leafCertPem, leafKeyPem }.
+ *
+ * `keep` is for a caller that hands the CA to a client while a proxy is
+ * running (`teamclaude env` and `run`). The running proxy presents the leaf it
+ * read from these files, and a regenerated chain always comes with a new CA,
+ * since the old CA's key is gone. Replacing the files then gave every client
+ * launched afterwards a CA the proxy's leaf is not signed by, and each one
+ * failed its TLS handshake until the proxy restarted. So with `keep` a stored
+ * chain whose leaf the CA signed is reused even when it falls short, and
+ * `renewal` says why it is due; the proxy renews it when it next starts.
+ *
+ * Returns { caPath, caCertPem, leafCertPem, leafKeyPem, renewal }, where
+ * `renewal` is null unless a kept chain falls short.
+ * @param {string|string[]} host
+ * @param {{ keep?: boolean }} [opts]
  */
-export async function ensureCerts(host) {
+export async function ensureCerts(host, { keep = false } = {}) {
   const named = Array.isArray(host) ? host : [host];
   const hosts = [...new Set(named.filter(Boolean))];
   if (!hosts.includes(TEST_HOST)) hosts.push(TEST_HOST);
@@ -141,8 +174,14 @@ export async function ensureCerts(host) {
     readIf(fpath(CA_CERT)), readIf(fpath(LEAF_CERT)), readIf(fpath(LEAF_KEY)),
   ]);
 
-  if (caCertPem && leafCertPem && leafKeyPem && leafCovers(caCertPem, leafCertPem, hosts) && keyMatchesCert(leafCertPem, leafKeyPem)) {
-    return { caPath: fpath(CA_CERT), caCertPem, leafCertPem, leafKeyPem };
+  // keyMatchesCert (fork): a crash between writing the key and the cert leaves
+  // a mismatched pair; treat it as stale rather than serve a leaf whose key is
+  // not its own.
+  if (caCertPem && leafCertPem && leafKeyPem && keyMatchesCert(leafCertPem, leafKeyPem)) {
+    const { signed, shortfall } = chainShortfall(caCertPem, leafCertPem, hosts);
+    if (signed && (!shortfall || keep)) {
+      return { caPath: fpath(CA_CERT), caCertPem, leafCertPem, leafKeyPem, renewal: shortfall };
+    }
   }
 
   const chain = generateCertChain(hosts); // caKeyPem intentionally discarded
@@ -158,6 +197,7 @@ export async function ensureCerts(host) {
     caCertPem: chain.caCertPem,
     leafCertPem: chain.leafCertPem,
     leafKeyPem: chain.leafKeyPem,
+    renewal: null,
   };
 }
 
@@ -177,6 +217,11 @@ export function hostMode(host, config) {
   // Explicitly never intercepted, even though it sits under a provider's domain
   // — checked before anything else so no later rule can claim it.
   if (isNeverIntercepted(host)) return 'tunnel';
+  // In terminal-only mode the MITM must never terminate ChatGPT Desktop's
+  // connection. Terminal Codex uses the explicit /backend-api/codex base URL;
+  // this host-level bypass keeps Desktop's native auth and feature endpoints
+  // outside TeamClaude entirely.
+  if (config?.proxy?.terminalOnly === true && host === 'chatgpt.com') return 'tunnel';
   if (host === upstreamHostOf(config)) return 'rewrite';
   // A second provider's host, and only when an account actually uses that
   // provider. MITM is the mode that works without the client cooperating — a
@@ -296,6 +341,21 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       key, cert, allowHTTP1: true,
       ...(http1Only ? { ALPNProtocols: ['http/1.1'] } : {}),
     });
+    // The same client pools sit in front of this server as the base listener,
+    // so it holds an idle connection for the same time. Set on the h2 server,
+    // which passes it to the internal HTTP/1 server that `allowHTTP1` clients
+    // actually land on. Left unset, the two halves of one proxy disagree:
+    // measured on node 24, the base listener advertises `Keep-Alive:
+    // timeout=120` and this one advertises nothing at all, so the idle window
+    // is whatever that runtime happens to default to (node 26: 5s).
+    // @types/node does not declare keepAliveTimeout on Http2SecureServer, but
+    // the runtime honours it for the HTTP/1 connections allowHTTP1 accepts —
+    // asserted end-to-end through a real tunnel in mitm-integration.test.js,
+    // so the cast is checked by a test rather than taken on trust.
+    /** @type {any} */ (srv).keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
+    // Node 24.6 adds this buffer when an HTTP/1 response finishes, but its
+    // HTTP/2 server leaves it undefined; timeout + undefined would be NaN.
+    /** @type {any} */ (srv).keepAliveTimeoutBuffer ??= 1_000;
     srv.on('request', createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, forcedPin: pin || null, egress, clientUsage, forcedClient: client, dimensionUsage }));
     // Remote Control's real-time channel is a WebSocket (Upgrade handshake),
     // which never fires 'request' — only 'upgrade', with a raw socket instead
@@ -312,9 +372,23 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
           socket.destroy();
           return;
         }
+        // A provider's inference over a WebSocket — the Codex Responses channel
+        // — cannot be pooled here: relayUpgrade carries the client's own headers,
+        // so the turn would run on the client's login with nothing booked
+        // against the fleet (#492: a 12,727-token turn, 0 booked). Refused with
+        // a status the client reads as "no WebSocket here", so it falls back to
+        // HTTPS, where the pool serves it. Anthropic's path is the Remote
+        // Control channel, which is the client's own and still relayed.
+        const wsProvider = providerForPath(req.url);
+        if (wsProvider !== DEFAULT_PROVIDER) {
+          log(`[TeamClaude] MITM: refusing a ${wsProvider} WebSocket for ${safeLine(req.url, 96)} — it would run on the client's own login, not the pool; the client falls back to HTTPS`);
+          try { socket.write('HTTP/1.1 501 Not Implemented\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
+          socket.destroy();
+          return;
+        }
         // The CONNECT's client identity is bound to this listener (see getServer),
         // so the channel is attributed the way the requests in the tunnel are.
-        relayUpgrade(req, socket, head, target, sx, { client, clientUsage, log });
+        relayUpgrade(req, socket, head, target, sx, { client, clientUsage, log, stripOverage: shouldStripOverageHeaders(config) });
       } catch (err) {
         log(`[TeamClaude] MITM: WebSocket upgrade handler failed for ${safeLine(req?.url)}: ${err?.message || err}`);
         try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }

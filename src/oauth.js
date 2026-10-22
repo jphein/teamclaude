@@ -1,11 +1,14 @@
 import { readFile } from 'node:fs/promises';
 import { homedir, userInfo } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
-import { exec, execFile } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { createInterface } from 'node:readline';
 import http from 'node:http';
 import { proxyFetch } from './upstream-fetch.js';
+import { envVar } from './brand.js';
+import { creditCount } from './codex-usage.js';
+import { LOGIN_TIMEOUT_MS, codeRace, openBrowser, pasteFromTerminal } from './login-flow.js';
+import { safeLine } from './safe-text.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 const execFileAsync = promisify(execFile);
@@ -128,23 +131,55 @@ export async function importCredentials(filePath, {
 }
 
 const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
-const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
-const OAUTH_USAGE_BETA = 'oauth-2025-04-20';
+// `cedar_ember=1` asks the endpoint to add its banked-reset block (issue #493).
+// It is additive: every other field comes back unchanged.
+export const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage?cedar_ember=1';
+export const OAUTH_USAGE_BETA = 'oauth-2025-04-20';
+// The banked-reset block is gated on the User-Agent alone, measured against
+// the live endpoint: a non-Claude-Code agent reads `ineligible_reason:
+// "surface"`, a claude-cli older than 2.1.280 reads `"cli_version"`. This is a
+// published Claude Code release. If upstream raises the floor, the block comes
+// back ineligible, bankedResets() yields null, and only the reset reading goes
+// quiet; the quota buckets do not depend on it.
+export const USAGE_USER_AGENT = 'claude-cli/2.1.288 (external, cli)';
 const DEFAULT_TOKEN_ENDPOINT = 'https://platform.claude.com/v1/oauth/token';
 const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 
 /**
+ * A Retry-After header in milliseconds: delta-seconds or an HTTP date (RFC 9110
+ * §10.2.3). Undefined when absent or unparseable.
+ * @param {string|null|undefined} value
+ * @param {number} [now]
+ */
+export function parseRetryAfterMs(value, now = Date.now()) {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  if (/^\d+$/.test(value.trim())) return Number(value.trim()) * 1000;
+  const at = Date.parse(value);
+  return Number.isFinite(at) ? Math.max(0, at - now) : undefined;
+}
+
+/**
  * Refresh an expired OAuth access token using the refresh token.
  * Retries on 5xx and network errors with exponential backoff.
+ * `routing` is the account's own egress proxy (account-routing.js); null goes
+ * by the fleet path (upstream proxy when configured, direct otherwise).
+ * `budgetMs` bounds the whole call, retries included: no attempt goes out once
+ * it is spent, and none outlives it — the time a lock held for this renewal
+ * has left (credential-sync.js).
+ * @param {string} refreshToken
+ * @param {string} [endpoint]
+ * @param {import('./account-routing.js').RoutingProxy|null} [routing]
+ * @param {{ budgetMs?: number }} [opts]
  */
-export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_ENDPOINT) {
+export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_ENDPOINT, routing = null, { budgetMs = Infinity } = {}) {
   const maxRetries = 2;
   const baseDelayMs = 500;
   // Bound each attempt so a dead pooled socket (after a network drop/reconnect)
   // can't hang the refresh forever. A hung refresh is especially harmful here:
   // ensureTokenFresh coalesces callers into a single _refreshPromise, so one
   // stuck refresh wedges every request for that account until a restart.
-  const timeoutMs = Number(process.env.TEAMCLAUDE_REFRESH_TIMEOUT_MS) || 30_000;
+  const timeoutMs = Number(envVar('REFRESH_TIMEOUT_MS')) || 30_000;
+  const deadline = Date.now() + budgetMs;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -152,6 +187,8 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
         const delay = baseDelayMs * 2 ** (attempt - 1);
         await new Promise(resolve => setTimeout(resolve, delay));
       }
+      const left = deadline - Date.now();
+      if (left <= 0) throw new Error('Token refresh ran out of time');
 
       const res = await proxyFetch(endpoint, {
         method: 'POST',
@@ -165,7 +202,8 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
           refresh_token: refreshToken,
           client_id: DEFAULT_CLIENT_ID,
         }),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: AbortSignal.timeout(Math.min(timeoutMs, left)),
+        routing,
       });
 
       if (!res.ok) {
@@ -180,6 +218,12 @@ export async function refreshAccessToken(refreshToken, endpoint = DEFAULT_TOKEN_
         // transient server error. 5xx is retried above; reaching here with a 5xx
         // means retries were exhausted, which is still transient, not auth.
         err.status = res.status;
+        // A 429 says how long to stay away; the account holds its refreshes
+        // for that long (AccountManager.ensureTokenFresh).
+        if (res.status === 429) {
+          const retryAfterMs = parseRetryAfterMs(res.headers.get('retry-after'));
+          if (retryAfterMs !== undefined) /** @type {any} */ (err).retryAfterMs = retryAfterMs;
+        }
         throw err;
       }
 
@@ -287,11 +331,14 @@ export function normalizeProfile(data) {
  * Fetch account profile for an OAuth token.
  * Returns { email, name, orgName, orgType, ... } on success,
  * or { error: 'reason' } on failure.
+ * @param {string} accessToken
+ * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the account's own egress proxy
  */
-export async function fetchProfile(accessToken) {
+export async function fetchProfile(accessToken, routing = null) {
   try {
     const res = await proxyFetch(PROFILE_URL, {
       headers: { 'Authorization': `Bearer ${accessToken}` },
+      routing,
     });
     if (!res.ok) {
       let detail = '';
@@ -301,13 +348,91 @@ export async function fetchProfile(accessToken) {
       } catch {
         detail = await res.text().catch(() => '');
       }
-      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}` };
+      // Carry the status alongside the message, as fetchUsage already does:
+      // a caller has to tell "this token is dead" (401) from "we could not
+      // reach the endpoint" (5xx, network), and parsing that back out of the
+      // string would be fragile. What the status means is decided by the
+      // caller (identity.js isTokenRejection); this only reports it.
+      return { error: `HTTP ${res.status}${detail ? ': ' + detail : ''}`, status: res.status };
     }
     const data = await res.json();
     return normalizeProfile(data);
   } catch (err) {
-    return { error: err.message || String(err) };
+    return { error: err.message || String(err), status: null };
   }
+}
+
+/**
+ * The profile behind a credential set, renewing a stale access token first.
+ *
+ * An import hands over whatever Claude Code left on disk, and that access
+ * token is routinely past its hour while the refresh token beside it is still
+ * good. A 401 from the profile endpoint on such a token says nothing about the
+ * account — the refresh token is what proves it — so the token is refreshed
+ * (straight away when the clock already says it has expired, sparing the
+ * doomed round trip) and the profile fetched again with the new one. The
+ * credentials that come back are the ones to save: the renewed pair over every
+ * other field the set came with.
+ *
+ * `profile.status` is then the upstream's verdict on the set as a whole, which
+ * is what identity.js isTokenRejection keys on:
+ *   - 401 when the credential is dead: the profile endpoint rejected the access
+ *     token and there was no refresh token to renew it with, or the token
+ *     endpoint rejected the refresh (400/401/403 — the same reading
+ *     account-manager gives a refresh that needs a re-login);
+ *   - the token endpoint's status, or null, when the refresh failed for a
+ *     reason that says nothing about the token (network, 5xx after retries):
+ *     the credential is unreachable, not refused, and stays importable by name.
+ * A 403 is neither refreshed nor a rejection: the upstream answers 403 to a
+ * valid token from an unexpected region (see egress-guard.js) and under an org
+ * policy, and a new token would meet the same answer.
+ *
+ * @param {Record<string, any>} creds - { accessToken, refreshToken?, expiresAt?, ... }
+ * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the
+ * account's own egress proxy; every call here (the profile, and the refresh it
+ * may need first) is that account's traffic. Null goes by the fleet path.
+ * @param {{ renew?: (creds: Record<string, any>) => Promise<{ accessToken: string, refreshToken: string, expiresAt: number }> }} [opts]
+ * renew: the refresh itself, which the caller can put behind the callback.net
+ * lock (credential-sync.js refreshOutsideProxy); the default is a plain one.
+ * @returns {Promise<{ creds: Record<string, any>, profile: Record<string, any> }>}
+ */
+export async function profileForCredentials(creds, routing = null, { renew = (c) => refreshAccessToken(c.refreshToken, undefined, routing) } = {}) {
+  /** @type {Record<string, any>|null} */
+  let profile = isTokenExpired(creds.expiresAt) ? null : await fetchProfile(creds.accessToken, routing);
+  if (profile && profile.status !== 401) return { creds, profile };
+
+  if (!creds.refreshToken) {
+    // Nothing to renew with: the upstream's answer on the access token is final.
+    profile ??= await fetchProfile(creds.accessToken, routing);
+    if (profile.status === 401) {
+      profile = { ...profile, error: `${profile.error}; no refresh token to renew it with` };
+    }
+    return { creds, profile };
+  }
+
+  let renewed;
+  try {
+    renewed = await renew(creds);
+  } catch (err) {
+    // The refresh did not go through. The upstream keeps the last word on the
+    // access token itself, so one the clock wrote off is still presented once:
+    // a skewed clock must not refuse a token the upstream accepts.
+    profile ??= await fetchProfile(creds.accessToken, routing);
+    if (profile.status !== 401) return { creds, profile };
+    const e = /** @type {CodedError} */ (err);
+    const rejected = e.status === 400 || e.status === 401 || e.status === 403;
+    return {
+      creds,
+      profile: rejected
+        ? { ...profile, error: `${profile.error}; token refresh rejected: ${e.message}` }
+        // Not a verdict: the refresh token may well be good, so this is the
+        // unreachable shape, carrying the token endpoint's status if it gave one.
+        : { error: `${profile.error}; token refresh failed: ${e.message}`, status: e.status ?? null },
+    };
+  }
+
+  const fresh = { ...creds, ...renewed };
+  return { creds: fresh, profile: await fetchProfile(fresh.accessToken, routing) };
 }
 
 // Pull a per-model weekly limit out of the payload's `limits[]` array, which is
@@ -465,15 +590,20 @@ export function normalizeUsageBucket(bucket) {
  * poll. Returns normalized { fiveHour, sevenDay, sevenDaySonnet, sevenDayFable } buckets
  * plus scopedWeeklyListed (whether the payload enumerated its model-scoped
  * weekly caps), or { error, status } on failure.
+ * @param {string} accessToken
+ * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the account's own egress proxy
+ * @param {{ fetchImpl?: Function }} [opts]
  */
-export async function fetchUsage(accessToken) {
+export async function fetchUsage(accessToken, routing = null, { fetchImpl = proxyFetch } = {}) {
   try {
-    const res = await proxyFetch(USAGE_URL, {
+    const res = await fetchImpl(USAGE_URL, {
       headers: {
         'Authorization': `Bearer ${accessToken}`,
         'anthropic-beta': OAUTH_USAGE_BETA,
         'Accept': 'application/json',
+        'User-Agent': USAGE_USER_AGENT,
       },
+      routing,
     });
 
     if (!res.ok) {
@@ -520,7 +650,66 @@ export function normalizeUsagePayload(data) {
     // caps and that family was not among them. Without the list, a missing
     // family is our own ignorance and nothing may be concluded from it.
     scopedWeeklyListed: Array.isArray(data?.limits),
+    // Banked usage-limit resets (the claude.ai "Resets" offer), in the same
+    // shape the Codex probe reports its free reset credits, so the status
+    // line, the TUI tag and the dashboard badge read both without knowing
+    // which provider the account is on.
+    resetCredits: bankedResets(data?.cedar_ember),
   };
+}
+
+/**
+ * The banked usage-limit resets this account holds, from the `cedar_ember`
+ * block, or null when the payload says nothing usable about them. Observed
+ * shape (Max account, 2026-10-04):
+ *
+ *   { eligible: true, ineligible_reason: null, grants: [{
+ *       label, resets_total: 1, resets_left: 1,
+ *       starts_at: '2026-09-22T16:00:00+00:00', ends_at: '2026-10-22T16:00:00+00:00',
+ *       clears: ['five_hour', 'seven_day', ...], paused: false, usable_now: true, ... }] }
+ *
+ * Mapped onto the Codex counts:
+ *
+ *  - `available` is every reset a live grant still holds, which is what the
+ *    claude.ai Resets page shows.
+ *  - `applicable` is the subset upstream says can be spent this instant
+ *    (`usable_now`, not `paused`); a grant whose `starts_at` is still ahead
+ *    reads `usable_now: false`.
+ *  - `expiresAt` is the soonest `ends_at` among the grants counted, so the
+ *    displays can say when the reset lapses and drop it once it has.
+ *
+ * An ineligible block is null, not zero. Its reason so far has always been
+ * about the caller (`surface`, `cli_version`), not the account, so "none" would
+ * be a claim the payload does not make. An eligible block with no live grant is
+ * a real zero: the reset was spent or has expired.
+ *
+ * Grant ids (and the payload's `next_grant_id`) are never read here. They are
+ * the handle that spends a reset: only the opt-in redeemer (claude-resets.js)
+ * reads them, from a fresh status of its own, and none is ever stored.
+ *
+ * @param {any} block  the payload's `cedar_ember` object
+ * @param {number} [now]  ms epoch a grant's expiry is measured against
+ * @returns {{available: number, applicable: number, expiresAt: number|null}|null}
+ */
+export function bankedResets(block, now = Date.now()) {
+  if (!block || typeof block !== 'object' || block.eligible !== true) return null;
+  if (!Array.isArray(block.grants)) return null;
+  let available = 0;
+  let applicable = 0;
+  /** @type {number|null} */
+  let expiresAt = null;
+  for (const grant of block.grants) {
+    if (!grant || typeof grant !== 'object') continue;
+    const left = creditCount(grant.resets_left);
+    if (!left) continue;
+    const ends = typeof grant.ends_at === 'string' ? Date.parse(grant.ends_at) : NaN;
+    if (Number.isFinite(ends) && ends <= now) continue;
+    available += left;
+    if (grant.usable_now === true && grant.paused !== true) applicable += left;
+    if (Number.isFinite(ends) && (expiresAt == null || ends < expiresAt)) expiresAt = ends;
+  }
+  // Re-capped after summing, for the same width budget creditCount guards.
+  return { available: creditCount(available) ?? 0, applicable: creditCount(applicable) ?? 0, expiresAt };
 }
 
 // OAuth config (extracted from Claude Code). Client id + token endpoint are
@@ -532,8 +721,17 @@ const MANUAL_LOGIN_REDIRECT_URI = 'https://console.anthropic.com/oauth/code/call
 /**
  * Exchange an OAuth authorization code for access/refresh tokens.
  * Shared by both browser-callback and manual/paste login paths.
+ * `routing` is the about-to-be-added account's own egress proxy (the login
+ * CLI's --routing): the exchange and the profile fetch that follows are that
+ * account's traffic too.
+ * @param {string} code
+ * @param {string} state
+ * @param {string} codeVerifier
+ * @param {string} redirectUri
+ * @param {string} [tokenEndpoint]
+ * @param {import('./account-routing.js').RoutingProxy|null} [routing]
  */
-async function exchangeCodeForTokens(code, state, codeVerifier, redirectUri, tokenEndpoint = DEFAULT_TOKEN_ENDPOINT) {
+async function exchangeCodeForTokens(code, state, codeVerifier, redirectUri, tokenEndpoint = DEFAULT_TOKEN_ENDPOINT, routing = null) {
   const tokenRes = await proxyFetch(tokenEndpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -545,6 +743,7 @@ async function exchangeCodeForTokens(code, state, codeVerifier, redirectUri, tok
       redirect_uri: redirectUri,
       code_verifier: codeVerifier,
     }),
+    routing,
   });
 
   if (!tokenRes.ok) {
@@ -556,52 +755,332 @@ async function exchangeCodeForTokens(code, state, codeVerifier, redirectUri, tok
 }
 
 /**
+ * A paste read as an address, when it is one: anything with a scheme, and a
+ * loopback address without one (some browsers hide `http://` in the address
+ * bar). A `code#state` or a bare code is not an address, and gets null.
+ * @param {string} text
+ */
+function pastedUrl(text) {
+  const t = text.trim();
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(t) ? t
+    : /^(localhost|127\.0\.0\.1):\d+\//i.test(t) ? `http://${t}` : null;
+  if (!withScheme) return null;
+  try { return new URL(withScheme); } catch { return null; }
+}
+
+/**
  * Parse an authorization code from user input.
  * Accepts either:
- * 1. A full callback URL with ?code= and ?state= parameters
+ * 1. A full callback URL with ?code= and ?state= parameters (the scheme may
+ *    be missing from a loopback one)
  * 2. A code#state format (manual login success page)
  * 3. A raw authorization code (falls back to using expectedState if provided)
+ *
+ * The two forms that carry a state must carry it, and it must be this
+ * login's: a paste missing it, or from another attempt, is refused here with
+ * a reason the person can act on, rather than sent to the token endpoint to
+ * fail there (by then the TUI's panel has closed). A URL carrying `error` is
+ * reported only after its state checks out, and the provider's text is cut
+ * to one plain line, since it is printed on a terminal.
  *
  * A bare code carries no state, so the state check cannot run for that shape:
  * the code is sent with `expectedState` unchecked. PKCE still binds the
  * exchange to this process's code verifier, so a code obtained elsewhere is
- * useless to it. Exported for tests.
+ * useless to it, and a genuine one copied without its `#state` still works.
+ * Exported for tests.
+ *
+ * @param {string} input
+ * @param {string} expectedState
+ * @returns {{ code: string, state: string } | null}  null for an empty paste
  */
 export function parseAuthCode(input, expectedState) {
-  const trimmed = input.trim();
+  const trimmed = String(input ?? '').trim();
   if (!trimmed) return null;
+  const mismatch = () => new Error('OAuth state mismatch: that code is from a different sign-in attempt. Open this link again and paste the new code');
 
-  // Try to parse as a URL with ?code= parameter
-  try {
-    const url = new URL(trimmed);
+  const url = pastedUrl(trimmed);
+  if (url) {
     const code = url.searchParams.get('code');
+    const error = url.searchParams.get('error');
     const state = url.searchParams.get('state');
-    if (code) {
-      if (expectedState && state && state !== expectedState) {
-        throw new Error('OAuth state mismatch');
-      }
-      return { code, state: state || expectedState };
+    if (!code && !error) throw new Error('That address carries no code. Paste the code the page shows after you sign in, or the whole address it was sent to');
+    if (!state) throw new Error('That address has no state. Paste the whole address, not only the code');
+    if (expectedState && state !== expectedState) throw mismatch();
+    if (error) {
+      const description = safeLine(url.searchParams.get('error_description') || '', 200);
+      throw new Error(`The sign-in was refused: ${safeLine(error, 80)}${description ? ` (${description})` : ''}`);
     }
-  } catch (e) {
-    if (e.message === 'OAuth state mismatch') throw e;
+    return { code: /** @type {string} */ (code), state };
   }
 
-  // Try to parse as code#state format (manual login)
   if (trimmed.includes('#')) {
-    const parts = trimmed.split('#');
-    const code = parts[0].trim();
-    const state = parts[1]?.trim();
-    if (code) {
-      if (expectedState && state && state !== expectedState) {
-        throw new Error('OAuth state mismatch');
-      }
-      return { code, state: state || expectedState };
-    }
+    const at = trimmed.indexOf('#');
+    const code = trimmed.slice(0, at).trim();
+    const state = trimmed.slice(at + 1).trim();
+    if (!code || !state) throw new Error('That is not the whole code. Paste all of what the page shows, the part after the # included');
+    if (expectedState && state !== expectedState) throw mismatch();
+    return { code, state };
   }
 
-  // Treat as raw authorization code
   return { code: trimmed, state: expectedState };
 }
+
+/**
+ * The authorize URL for one redirect. Both of a login's URLs carry the same
+ * challenge and state, so either one can complete it.
+ * @param {string} redirectUri
+ * @param {string} codeChallenge
+ * @param {string} state
+ */
+function buildAuthUrl(redirectUri, codeChallenge, state) {
+  const authUrl = new URL(OAUTH_AUTHORIZE);
+  authUrl.searchParams.set('code', 'true');
+  authUrl.searchParams.set('client_id', DEFAULT_CLIENT_ID);
+  authUrl.searchParams.set('response_type', 'code');
+  authUrl.searchParams.set('redirect_uri', redirectUri);
+  authUrl.searchParams.set('scope', OAUTH_SCOPES);
+  authUrl.searchParams.set('code_challenge', codeChallenge);
+  authUrl.searchParams.set('code_challenge_method', 'S256');
+  authUrl.searchParams.set('state', state);
+  return authUrl.toString();
+}
+
+/** Whether a paste is the address a browser reached on this login's loopback
+ *  listener, as opposed to a code from the code page.
+ *  @param {string} text  @param {number} port */
+function isLoopbackAddress(text, port) {
+  const url = pastedUrl(text);
+  return url?.protocol === 'http:' && (url.hostname === 'localhost' || url.hostname === '127.0.0.1') && Number(url.port) === port;
+}
+
+/**
+ * Start a Claude sign-in and hand back what finishing it needs.
+ *
+ * The token exchange must name the redirect the code was issued for, and no
+ * one redirect serves both ends of the problem, so a login has up to two:
+ *
+ *  - loopback, http://localhost:<port>/callback: a listener on this machine.
+ *    Only a browser on this machine reaches it, and then the sign-in finishes
+ *    with nothing to copy. It exists only when `loopback` is set, which a
+ *    caller does when it is about to open that browser itself.
+ *  - manual, the console's code page: it shows `code#state` for the person to
+ *    paste back. It works from any device, so it is the URL handed to the
+ *    person (printed, linked, copied) in every case.
+ *
+ * Both URLs carry the same PKCE challenge and state, and only one code is ever
+ * exchanged, so the listener and the paste can race inside one login. Each
+ * answer is exchanged under the redirect it came from: a pasted
+ * http://localhost:<port>/callback address (a browser that reached the page
+ * but not the listener) is the loopback's, and anything else is the code
+ * page's.
+ *
+ * Opening a browser is the caller's decision, so this never does.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.loopback]  also listen on loopback, and return the URL for a local browser
+ * @param {import('./account-routing.js').RoutingProxy | null} [opts.routing]  the about-to-be-added account's own egress proxy
+ * @param {AbortSignal | null} [opts.signal]  cancels the wait and closes the listener
+ * @param {number} [opts.timeoutMs]  0 waits for ever
+ * @param {typeof exchangeCodeForTokens} [opts.exchange]  injectable so tests need no token endpoint
+ */
+export async function startOAuthLogin({ loopback = true, routing = null, signal = null, timeoutMs = LOGIN_TIMEOUT_MS, exchange = exchangeCodeForTokens } = {}) {
+  const codeVerifier = randomBytes(32).toString('base64url');
+  const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
+  const state = randomBytes(32).toString('base64url');
+  const url = buildAuthUrl(MANUAL_LOGIN_REDIRECT_URI, codeChallenge, state);
+
+  const callback = loopback ? await startCallbackServer(state) : null;
+  const loopbackRedirect = callback ? `http://localhost:${callback.port}/callback` : null;
+
+  /** @param {string} text */
+  const parse = text => {
+    // The link this login handed out, pasted back by mistake. It even carries a
+    // `code` parameter (`code=true`), which would otherwise be sent as the code
+    // and burn the attempt at the token endpoint.
+    const pasted = pastedUrl(text);
+    if (pasted && `${pasted.origin}${pasted.pathname}` === OAUTH_AUTHORIZE) {
+      throw new Error('That is the sign-in link itself. Open it in a browser, sign in, and paste the code the page shows');
+    }
+    const parsed = parseAuthCode(text, state);
+    if (!parsed?.code) return null;
+    const redirectUri = callback && loopbackRedirect && isLoopbackAddress(text, callback.port) ? loopbackRedirect : MANUAL_LOGIN_REDIRECT_URI;
+    return { code: parsed.code, state: parsed.state || state, redirectUri };
+  };
+  const race = codeRace({
+    listener: callback && loopbackRedirect ? callback.codePromise.then(code => ({ code, state, redirectUri: loopbackRedirect })) : null,
+    parse,
+    signal,
+    timeoutMs,
+    onSettle: () => callback?.server.close(),
+  });
+  const tokens = race.result.then(answer => {
+    console.log('Exchanging authorization code for tokens...');
+    return exchange(answer.code, answer.state, codeVerifier, answer.redirectUri, DEFAULT_TOKEN_ENDPOINT, routing);
+  });
+  // Awaited by every caller; this only stops one that failed before awaiting
+  // from leaving a later rejection unhandled, which would end the process.
+  tokens.catch(() => {});
+  return {
+    url,
+    browserUrl: loopbackRedirect ? buildAuthUrl(loopbackRedirect, codeChallenge, state) : null,
+    submit: race.submit,
+    settled: race.settled,
+    tokens,
+  };
+}
+
+/**
+ * `teamclaude login` on the machine with the browser: open it on the loopback
+ * URL and wait for the redirect.
+ *
+ * On a terminal the code-page URL is printed as the fallback, and its code can
+ * be pasted while the browser flow is still waiting; whichever arrives first is
+ * used. Without a terminal there is nowhere to paste, so the fallback printed
+ * is the loopback URL itself, as before.
+ *
+ * @param {{ routing?: import('./account-routing.js').RoutingProxy | null, input?: NodeJS.ReadStream }} [opts]
+ *   `routing` is the about-to-be-added account's own egress proxy (login --routing).
+ */
+export async function loginOAuth({ routing = null, input = process.stdin } = {}) {
+  const canPaste = Boolean(input.isTTY);
+  const controller = new AbortController();
+  const flow = await startOAuthLogin({ loopback: true, routing, signal: controller.signal });
+  const browserUrl = flow.browserUrl || flow.url;
+
+  console.log('Opening browser for authentication...');
+  openBrowser(browserUrl);
+  if (!canPaste) {
+    console.log(`If it doesn't open, visit:\n  ${browserUrl}\n`);
+    return flow.tokens;
+  }
+  console.log(`If it doesn't open, visit this on any device and paste the code it shows:\n  ${flow.url}\n`);
+  pasteFromTerminal({
+    submit: flow.submit,
+    settled: flow.settled,
+    prompt: 'Paste the code here (or wait for the browser): ',
+    onEnd: () => controller.abort(),
+    input,
+  });
+  return flow.tokens;
+}
+
+/**
+ * `teamclaude login --token`, and `teamclaude login` on a remote session: the
+ * sign-in with no browser and no listener on this machine.
+ *
+ * The person opens the URL on any device, signs in, and pastes back the code
+ * the page shows. There is no timeout: nothing is listening, so a slow paste
+ * holds nothing open. A paste that cannot be used is asked for again; the end
+ * of input ends the login.
+ *
+ * @param {{ routing?: import('./account-routing.js').RoutingProxy | null, input?: NodeJS.ReadStream }} [opts]
+ */
+export async function loginOAuthWithPastedCode({ routing = null, input = process.stdin } = {}) {
+  const controller = new AbortController();
+  const flow = await startOAuthLogin({ loopback: false, routing, signal: controller.signal, timeoutMs: 0 });
+
+  console.log('Authorization URL:');
+  console.log(`  ${flow.url}\n`);
+  console.log('Steps:');
+  console.log('  1. Open the URL above in a browser (on any device)');
+  console.log('  2. Log in to your Claude account');
+  console.log('  3. Copy the authorization code shown on the success page');
+  console.log('  4. Paste it below\n');
+
+  pasteFromTerminal({
+    submit: flow.submit,
+    settled: flow.settled,
+    prompt: 'Paste authorization code (or full callback URL): ',
+    onEnd: () => controller.abort(new Error('No authorization code provided')),
+    input,
+  });
+  return flow.tokens;
+}
+
+/**
+ * The loopback listener the browser is redirected back to.
+ *
+ * Only a request carrying the expected `state` may settle the login. The state
+ * is checked FIRST, and a mismatch is answered 400 without touching the
+ * promise: this port is briefly open while the user is in the browser, and a
+ * stray GET — a drive-by page hitting localhost ports, a scanner, a stale tab —
+ * used to abort the whole login by arriving with `?error=` or with no state at
+ * all. A request line Node accepts but URL cannot parse (`GET http://[::1`)
+ * is a 400 as well, not an exception thrown in the proxy's process; and a
+ * server error after the bind rejects the code, not the process, through the
+ * 'error' listener kept for the server's whole life. How long it waits is the
+ * caller's business (see codeRace), so it keeps no timer of its own.
+ * Exported for tests.
+ *
+ * @param {string} expectedState
+ * @returns {Promise<{ port: number, codePromise: Promise<string>, server: import('node:http').Server }>}
+ */
+export function startCallbackServer(expectedState) {
+  return new Promise((resolve, reject) => {
+    /** @type {(code: string) => void} */
+    let resolveCode = () => {};
+    /** @type {(err: Error) => void} */
+    let rejectCode = () => {};
+    /** @type {Promise<string>} */
+    const codePromise = new Promise((res, rej) => { resolveCode = res; rejectCode = rej; });
+
+    const server = http.createServer((req, res) => {
+      let url;
+      try {
+        url = new URL(req.url || '/', 'http://localhost');
+      } catch {
+        res.writeHead(400);
+        res.end('Bad request');
+        return;
+      }
+
+      if (url.pathname === '/callback') {
+        const state = url.searchParams.get('state');
+        if (!state || state !== expectedState) {
+          res.writeHead(400, { 'Content-Type': 'text/html' });
+          res.end('<html><body><h2>Invalid request</h2><p>State mismatch. You can close this tab.</p></body></html>');
+          return;
+        }
+
+        const error = url.searchParams.get('error');
+        if (error) {
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.end('<html><body><h2>Authentication failed</h2><p>You can close this tab.</p></body></html>');
+          // Provider text, bound for a terminal: one plain line, no escapes.
+          rejectCode(new Error(`OAuth error: ${safeLine(error, 80)} - ${safeLine(url.searchParams.get('error_description') || '', 200)}`));
+          return;
+        }
+
+        const code = url.searchParams.get('code');
+        if (code) {
+          res.writeHead(302, { 'Location': 'https://platform.claude.com/oauth/code/success?app=claude-code' });
+          res.end();
+          resolveCode(code);
+          return;
+        }
+      }
+
+      res.writeHead(404);
+      res.end('Not found');
+    });
+
+    // Loopback only: the redirect URI is http://localhost:<port>/callback, so
+    // nothing off this machine ever has a reason to reach the listener.
+    let listening = false;
+    server.listen(0, '127.0.0.1', () => {
+      listening = true;
+      resolve({ port: /** @type {import('node:net').AddressInfo} */ (server.address()).port, codePromise, server });
+    });
+    // Before the bind an error is the bind's, and nobody holds codePromise yet
+    // to hear it; after, it is the login's.
+    server.on('error', err => (listening ? rejectCode(err) : reject(err)));
+  });
+}
+
+// ── Fork: dashboard reauth (src/reauth.js) ──────────────────────────────────
+// One PKCE session with a loopback listener and a bound exchange, raced by the
+// web dashboard against a pasted code or callback URL. The CLI login uses
+// upstream's startOAuthLogin above.
 
 /**
  * Create a PKCE authorization session: a fresh verifier/state pair, a local
@@ -682,7 +1161,10 @@ export function parseAuthCodeInput(text, expectedState) {
     const code = url.searchParams.get('code');
     const state = url.searchParams.get('state');
     if (code) {
-      if (expectedState && state && state !== expectedState) {
+      // A pasted callback URL must carry THIS session's state: a missing one is
+      // not "unknown, so fine" (xreview 2026-10-21). A raw code is the separate
+      // manual path below.
+      if (expectedState && state !== expectedState) {
         throw new Error('OAuth state mismatch');
       }
       return code;
@@ -693,190 +1175,4 @@ export function parseAuthCodeInput(text, expectedState) {
 
   // Treat raw input as the authorization code
   return trimmed;
-}
-
-/**
- * Perform OAuth login via browser with PKCE flow.
- * Opens the user's browser, waits for the callback, exchanges the code for tokens.
- */
-export async function loginOAuth() {
-  const session = await createOAuthSession();
-
-  // Open browser
-  console.log('Opening browser for authentication...');
-  console.log(`If it doesn't open, visit:\n  ${session.authUrl}\n`);
-  openBrowser(session.authUrl);
-
-  // Wait for either the callback server or manual paste from stdin
-  let code;
-  try {
-    code = await raceWithStdinCode(session.codePromise, session.state);
-  } finally {
-    session.close();
-  }
-
-  // Exchange code for tokens
-  console.log('Exchanging authorization code for tokens...');
-  return session.exchange(code);
-}
-
-/**
- * Perform OAuth login via manual copy/paste (no local callback server).
- * User opens the authorization URL on any device, logs in, and pastes back
- * the authorization code shown on the success page. Useful for headless
- * machines, remote servers, or when localhost callbacks are unavailable.
- */
-export async function loginOAuthWithPastedCode() {
-  // Generate PKCE
-  const codeVerifier = randomBytes(32).toString('base64url');
-  const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
-  const state = randomBytes(32).toString('base64url');
-  const redirectUri = MANUAL_LOGIN_REDIRECT_URI;
-
-  // Build authorization URL
-  const authUrl = new URL(OAUTH_AUTHORIZE);
-  authUrl.searchParams.set('code', 'true');
-  authUrl.searchParams.set('client_id', DEFAULT_CLIENT_ID);
-  authUrl.searchParams.set('response_type', 'code');
-  authUrl.searchParams.set('redirect_uri', redirectUri);
-  authUrl.searchParams.set('scope', OAUTH_SCOPES);
-  authUrl.searchParams.set('code_challenge', codeChallenge);
-  authUrl.searchParams.set('code_challenge_method', 'S256');
-  authUrl.searchParams.set('state', state);
-
-  // Display the authorization URL
-  console.log('Authorization URL:');
-  console.log(`  ${authUrl.toString()}\n`);
-  console.log('Steps:');
-  console.log('  1. Open the URL above in a browser (on any device)');
-  console.log('  2. Log in to your Claude account');
-  console.log('  3. Copy the authorization code shown on the success page');
-  console.log('  4. Paste it below\n');
-
-  // Prompt for manual paste
-  const rl = createInterface({ input: process.stdin, output: process.stderr });
-  const input = await new Promise(resolve => {
-    rl.question('Paste authorization code (or full callback URL): ', resolve);
-  });
-  rl.close();
-
-  // Parse the input
-  const parsed = parseAuthCode(input, state);
-  if (!parsed || !parsed.code) {
-    throw new Error('No authorization code provided');
-  }
-
-  // Exchange code for tokens
-  console.log('Exchanging authorization code for tokens...');
-  return exchangeCodeForTokens(parsed.code, parsed.state, codeVerifier, redirectUri);
-}
-
-/**
- * Race the callback server promise against manual code entry from stdin.
- * The user can paste the full callback URL or just the authorization code.
- */
-function raceWithStdinCode(callbackPromise, expectedState) {
-  if (!process.stdin.isTTY) return callbackPromise;
-
-  return new Promise((resolve, reject) => {
-    const rl = createInterface({ input: process.stdin, output: process.stderr });
-    let settled = false;
-
-    const settle = (fn, val) => {
-      if (settled) return;
-      settled = true;
-      rl.close();
-      fn(val);
-    };
-
-    rl.question('Paste authorization code here (or wait for browser callback): ', answer => {
-      let code;
-      try {
-        code = parseAuthCodeInput(answer, expectedState);
-      } catch (err) {
-        settle(reject, err);
-        return;
-      }
-      if (!code) return; // empty input, keep waiting for callback
-      settle(resolve, code);
-    });
-
-    callbackPromise.then(
-      code => settle(resolve, code),
-      err => settle(reject, err),
-    );
-  });
-}
-
-/**
- * The loopback listener the browser is redirected back to.
- *
- * Only a request carrying the expected `state` may settle the login. The state
- * is checked FIRST, and a mismatch is answered 400 without touching the
- * promise: this port is briefly open while the user is in the browser, and a
- * stray GET — a drive-by page hitting localhost ports, a scanner, a stale tab —
- * used to abort the whole login by arriving with `?error=` or with no state at
- * all. Exported for tests.
- */
-export function startCallbackServer(expectedState) {
-  return new Promise((resolve, reject) => {
-    let resolveCode, rejectCode;
-    const codePromise = new Promise((res, rej) => { resolveCode = res; rejectCode = rej; });
-
-    const server = http.createServer((req, res) => {
-      const url = new URL(req.url, `http://localhost`);
-
-      if (url.pathname === '/callback') {
-        const state = url.searchParams.get('state');
-        if (!state || state !== expectedState) {
-          res.writeHead(400, { 'Content-Type': 'text/html' });
-          res.end('<html><body><h2>Invalid request</h2><p>State mismatch. You can close this tab.</p></body></html>');
-          return;
-        }
-
-        const error = url.searchParams.get('error');
-        if (error) {
-          res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end('<html><body><h2>Authentication failed</h2><p>You can close this tab.</p></body></html>');
-          rejectCode(new Error(`OAuth error: ${error} - ${url.searchParams.get('error_description') || ''}`));
-          return;
-        }
-
-        const code = url.searchParams.get('code');
-        if (code) {
-          res.writeHead(302, { 'Location': 'https://platform.claude.com/oauth/code/success?app=claude-code' });
-          res.end();
-          resolveCode(code);
-          return;
-        }
-      }
-
-      res.writeHead(404);
-      res.end('Not found');
-    });
-
-    // Loopback only: the redirect URI is http://localhost:<port>/callback, so
-    // nothing off this machine ever has a reason to reach the listener.
-    server.listen(0, '127.0.0.1', () => {
-      resolve({ port: /** @type {import('node:net').AddressInfo} */ (server.address()).port, codePromise, server });
-    });
-    server.on('error', reject);
-
-    // Timeout after 2 minutes (unref so it doesn't keep the process alive)
-    const timer = setTimeout(() => {
-      rejectCode(new Error('Login timed out after 2 minutes'));
-      server.close();
-    }, 120_000);
-    timer.unref();
-  });
-}
-
-function openBrowser(url) {
-  const platform = process.platform;
-  // `start` takes its first quoted argument as the window title, so the URL
-  // needs an empty title in front of it or the browser never opens.
-  const cmd = platform === 'darwin' ? 'open'
-    : platform === 'win32' ? 'start ""'
-    : 'xdg-open';
-  exec(`${cmd} ${JSON.stringify(url)}`, () => {});
 }

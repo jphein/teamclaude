@@ -1,7 +1,21 @@
-// Tracks Claude Code sessions by their `x-claude-code-session-id` header so
-// teamclaude can (a) report how many sessions are running and (b) optionally
-// keep each session pinned to one account while spreading NEW sessions across
-// accounts (the opt-in fix for concurrency funnelling — issue #109).
+// Tracks live CONVERSATIONS so teamclaude can (a) report what the fleet is
+// carrying and (b) optionally keep each conversation pinned to one account
+// while spreading NEW ones across accounts (the opt-in fix for concurrency
+// funnelling — issue #109).
+//
+// The key is a pin key, not a bare session id: a client's
+// `x-claude-code-session-id` narrowed to the conversation within it (see
+// conversation.js for how, and why). One Claude Code session emits one session
+// id for its own turns AND for every subagent it launches, so keying on that
+// header alone held a whole fan-out on one account — N concurrent requests
+// queueing behind one account's ceiling, for a prompt cache none of them
+// shared. A conversation is the thing that owns a cache, so it is the thing
+// that is pinned, counted as load, and spread.
+//
+// Each record carries the session id it belongs to, unnarrowed, so the readout
+// can still group and name what an operator recognises. Counts here are
+// therefore conversations: a session that fans out nine ways is nine of them,
+// which is also what its load on the fleet actually is.
 //
 // A session pins PER WEEKLY QUOTA BUCKET, not once overall. Quota and
 // eligibility are already decided per bucket — an account whose Fable weekly is
@@ -26,20 +40,51 @@ export const SESSION_ACTIVE_TTL_MS = 2 * 60 * 1000; // 2min idle → no longer "
 
 const SWEEP_INTERVAL_MS = 60 * 1000; // bound growth without an external timer
 
-// The session id is a client-supplied header, and every distinct value becomes
-// a Map key that lives for the known window. A client minting a fresh id per
-// request would otherwise grow this map for an hour with nothing to stop it, so
-// the tracker bounds itself: at most this many sessions (the idle ones go first
-// when the cap is hit — one still in flight is never dropped), and no key longer
-// than this. server.js validates the header too; this is the tracker's own guard.
+// A pin key is derived from client-supplied bytes — the session header and the
+// conversation's opening — and every distinct value becomes a Map key that lives
+// for the known window. A client minting a fresh session id per request, or one
+// rewriting its first message every turn, would otherwise grow this map for an
+// hour with nothing to stop it, so the tracker bounds itself: at most this many
+// conversations (the idle ones go first when the cap is hit — one still in
+// flight is never dropped), and no key longer than this.
+//
+// The cap counts conversations, so one client fanning out holds as many entries
+// as it has agents in flight rather than one. That is the quantity worth
+// bounding: the entries exist to hold a pin and a prompt cache each, and a
+// client with ten thousand live conversations has bigger problems than this map.
 export const MAX_SESSIONS = 10_000;
+// The window `recentRequestsFor` counts over: long enough that a lane's turn
+// cadence (one request every few seconds while it works, none while it thinks)
+// averages out, short enough that a session that went quiet stops weighing on
+// its account's placement score within the time a new session would notice.
+export const LOAD_WINDOW_MS = 10 * 60 * 1000;
+// Bound on the routed-request ring, independent of MAX_SESSIONS: a fleet of
+// 40 lanes at one request every 10 s is 2,400 entries per window.
+export const MAX_ROUTED = 50_000;
 export const MAX_SESSION_ID_LENGTH = 128;
+// The session id, the separator and the digest conversation.js appends. Bounded
+// rather than derived from that module so the tracker's own guard does not
+// depend on the caller it is guarding against.
+export const MAX_KEY_LENGTH = MAX_SESSION_ID_LENGTH + 1 + 22;
 
-// The Map key for a client-supplied id. Bounded here so every entry point keys
-// the same way and a long id cannot hold more memory than a short one.
-function keyOf(sessionId) {
-  if (typeof sessionId !== 'string' || sessionId.length <= MAX_SESSION_ID_LENGTH) return sessionId;
-  return sessionId.slice(0, MAX_SESSION_ID_LENGTH);
+// A message-thread continue names the message it follows and nothing else, so a
+// conversation keeps the ids of its threaded messages that a continue may still
+// name: the newest message of each thread running in it. That is one id for an
+// ordinary conversation and one per agent for a fan-out of forks, which share
+// their parent's conversation. The cap is for a client that keeps starting
+// threads it never continues; the oldest id goes first. An id is an upstream
+// message id, a few dozen characters, so one longer than the bound is no id.
+export const MAX_THREAD_MESSAGES = 32;
+const MAX_MESSAGE_ID_LENGTH = 128;
+
+/** @param {unknown} id @returns {id is string} */
+const isMessageId = (id) => typeof id === 'string' && id.length > 0 && id.length <= MAX_MESSAGE_ID_LENGTH;
+
+// The Map key for a client-supplied pin key. Bounded here so every entry point
+// keys the same way and a long key cannot hold more memory than a short one.
+function keyOf(key) {
+  if (typeof key !== 'string' || key.length <= MAX_KEY_LENGTH) return key;
+  return key.slice(0, MAX_KEY_LENGTH);
 }
 
 // Per-session token totals, kept per weekly bucket rather than once per session.
@@ -120,6 +165,13 @@ export class SessionTracker {
    * @param {() => number} [opts.now]
    */
   constructor({ knownTtlMs, activeTtlMs, now } = {}) {
+    // Requests routed per account, oldest first: [timestamp, accountIndex],
+    // with a running count per account so a read is O(1) after the prune.
+    // Fed by noteRouted() from recordSession(), read by recentRequestsFor().
+    /** @type {Array<[number, number]>} */
+    this._routed = [];
+    /** @type {Map<number, number>} */
+    this._routedCounts = new Map();
     // id -> { pins: Map<bucketKey, { idx, at }>,
     //         refs: Map<bucketKey, Observation>,
     //         firstSeen, lastSeen, count, inFlight, tokens: Map<bucketKey, ...> }
@@ -272,6 +324,98 @@ export class SessionTracker {
     return s.starved;
   }
 
+  /**
+   * Record one client request's outcome against EVERY live conversation of a
+   * session, for the exits that refuse a request before its body is read: an
+   * unreachable egress, a dot-segment path, an unknown account pin. They can
+   * name the session that asked but not the conversation within it, because the
+   * conversation is named by a body nobody has read yet.
+   *
+   * Refusing them all is the honest reading rather than a convenient one: what
+   * those exits refuse is the SESSION's request, on grounds that have nothing to
+   * do with which of its conversations sent it — an egress that is not up is not
+   * up for any of them. Attributing it to one conversation would need a guess,
+   * and dropping it entirely would let a proxy refusing everything report that
+   * nothing is starving.
+   *
+   * Walks rather than keeping an index: these exits are rare, the map is bounded
+   * by MAX_SESSIONS, and a second map keyed by session id would need its own
+   * lifetime and its own sweep to stay in step with this one.
+   *
+   * @param {string|null} sessionId
+   * @param {boolean} usable
+   * @param {number} [now]
+   * @returns {number} how many conversations took the outcome
+   */
+  recordOutcomeForSession(sessionId, usable, now = this._now()) {
+    if (!sessionId) return 0;
+    let touched = 0;
+    // Deleting the entry a Map iterator is on is defined behaviour, so the
+    // expired ones are dropped in place without copying the map first.
+    for (const [key, s] of this.sessions) {
+      if (this._isExpired(s, now)) { this.sessions.delete(key); continue; }
+      if (s.sessionId !== sessionId) continue;
+      s.starved = usable ? 0 : s.starved + 1;
+      touched += 1;
+    }
+    return touched;
+  }
+
+  /**
+   * Record that a threaded request filed under `key` was answered with message
+   * `messageId`, after `previousId` when it continued a thread. The id it
+   * followed is dropped: a continue moves its thread to the new message, and
+   * the next continue names that one.
+   *
+   * Like recordTokens this never creates a record. The request that produced
+   * the message opened its conversation before it was forwarded, so a missing
+   * record is one already forgotten.
+   *
+   * @param {string|null} key
+   * @param {string} messageId
+   * @param {string|null} [previousId]
+   * @param {number} [now]
+   */
+  recordThreadMessage(key, messageId, previousId = null, now = this._now()) {
+    const s = this._live(key, now);
+    if (!s || !isMessageId(messageId)) return;
+    if (previousId) s.threads.delete(previousId);
+    s.threads.delete(messageId);
+    s.threads.add(messageId);
+    while (s.threads.size > MAX_THREAD_MESSAGES) s.threads.delete(s.threads.values().next().value);
+  }
+
+  /**
+   * The conversation a thread continue belongs to: the one, within the same
+   * client session, that produced the message the continue names. Null when no
+   * live conversation of that session did.
+   *
+   * The body of a continue carries only the turn's delta, so its opening names
+   * nothing and the conversation has to be found through the message id. The id
+   * comes from the client, so the walk stays inside the client session that sent
+   * it: it can move a request between that session's own conversations, never
+   * into another one.
+   *
+   * Walks rather than keeping an index, like recordOutcomeForSession: the map is
+   * bounded by MAX_SESSIONS, and an index keyed by message id would need its own
+   * lifetime and its own sweep to stay in step with the records holding them.
+   * One walk per continue is one per agent turn.
+   *
+   * @param {string|null} sessionId
+   * @param {unknown} messageId
+   * @param {number} [now]
+   * @returns {{ key: string, conversation: string|null }|null}
+   */
+  threadOwner(sessionId, messageId, now = this._now()) {
+    if (!sessionId || !isMessageId(messageId)) return null;
+    for (const [key, s] of this.sessions) {
+      if (s.sessionId !== sessionId || !s.threads.has(messageId)) continue;
+      if (this._isExpired(s, now)) { this.sessions.delete(key); return null; }
+      return { key, conversation: s.conversation };
+    }
+    return null;
+  }
+
   // A known, non-expired session's record, or null. Never creates one, and
   // drops an expired one on read like pinnedAccount does.
   _live(sessionId, now) {
@@ -299,6 +443,10 @@ export class SessionTracker {
         // The same key space as `pins`, so a family's spend and the account it
         // is pinned to are looked up by one bucket key.
         tokens: new Map(),
+        // Ids of the threaded messages a continue may name (see
+        // MAX_THREAD_MESSAGES), oldest first. On the record for the same reason
+        // as `tokens`: a thread lives exactly as long as its conversation does.
+        threads: new Set(),
         // Consecutive CLIENT requests that ended without a usable answer; any
         // usable answer resets it. A streak rather than a total, so a blip
         // during an upstream wobble never accumulates on a session that is
@@ -306,7 +454,12 @@ export class SessionTracker {
         // monotonically — and no denominator is needed, which keeps `count`
         // (forward attempts, inflated by retries) out of the question entirely.
         starved: 0,
-        // Labels from the request that opened the session (see beginRequest).
+        // Labels from the request that opened the conversation (see
+        // beginRequest). `sessionId` is the client session this conversation is
+        // one of — what the readout groups by, and the only name of it an
+        // operator would recognise.
+        sessionId: null,
+        conversation: null,
         client: null,
         dimensions: null,
       };
@@ -460,6 +613,17 @@ export class SessionTracker {
         ref.unescaped = held;
       }
     }
+    // The routed ring follows the same shift; a removed account's entries go.
+    /** @type {Array<[number, number]>} */
+    const routed = [];
+    this._routedCounts = new Map();
+    for (const [at, idx] of this._routed) {
+      const moved = mapFn(idx);
+      if (moved == null) continue;
+      routed.push([at, moved]);
+      this._routedCounts.set(moved, (this._routedCounts.get(moved) || 0) + 1);
+    }
+    this._routed = routed;
   }
 
   // Does this pin count as load on `accountIndex` right now? A pin outlives the
@@ -490,6 +654,51 @@ export class SessionTracker {
     return out;
   }
 
+  /** Record that a request was routed to an account. One entry per forward
+   * decision, which is what the proxy charges upstream, so the count is in the
+   * unit the account's rate limits are in. Pruned to LOAD_WINDOW_MS on read and
+   * capped at MAX_ROUTED on write (oldest dropped), so the ring is bounded even
+   * when nothing reads it.
+   * @param {number|null|undefined} accountIndex
+   * @param {number} [now] */
+  noteRouted(accountIndex, now = this._now()) {
+    if (accountIndex == null) return;
+    this._routed.push([now, accountIndex]);
+    this._routedCounts.set(accountIndex, (this._routedCounts.get(accountIndex) || 0) + 1);
+    if (this._routed.length > MAX_ROUTED) this._dropRouted(this._routed.length - MAX_ROUTED);
+  }
+
+  /** Requests routed to `accountIndex` within the last LOAD_WINDOW_MS. The
+   * load an account is actually carrying, as opposed to activeCountFor's
+   * session count: a lane that fires a request every ten seconds and a TUI
+   * that fires one a minute are both one session, and the difference between
+   * them is what this measures.
+   * @param {number} accountIndex
+   * @param {number} [now] */
+  recentRequestsFor(accountIndex, now = this._now()) {
+    this._pruneRouted(now);
+    return this._routedCounts.get(accountIndex) || 0;
+  }
+
+  // Drop entries older than the window. Entries are appended in time order,
+  // so the stale ones are a prefix.
+  /** @param {number} now */
+  _pruneRouted(now) {
+    const cutoff = now - LOAD_WINDOW_MS;
+    let i = 0;
+    while (i < this._routed.length && this._routed[i][0] < cutoff) i += 1;
+    if (i > 0) this._dropRouted(i);
+  }
+
+  // Remove the oldest `n` entries, keeping the per-account counts in step.
+  /** @param {number} n */
+  _dropRouted(n) {
+    for (const [, idx] of this._routed.splice(0, n)) {
+      const left = (this._routedCounts.get(idx) || 1) - 1;
+      if (left > 0) this._routedCounts.set(idx, left); else this._routedCounts.delete(idx);
+    }
+  }
+
   // Active sessions currently pinned to `accountIndex` — the load metric used to
   // spread new sessions across accounts. Counts in-flight sessions regardless of
   // how long their request has been streaming. A session spending two accounts
@@ -515,8 +724,23 @@ export class SessionTracker {
     return ids;
   }
 
+  // Whether a client session with this id has made a request within the known
+  // window. Records are keyed by conversation, so it is matched against the
+  // session id each one carries, and against the key for one that names no
+  // conversation. A scan, for the control plane only: never on the request path.
+  /** @param {string|null} sessionId */
+  knowsSession(sessionId, now = this._now()) {
+    if (!sessionId) return false;
+    for (const [id, s] of this.sessions) {
+      if (this._isExpired(s, now)) continue;
+      if (id === sessionId || s.sessionId === sessionId) return true;
+    }
+    return false;
+  }
+
   // Drop sessions idle longer than the known window (but never one still in flight).
   sweep(now = this._now()) {
+    this._pruneRouted(now);
     this._lastSweep = now;
     for (const [id, s] of this.sessions) {
       if (this._isExpired(s, now)) this.sessions.delete(id);
@@ -629,6 +853,8 @@ function sessionItem(id, s, active) {
     starved: s.starved,
     firstSeen: s.firstSeen,
     lastSeen: s.lastSeen,
+    session: s.sessionId,
+    conversation: s.conversation,
     client: s.client,
     dimensions: s.dimensions ? { ...s.dimensions } : null,
     pins: Object.fromEntries([...s.pins].map(([bucket, p]) => [bucket, p.idx])),
@@ -645,6 +871,8 @@ function sessionItem(id, s, active) {
 function applyMetadata(s, metadata) {
   if (!metadata || typeof metadata !== 'object') return;
   if (typeof metadata.client === 'string' && metadata.client) s.client = metadata.client;
+  if (typeof metadata.sessionId === 'string' && metadata.sessionId) s.sessionId = metadata.sessionId;
+  if (typeof metadata.conversation === 'string' && metadata.conversation) s.conversation = metadata.conversation;
   const dims = metadata.dimensions;
   if (dims && typeof dims === 'object' && Object.keys(dims).length) {
     s.dimensions = { ...(s.dimensions || {}), ...dims };

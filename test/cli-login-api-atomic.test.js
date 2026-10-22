@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import net from 'node:net';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { closedPort } from '../test-helpers/spawn-server.js';
 
 // `teamclaude login --api` loads the config, waits on the key prompt for as long
 // as the user takes, and then saves. A running server may rotate an OAuth
@@ -37,17 +37,6 @@ async function writeConfig(config) {
   const path = join(dir, 'config.json');
   await writeFile(path, JSON.stringify(config));
   return path;
-}
-
-// A port nothing is listening on: bind one, learn its number, give it back.
-function closedPort() {
-  return new Promise(resolve => {
-    const probe = net.createServer();
-    probe.listen(0, '127.0.0.1', () => {
-      const { port } = probe.address();
-      probe.close(() => resolve(port));
-    });
-  });
 }
 
 // A stand-in running server that records what the CLI posts to it.
@@ -121,6 +110,45 @@ test('login --api saves onto a fresh read of the config, not the copy it loaded'
   assert.equal(added.type, 'apikey');
   assert.equal(added.apiKey, 'sk-ant-test-key');
   assert.equal(saved.accounts.length, 2);
+});
+
+// A key is metered, a subscription is not: level with the subscriptions, the key
+// served while plan quota sat idle (#497). It joins as a last resort unless placed.
+test('login --api adds the key as a last resort, and --priority places it', async () => {
+  const port = await closedPort();
+  const configPath = await writeConfig(baseConfig(port));
+
+  const cli = runCli(configPath, ['login', '--api', '--name', 'api-test']);
+  await cli.prompted;
+  cli.answer('sk-ant-test-key');
+  const res = await cli.done;
+  assert.equal(res.code, 0, res.stderr);
+  assert.match(res.stdout, /Added API key account "api-test" at priority 100/);
+  assert.match(res.stdout, /last resort/);
+  let saved = JSON.parse(await readFile(configPath, 'utf8'));
+  assert.equal(saved.accounts.find(a => a.name === 'api-test').priority, 100);
+
+  const placed = runCli(configPath, ['login', '--api', '--name', 'api-level', '--priority', '0']);
+  await placed.prompted;
+  placed.answer('sk-ant-other-key');
+  const res2 = await placed.done;
+  assert.equal(res2.code, 0, res2.stderr);
+  assert.match(res2.stdout, /Added API key account "api-level" at priority 0/);
+  assert.doesNotMatch(res2.stdout, /last resort/);
+  saved = JSON.parse(await readFile(configPath, 'utf8'));
+  assert.equal(saved.accounts.find(a => a.name === 'api-level').priority, 0);
+});
+
+test('login --api refuses a priority that is not an integer before asking for the key', async () => {
+  const port = await closedPort();
+  const configPath = await writeConfig(baseConfig(port));
+  const cli = runCli(configPath, ['login', '--api', '--name', 'api-test', '--priority', 'high']);
+  await assert.rejects(cli.prompted, /CLI exited before prompting/);
+  const res = await cli.done;
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /--priority wants an integer/);
+  const saved = JSON.parse(await readFile(configPath, 'utf8'));
+  assert.equal(saved.accounts.length, 1, 'nothing was added');
 });
 
 test('login --api tells a running server to reload once the key is saved', async (t) => {

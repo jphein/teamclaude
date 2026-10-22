@@ -114,3 +114,9 @@ test('exchange() surfaces a non-2xx token response as an error', async () => {
     mock.close();
   }
 });
+
+test('parseAuthCodeInput: a pasted callback URL with no state is refused (xreview 2026-10-21)', () => {
+  assert.throws(() => parseAuthCodeInput('http://localhost:1234/callback?code=abc', 'expected-state'), /state mismatch/);
+  assert.equal(parseAuthCodeInput('http://localhost:1234/callback?code=abc&state=expected-state', 'expected-state'), 'abc');
+  assert.equal(parseAuthCodeInput('abc', 'expected-state'), 'abc', 'a raw code is the manual path');
+});

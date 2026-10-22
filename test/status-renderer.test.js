@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { renderStatus } from '../src/status-renderer.js';
+import { renderStatus, showSessionRow, showWeeklyRow } from '../src/status-renderer.js';
+import { renderDashboardHtml } from '../src/dashboard.js';
 
 const now = Date.parse('2026-07-03T12:00:00Z');
 
@@ -33,6 +34,42 @@ test('renderStatus prints core status', () => {
   assert.match(output, /Session\s+\[█████████████████░\] 95% reset 1m/);
   assert.match(output, /Probe\s+ok 2m ago/);
   assert.match(output, /2 req, 1.5k tok/);
+});
+
+// A subscription that meters no session window says so (sessionWindowStated
+// false); an empty Session row would read as "unknown" for something that does
+// not exist.
+test('renderStatus leaves out the Session row for a plan with no session window', () => {
+  const status = sampleStatus();
+  status.accounts[0].quota = { unified5h: null, unified7d: 0.4, unified7dReset: now + 86_400_000, sessionWindowStated: false };
+  const output = renderStatus(status, { color: false, now });
+  assert.doesNotMatch(output, /Session/);
+  assert.match(output, /Weekly\s+\[/);
+});
+
+test('renderStatus still draws a Session reading the plan flag says it lacks', () => {
+  const status = sampleStatus();
+  status.accounts[0].quota = { unified5h: 0.99, unified5hReset: now + 3_600_000, unified7d: 0.1, unified7dReset: now + 86_400_000, sessionWindowStated: false };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Session\s+\[.*\] 99%/);
+});
+
+// A plan that meters no shared weekly window (a Team seat) says so (weeklyWindowStated
+// false); an empty Weekly row would read as "unknown" for something that does
+// not exist.
+test('renderStatus leaves out the Weekly row for a plan with no shared weekly window', () => {
+  const status = sampleStatus();
+  status.accounts[0].quota = { unified5h: 0.38, unified5hReset: now + 3_600_000, unified7d: null, weeklyWindowStated: false };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Session\s+\[.*\] 38%/);
+  assert.doesNotMatch(output, /Weekly/);
+});
+
+test('renderStatus still draws a Weekly reading the plan flag says it lacks', () => {
+  const status = sampleStatus();
+  status.accounts[0].quota = { unified5h: 0.38, unified5hReset: now + 3_600_000, unified7d: 0.25, unified7dReset: now + 86_400_000, weeklyWindowStated: false };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Weekly\s+\[.*\] 25%/);
 });
 
 test('renderStatus shows an OAuth entitlement cooldown separately from account status', () => {
@@ -90,6 +127,13 @@ test('renderStatus shows the sessions line and per-account session count when pr
   assert.match(output, /a \(oauth, prio 0\).*2 sess/);
 });
 
+test('renderStatus names the load distribution mode', () => {
+  const status = sampleStatus();
+  status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: true, mode: 'load' };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Sessions\s+2 active \/ 3 known · distributing by load/);
+});
+
 test('renderStatus reports a draining distribution toggle instead of single-account', () => {
   const status = sampleStatus();
   status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: false, draining: 2 };
@@ -138,6 +182,40 @@ test('renderStatus shows per-model eligibility when a family is metered separate
 test('renderStatus omits the Models line for accounts with no family-specific bucket', () => {
   const output = renderStatus(sampleStatus(), { color: false, now });
   assert.doesNotMatch(output, /Models/);
+});
+
+// The Models row used to judge every bucket against one flat number (the
+// account's resolved `default`), so a per-account table that overrides only
+// unified7dFable never reached this row: Fable read ✓ at 60% against the
+// fleet's 98% default even though the router itself (thresholdFor(bucket,
+// account)) was already refusing it at the account's own 50% Fable wall.
+test('the Models row judges each bucket against the account\'s OWN threshold for that bucket (#409)', () => {
+  const status = sampleStatus();
+  status.accounts[0].switchThreshold = { unified7dFable: 0.5 };
+  status.accounts[0].quota = {
+    unified5h: 0.2, unified5hReset: now + 60_000,
+    unified7d: 0.3, unified7dReset: now + 600_000,
+    // Under the fleet's 98% default, but over the account's own 50% Fable wall.
+    unified7dFable: 0.6, unified7dFableReset: now + 86_400_000,
+  };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Models\s+Opus ✓/);   // Opus still judges against the fleet's default
+  assert.match(output, /Fable ✗/);           // Fable judges against the account's own override
+});
+
+test('a bucket the account does not override still judges against the fleet value', () => {
+  const status = sampleStatus();
+  status.accounts[0].switchThreshold = { unified7dFable: 0.99 }; // Fable only
+  status.accounts[0].quota = {
+    unified5h: 0.2, unified5hReset: now + 60_000,
+    // unified7d carries no account override: at 90% it is under the fleet's
+    // 98% default, which is the number it must still be judged against.
+    unified7d: 0.9, unified7dReset: now + 600_000,
+    unified7dFable: 0.3, unified7dFableReset: now + 86_400_000,
+  };
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Models\s+Opus ✓/); // judged against the fleet's 98%, not the account's Fable-only 99%
+  assert.match(output, /Fable ✓/);         // 30% is well under the account's own 99% Fable wall
 });
 
 test('renderStatus prints the routing table with configured and auto routes', () => {
@@ -365,6 +443,52 @@ test('the blocked line names the cap as the reason', () => {
   assert.match(renderStatus(status, { color: false, now }), /Blocked\s+account usage cap reached \(maxUsage\)/);
 });
 
+// ── per-account switch threshold (accounts[].switchThreshold, #409) ────────
+
+function thresholdedStatus(switchThreshold, fleetSwitchThreshold = 0.98, switchThresholds = null) {
+  return {
+    currentAccount: 'a',
+    switchThreshold: fleetSwitchThreshold,
+    switchThresholds,
+    accounts: [
+      { name: 'a', type: 'oauth', priority: 0, status: 'active', quota: {}, usage: {}, switchThreshold: null },
+      { name: 'b', type: 'oauth', priority: 0, status: 'active', quota: {}, usage: {}, switchThreshold },
+    ],
+  };
+}
+
+test('a per-account switchThreshold that differs from the fleet gets its own line', () => {
+  const out = renderStatus(thresholdedStatus(1.0), { color: false, now });
+  assert.match(out, /Switch\s+switch at 100%/);
+  // The unmodified account is silent — the diff, not the config, earns the line.
+  assert.doesNotMatch(out.split('b (oauth')[0], /Switch\s+switch/);
+});
+
+test('an override that merely repeats the fleet value stays silent', () => {
+  const out = renderStatus(thresholdedStatus(0.98), { color: false, now });
+  assert.doesNotMatch(out, /Switch\s+switch/);
+});
+
+test('a per-bucket table names only the buckets that actually differ', () => {
+  const out = renderStatus(thresholdedStatus({ unified7d: 0.9, unified7dFable: 0.8 }), { color: false, now });
+  assert.match(out, /Switch\s+switch 7d 90%, fable 80%/);
+});
+
+test('a table entry matching the fleet\'s own per-bucket override is left out', () => {
+  const out = renderStatus(thresholdedStatus(
+    { unified7d: 0.9, unified7dFable: 0.7 }, 0.98, { default: 0.98, unified7d: 0.9 },
+  ), { color: false, now });
+  // unified7d (0.9) matches the fleet's own unified7d (0.9) — silent; Fable
+  // (0.7) differs from the fleet's default (0.98) — shown.
+  assert.match(out, /Switch\s+switch fable 70%/);
+  assert.doesNotMatch(out, /7d 90%/);
+});
+
+test('an invalid override (array, #425 hazard class) is refused, not shown', () => {
+  const out = renderStatus(thresholdedStatus([0.5]), { color: false, now });
+  assert.doesNotMatch(out, /Switch\s+switch/);
+});
+
 // ── The Active/Serving row under session distribution ───────────────────────
 //
 // `currentAccount` is the rotation cursor. Under ADAPTIVE distribution the
@@ -508,4 +632,40 @@ test('renderStatus strips control characters out of account and route strings', 
   assert.match(output, /Blocked\s+custom/);
   assert.match(output, /pinned: a/);
   assert.equal(output.split('\n').filter(l => /forged/.test(l)).length, 1);   // no forged line
+});
+
+// #511: status, the TUI row and the dashboard card all ask this one function,
+// so they cannot disagree about a plan with no session window.
+test('showSessionRow hides the row only for a plan with no session window and no reading', () => {
+  assert.equal(showSessionRow({ sessionWindowStated: false, unified5h: null }), false);
+  assert.equal(showSessionRow({ sessionWindowStated: false }), false);
+  assert.equal(showSessionRow({ sessionWindowStated: false, unified5h: 0.99 }), true, 'a reading still present is drawn');
+  assert.equal(showSessionRow({ sessionWindowStated: false, unified5h: 0 }), true, 'zero is a reading');
+  assert.equal(showSessionRow({ sessionWindowStated: true, unified5h: null }), true);
+  assert.equal(showSessionRow({ unified5h: null }), true, 'an account that has not said keeps the row');
+  assert.equal(showSessionRow(null), true);
+});
+
+test('the dashboard card draws its Session row by the same rule', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes(showSessionRow.toString()), 'the page carries the shared helper');
+  assert.match(html, /if \(showSessionRow\(q\)\) card\.appendChild\(quotaRow\('Session'/);
+  assert.doesNotMatch(html, /^\s*card\.appendChild\(quotaRow\('Session'/m, 'no unconditional Session row is left');
+});
+
+test('showWeeklyRow hides the row only for a plan with no shared weekly window and no reading', () => {
+  assert.equal(showWeeklyRow({ weeklyWindowStated: false, unified7d: null }), false);
+  assert.equal(showWeeklyRow({ weeklyWindowStated: false }), false);
+  assert.equal(showWeeklyRow({ weeklyWindowStated: false, unified7d: 0.25 }), true, 'a reading still present is drawn');
+  assert.equal(showWeeklyRow({ weeklyWindowStated: false, unified7d: 0 }), true, 'zero is a reading');
+  assert.equal(showWeeklyRow({ weeklyWindowStated: true, unified7d: null }), true);
+  assert.equal(showWeeklyRow({ unified7d: null }), true, 'an account that has not said keeps the row');
+  assert.equal(showWeeklyRow(null), true);
+});
+
+test('the dashboard card draws its Weekly row by the same rule', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes(showWeeklyRow.toString()), 'the page carries the shared helper');
+  assert.match(html, /if \(showWeeklyRow\(q\)\) card\.appendChild\(quotaRow\('Weekly'/);
+  assert.doesNotMatch(html, /^\s*card\.appendChild\(quotaRow\('Weekly'/m, 'no unconditional Weekly row is left');
 });

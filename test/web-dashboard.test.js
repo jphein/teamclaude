@@ -53,23 +53,8 @@ test('POST /teamclaude/switch 404s an unknown account and 400s a missing one', a
   });
 });
 
-test('POST /teamclaude/threshold applies live and calls the persist hook', async () => {
-  let persisted = null;
-  await withProxy({ persistThreshold: (v) => { persisted = v; } }, async (port, am) => {
-    const res = await post(port, '/teamclaude/threshold', { value: 0.8 });
-    assert.equal(res.status, 200);
-    assert.equal((await res.json()).switchThreshold, 0.8);
-    assert.equal(am.switchThreshold, 0.8);
-    assert.equal(persisted, 0.8);
-  });
-});
-
-test('POST /teamclaude/threshold rejects out-of-range values', async () => {
-  await withProxy({}, async (port) => {
-    assert.equal((await post(port, '/teamclaude/threshold', { value: 1.5 })).status, 400);
-    assert.equal((await post(port, '/teamclaude/threshold', { value: 'x' })).status, 400);
-  });
-});
+// The fork's POST /teamclaude/threshold tests were removed in the 2026-10-21
+// sync: the endpoint is upstream's now (percent body), with its own tests.
 
 test('POST /teamclaude/account disables live and persists', async () => {
   let persisted = null;

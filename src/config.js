@@ -1,15 +1,22 @@
 import { readFile, open, mkdir, chmod, rename, unlink, realpath } from 'node:fs/promises';
-import { openSync, writeSync, closeSync, readFileSync, statSync } from 'node:fs';
+import { openSync, writeSync, closeSync, readFileSync, statSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { resolveUpstreamProxy, setUpstreamProxy } from './upstream-proxy.js';
-import { ensureAccountIds } from './account-id.js';
+import { ensureAccountIds, accountIdsComplete } from './account-id.js';
+import { envVar, NAME, LEGACY_NAME } from './brand.js';
 
 export function getConfigPath() {
-  if (process.env.TEAMCLAUDE_CONFIG) return process.env.TEAMCLAUDE_CONFIG;
+  const fromEnv = envVar('CONFIG');
+  if (fromEnv) return fromEnv;
   const configDir = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
-  return join(configDir, 'teamclaude.json');
+  // The renamed file is used when it exists; until then, and for a fresh
+  // install, the file keeps its current name (issue #72, phase 1). The state
+  // file, crash log and certificates sit beside whichever one this returns.
+  const renamed = join(configDir, `${NAME}.json`);
+  if (existsSync(renamed)) return renamed;
+  return join(configDir, `${LEGACY_NAME}.json`);
 }
 
 /**
@@ -62,7 +69,7 @@ export async function saveState(state) {
  * was once world-readable becomes 0600 on the next save, and the tokens are
  * never on disk under a looser mode even for an instant.
  */
-async function writeJsonAtomic(path, value) {
+export async function writeJsonAtomic(path, value) {
   // A rename replaces the NAME, so a config that is a symlink (a dotfiles
   // checkout, say) would silently become a regular file where the old in-place
   // write followed the link. Resolve it first; a dangling or absent path is
@@ -99,8 +106,17 @@ export function createDefaultConfig() {
     holdSeconds: 0,
     distributeSessions: false,
     sessionTitles: { enabled: false, width: 18 },
+    quotaBarPercent: false,
+    accountSort: 'arranged',
     eventLogging: 'hide',
+    defaultClientMode: 'mitm',
+    // Written out rather than left absent, so a fresh config states the one
+    // setting whose default matters most: a redemption cannot be undone and the
+    // credits are scarce, so nothing spends one until this is switched on.
+    autoRedeemResets: false,
     blockedModels: [],
+    stripOverageHeaders: false,
+    synthesizeQuotaHeaders: false,
     accounts: [],
   };
 }
@@ -188,6 +204,14 @@ const LOCK_STALE_MS = 10_000;
 const LOCK_WAIT_MS = 2_000;
 const LOCK_POLL_MS = 25;
 
+/** The wait budget, read per acquisition: TEAMCLAUDE_CONFIG_LOCK_WAIT_MS
+ * overrides the 2 s for a deployment whose writers are known to hold the
+ * lock longer (and lets a test pick a budget its assertions do not race). */
+function lockWaitMs() {
+  const env = Number(envVar('CONFIG_LOCK_WAIT_MS'));
+  return env > 0 ? env : LOCK_WAIT_MS;
+}
+
 function lockIsStale(lockPath) {
   let pid, at;
   try {
@@ -205,7 +229,8 @@ function lockIsStale(lockPath) {
 
 /** True when the lock is ours; false when we gave up and proceed without it. */
 async function acquireConfigLock(lockPath) {
-  const deadline = Date.now() + LOCK_WAIT_MS;
+  const waitMs = lockWaitMs();
+  const deadline = Date.now() + waitMs;
   for (;;) {
     try {
       const fd = openSync(lockPath, 'wx', 0o600);
@@ -222,7 +247,7 @@ async function acquireConfigLock(lockPath) {
       continue;
     }
     if (Date.now() >= deadline) {
-      console.error(`[TeamClaude] ${lockPath} is still held by another process after ${LOCK_WAIT_MS}ms; writing the config without it`);
+      console.error(`[TeamClaude] ${lockPath} is still held by another process after ${waitMs}ms; writing the config without it`);
       return false;
     }
     await new Promise(resolve => setTimeout(resolve, LOCK_POLL_MS));
@@ -258,6 +283,8 @@ export function withConfigLock(configPath, fn) {
 
 export async function saveConfig(config) {
   const path = getConfigPath();
+  // Every row leaves with an id; see atomicConfigUpdate.
+  ensureAccountIds(config.accounts);
   // The proxy apiKey and every account's tokens live here: see writeJsonAtomic
   // for why this is not a plain writeFile.
   await withConfigLock(path, () => writeJsonAtomic(path, config));
@@ -275,7 +302,40 @@ export function atomicConfigUpdate(updater) {
   return withConfigLock(path, async () => {
     const config = await loadConfig() || createDefaultConfig();
     await updater(config);
+    // A row the updater added (a login, an API key, an import) is written with
+    // its id, minted here rather than by every reader. A row written without
+    // one is given a fresh id by each read: the running server pairs its token
+    // writes by id, so the id it minted on reload matched no row on disk, and
+    // the account's refreshed tokens were never saved (#564).
+    ensureAccountIds(config.accounts);
     await writeJsonAtomic(path, config);
+    return config;
+  });
+}
+
+/**
+ * loadConfig, with any entry id it had to mint written back to the file before
+ * the config is handed out. null when there is no file.
+ *
+ * For a reader that builds running accounts from what it loads: a running
+ * account keeps its entry's id, and every token write pairs it with its row by
+ * that id. A row the file holds without one (a hand edit, an older CLI) would
+ * get a different id on each read, and the account built from it would find no
+ * row to save to. Under the config lock, so no writer lands between the read
+ * and the write; a file that already carries every id is not rewritten.
+ */
+export function loadConfigPersistingIds() {
+  const path = getConfigPath();
+  return withConfigLock(path, async () => {
+    let raw;
+    try {
+      raw = JSON.parse(await readFile(path, 'utf-8'));
+    } catch (err) {
+      if (/** @type {any} */ (err).code === 'ENOENT') return null;
+      throw err;
+    }
+    const config = await loadConfig();
+    if (config && !accountIdsComplete(raw?.accounts)) await writeJsonAtomic(path, config);
     return config;
   });
 }

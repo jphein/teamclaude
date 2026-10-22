@@ -115,8 +115,8 @@ export const FIELDS = [
     check: (v) => (isObj(v) ? null : 'must be an object { enabled, startConc, stepConc, stepMs, windowMs }') },
 
   // ── Routing ─────────────────────────────────────────────────────────────
-  { key: 'distributeSessions', group: 'Routing', label: 'Distribute sessions', type: 'enum', apply: 'hot', def: false, options: [false, true, 'adaptive'],
-    help: 'Spread sessions across EQUAL-priority accounts (true), or by plan tier and load (adaptive). Off = one account at a time.' },
+  { key: 'distributeSessions', group: 'Routing', label: 'Distribute sessions', type: 'enum', apply: 'hot', def: false, options: [false, true, 'adaptive', 'load'],
+    help: 'Spread conversations across EQUAL-priority accounts (true), by plan tier and load (adaptive), or by load alone (load). Off = one account at a time.' },
   { key: 'adaptiveDistribution', group: 'Routing', label: 'Adaptive tuning', type: 'json', apply: 'restart', def: {},
     help: 'Optional numbers that tune adaptive distribution. Leave empty for the defaults.',
     check: (v) => { try { validateAdaptiveConfig(v); return null; } catch (e) { return /** @type {Error} */ (e).message; } } },
@@ -236,6 +236,27 @@ export const FIELDS = [
   { key: 'service.restart', group: 'Dashboard service', label: 'Restart button', type: 'json', apply: 'restart', def: 'systemd', danger: true,
     help: 'How Restart works: "systemd", "exit" (a supervisor restarts it), { "command": [argv] }, or false.',
     check: (v) => { const r = /** @type {any} */ (resolveRestartMethod({ service: { restart: v } })); return v === false || r.kind !== 'off' ? null : r.reason; } },
+  // ── Upstream features (2026-10-21 sync) ─────────────────────────────────
+  { key: 'advisorEligibility', group: 'Routing', label: 'Advisor eligibility', type: 'enum', apply: 'hot', def: 'strict', options: ['strict', 'prefer'],
+    help: 'How an advisor request\'s second model bears on account choice: strict = only accounts eligible for both models; prefer = the advisor model only describes the fleet.' },
+  { key: 'messageThreads', group: 'Upstream & network', label: 'Upstream keeps message threads', type: 'bool', apply: 'hot', def: false,
+    help: 'Set when the global upstream is a relay that keeps Anthropic message-thread state; otherwise thread continues to a non-Anthropic host are refused.' },
+  { key: 'stripOverageHeaders', group: 'Upstream & network', label: 'Strip overage headers', type: 'bool', apply: 'hot', def: false,
+    help: 'Remove the per-organization billing (overage / upgrade-path) rate-limit headers from upstream responses before they reach the client.' },
+  { key: 'synthesizeQuotaHeaders', group: 'Upstream & network', label: 'Synthesize quota headers', type: 'bool', apply: 'hot', def: false,
+    help: 'Tell clients a third-party backend\'s probed 5-hour and weekly windows as anthropic-ratelimit headers.' },
+  { key: 'autoRedeemResets', group: 'Rotation & quota', label: 'Auto-redeem reset credits', type: 'bool', apply: 'hot', def: false, danger: true,
+    help: 'Let an account whose weekly window ran out spend a scarce, non-refundable reset credit to clear it. Off by default on purpose.' },
+  { key: 'defaultClientMode', group: 'Proxy & access', label: 'Default client mode', type: 'enum', apply: 'hot', def: 'mitm', options: ['mitm', 'base-url'],
+    help: 'What `teamclaude run` and `env` do without --mitm/--no-mitm: mitm routes every request through the proxy; base-url sets only ANTHROPIC_BASE_URL.' },
+  { key: 'proxy.mcp', group: 'Proxy & access', label: 'MCP endpoint', type: 'enum', apply: 'hot', def: 'off', options: ['off', 'read', 'full'],
+    help: 'Serve /teamclaude/mcp: read = status and settings; full adds the tools that change them, including removing accounts.', danger: true },
+  { key: 'proxy.terminalOnly', group: 'Proxy & access', label: 'Tunnel chatgpt.com', type: 'bool', apply: 'restart', def: false,
+    help: 'In MITM mode, tunnel chatgpt.com instead of terminating it (for a machine that also runs the ChatGPT Desktop app).' },
+  { key: 'quotaBarPercent', group: 'Dashboard service', label: 'TUI bar percentages', type: 'bool', apply: 'hot', def: false,
+    help: 'Show the utilization percentage beside the reset countdown on each TUI quota bar. Display only.' },
+  { key: 'accountSort', group: 'Dashboard service', label: 'TUI account order', type: 'enum', apply: 'hot', def: 'arranged', options: ['arranged', 'session-reset', 'weekly-reset'],
+    help: 'How the TUI orders accounts: your own order, or soonest five-hour or weekly reset first. Display only.' },
 ];
 
 /** Per-account fields the Settings view edits. Tokens and identity are not here. */
@@ -247,6 +268,21 @@ export const ACCOUNT_FIELDS = [
   { key: 'upstream', label: 'Account upstream', type: 'text', credUrl: true, apply: 'hot', def: null, danger: true, help: 'Alternative backend URL for this account only. Empty = the global upstream.', check: httpUrlCheck },
   { key: 'modelMap', label: 'Model map', type: 'json', apply: 'hot', def: null, help: 'Rename models for this account\'s backend. Empty = none.', check: (v) => (v == null || isObj(v) ? null : 'must be an object') },
   { key: 'stripRequestFields', label: 'Strip request fields', type: 'list', apply: 'restart', def: [], help: 'Top-level request fields dropped before sending to this account; "cache_control.<subfield>" drops that subfield.' },
+  { key: 'switchThreshold', label: 'Switch threshold', type: 'json', apply: 'hot', def: null,
+    help: 'Per-account override of the fleet switch threshold: a number or a per-bucket table. Empty = the fleet value.',
+    check: (v) => (v == null ? null : thresholdCheck(v)) },
+  { key: 'displayOrder', label: 'TUI position', type: 'int', apply: 'hot', def: null, min: 0,
+    help: 'Where the account sits in the TUI list, lowest first. Display only; rotation uses priority.' },
+  { key: 'routing', label: 'Egress proxy', type: 'text', credUrl: true, apply: 'hot', def: null, danger: true,
+    help: 'This account\'s own egress proxy (socks5h://user:pass@host:1080, http://…). Every connection for the account goes through it.' },
+  { key: 'messageThreads', label: 'Upstream keeps message threads', type: 'bool', apply: 'hot', def: false,
+    help: 'Set when this account\'s upstream keeps Anthropic message-thread state.' },
+  { key: 'allowExtraUsage', label: 'Allow paid extra usage', type: 'bool', apply: 'hot', def: false, danger: true,
+    help: 'Let this account keep serving PAST its quota on Anthropic\'s paid extra usage. This spends real money.' },
+  { key: 'maxSpend', label: 'Money cap', type: 'number', apply: 'hot', def: null, min: 0,
+    help: 'Hard monthly extra-usage cap in the account\'s billing currency; at the cap it receives no requests. 0 = not one cent.' },
+  { key: 'autoRedeemReset', label: 'May redeem reset credits', type: 'bool', apply: 'hot', def: true,
+    help: 'Set false to exempt this account from auto-redeeming reset credits.' },
 ];
 
 /** Identity fields shown read-only (set from the OAuth profile). */

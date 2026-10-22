@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { SessionTracker, SESSION_KNOWN_TTL_MS, SESSION_ACTIVE_TTL_MS, MAX_SESSIONS, MAX_SESSION_ID_LENGTH } from '../src/session-tracker.js';
+import { SessionTracker, SESSION_KNOWN_TTL_MS, SESSION_ACTIVE_TTL_MS, MAX_SESSIONS, MAX_KEY_LENGTH, MAX_THREAD_MESSAGES } from '../src/session-tracker.js';
 
 // The weekly buckets a pin is keyed by (see model.js weeklyBucketForModel).
 const SHARED = 'unified7d';
@@ -417,15 +417,41 @@ test('the cap never evicts a session with a request in flight', () => {
   assert.equal(st.sessions.size, MAX_SESSIONS);
 });
 
-test('an over-long session id is keyed by its first MAX_SESSION_ID_LENGTH characters', () => {
+test('a refusal that can only name the session reaches every conversation of it', () => {
+  // The exits that refuse before reading a body — an egress that is not up, a
+  // dot-segment path, an unknown account pin — know the session and not the
+  // conversation, because the conversation is named by bytes nobody has read.
+  // A proxy refusing everything must not report that nothing is starving.
   const { clock, now } = fixedClock();
   const st = new SessionTracker({ now });
-  const base = 'x'.repeat(MAX_SESSION_ID_LENGTH);
+  for (const key of ['s1/conv-a', 's1/conv-b', 's2/conv-c']) {
+    st.beginRequest(key, clock.t, { sessionId: key.split('/')[0] });
+    st.touch(key, 0, SHARED, clock.t);
+  }
+  assert.equal(st.recordOutcomeForSession('s1', false, clock.t), 2, 'both of s1, neither of s2');
+  assert.equal(st.sessions.get('s1/conv-a').starved, 1);
+  assert.equal(st.sessions.get('s1/conv-b').starved, 1);
+  assert.equal(st.sessions.get('s2/conv-c').starved, 0, "another session's streak is untouched");
+  // A usable answer clears them the same way round.
+  st.recordOutcomeForSession('s1', true, clock.t);
+  assert.equal(st.sessions.get('s1/conv-a').starved, 0);
+  // An unknown session, and a missing one, are no-ops rather than throws.
+  assert.equal(st.recordOutcomeForSession('nobody', false, clock.t), 0);
+  assert.equal(st.recordOutcomeForSession(null, false, clock.t), 0);
+});
+
+test('an over-long pin key is keyed by its first MAX_KEY_LENGTH characters', () => {
+  // The bound covers a session id AND the conversation digest appended to it,
+  // so a key the request path produced is never truncated; only one a client
+  // forged past the length server.js admits is.
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  const base = 'x'.repeat(MAX_KEY_LENGTH);
   st.touch(base + '-tail-one', 3, SHARED, clock.t);
   assert.equal(st.sessions.has(base), true);
-  assert.equal([...st.sessions.keys()][0].length, MAX_SESSION_ID_LENGTH);
+  assert.equal([...st.sessions.keys()][0].length, MAX_KEY_LENGTH);
   // Every entry point keys the same way, so a long id round-trips through them.
-  assert.equal(st.pinnedAccount(base + '-tail-two', SHARED, clock.t), 3, 'the same prefix is the same session');
+  assert.equal(st.pinnedAccount(base + '-tail-two', SHARED, clock.t), 3, 'the same prefix is the same conversation');
   st.beginRequest(base + '-tail-three', clock.t);
   assert.equal(st.sessions.get(base).inFlight, 1);
   st.endRequest(base + '-tail-three', clock.t);
@@ -444,4 +470,73 @@ test('beginRequest sweeps expired sessions on the same throttle as touch', () =>
   st.beginRequest('s2', clock.t);
   assert.equal(st.sessions.has('s1'), false, 'the idle session was shed without touch() or stats()');
   assert.equal(st.sessions.size, 1);
+});
+
+// Message threads. A continue names the message it follows and nothing else, so
+// the tracker remembers which conversation produced each threaded message.
+function threaded(now, key = 'S/conv', sessionId = 'S', conversation = 'conv') {
+  const st = new SessionTracker({ now });
+  st.beginRequest(key, now(), { sessionId, conversation });
+  st.endRequest(key, now());
+  return st;
+}
+
+test('a threaded message leads back to the conversation that produced it', () => {
+  const { clock, now } = fixedClock();
+  const st = threaded(now);
+  st.recordThreadMessage('S/conv', 'msg_1', null, clock.t);
+  assert.deepEqual(st.threadOwner('S', 'msg_1', clock.t), { key: 'S/conv', conversation: 'conv' });
+  assert.equal(st.threadOwner('S', 'msg_unknown', clock.t), null);
+});
+
+test('a thread followed turn by turn stays with its conversation', () => {
+  const { clock, now } = fixedClock();
+  const st = threaded(now);
+  st.recordThreadMessage('S/conv', 'msg_1', null, clock.t);
+  st.recordThreadMessage('S/conv', 'msg_2', 'msg_1', clock.t);
+  st.recordThreadMessage('S/conv', 'msg_3', 'msg_2', clock.t);
+  assert.equal(st.threadOwner('S', 'msg_3', clock.t)?.key, 'S/conv');
+});
+
+test('threads sharing one conversation each keep their place', () => {
+  // A forked subagent opens with its parent's messages, so it files under the
+  // parent's conversation while running a thread of its own beside it.
+  const { clock, now } = fixedClock();
+  const st = threaded(now);
+  st.recordThreadMessage('S/conv', 'msg_parent1', null, clock.t);
+  st.recordThreadMessage('S/conv', 'msg_fork1', null, clock.t);
+  st.recordThreadMessage('S/conv', 'msg_parent2', 'msg_parent1', clock.t);
+  st.recordThreadMessage('S/conv', 'msg_fork2', 'msg_fork1', clock.t);
+  assert.equal(st.threadOwner('S', 'msg_parent2', clock.t)?.key, 'S/conv');
+  assert.equal(st.threadOwner('S', 'msg_fork2', clock.t)?.key, 'S/conv');
+});
+
+test('a message id from another client session leads nowhere', () => {
+  // The id arrives in a client-supplied body: it may move a request between
+  // the conversations of its own session, never into someone else's.
+  const { clock, now } = fixedClock();
+  const st = threaded(now);
+  st.recordThreadMessage('S/conv', 'msg_1', null, clock.t);
+  assert.equal(st.threadOwner('OTHER', 'msg_1', clock.t), null);
+});
+
+test('a forgotten conversation takes its threads with it and is not resurrected', () => {
+  const { clock, now } = fixedClock();
+  const st = threaded(now);
+  st.recordThreadMessage('S/conv', 'msg_1', null, clock.t);
+  clock.t += SESSION_KNOWN_TTL_MS + 1;
+  assert.equal(st.threadOwner('S', 'msg_1', clock.t), null);
+  st.recordThreadMessage('S/conv', 'msg_2', 'msg_1', clock.t);
+  assert.equal(st.threadOwner('S', 'msg_2', clock.t), null);
+  assert.equal(st.stats(clock.t).known, 0);
+});
+
+test('a conversation holds a bounded number of thread messages, newest kept', () => {
+  // Every create starts a thread, and a client that keeps recreating them (each
+  // continue refused) would otherwise grow one conversation's record per turn.
+  const { clock, now } = fixedClock();
+  const st = threaded(now);
+  for (let i = 0; i <= MAX_THREAD_MESSAGES; i++) st.recordThreadMessage('S/conv', `msg_${i}`, null, clock.t);
+  assert.equal(st.threadOwner('S', 'msg_0', clock.t), null);
+  assert.equal(st.threadOwner('S', `msg_${MAX_THREAD_MESSAGES}`, clock.t)?.key, 'S/conv');
 });

@@ -8,7 +8,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
-import { injectUiHelpers, uiCsp, dashboardCsp, renderDashboardHtml, withKey, sseFrames, KEY_STORAGE } from '../src/dashboard.js';
+import { injectUiHelpers, uiCsp, dashboardCsp, renderDashboardHtml, inlineScripts, withKey, sseFrames, KEY_STORAGE } from '../src/dashboard.js';
 
 // /ui from another machine (2026-10-07). The page is a static asset served
 // before the key gate, like /teamclaude/dashboard; everything it shows or
@@ -79,7 +79,8 @@ function spies() {
 // Every state-changing endpoint /ui calls, with a body that would succeed.
 const MUTATIONS = [
   ['/teamclaude/switch', { account: 'b' }],
-  ['/teamclaude/threshold', { value: 0.5 }],
+  // /teamclaude/threshold is upstream's since the 2026-10-21 sync (percent body,
+  // client keys refused, saved under the config lock); its own tests cover it.
   ['/teamclaude/account', { name: 'a', disabled: true }],
   ['/teamclaude/reauth', { name: 'a' }],
   ['/teamclaude/reauth/code', { code: 'x' }],
@@ -121,8 +122,9 @@ test('/ui\'s policy admits exactly its own inline scripts, and loosens the basel
   // The only difference from the dashboard's policy is the favicon allowance.
   const strip = (p) => p.split('; ').filter(d => !d.startsWith('script-src ')).join('; ');
   assert.equal(strip(csp).replace("; img-src data:", ''), strip(dashboardCsp()));
-  // The dashboard's own policy is unchanged by the generalisation: one hash.
-  assert.equal(dashboardCsp().match(/'sha256-/g).length, 1);
+  // The dashboard's own policy: one hash per inline script (upstream's page has
+  // a theme bootstrap in <head> beside the main script since the 2026-10 sync).
+  assert.equal(dashboardCsp().match(/'sha256-/g).length, inlineScripts(renderDashboardHtml()).length);
   // Nothing on the page loads from elsewhere, so connect/img/script need no host.
   assert.doesNotMatch(html, /(src|href)\s*=\s*["']https?:/i);
   assert.doesNotMatch(html, /@import|url\(\s*["']?https?:/i);
@@ -174,12 +176,30 @@ test('every mutating endpoint /ui calls refuses a keyless remote caller, with no
 test('a remote caller with the key reaches each mutating endpoint (restart excluded: it would run systemctl)', async () => {
   const { calls, hooks } = spies();
   const { server, am } = makeServer(hooks);
+  // A client key is refused the account and restart controls (they retire or
+  // stop the fleet for every tenant); the shared key below still reaches them.
+  const OPERATOR_ONLY = new Set(['/teamclaude/account', '/teamclaude/restart']);
   for (const [url, body] of MUTATIONS.filter(([u]) => u !== '/teamclaude/restart')) {
     const res = await request(server, { method: 'POST', url, headers: { ...JSON_HEADERS, 'x-api-key': KEY }, body: body ? JSON.stringify(body) : '' });
-    assert.equal(res.status, 200, url + ' ' + res.chunks);
+    assert.equal(res.status, OPERATOR_ONLY.has(url) ? 403 : 200, url + ' ' + res.chunks);
   }
-  assert.deepEqual(calls.sort(), ['account', 'probe', 'reauth', 'reauth/cancel', 'reauth/code', 'reload', 'threshold']);
+  const shared = await request(server, { method: 'POST', url: '/teamclaude/account', headers: { ...JSON_HEADERS, 'x-api-key': PROXY.apiKey }, body: JSON.stringify({ name: 'a', disabled: true }) });
+  assert.equal(shared.status, 200, 'the shared key still reaches /account');
+  calls.splice(calls.indexOf('account'), 1);
+  assert.deepEqual(calls.sort(), ['probe', 'reauth', 'reauth/cancel', 'reauth/code', 'reload']);
   assert.equal(am.currentIndex, 1);
+});
+
+test('the threshold endpoint (upstream\'s since the 2026-10 sync) refuses a client key and a key-less remote caller', async () => {
+  const { calls, hooks } = spies();
+  const { server, am } = makeServer(hooks);
+  const body = JSON.stringify({ percent: 70 });
+  const withClient = await request(server, { method: 'POST', url: '/teamclaude/threshold', headers: { ...JSON_HEADERS, 'x-api-key': KEY }, body });
+  assert.equal(withClient.status, 403, withClient.chunks);
+  const noKey = await request(server, { method: 'POST', url: '/teamclaude/threshold', headers: JSON_HEADERS, body });
+  assert.ok(noKey.status === 401 || noKey.status === 403, `key-less remote caller got ${noKey.status}`);
+  assert.equal(am.switchThreshold, 0.98, 'nothing changed');
+  assert.deepEqual(calls, []);
 });
 
 test('a page on another origin holding no key gets nothing; even with the key, a cross-site POST is refused', async () => {
@@ -208,10 +228,10 @@ test('loopback is unchanged: page, reads and controls work with no key', async (
     assert.equal(page.status, 200);
     assert.ok(page.headers.get('content-security-policy'));
     assert.equal((await fetch(`${base}/teamclaude/status`)).status, 200);
-    const thr = await fetch(`${base}/teamclaude/threshold`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ value: 0.7 }) });
-    assert.equal(thr.status, 200);
-    assert.equal(am.switchThreshold, 0.7);
-    assert.deepEqual(calls, ['threshold']);
+    const acct = await fetch(`${base}/teamclaude/account`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'a', disabled: true }) });
+    assert.equal(acct.status, 200);
+    assert.equal(!!am.accounts[0].disabled, true);
+    assert.deepEqual(calls, ['account']);
   } finally { server.close(); }
 });
 

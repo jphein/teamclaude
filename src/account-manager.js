@@ -90,6 +90,11 @@ const MODEL_DENIAL_COOLDOWN_SECONDS = 6 * 60 * 60;
 // proxies do come back, and the first request after the cooldown is the probe:
 // it either serves or re-arms this.
 const ROUTING_FAILURE_COOLDOWN_SECONDS = 30;
+
+// How long a session must sit idle before band preemption may move its pin: the
+// prompt cache's default lifetime, after which the next request rebuilds it
+// wherever it lands, so moving costs nothing a stay would have saved.
+export const PIN_IDLE_BREAK_MS = 5 * 60 * 1000;
 // How long an API-key account sits out after upstream answers 401, indexed by
 // how many 401s it has answered in a row. A 401 on an API key is weaker
 // evidence than it looks: a gateway (LiteLLM and the like) answers one while
@@ -661,6 +666,10 @@ export class AccountManager {
     // matches another. Live before the settings, since turning the knob on
     // takes a reading.
     this._obsGen = 0;
+    /** @type {number|null} the account an operator switched to, held against band preemption */
+    this._manualHold = null;
+    /** @type {boolean} set for the length of a selection walk: is this a request's first attempt */
+    this._firstAttempt = false;
     this.setExpiryRouting(expiryRouting);
     // The rollover mechanism's whole state for the sticky current account: one
     // observation, { idx, windows: name → reset }, of the account traffic was
@@ -913,6 +922,9 @@ export class AccountManager {
    * held roll to its own account, and otherwise writes where nothing is lost.
    */
   _setCurrent(account) {
+    // A move in another provider's fleet (a borrowed Codex walk) leaves this one's hold.
+    const held = this._manualHold != null ? this.accounts[this._manualHold] : null;
+    if (held && held.index !== account.index && providerOf(held) === providerOf(account)) this._manualHold = null;
     this.currentIndex = account.index;
     // A move made by an operator or a poll names the provider cursor of the
     // account it lands on. A move inside a selection walk does not: the walk
@@ -932,6 +944,9 @@ export class AccountManager {
     const account = this.accounts[index];
     if (!account) return false;
     this._setCurrent(account);
+    // An operator's choice outranks the band's preference: rebalancing leaves it
+    // alone until the cursor leaves this account for a reason of its own.
+    this._manualHold = account.index;
     return true;
   }
 
@@ -1238,11 +1253,17 @@ export class AccountManager {
       // was routed on. Announced by a first attempt only: a retry's exclusions
       // shrink both sets, so its counts describe that request and not the fleet.
       const first = !(/** @type {Set<number>|null} */ (exclude)?.size);
+      // Read by rebalancing, which is a fleet decision for a request's first
+      // attempt only. Taken from the request's OWN exclusions: `excluded` also
+      // carries every other provider's accounts, so its size says nothing about
+      // whether this is a retry.
+      this._firstAttempt = first;
       routedAdvisor = this._advisorForSelection(excluded, model, advisorModel, first);
       account = this._pickActiveAccount(excluded, model, routedAdvisor, sessionId);
     } finally {
       this._selectingProvider = null;
       this._selectionDecision = null;
+      this._firstAttempt = false;
       walked = this.currentIndex;
       // Hand the slot back before anything can observe it moved. Only the
       // provider that owns currentIndex gets to change it.
@@ -1717,6 +1738,25 @@ export class AccountManager {
       }
       const betterExists = this._preemptedBy(current, model, advisorModel, exclude);
       if (betterExists) return this._selectNext(exclude, model, advisorModel);
+      // Band preemption (expiry routing): the cursor is otherwise sticky until a
+      // threshold, so a seat that comes back from a re-auth, an error or a reset
+      // with the most expiring quota waited for the incumbent to run dry (JP,
+      // 2026-10-22: "smart after reauth and recalculate which is best"). Asked on
+      // every request, so any status change is acted on at the next one; the
+      // band's tolerance is the hysteresis that keeps it from flapping. A
+      // request's first attempt only: on a retry the band's best may be the
+      // account that just failed, and moving the fleet's cursor to whatever is
+      // left would be undone by the very next request.
+      if (this._firstAttempt && this._manualHold !== current.index && this._bandPreempts(current, model, advisorModel)) {
+        const next = this._selectNext(exclude, model, advisorModel);
+        if (next && next.index !== current.index) {
+          // As a rollover does: a later availability hop inside this request
+          // must not hand the traffic straight back to the account it left.
+          if (this._selectionDecision) (this._selectionDecision.rolledOff ??= new Set()).add(current.index);
+          console.log(`[TeamClaude] Rebalanced "${current.name}" → "${next.name}": ${this._bandWhy(current, next, model)}`);
+          return next;
+        }
+      }
       return current;
     }
     // Barred for this request only: keep the family where it was diverted.
@@ -1898,6 +1938,18 @@ export class AccountManager {
         // the next request asks again.
         this._noteHeldRollover(pinned, model, advisorModel, exclude);
         return pinned;
+      }
+      // Band preemption, at a natural break only: a pin exists for its prompt
+      // cache, so it moves once the session has sat idle long enough for that
+      // cache to be cold anyway — never mid-conversation.
+      if (this._bandPreempts(pinned, model, advisorModel)
+          && this.sessionTracker.pinIdleMs(sessionId, bucket) >= PIN_IDLE_BREAK_MS) {
+        const next = this._pickLeastLoaded(exclude, model, advisorModel);
+        if (next && next.index !== idx) {
+          this._beginRamp(next);
+          console.log(`[TeamClaude] Rebalanced an idle session's pin "${pinned.name}" → "${next.name}": ${this._bandWhy(pinned, next, model)}`);
+          return next;
+        }
       }
       // Mirror _select's priority preemption so an operator's priority order
       // still wins over a session's stickiness.
@@ -3078,6 +3130,11 @@ export class AccountManager {
         ? Math.max(1, c.tolerance)
         : 1.5,
       preempt: typeof c.preempt === 'boolean' ? c.preempt : true,
+      // Re-rank the current account (and idle session pins) against the band on
+      // every request rather than only when it becomes unavailable or rolls
+      // over. Fork option, off unless literally true: stickiness is the stock
+      // design and its rollover bookkeeping is built on it.
+      rebalance: c.rebalance === true,
     };
     // Nothing survives the knob being off: every observation is dropped when
     // preemption stops and none is written while it is off, so no mechanism
@@ -3234,6 +3291,32 @@ export class AccountManager {
     return this._governingWindow(account, model).resetAt ?? null;
   }
 
+  /**
+   * True when expiry routing would not choose `account` now: it is outside the
+   * top pressure band of the fleet it serves. Drawn over that fleet (the provider
+   * partition) and never over one request's tried set, as in
+   * _switchOnSessionReset. An account whose pressure is unknown is never moved
+   * off: the band passes it through rather than ranking a guess.
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   */
+  _bandPreempts(account, model = null, advisorModel = null) {
+    const er = this.expiryRouting;
+    if (!account || !er?.enabled || !er.preempt || !er.rebalance) return false;
+    const band = this._bandedCandidates(
+      this._excludeOtherProviders(null, this._selectingProvider || DEFAULT_PROVIDER), model, advisorModel);
+    return band.length > 0 && !band.includes(account);
+  }
+  /** One clause for the rebalance log line: both pressures and the band edge.
+   * @param {Record<string, any>} from @param {Record<string, any>} to @param {any} model the request model, as _expiryPressure takes it */
+  _bandWhy(from, to, model) {
+    const p = (/** @type {Record<string, any>} */ a) => {
+      const v = this._expiryPressure(a, model);
+      return v == null ? 'unknown' : `${(v * 3600 * 100).toFixed(2)}%/h`;
+    };
+    return `out of the expiry band (${p(from)} of expiring quota vs ${p(to)}, tolerance ${this.expiryRouting?.tolerance}×)`;
+  }
   /**
    * The accounts a selection pass may choose from: everything eligible for this
    * request, narrowed to the top pressure band when expiry routing is on.
@@ -5470,6 +5553,7 @@ export class AccountManager {
     // Session pins are positions in the same list and shift the same way, and so
     // are the rollover observations hanging off them and off the current account.
     const remap = idx => (idx === index ? null : idx > index ? idx - 1 : idx);
+    if (this._manualHold != null) this._manualHold = remap(this._manualHold);
     this.sessionTracker.remapAccounts(remap);
     this.burnRateLearner.remapAccounts(remap);
     this.outsideSpend.remapAccounts(remap);

@@ -244,6 +244,19 @@ export class SessionTracker {
   // the one a session making requests in sequence just touched. Two concurrent
   // requests on different families can still refresh the wrong one, which is the
   // same limit the in-flight arm has.
+  /**
+   * How long the session's pin on `bucket` has been idle: since its last request
+   * on it ended (endRequest re-stamps `at`), or since it was routed while one is
+   * still outstanding. 0 while another of its requests is in flight — a session
+   * mid-fan-out is not at a break — and 0 with no pin.
+   * @param {string} sessionId @param {string} bucket @param {number} [now]
+   */
+  pinIdleMs(sessionId, bucket, now = this._now()) {
+    const s = this.sessions.get(keyOf(sessionId));
+    const pin = s?.pins.get(bucket);
+    if (!pin || s.inFlight > 1) return 0;
+    return Math.max(0, now - pin.at);
+  }
   endRequest(sessionId, now = this._now()) {
     sessionId = keyOf(sessionId);
     const s = sessionId && this.sessions.get(sessionId);

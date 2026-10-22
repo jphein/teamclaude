@@ -1733,8 +1733,11 @@ export class AccountManager {
       // with the most expiring quota waited for the incumbent to run dry (JP,
       // 2026-10-22: "smart after reauth and recalculate which is best"). Asked on
       // every request, so any status change is acted on at the next one; the
-      // band's tolerance is the hysteresis that keeps it from flapping.
-      if (this._manualHold !== current.index && this._bandPreempts(current, model, advisorModel)) {
+      // band's tolerance is the hysteresis that keeps it from flapping. A
+      // request's first attempt only: on a retry the band's best may be the
+      // account that just failed, and moving the fleet's cursor to whatever is
+      // left would be undone by the very next request.
+      if (!exclude?.size && this._manualHold !== current.index && this._bandPreempts(current, model, advisorModel)) {
         const next = this._selectNext(exclude, model, advisorModel);
         if (next && next.index !== current.index) {
           console.log(`[TeamClaude] Rebalanced "${current.name}" → "${next.name}": ${this._bandWhy(current, next, model)}`);

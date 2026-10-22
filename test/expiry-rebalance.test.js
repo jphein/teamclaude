@@ -131,3 +131,16 @@ test('a pinned session moves off an out-of-band seat only at an idle break', () 
   assert.notEqual(value.name, 'a');
   assert.equal(lines.filter(l => l.includes('Rebalanced an idle session')).length, 1);
 });
+
+test('a retry inside one request never rebalances the fleet onto a worse seat', () => {
+  // b is the band's best but this request already failed on it. Moving the
+  // cursor to c (out of band too) would be undone by the next request.
+  const am = mgr();
+  seat(am, 0, 0.97, 26);            // current, out of band
+  seat(am, 1, 0.84, 11);            // the band
+  seat(am, 2, 0.40, 300);           // far out of band
+  am._setCurrent(am.accounts[0]);
+  const { lines } = captureLog(() => am.getActiveAccount(new Set([1]), OPUS));
+  assert.equal(lines.filter(l => l.includes('Rebalanced')).length, 0);
+  assert.equal(am.accounts[am.currentIndex].name, 'a', 'the fleet cursor stays for the next first attempt to decide');
+});

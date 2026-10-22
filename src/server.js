@@ -21,6 +21,7 @@ import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequest
 import { conversationDigest, pinKeyFor } from './conversation.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
+import { cachedLookup } from './dns-cache.js';
 import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerForHost, interceptHostsFor, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
@@ -2627,7 +2628,11 @@ function relayStream(req, res, upstream, sx, stripOverage = false) {
   const agent = useProxy ? sxAgent(sx, target.hostname) : undefined;
   const transport = target.protocol === 'http:' ? http : https;
 
-  const upstreamReq = transport.request(target, { method: req.method, headers, agent }, (upstreamRes) => {
+  // No proxy agent → the global agent, whose bare dns.lookup turns a brief
+  // resolver stall into EAI_AGAIN and a dropped Remote Control session (2026-10-22:
+  // ×4 on the VM in 3 h). cachedLookup serves the last answer through it, as the
+  // pooled upstream agents do (upstream-fetch.js).
+  const upstreamReq = transport.request(target, { method: req.method, headers, agent, ...(agent ? {} : { lookup: cachedLookup }) }, (upstreamRes) => {
     const responseHeaders = {};
     for (const [key, value] of Object.entries(upstreamRes.headers)) {
       if (CONNECTION_SPECIFIC_HEADERS.has(key) || key === 'content-encoding' || key === 'content-length') continue;

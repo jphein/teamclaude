@@ -235,3 +235,28 @@ test('destroys the client stream when the upstream leg dies mid-response', async
     upstream.closeAllConnections();
   }
 });
+
+// 2026-10-22: the relay's direct path (no upstream proxy) used the global
+// agent's bare dns.lookup, so a brief resolver stall on the VM surfaced as
+// "Remote Control relay error: getaddrinfo EAI_AGAIN api.anthropic.com" while
+// every pooled path rode it out on cachedLookup's last answer.
+test('the direct relay resolves upstream through the shared cachedLookup', async () => {
+  const { cachedLookup } = await import('../src/dns-cache.js');
+  const { server: upstream, port: upstreamPort } = await listen((req, res) => { res.writeHead(200); res.end('ok'); });
+  const realRequest = http.request;
+  /** @type {any[]} */
+  const seen = [];
+  http.request = /** @type {any} */ ((/** @type {any[]} */ ...args) => { seen.push(args[1]); return realRequest.apply(http, /** @type {any} */ (args)); });
+  try {
+    const accountManager = { getActiveAccount() { throw new Error('must not rotate'); } };
+    const listener = createProxyRequestListener({ accountManager, upstream: `http://127.0.0.1:${upstreamPort}` });
+    const { status } = await requestThrough(listener, { path: '/v1/code/sessions/abc', headers: { authorization: 'Bearer t' } });
+    assert.equal(status, 200);
+    const relayed = seen.find((o) => o && o.method === 'GET' && o.headers?.authorization === 'Bearer t');
+    assert.ok(relayed, 'relayStream went through http.request');
+    assert.equal(relayed.lookup, cachedLookup);
+  } finally {
+    http.request = realRequest;
+    upstream.close();
+  }
+});

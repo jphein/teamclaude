@@ -92,9 +92,12 @@ test('forwardHeaders: strips proxy credentials case-insensitively, keeps the res
     'x-api-key': 'anything', authorization: `bearer   ${CLIENT} `, 'proxy-authorization': 'x', connection: 'keep-alive',
     host: 'h', 'proxy-connection': 'keep-alive', accept: 'text/plain',
   }, PROXY);
-  assert.deepEqual(out, { accept: 'text/plain' });
-  // With no keys configured, a client's Authorization is never mistaken for one.
-  assert.deepEqual(forwardHeaders({ authorization: 'Bearer t', 'x-api-key': 'k' }, {}), { authorization: 'Bearer t' });
+  // An x-api-key that is not one of our keys belongs to the destination API
+  // and is kept (upstream's rule since the 2026-10-21 sync); ours never leaves.
+  assert.deepEqual(out, { 'x-api-key': 'anything', accept: 'text/plain' });
+  assert.deepEqual(forwardHeaders({ 'x-api-key': CLIENT, accept: 'a' }, PROXY), { accept: 'a' });
+  // With no keys configured, nothing a client sends is mistaken for one.
+  assert.deepEqual(forwardHeaders({ authorization: 'Bearer t', 'x-api-key': 'k' }, {}), { authorization: 'Bearer t', 'x-api-key': 'k' });
   assert.deepEqual(forwardHeaders({ authorization: '' }, PROXY), { authorization: '' });
 });
 

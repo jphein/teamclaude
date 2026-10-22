@@ -8,7 +8,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
-import { injectUiHelpers, uiCsp, dashboardCsp, renderDashboardHtml, withKey, sseFrames, KEY_STORAGE } from '../src/dashboard.js';
+import { injectUiHelpers, uiCsp, dashboardCsp, renderDashboardHtml, inlineScripts, withKey, sseFrames, KEY_STORAGE } from '../src/dashboard.js';
 
 // /ui from another machine (2026-10-07). The page is a static asset served
 // before the key gate, like /teamclaude/dashboard; everything it shows or
@@ -79,7 +79,8 @@ function spies() {
 // Every state-changing endpoint /ui calls, with a body that would succeed.
 const MUTATIONS = [
   ['/teamclaude/switch', { account: 'b' }],
-  ['/teamclaude/threshold', { value: 0.5 }],
+  // /teamclaude/threshold is upstream's since the 2026-10-21 sync (percent body,
+  // client keys refused, saved under the config lock); its own tests cover it.
   ['/teamclaude/account', { name: 'a', disabled: true }],
   ['/teamclaude/reauth', { name: 'a' }],
   ['/teamclaude/reauth/code', { code: 'x' }],
@@ -121,8 +122,9 @@ test('/ui\'s policy admits exactly its own inline scripts, and loosens the basel
   // The only difference from the dashboard's policy is the favicon allowance.
   const strip = (p) => p.split('; ').filter(d => !d.startsWith('script-src ')).join('; ');
   assert.equal(strip(csp).replace("; img-src data:", ''), strip(dashboardCsp()));
-  // The dashboard's own policy is unchanged by the generalisation: one hash.
-  assert.equal(dashboardCsp().match(/'sha256-/g).length, 1);
+  // The dashboard's own policy: one hash per inline script (upstream's page has
+  // a theme bootstrap in <head> beside the main script since the 2026-10 sync).
+  assert.equal(dashboardCsp().match(/'sha256-/g).length, inlineScripts(renderDashboardHtml()).length);
   // Nothing on the page loads from elsewhere, so connect/img/script need no host.
   assert.doesNotMatch(html, /(src|href)\s*=\s*["']https?:/i);
   assert.doesNotMatch(html, /@import|url\(\s*["']?https?:/i);
@@ -178,7 +180,7 @@ test('a remote caller with the key reaches each mutating endpoint (restart exclu
     const res = await request(server, { method: 'POST', url, headers: { ...JSON_HEADERS, 'x-api-key': KEY }, body: body ? JSON.stringify(body) : '' });
     assert.equal(res.status, 200, url + ' ' + res.chunks);
   }
-  assert.deepEqual(calls.sort(), ['account', 'probe', 'reauth', 'reauth/cancel', 'reauth/code', 'reload', 'threshold']);
+  assert.deepEqual(calls.sort(), ['account', 'probe', 'reauth', 'reauth/cancel', 'reauth/code', 'reload']);
   assert.equal(am.currentIndex, 1);
 });
 
@@ -208,10 +210,10 @@ test('loopback is unchanged: page, reads and controls work with no key', async (
     assert.equal(page.status, 200);
     assert.ok(page.headers.get('content-security-policy'));
     assert.equal((await fetch(`${base}/teamclaude/status`)).status, 200);
-    const thr = await fetch(`${base}/teamclaude/threshold`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ value: 0.7 }) });
-    assert.equal(thr.status, 200);
-    assert.equal(am.switchThreshold, 0.7);
-    assert.deepEqual(calls, ['threshold']);
+    const acct = await fetch(`${base}/teamclaude/account`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'a', disabled: true }) });
+    assert.equal(acct.status, 200);
+    assert.equal(!!am.accounts[0].disabled, true);
+    assert.deepEqual(calls, ['account']);
   } finally { server.close(); }
 });
 

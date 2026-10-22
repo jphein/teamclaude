@@ -1415,7 +1415,10 @@
         const res = await api('/teamclaude/threshold', {
           method: 'POST',
           headers: { 'content-type': 'application/json', 'x-teamclaude-control': '1' },
-          body: JSON.stringify({ value }),
+          // Upstream's threshold endpoint (since the 2026-10-21 sync) takes a
+          // percentage, 1–100, kept to tenths; it saves under the config lock
+          // and reloads, so the change survives a restart.
+          body: JSON.stringify({ percent: Number(thr.value) }),
         });
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));

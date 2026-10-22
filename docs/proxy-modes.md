@@ -24,12 +24,16 @@ MITM mode launches claude pointed at TeamClaude as an **HTTPS forward proxy** (`
 - reads `anthropic-ratelimit-*` from responses for quota; and
 - **resends the request on a different account** if one returns a quota `429`, so a "you've reached your limit" is never surfaced while another account has headroom.
 
-Because the request is buffered, the retry is transparent to claude. Client token refreshes (`/v1/oauth/token`), Remote Control (`/v1/code/*`) and claude.ai attachment transfers (`/api/oauth/files/*`, `/api/oauth/file_upload`) are passed through with the client's own credential, since they are bound to the paired identity and would 403 under a rotated token. Any host other than the upstream is blind-tunnelled. The server accepts *both* base-URL and proxy clients at once, so instances launched with and without `--no-mitm` can share one server.
+Because the request is buffered, the retry is transparent to claude. Client token refreshes (`/v1/oauth/token`), Remote Control (`/v1/code/*`, and the bridge's `/v1/environments/*`, `/v1/sessions/*`, `/v2/session_ingress/*` and `/v2/ccr-sessions/*`, which `claude remote-control` sends through `HTTPS_PROXY` since Claude Code 2.1.287), claude.ai attachment transfers (`/api/oauth/files/*`, `/api/oauth/file_upload`) and the claude.ai connector list (`/v1/mcp_servers`) are passed through with the client's own credential, since they are bound to the paired identity and fail under a rotated token. Any host other than the upstream is blind-tunnelled. The server accepts *both* base-URL and proxy clients at once, so instances launched with and without `--no-mitm` can share one server.
+
+A pool with Codex accounts also intercepts `chatgpt.com`. Inside that tunnel only `/backend-api/codex/*` is pooled; every other request (workspace discovery, plugins, settings) is passed through to `chatgpt.com` with the client's own login, and the Codex Responses WebSocket is refused so the CLI falls back to pooled HTTPS — see [Codex accounts](accounts.md#through-the-mitm-proxy-no-codex-config-needed). `chatgpt.com` is where ChatGPT Desktop talks to as well. On a machine running that app, set `proxy.terminalOnly` to `true` to tunnel that host untouched: the terminal Codex CLI keeps reaching the pool through its explicit `/backend-api/codex` base URL, and the desktop app keeps its own login.
 
 ### Trust model
 
 - The CA is generated locally, stored in the config dir, and trusted **only** by the claude process you launch via `teamclaude run` (through `NODE_EXTRA_CA_CERTS`) — it is **never** added to your system trust store. The leaf private key is `0600`; the CA private key is never written to disk.
 - TeamClaude still verifies the **real** Anthropic certificate on the upstream leg.
+- Plain-HTTP forwarding consumes `x-api-key` values matching the shared proxy key or a configured client key instead of sending them to the destination. Unrelated application API keys remain intact, including on key-exempt loopback connections and when no proxy key is configured.
+- The chain is renewed when the leaf no longer names every intercepted host (the first Codex account adds `chatgpt.com`) or either certificate has under 30 days left. Since the CA key is not kept, a renewal always brings a new CA. So while the proxy runs, `teamclaude env` and `teamclaude run` keep the stored chain, which is the one the proxy presents, and print a warning that a renewal is due. Restart the proxy to renew it: a starting server renews a stored chain that falls short before it opens its port. Clients launched before a renewal still trust the old CA and need a restart of their own.
 
 Verify the proxy and CA without any credentials — the proxy always answers a built-in test host:
 
@@ -74,8 +78,10 @@ screen (**Network → Upstream proxy**) — it applies to the next request, with
 restart.
 
 - Covers **all** Anthropic-bound traffic: request forwarding, OAuth login, token
-  refresh, profile and usage lookups. A proxy that covered only some of them
-  would leave you able to refresh an account but not add one, or the reverse.
+  refresh, profile and usage lookups, and (since per-account routing landed)
+  `teamclaude api`, which used to go direct. A proxy that covered only some of
+  them would leave you able to refresh an account but not add one, or the
+  reverse.
 - `HTTPS_PROXY` / `ALL_PROXY` are picked up automatically when the config sets
   nothing, so a machine already configured for other tools needs no extra setup.
   When that happens the server says so on startup, and the TUI marks the row with
@@ -93,12 +99,12 @@ restart.
 - **TLS stays end-to-end.** The tunnel is a plain `CONNECT`; the proxy sees
   ciphertext only, and certificate verification is unchanged. A proxy that
   intercepts TLS needs its CA in `NODE_EXTRA_CA_CERTS`.
-- SOCKS proxies are not supported — only HTTP `CONNECT`. A `socks5://` value is
-  rejected at startup rather than failing later at connect time. So is an
-  `https://` proxy URL: TeamClaude does not speak TLS *to* the proxy, and
-  accepting the scheme would send the `CONNECT` (credentials included) in
-  plaintext to port 443. Write `http://host:port` — the tunnel through it is
-  end-to-end TLS regardless.
+- SOCKS URLs are refused here (`http` `CONNECT` only), as is `https://` to the
+  proxy itself: TeamClaude does not speak TLS *to* the proxy, and accepting the
+  scheme would send the `CONNECT` (credentials included) in plaintext to port
+  443. Write `http://host:port` — the tunnel through it is end-to-end TLS
+  regardless. (SOCKS **is** supported one level down, per account: see
+  [per-account routing](#per-account-routing) below.)
 
 This is a property of the **network**, not a routing policy: when set, it is
 simply how this machine reaches Anthropic. That is what separates it from sx.org
@@ -106,6 +112,50 @@ below, which is a specific egress *provider* chosen per request. If both are
 configured, a request routed via sx.org uses sx.org; everything else uses the
 upstream proxy. Neither is related to `proxy.port`, which is the local port
 Claude Code connects **to**.
+
+## Per-account routing
+
+The fleet settings above move *every* account together. `accounts[].routing`
+does the opposite: it pins **one** account to its own proxy and leaves the rest
+untouched.
+
+```bash
+teamclaude login --name "waffles@waffle.com" --routing "socks5h://alice:s3cret@proxy.example.com:1080"
+teamclaude routing waffles@waffle.com socks5h://alice:s3cret@proxy.example.com:1080
+teamclaude routing waffles@waffle.com none   # back to the fleet path
+```
+
+```json
+{ "name": "waffles@waffle.com", "type": "oauth", "routing": "socks5h://alice:s3cret@proxy.example.com:1080" }
+```
+
+- **All of that account's traffic** tunnels through it: request forwarding,
+  OAuth login and token refresh, profile, usage and quota probes. A proxy that
+  covered only some of those would strand the account mid-rotation.
+- **Only that account.** Every other account keeps the fleet path, and the
+  routed account ignores both the fleet upstream proxy and sx.org (chaining
+  would be two hops for one problem).
+- Schemes: `http` (CONNECT), `socks5`, `socks5h`, `socks4`, `socks4a`, with
+  optional `user:pass@` auth (SOCKS4 takes a username only). The `h`/`a`
+  suffixes follow curl's convention and resolve hostnames at the proxy; the
+  bare forms resolve locally. A bare `host:port` is `http`.
+- **TLS stays end-to-end** exactly as through the fleet proxy: the account's
+  proxy relays ciphertext only, and certificate verification is unchanged.
+- Changes apply live: the CLI command and disk edits both flow through the same
+  reload as every other per-account field. The URL shows password-masked in
+  `accounts`, `status`, the TUI and the dashboard.
+- A new URL is tested first: a tunnel to the account's upstream and a TLS
+  handshake, with no request sent. A proxy that does not answer is refused and
+  nothing is saved (`--no-check` skips the test).
+- A proxy that goes down later takes only its own account out. The request
+  fails over to the next account and the routed one sits out for 30 seconds
+  before its proxy is tried again. See
+  [When the proxy is down](accounts.md#when-the-proxy-is-down).
+
+Typical uses: one account that only answers from a specific region, an account
+served through a jump host the others cannot use, or one seat whose traffic
+must exit a particular network. See [accounts.md](accounts.md#per-account-routing-routing)
+for the CLI reference.
 
 ## sx.org proxy mode
 

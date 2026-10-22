@@ -47,8 +47,10 @@ export function sameOrg(a, b) {
  *   UUID. Checked first because the name fallback below is what a cross-provider
  *   pair reaches — a Codex account has no accountUuid to tell it apart from its
  *   Claude namesake, so one email holding both subscriptions read as one account.
- * - Both have an accountId (the ChatGPT one): it must match. Same evidence class
- *   as the accountUuid below, so it decides before the name.
+ * - Both have an accountId (the ChatGPT one): it must match, and so must the
+ *   userId when both sides have one (members of one ChatGPT workspace share an
+ *   accountId). Same evidence class as the accountUuid below, so it decides
+ *   before the name.
  * - Both have an accountUuid: it must match. If the organizations can be
  *   compared (see sameOrg) they must also match; but if either side's org is
  *   still unknown we treat them as the same. This lets a freshly-profiled login
@@ -59,7 +61,9 @@ export function sameOrg(a, b) {
  */
 export function sameIdentity(a, b) {
   if (providerOf(a) !== providerOf(b)) return false;
-  if (a?.accountId && b?.accountId) return a.accountId === b.accountId;
+  if (a?.accountId && b?.accountId) {
+    return a.accountId === b.accountId && (!a.userId || !b.userId || a.userId === b.userId);
+  }
   if (a?.accountUuid && b?.accountUuid) {
     if (a.accountUuid !== b.accountUuid) return false;
     return sameOrg(a, b) !== false;
@@ -75,7 +79,9 @@ export function sameIdentity(a, b) {
  */
 export function distinctAccounts(a, b) {
   if (providerOf(a) !== providerOf(b)) return true;
-  if (a?.accountId && b?.accountId) return a.accountId !== b.accountId;
+  if (a?.accountId && b?.accountId) {
+    return a.accountId !== b.accountId || (!!a.userId && !!b.userId && a.userId !== b.userId);
+  }
   if (!a?.accountUuid || !b?.accountUuid) return false;
   if (a.accountUuid !== b.accountUuid) return true;
   return sameOrg(a, b) === false;
@@ -165,10 +171,35 @@ export function matchAccounts(accounts, query, orgFilter) {
 }
 
 /**
+ * Whether a failed fetchProfile proves the token is dead, as opposed to merely
+ * unreachable. Only a 401 counts. A 5xx, a timeout or a DNS failure says
+ * nothing about the token, and neither does a 403: the upstream answers 403
+ * "Request not allowed" to a valid token from an unexpected region (see
+ * egress-guard.js), and an org-policy 403 is a cooldown at request time, not a
+ * dead credential — a fresh token would meet the same answer.
+ *
+ * @param {Record<string, any>|null|undefined} profile - a fetchProfile result, success or error
+ */
+export function isTokenRejection(profile) {
+  return profile?.status === 401;
+}
+
+/**
  * Automatic naming is safe only when the profile identifies the account.
  * An explicit name is the caller's opt-in to importing without detection.
  */
 export function canUpsertOAuthAccount(profile, userNamed) {
+  // A token the upstream has REJECTED is dead, and --name must not override
+  // that. The import reports success and then every request 401s, with nothing
+  // pointing back at the account that was already known to be bad at the moment
+  // it was added.
+  //
+  // Only a definitive refusal counts — a 401 the caller could not refresh away
+  // (oauth.js profileForCredentials renews a stale access token before the
+  // profile gets here). A 5xx, a 403, a timeout or a DNS failure says nothing
+  // about the token, and a healthy one must stay importable from a restricted
+  // network — which is what `userNamed` is for, and still is.
+  if (isTokenRejection(profile)) return false;
   return Boolean(
     userNamed
     || (profile && !profile.error && (profile.accountUuid || profile.email))

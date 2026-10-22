@@ -49,6 +49,7 @@ const DIRECT_MODEL_IDS = {
 export function directModelId(model) {
   return DIRECT_MODEL_IDS[model] || model;
 }
+import { providerOf } from './provider.js';
 import {
   ROLLING_NEAR_RESET_TOLERANCE_MS,
   ROLLING_POST_RESET_BUFFER_MS,
@@ -56,6 +57,13 @@ import {
 } from './warmup-schedule.js';
 
 const SCHEDULE_TIMER_GRACE_MS = 60_000;
+
+// The warm-up is a `claude` run, so only an Anthropic subscription can take
+// it: a third-party backend has no 5-hour window of Anthropic's, and the server
+// refuses a Codex account outright.
+export function warmApplicable(/** @type {any} */ account) {
+  return account.type === 'oauth' && !account.upstream && providerOf(account) === 'anthropic';
+}
 
 export class Warmer {
   /**
@@ -72,7 +80,7 @@ export class Warmer {
    * @param {string} [opts.prompt]
    * @param {Function} [opts.spawnFn]
    * @param {number} [opts.timeoutMs]
-   * @param {Function} [opts.log]
+   * @param {Function} [opts.log] defaults to a call-time `console.log` — see below
    * @param {Function} [opts.nowFn]
    * @param {Function} [opts.setTimeoutFn]
    * @param {Function} [opts.clearTimeoutFn]
@@ -89,7 +97,15 @@ export class Warmer {
     spawnFn = defaultSpawn,
     fetchFn = globalThis.fetch,
     timeoutMs = 120_000,
-    log = console.log,
+    // Resolves the console per call rather than capturing it. A default
+    // parameter is evaluated when the constructor runs, and the server builds
+    // its warmer in the same tick as `server.listen()` — before the listen
+    // callback reaches `tui.start()`, which swaps `console.log` for the
+    // activity log. Only an interval or schedule set at startup is announced
+    // before that; a reload's reschedule and a sweep's deferral notice both
+    // come afterwards, and a captured `console.log` would put them on a
+    // terminal the alternate screen has already covered.
+    log = (/** @type {string} */ line) => console.log(line),
     nowFn = Date.now,
     setTimeoutFn = setTimeout,
     clearTimeoutFn = clearTimeout,
@@ -274,16 +290,14 @@ export class Warmer {
   /**
    * True when `account` is a healthy, idle Anthropic OAuth account whose 5h
    * window is NOT already running. We skip:
-   *  - non-OAuth and third-party-backend accounts (`upstream` set) — the 5h
-   *    concept is Anthropic-specific;
+   *  - non-OAuth, third-party-backend and Codex accounts (see warmApplicable);
    *  - disabled / errored / exhausted / throttled accounts — warming them is
    *    pointless or would just 429;
    *  - accounts with a live 5h window — already warm, so warming again only burns
    *    quota for nothing.
    */
   _isWarmCandidate(account) {
-    if (account.type !== 'oauth' || !account.credential) return false;
-    if (account.upstream) return false;
+    if (!warmApplicable(account) || !account.credential) return false;
     if (account.disabled) return false;
     if (account.status === 'error' || account.status === 'exhausted' || account.status === 'throttled') return false;
     return true;
@@ -531,7 +545,7 @@ export class Warmer {
       nextRunAt: iso(this.nextRunAt),
       accounts: this.am.accounts.map(account => {
         const status = this.accountStatus.get(account.name);
-        const applicable = account.type === 'oauth' && !account.upstream;
+        const applicable = warmApplicable(account);
         return {
           name: account.name,
           status: applicable ? (status?.status || 'never') : 'not-applicable',
@@ -561,7 +575,10 @@ function defaultSpawn({ command, args, env, timeoutMs, signal }) {
     if (signal?.aborted) { reject(new Error('warm-up aborted')); return; }
     let child;
     try {
-      child = spawn(command, args, { env, stdio: 'ignore' });
+      // On Windows the `claude` on PATH is npm's .cmd shim, which a shell-less
+      // spawn never resolves (it only tries .exe), so warming failed with ENOENT.
+      // Same platform guard `teamclaude run` applies to its own spawnSync.
+      child = spawn(command, args, { env, stdio: 'ignore', shell: process.platform === 'win32' });
     } catch (err) {
       reject(err);
       return;

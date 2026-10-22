@@ -2,6 +2,7 @@
 //
 // We ONLY ever touch a global npm install (`npm install -g @karpeleslab/teamclaude`):
 //   - a git checkout (a `.git` at the package root) is a dev tree — never touched;
+//   - a pnpm install is pointed at pnpm, since npm cannot update it;
 //   - a local dependency / npx copy is left alone (we only notify).
 // Checks hit the npm registry at most once a day (cached in a small file next to
 // the config), so the overwhelmingly common invocation does zero network I/O.
@@ -15,11 +16,19 @@ import { existsSync, readFileSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
+import { promisify } from 'node:util';
 import { getConfigPath } from './config.js';
+import { safeLine } from './safe-text.js';
+import { envVar } from './brand.js';
 
 export const PKG_NAME = '@karpeleslab/teamclaude';
 const REGISTRY = 'https://registry.npmjs.org';
 const DAY_MS = 24 * 60 * 60 * 1000;
+// Wide enough for `v1.2.3-rc.1+build`, narrow enough that a tag cannot be the
+// reason a fixed-width caller has no room left.
+const LABEL_MAX = 32;
+
+const pexec = promisify(execFile);
 
 /** Package root = one directory above this file's src/ directory. */
 function packageRoot() {
@@ -33,6 +42,37 @@ export function currentVersion(root = packageRoot()) {
   } catch {
     return null;
   }
+}
+
+/**
+ * How the running copy identifies itself, for display: the exact tag when the
+ * checkout sits on one, else the short sha, else the shipped package.json
+ * version, else the literal `local`. `git` reports a checkout — npm cannot
+ * update one, so nothing should offer to.
+ *
+ * The git calls are pinned to the package root. `teamclaude server` is started
+ * from the operator's own project directory, and resolving against the process
+ * cwd would report that repository's sha as this package's version.
+ *
+ * @param {Object} [opts]
+ * @param {string} [opts.root]
+ * @param {(file: string, args: string[], options: { cwd: string, encoding: 'utf8', timeout: number }) => Promise<{ stdout: string }>} [opts.exec]
+ * @returns {Promise<{ label: string, git: boolean }>}
+ */
+export async function resolveVersionLabel({ root = packageRoot(), exec = pexec } = {}) {
+  const git = existsSync(join(root, '.git'));
+  if (git) {
+    /** @type {{ cwd: string, encoding: 'utf8', timeout: number }} */
+    const opts = { cwd: root, encoding: 'utf8', timeout: 2000 };
+    const probes = [['describe', '--tags', '--exact-match', 'HEAD'], ['rev-parse', '--short', 'HEAD']];
+    for (const args of probes) {
+      try {
+        const label = safeLine((await exec('git', args, opts)).stdout, LABEL_MAX);
+        if (label) return { label, git };
+      } catch { /* not on a tag, a shallow or broken checkout, or no git binary */ }
+    }
+  }
+  return { label: safeLine(currentVersion(root) || 'local', LABEL_MAX), git };
 }
 
 /**
@@ -68,14 +108,29 @@ function npmGlobalRoot() {
   });
 }
 
-/** How this copy was installed: 'git', 'global', 'local', or 'unknown'. */
+/** How this copy was installed: 'git', 'global', 'pnpm', 'local', or 'unknown'. */
 export async function installKind({ root = packageRoot(), globalRoot = npmGlobalRoot } = {}) {
   if (existsSync(join(root, '.git'))) return 'git';
   const norm = root.split('\\').join('/');
   if (!norm.includes('/node_modules/')) return 'unknown';
+  // pnpm links a package out of its `.pnpm` store, and the package root is the
+  // real path, so it runs through that store. Such a copy used to read as
+  // 'local': the notice said "Run: teamclaude update", and that ran `npm
+  // install -g`, which put a second copy in npm's global directory and said
+  // "Updated" while the copy on PATH stayed as it was.
+  if (norm.includes('/node_modules/.pnpm/')) return 'pnpm';
   const g = await (typeof globalRoot === 'function' ? globalRoot() : globalRoot);
   if (g && norm.startsWith(g.split('\\').join('/'))) return 'global';
   return 'local';
+}
+
+/**
+ * The command that updates a copy installed as `kind` in place: pnpm's own for
+ * a pnpm copy, `teamclaude update` (which runs npm) for anything else.
+ * @param {string} kind
+ */
+export function updateCommandFor(kind) {
+  return kind === 'pnpm' ? `pnpm add -g ${PKG_NAME}@latest` : 'teamclaude update';
 }
 
 /** Fetch the registry's current "latest" version (null on any failure/timeout). */
@@ -139,6 +194,22 @@ export async function checkForUpdate({
   }
   if (!latest) return null;
   return { current, latest, updateAvailable: compareVersions(latest, current) > 0 };
+}
+
+/**
+ * Whether the last recorded check saw a newer release. Cache only — never the
+ * registry — so a caller on a render or status path costs nothing. Like
+ * `checkForUpdate`, the cached `latest` is used regardless of its age.
+ *
+ * @param {Object} [opts]
+ * @param {string|null} [opts.current]
+ * @param {string} [opts.cachePath]
+ * @returns {Promise<boolean>}
+ */
+export async function updateAvailableFromCache({ current = currentVersion(), cachePath = defaultCacheFile() } = {}) {
+  if (!current) return false;
+  const { latest } = await readCache(cachePath);
+  return !!latest && compareVersions(latest, current) > 0;
 }
 
 /**
@@ -220,7 +291,7 @@ export async function autoUpdate({
   check = checkForUpdate, kind = installKind, install = runUpdate,
 } = {}) {
   if (existsSync(join(root, '.git'))) return { skipped: 'git' }; // dev checkout — never touch
-  if (process.env.TEAMCLAUDE_DISABLE_AUTOUPDATE || config.autoUpdate === false) {
+  if (envVar('DISABLE_AUTOUPDATE') || config.autoUpdate === false) {
     return { skipped: 'disabled' };
   }
   if (uid === 0) {
@@ -238,8 +309,9 @@ export async function autoUpdate({
     return { ...info, skipped: 'bad-version' };
   }
 
-  if (await kind({ root }) !== 'global') {
-    log(`[TeamClaude] Update available: ${info.current} → ${info.latest}. Run: teamclaude update`);
+  const how = await kind({ root });
+  if (how !== 'global') {
+    log(`[TeamClaude] Update available: ${info.current} → ${info.latest}. Run: ${updateCommandFor(how)}`);
     return { ...info, notified: true };
   }
   log(`[TeamClaude] Updating ${info.current} → ${info.latest}…`);

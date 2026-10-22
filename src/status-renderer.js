@@ -1,6 +1,8 @@
 import { formatMoney } from './oauth.js';
-import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage } from './model.js';
+import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage, resolveSwitchThreshold, resolveFleetThreshold, switchThresholdDiffs, resolveMaxSpendMinor, spendCapReached } from './model.js';
 import { safeLine } from './safe-text.js';
+import { ROUTE_COLORS } from './config-ops.js';
+import { describeRouting } from './account-routing.js';
 
 const ESC = '\x1b[';
 const RESET = `${ESC}0m`;
@@ -40,6 +42,12 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
   if (status.sessions) {
     lines.push(`${paint.dim('Sessions'.padEnd(12))} ${formatSessions(status.sessions, paint)}`);
   }
+  // Sessions the operator held on one account (`switch --session`), so one
+  // that will not follow the fleet is never a mystery. Absent when there are none.
+  const sessionPins = Array.isArray(status.sessionPins) ? status.sessionPins : [];
+  if (sessionPins.length) {
+    lines.push(`${paint.dim('Pinned'.padEnd(12))} ${formatSessionPins(sessionPins, paint)}`);
+  }
   lines.push(`${paint.dim('Probe'.padEnd(12))} ${formatProbeSummary(probe, now, paint)}`);
   if (warm.enabled) {
     lines.push(`${paint.dim('Keep-warm'.padEnd(12))} ${formatProbeSummary(warm, now, paint)}`);
@@ -56,12 +64,30 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     for (const quotaLine of quotaLines(account, now, paint)) {
       lines.push(`  ${quotaLine}`);
     }
-    const routing = modelRoutingLine(account, status.switchThreshold, blocked, now, paint);
+    // The account's OWN threshold (issue #409) for each bucket the row judges
+    // — a per-bucket lookup, not one flat number, so a table that overrides
+    // only unified7dFable reddens THAT cell at the account's own wall while
+    // Opus/Sonnet still judge against the fleet's, exactly as the live gate
+    // (thresholdFor(bucket, account)) does.
+    /** @param {string} bucket */
+    const accountThresholdFor = bucket => resolveSwitchThreshold(
+      account.switchThreshold, bucket, resolveFleetThreshold(status.switchThreshold, status.switchThresholds, bucket));
+    const routing = modelRoutingLine(account, accountThresholdFor, blocked, now, paint);
     if (routing) lines.push(`  ${routing}`);
+    const threshold = thresholdLine(account, status, paint);
+    if (threshold) lines.push(`  ${threshold}`);
+    const egress = egressProxyLine(account, paint);
+    if (egress) lines.push(`  ${egress}`);
     const why = unavailableLine(account, paint);
     if (why) lines.push(`  ${why}`);
     const spend = spendLine(account, paint);
     if (spend) lines.push(`  ${spend}`);
+    const resetCredits = resetCreditLine(account, paint, now);
+    if (resetCredits) lines.push(`  ${resetCredits}`);
+    const outside = outsideSpendText(account.quota?.outsideSpend);
+    if (outside) lines.push(`  ${paint.dim('Outside'.padEnd(8))} ${outside}`);
+    const forecast = forecastText(account.quota?.forecast, now);
+    if (forecast) lines.push(`  ${paint.dim('Forecast'.padEnd(8))} ${forecast}`);
     lines.push(`  ${paint.dim('Usage'.padEnd(8))} ${formatUsage(account.usage, now)}`);
     lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(nameText(account.name), probe, now, paint)}`);
     const adaptive = adaptiveFor(status, nameText(account.name));
@@ -126,8 +152,11 @@ export const UNAVAILABLE_TEXT = {
   'upstream-rejected': 'upstream reports quota rejected',
   quota: 'local switch threshold reached',
   capped: 'account usage cap reached (maxUsage)',
+  'spend-capped': 'extra-usage spend cap reached (maxSpend)',
   'advisor-capped': "advisor model's usage cap reached (maxUsage)",
   entitlement: 'upstream refused this account for the organization (cooldown)',
+  routing: "the account's routing proxy is unreachable (cooldown)",
+  credential: 'upstream rejected its API key with a 401 (cooldown, then retried)',
   route: 'no route allows this account',
   'advisor-quota': "advisor model's weekly bucket spent",
   'advisor-route': 'no route allows the advisor model',
@@ -151,12 +180,21 @@ export function spendLine(account, paint) {
   if (!spend.enabled && !spent) return null;
 
   const amount = formatMoney(spend);
+  // The operator's own ceiling (accounts[].maxSpend), drawn beside the upstream
+  // figure it is judged against so the two read in one glance: `$14.35 of
+  // $10,000.00 used this month, cap $20.00`. Named `cap` like the usage caps on
+  // the bars above — same word, same meaning: at it the account gets nothing.
+  const capMinor = resolveMaxSpendMinor(account?.maxSpend, spend);
+  const cap = capMinor == null ? '' : `, cap ${formatMoney({ ...spend, usedMinor: capMinor, limitMinor: null })}`;
   if (spend.enabled) {
     // Already billing is the louder of the two: red, and named as money rather
     // than as a percentage, so it cannot be mistaken for another quota bar.
-    const text = spent
-      ? `billing real money — ${amount} used this month`
-      : `can bill real money past its plan limits — ${amount} used`;
+    const reached = spendCapReached(account?.maxSpend, spend);
+    const text = reached
+      ? `spend cap reached — ${amount} used this month${cap}`
+      : spent
+        ? `billing real money — ${amount} used this month${cap}`
+        : `can bill real money past its plan limits — ${amount} used${cap}`;
     return `${paint.dim('Spend'.padEnd(8))} ${(spent ? paint.red : paint.yellow)(`\u26a0 ${text}`)}`;
   }
   // Not enabled, but money was spent this month. Say why it is off now, since
@@ -167,11 +205,265 @@ export function spendLine(account, paint) {
   return `${paint.dim('Spend'.padEnd(8))} ${paint.yellow(`${amount} spent this month, ${why}`)}`;
 }
 
+/**
+ * The outside-spend read-out for one account, or null when it reports no
+ * weekly window (#475). One phrase per window, joined with " · ":
+ *
+ *   "4.0% of the week went elsewhere"          measured (0% is a real answer)
+ *   "Fable week: not measurable"               served at every reading
+ *   "week: not observed (quota probe off?)"    no fresh readings to compare
+ *
+ * Never "0%" for the last two: those are "no answer", not "nothing". The
+ * share is a floor — spend elsewhere while this proxy was also serving the
+ * account is not counted, and docs/quota.md says so.
+ *
+ * Pure and closure-free on purpose: the dashboard serializes it into its page
+ * with toString(), so the terminal and the browser say the same thing.
+ *
+ * @param {Record<string, {share: number|null, state: string, since: string|null}>|null|undefined} outsideSpend
+ * @returns {string|null}
+ */
+export function outsideSpendText(outsideSpend) {
+  var o = outsideSpend || {};
+  var keys = Object.keys(o).sort(function (a, b) {
+    if (a === 'unified7d') return -1;
+    if (b === 'unified7d') return 1;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  if (!keys.length) return null;
+  var parts = keys.map(function (key) {
+    /** @type {{share?: number|null, state?: string}} */
+    var v = o[key] || {};
+    var family = key === 'unified7d' ? ''
+      : key === 'unified7dFable' ? 'fable'
+      : key === 'unified7dSonnet' ? 'sonnet'
+      : key.indexOf('scoped:') === 0 ? key.slice(7) : key;
+    var label = family ? family.charAt(0).toUpperCase() + family.slice(1) + ' week' : 'week';
+    if (v.state === 'measured' && typeof v.share === 'number') {
+      return (Math.round(v.share * 1000) / 10).toFixed(1) + '% of the ' + label + ' went elsewhere';
+    }
+    if (v.state === 'not_measurable') return label + ': not measurable';
+    return label + ': not observed (quota probe off?)';
+  });
+  return parts.join(' \u00b7 ');
+}
+
+/**
+ * The burn-rate forecast for one account, or null when there is nothing to
+ * warn about (#475). One phrase per weekly window that, at the learned rate,
+ * reaches its switch threshold before it resets:
+ *
+ *   "week reaches 98% in ~31h, resets in 52h"
+ *   "Fable week reaches 95% in ~5h, resets in 2d4h"
+ *
+ * A window that resets first is the good case and gets no sentence; so does a
+ * window the learner has no rate for yet. A window with no known reset still
+ * gets the first half, since nothing says it resets first.
+ *
+ * Pure and closure-free on purpose, like outsideSpendText: the dashboard
+ * serializes it into its page with toString().
+ *
+ * @param {Record<string, {ratePerHour?: number|null, threshold?: number, reachesThresholdAt?: number|null, resetAt?: number|null}>|null|undefined} forecast
+ * @param {number} now  ms epoch
+ * @returns {string|null}
+ */
+export function forecastText(forecast, now) {
+  var f = forecast || {};
+  /** @param {number} ms */
+  var dur = function (ms) {
+    var minutes = Math.max(1, Math.round(ms / 60000));
+    if (minutes < 60) return minutes + 'm';
+    var hours = Math.round(minutes / 60);
+    if (hours < 48) return hours + 'h';
+    var days = Math.floor(hours / 24);
+    var rem = hours % 24;
+    return rem ? days + 'd' + rem + 'h' : days + 'd';
+  };
+  var keys = Object.keys(f).sort(function (a, b) {
+    if (a === 'unified7d') return -1;
+    if (b === 'unified7d') return 1;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  var parts = [];
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i];
+    var v = f[key] || {};
+    var at = v.reachesThresholdAt;
+    if (typeof at !== 'number' || !(at > now)) continue;
+    var reset = typeof v.resetAt === 'number' && v.resetAt > now ? v.resetAt : null;
+    if (reset != null && at >= reset) continue;
+    var family = key === 'unified7d' ? ''
+      : key === 'unified7dFable' ? 'fable'
+      : key === 'unified7dSonnet' ? 'sonnet'
+      : key.indexOf('scoped:') === 0 ? key.slice(7) : key;
+    var label = family ? family.charAt(0).toUpperCase() + family.slice(1) + ' week' : 'week';
+    var pct = typeof v.threshold === 'number' ? Math.round(v.threshold * 100) + '%' : 'its threshold';
+    var reach = dur(at - now);
+    var resetText = reset != null ? dur(reset - now) : null;
+    // Rounded separately, the two can print alike; the threshold still comes first.
+    parts.push(label + ' reaches ' + pct + ' in ~' + reach
+      + (resetText == null ? '' : resetText === reach ? ', just before it resets' : ', resets in ' + resetText));
+  }
+  return parts.length ? parts.join(' \u00b7 ') : null;
+}
+
+/**
+ * Whether an account's Session (five-hour) row is drawn. A plan that meters no
+ * session window (`sessionWindowStated === false`) has none to draw, and an
+ * empty row would read as "unknown" for something that does not exist. A
+ * reading that is still there is drawn whatever the flag says: it may be the
+ * one keeping the account out of rotation.
+ *
+ * One rule for `teamclaude status`, the TUI row and the dashboard card (#511).
+ * Closure-free: the dashboard serializes it into its page with toString().
+ *
+ * @param {{sessionWindowStated?: boolean, unified5h?: number|null}|null|undefined} quota
+ * @returns {boolean}
+ */
+export function showSessionRow(quota) {
+  var q = quota || {};
+  return q.sessionWindowStated !== false || q.unified5h != null;
+}
+
+/**
+ * showSessionRow's rule for the shared weekly window, which a Team seat lacks.
+ *
+ * @param {{weeklyWindowStated?: boolean, unified7d?: number|null}|null|undefined} quota
+ * @returns {boolean}
+ */
+export function showWeeklyRow(quota) {
+  var q = quota || {};
+  return q.weeklyWindowStated !== false || q.unified7d != null;
+}
+
+/**
+ * The free-reset-credit line, or null when this account holds none.
+ *
+ * Its own line rather than another bar: every bar above measures an allowance
+ * running down, while this counts something the account can spend to put one
+ * back. `applicable` is named alongside because a credit upstream would
+ * currently decline to apply is a different situation from one it would honour,
+ * and the count on its own reads the same either way.
+ *
+ * The reading's age rides along ("as of 3h ago"): the count is only refreshed
+ * by the usage probe, which is off by default, so how old it is says how much
+ * it is worth. Past RESET_CREDIT_MAX_AGE_MS the line is dropped altogether.
+ *
+ * @param {Record<string, any>|null|undefined} account  a row of the status payload
+ * @param {ReturnType<typeof colors>} paint
+ * @param {number} [now]  ms epoch the age is measured from
+ */
+export function resetCreditLine(account, paint, now = Date.now()) {
+  const credits = account?.quota?.resetCredits;
+  const available = heldResetCredits(account?.quota, now);
+  if (!available) return null;
+  const noun = `free rate-limit reset ${available === 1 ? 'credit' : 'credits'}`;
+  const notes = [];
+  if (credits.applicable === 0) notes.push('none applicable to a window right now');
+  if (Number.isFinite(credits.expiresAt)) notes.push(`expires ${formatDuration(credits.expiresAt - now)}`);
+  if (Number.isFinite(credits.seenAt)) notes.push(`as of ${formatAgo(Math.min(credits.seenAt, now), now)}`);
+  const note = notes.length ? ` — ${notes.join(', ')}` : '';
+  return `${paint.dim('Reset'.padEnd(8))} ${paint.cyan(`${available} ${noun}`)}${paint.gray(note)}`;
+}
+
+// How long a reset-credit reading is worth showing. Nothing refreshes the count
+// but the usage probe, and the probe is off by default, so a credit that was
+// redeemed or expired would otherwise stay on screen indefinitely. A week is the
+// longest Codex window: past it, every window the credit could have reset has
+// reset on its own, and the reading describes a situation that is gone.
+export const RESET_CREDIT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * How many reset credits to REPORT for this quota: the held count while the
+ * reading is fresh, 0 once it is older than RESET_CREDIT_MAX_AGE_MS, past its
+ * stated `expiresAt`, or states no positive count. One rule for the status screen and the TUI row, so the two
+ * cannot disagree about whether a credit is there (the dashboard page applies
+ * the same cut-off in its own serialized helper).
+ *
+ * A reading with no `seenAt` is shown: its age is unknown rather than old, and
+ * every reading the proxy stores itself is stamped.
+ *
+ * @param {Record<string, any>|null|undefined} quota
+ * @param {number} [now]  ms epoch the age is measured from
+ * @returns {number}
+ */
+export function heldResetCredits(quota, now = Date.now()) {
+  const credits = quota?.resetCredits;
+  const available = credits?.available;
+  if (!Number.isFinite(available) || available <= 0) return 0;
+  if (Number.isFinite(credits.seenAt) && now - credits.seenAt > RESET_CREDIT_MAX_AGE_MS) return 0;
+  // A grant past its stated expiry is gone whatever the last reading said.
+  if (Number.isFinite(credits.expiresAt) && credits.expiresAt <= now) return 0;
+  return available;
+}
+
 export function unavailableLine(account, paint) {
   const reason = account?.unavailable;
   if (!reason) return null;
-  const text = UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
+  const err = reason === 'error' ? account.errorReason : null;
+  const text = err
+    ? `needs a re-login: ${safeLine(err.detail, 120)} — run: ${safeLine(err.remedy, 40)}`
+    : UNAVAILABLE_TEXT[reason] || safeLine(reason, 64);
+  // An account serving as the extra-usage fallback reads as out of quota like
+  // any other, yet is taking traffic and billing for it. Say so on the line
+  // that would otherwise tell the operator it is idle.
+  if (account.onExtraUsage) {
+    return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)} ${paint.red('\u2014 serving on extra usage (paid overage), billing')}`;
+  }
   return `${paint.dim('Blocked'.padEnd(8))} ${paint.yellow(text)}`;
+}
+
+// Compact names for the "switch NN%" line below — short enough that several
+// can sit on one line (`switch 7d 90%, fable 80%`), and the same short form
+// `teamclaude threshold <bucket>=<pct>` already uses on the command line.
+/** @type {Object<string, string>} */
+const THRESHOLD_BUCKET_LABELS = {
+  unified5h: '5h', unified7d: '7d', unified7dSonnet: 'sonnet', unified7dFable: 'fable',
+  tokens: 'tokens', requests: 'requests',
+};
+
+/**
+ * "switch at 100%" / "switch 7d 90%, fable 80%" — this account's OWN
+ * switchThreshold (issue #409), shown ONLY where it actually moves rotation
+ * away from the fleet-wide setting a bare read of the header row already
+ * named. Silent for an account with no override, and silent for one whose
+ * table merely repeats the fleet's own numbers — the diff, not the config, is
+ * what earns a line (see switchThresholdDiffs).
+ *
+ * `default` reads as "at" rather than the bucket name: it is the account's
+ * own bare-number override, or its table's own `default`, and neither is a
+ * quota window a reader would recognise as a bucket.
+ * @param {any} account
+ * @param {any} status
+ * @param {any} paint
+ */
+export function thresholdLine(account, status, paint) {
+  /** @param {string} bucket */
+  const fleetFor = bucket => resolveFleetThreshold(status.switchThreshold, status.switchThresholds, bucket);
+  const diffs = switchThresholdDiffs(account?.switchThreshold, fleetFor);
+  if (!diffs.length) return null;
+  const parts = diffs.map(({ bucket, value }) => {
+    const label = bucket === 'default' ? 'at' : (THRESHOLD_BUCKET_LABELS[bucket] || bucket);
+    return `${label} ${formatPercent(value)}`;
+  });
+  return `${paint.dim('Switch'.padEnd(8))} ${paint.cyan(`switch ${parts.join(', ')}`)}`;
+}
+
+/**
+ * "Egress   via socks5h://alice:***@host:1080" — the account's OWN egress
+ * proxy (accounts[].routing), or null when it has none: the fleet path needs
+ * no line. The status payload carries it already password-masked; a renderer
+ * against the live manager (which holds the parsed object) gets the same
+ * masked string out of describeRouting.
+ * @param {any} account
+ * @param {any} paint
+ */
+export function egressProxyLine(account, paint) {
+  const r = account?.routing;
+  if (!r) return null;
+  const text = typeof r === 'string' ? r : describeRouting(r);
+  if (!text) return null;
+  return `${paint.dim('Egress'.padEnd(8))} ${paint.cyan(`via ${text}`)}`;
 }
 
 function colors(enabled) {
@@ -191,7 +483,6 @@ function colors(enabled) {
 }
 
 // Paint a route's name/globs in its configured color, defaulting to cyan.
-const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
 function paintRoute(paint, color, value) {
   const fn = ROUTE_COLORS.includes(String(color || '').toLowerCase()) ? paint[color.toLowerCase()] : paint.cyan;
   return fn(value);
@@ -274,7 +565,18 @@ function renderAccountHeader(account, currentAccount, paint, now, followSessions
   const sess = sessions
     ? ` ${paint.dim(`${sessions} sess${formatSessionBuckets(account.sessionsByBucket)}`)}`
     : '';
-  return `${marker} ${shown} ${paint.dim(`(${safeLine(account.type, 16)}, prio ${account.priority || 0})`)} ${status}${org}${sess}`;
+  // The opt-in is shown even while unused, so an operator can tell before the
+  // fleet runs dry which accounts would start billing; serving on it is said
+  // in red on the Blocked line (see unavailableLine).
+  const xu = account.allowExtraUsage === true ? ', extra usage allowed' : '';
+  return `${marker} ${shown} ${paint.dim(`(${safeLine(account.type, 16)}, prio ${account.priority || 0}${xu})`)} ${status}${org}${sess}`;
+}
+
+// "3f2a1b9c → api-1, 9d0e4c11 → work" — each pinned session by the prefix the
+// activity view shows, and the account it is held on.
+/** @param {any[]} pins @param {any} paint */
+export function formatSessionPins(pins, paint) {
+  return pins.map((/** @type {any} */ p) => `${nameText(String(p?.session ?? ''))} → ${paint.cyan(nameText(String(p?.account ?? '')))}`).join(', ');
 }
 
 // "2 active / 3 known · distributing" — the running-sessions readout. While a
@@ -289,6 +591,7 @@ function formatSessions(sessions, paint) {
   // different accounts for the same fleet, so an operator reading the line
   // needs to know which rule produced what they are looking at.
   if (sessions.mode === 'adaptive') mode = paint.green('adapting');
+  else if (sessions.mode === 'load') mode = paint.green('distributing by load');
   else if (sessions.distribute) mode = paint.green('distributing');
   else if (draining) mode = paint.yellow(`draining ${draining}`);
   else mode = paint.dim('single-account');
@@ -393,6 +696,16 @@ function formatAccountStatus(account, now, paint) {
     parts.push(paint.yellow(`entitlement cooldown ${formatDuration(entitlementAt - now)}`));
   }
 
+  const routingAt = parseTs(account.routingFailedUntil);
+  if (routingAt && routingAt > now) {
+    parts.push(paint.yellow(`routing proxy down, retry in ${formatDuration(routingAt - now)}`));
+  }
+
+  const credentialAt = parseTs(account.credentialRejectedUntil);
+  if (credentialAt && credentialAt > now) {
+    parts.push(paint.yellow(`API key rejected (401), retry in ${formatDuration(credentialAt - now)}`));
+  }
+
   return parts.join(' / ');
 }
 
@@ -409,7 +722,22 @@ function formatAccountStatus(account, now, paint) {
 // decision, so a second derivation of it is a copy that drifts. Reading the
 // family bucket alone printed `Fable ✓` on an account the router had already
 // refused, in one render.
-function modelRoutingLine(account, threshold, blocked, now, paint) {
+//
+// `thresholdFor` is a per-bucket lookup, `bucket => number`, not one flat
+// number — a per-account switchThreshold table (#409) can set Fable's own
+// bucket lower than the shared weekly's, exactly the case `_isNearQuota`
+// itself honors bucket by bucket. A single shared number here would show a
+// Fable override on the fleet-wide Weekly bar while the Models row quietly
+// judged Fable against the fleet's number instead of the account's own —
+// this row displays a routing decision, and that decision is per bucket.
+/**
+ * @param {any} account
+ * @param {(bucket: string) => number} thresholdFor
+ * @param {any} blocked
+ * @param {any} now
+ * @param {any} paint
+ */
+function modelRoutingLine(account, thresholdFor, blocked, now, paint) {
   const q = account.quota || {};
   // A family is metered here when its own weekly bucket is known, or when only
   // the learned one is: a spent reading is cleared for revalidation (see
@@ -419,8 +747,10 @@ function modelRoutingLine(account, threshold, blocked, now, paint) {
   // key regardless, which is what the router gates on.
   const metered = family => q[`unified7d${family}`] != null || q.scopedWeekly?.[family.toLowerCase()] != null;
   if (!metered('Sonnet') && !metered('Fable')) return null;
-  const t = Number(threshold);
-  const overThreshold = v => v != null && !Number.isNaN(t) && v >= t;
+  const overThreshold = (v, bucket) => {
+    const t = Number(thresholdFor(bucket));
+    return v != null && !Number.isNaN(t) && v >= t;
+  };
   // A per-account cap is the other ceiling a family can be over. Without it a
   // capped family reads ✓ on the very line that exists to say where a model can
   // still run, right beside the Blocked line saying it cannot.
@@ -431,7 +761,7 @@ function modelRoutingLine(account, threshold, blocked, now, paint) {
   // Blocks every family: the shared 5-hour bucket, and the shared weekly at its
   // CAP — family spend meters into the shared bucket, so a cap written against
   // it stops the families too (see AccountManager.capExceeded).
-  const sharedOver = overThreshold(q.unified5h) || overCap(q.unified5h, 'unified5h')
+  const sharedOver = overThreshold(q.unified5h, 'unified5h') || overCap(q.unified5h, 'unified5h')
     || overCap(q.unified7d, 'unified7d');
 
   const cell = (label, bucketKey, reset) => {
@@ -452,7 +782,7 @@ function modelRoutingLine(account, threshold, blocked, now, paint) {
     // Using the governing value for the cap would redden Fable because Opus
     // spent the shared weekly, which is not a decision the router made.
     const gating = gatingUtilization(q, bucketKey);
-    const weeklyOver = overThreshold(gating) || overCap(q[bucketKey] ?? null, bucketKey);
+    const weeklyOver = overThreshold(gating, bucketKey) || overCap(q[bucketKey] ?? null, bucketKey);
     const mark = sharedOver || weeklyOver ? paint.red('✗') : paint.green('✓');
     // The recovery time is the LATEST reset among the two WEEKLY buckets
     // currently over the threshold, not this bucket's. The weekly half of the
@@ -473,6 +803,12 @@ function modelRoutingLine(account, threshold, blocked, now, paint) {
     // rolling. Closing it means restructuring the cell rather than adding a
     // third candidate, since the whole `when` clause is gated on `weeklyOver`
     // and a 5h-only block suppresses the time entirely.
+    // Same bucket's threshold for both readings, matching `weeklyOver`'s own
+    // single comparison above: the governing value is the max of this
+    // family's bucket and the shared one, judged against THIS bucket's own
+    // threshold — never the shared bucket's, which is a different number
+    // once a per-account table sets them apart (#409).
+    const t = Number(thresholdFor(bucketKey));
     const over = [];
     if (!Number.isNaN(t)) {
       if (q[bucketKey] != null && q[bucketKey] >= t) over.push(parseTs(reset));
@@ -500,8 +836,12 @@ function quotaLines(account, now, paint) {
   const cap = bucket => resolveMaxUsage(account.maxUsage, bucket);
 
   if (quota.unified5h != null || quota.unified7d != null || quota.unified7dSonnet != null || quota.unified7dFable != null) {
-    lines.push(formatQuotaLine('Session', quota.unified5h, quota.unified5hReset, now, paint, cap('unified5h')));
-    lines.push(formatQuotaLine('Weekly', quota.unified7d, quota.unified7dReset, now, paint, cap('unified7d')));
+    if (showSessionRow(quota)) {
+      lines.push(formatQuotaLine('Session', quota.unified5h, quota.unified5hReset, now, paint, cap('unified5h')));
+    }
+    if (showWeeklyRow(quota)) {
+      lines.push(formatQuotaLine('Weekly', quota.unified7d, quota.unified7dReset, now, paint, cap('unified7d')));
+    }
     if (quota.unified7dSonnet != null) {
       lines.push(formatQuotaLine('Sonnet', quota.unified7dSonnet, quota.unified7dSonnetReset, now, paint, cap('unified7dSonnet')));
     }

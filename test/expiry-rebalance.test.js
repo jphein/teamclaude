@@ -144,3 +144,80 @@ test('a retry inside one request never rebalances the fleet onto a worse seat', 
   assert.equal(lines.filter(l => l.includes('Rebalanced')).length, 0);
   assert.equal(am.accounts[am.currentIndex].name, 'a', 'the fleet cursor stays for the next first attempt to decide');
 });
+
+// ── review fixes (spyglass-ba, PR #36) ──────────────────────────────────────
+
+const codex = name => ({ ...oauth(name), provider: 'codex', accountId: 'acct-' + name });
+
+test('a Codex account in the fleet does not turn rebalancing off', () => {
+  // The first-attempt gate once read the provider-augmented exclusions, which
+  // always carry the other fleet's accounts.
+  const am = new AccountManager([oauth('a'), oauth('b'), oauth('c'), codex('x')], 0.99,
+    { expiryRouting: { enabled: true, tolerance: 1.2, rebalance: true } });
+  seat(am, 0, 0.97, 26);
+  seat(am, 1, 0.30, 85);
+  seat(am, 2, 0.42, 80);
+  am._setCurrent(am.accounts[0]);
+  const { value, lines } = captureLog(() => am.getActiveAccount(null, OPUS));
+  assert.notEqual(value.name, 'a');
+  assert.equal(lines.filter(l => l.includes('Rebalanced')).length, 1);
+});
+
+test("an operator's switch holds against rebalancing until the account cannot serve", () => {
+  const am = mgr();
+  seat(am, 0, 0.97, 26);            // the worst choice, picked by hand
+  seat(am, 1, 0.30, 85);
+  seat(am, 2, 0.42, 80);
+  am.setCurrentAccount(0);
+  const held = captureLog(() => am.getActiveAccount(null, OPUS));
+  assert.equal(held.value.name, 'a');
+  assert.equal(held.lines.filter(l => l.includes('Rebalanced')).length, 0);
+  am.accounts[0].quota.unified7d = 0.995;  // now past the switch threshold
+  assert.notEqual(captureLog(() => am.getActiveAccount(null, OPUS)).value.name, 'a');
+  assert.equal(am._manualHold, null, 'leaving the held account releases the hold');
+});
+
+test("a Codex walk leaves the Anthropic fleet's hold where it is", () => {
+  const am = new AccountManager([oauth('a'), oauth('b'), codex('x')], 0.99,
+    { expiryRouting: { enabled: true, tolerance: 1.2, rebalance: true } });
+  seat(am, 0, 0.97, 26);
+  seat(am, 1, 0.30, 85);
+  am.setCurrentAccount(0);
+  captureLog(() => am.getActiveAccount(null, 'gpt-5.6-sol', null, null, 'codex'));
+  assert.equal(am._manualHold, 0);
+  assert.equal(captureLog(() => am.getActiveAccount(null, OPUS)).value.name, 'a');
+});
+
+test('removing an account remaps the hold to the same account', () => {
+  const am = mgr({ names: ['a', 'b', 'c', 'd'] });
+  am.setCurrentAccount(3);
+  am.removeAccount(1);
+  assert.equal(am.accounts[am._manualHold].name, 'd');
+  am.removeAccount(am._manualHold);
+  assert.equal(am._manualHold, null, 'the held account itself removed');
+});
+
+test('a pin with another request still in flight is not at a break, however long since it was routed', () => {
+  let now = Date.now();
+  const tracker = new SessionTracker({ now: () => now });
+  const am = mgr({ distributeSessions: true, sessionTracker: tracker });
+  seat(am, 0, 0.97, 26);
+  seat(am, 1, 0.30, 85);
+  seat(am, 2, 0.42, 80);
+  am.recordSession('s1', 0, OPUS);
+  tracker.beginRequest('s1', now);  // a long stream still running
+  now += PIN_IDLE_BREAK_MS + 60_000;
+  tracker.beginRequest('s1', now);  // this request
+  assert.equal(captureLog(() => am.getActiveAccount(null, OPUS, null, 's1')).value.name, 'a');
+});
+
+test('the seat a rebalance left is recorded so a hop in the same request cannot hand traffic back', () => {
+  const am = mgr();
+  seat(am, 0, 0.97, 26);
+  seat(am, 1, 0.30, 85);
+  seat(am, 2, 0.42, 80);
+  am._setCurrent(am.accounts[0]);
+  const decision = {};
+  captureLog(() => am.getActiveAccount(null, OPUS, null, null, undefined, decision));
+  assert.ok(decision.rolledOff?.has(0));
+});

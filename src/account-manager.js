@@ -668,6 +668,8 @@ export class AccountManager {
     this._obsGen = 0;
     /** @type {number|null} the account an operator switched to, held against band preemption */
     this._manualHold = null;
+    /** @type {boolean} set for the length of a selection walk: is this a request's first attempt */
+    this._firstAttempt = false;
     this.setExpiryRouting(expiryRouting);
     // The rollover mechanism's whole state for the sticky current account: one
     // observation, { idx, windows: name → reset }, of the account traffic was
@@ -920,7 +922,9 @@ export class AccountManager {
    * held roll to its own account, and otherwise writes where nothing is lost.
    */
   _setCurrent(account) {
-    if (this._manualHold != null && this._manualHold !== account.index) this._manualHold = null;
+    // A move in another provider's fleet (a borrowed Codex walk) leaves this one's hold.
+    const held = this._manualHold != null ? this.accounts[this._manualHold] : null;
+    if (held && held.index !== account.index && providerOf(held) === providerOf(account)) this._manualHold = null;
     this.currentIndex = account.index;
     // A move made by an operator or a poll names the provider cursor of the
     // account it lands on. A move inside a selection walk does not: the walk
@@ -1249,11 +1253,17 @@ export class AccountManager {
       // was routed on. Announced by a first attempt only: a retry's exclusions
       // shrink both sets, so its counts describe that request and not the fleet.
       const first = !(/** @type {Set<number>|null} */ (exclude)?.size);
+      // Read by rebalancing, which is a fleet decision for a request's first
+      // attempt only. Taken from the request's OWN exclusions: `excluded` also
+      // carries every other provider's accounts, so its size says nothing about
+      // whether this is a retry.
+      this._firstAttempt = first;
       routedAdvisor = this._advisorForSelection(excluded, model, advisorModel, first);
       account = this._pickActiveAccount(excluded, model, routedAdvisor, sessionId);
     } finally {
       this._selectingProvider = null;
       this._selectionDecision = null;
+      this._firstAttempt = false;
       walked = this.currentIndex;
       // Hand the slot back before anything can observe it moved. Only the
       // provider that owns currentIndex gets to change it.
@@ -1737,9 +1747,12 @@ export class AccountManager {
       // request's first attempt only: on a retry the band's best may be the
       // account that just failed, and moving the fleet's cursor to whatever is
       // left would be undone by the very next request.
-      if (!exclude?.size && this._manualHold !== current.index && this._bandPreempts(current, model, advisorModel)) {
+      if (this._firstAttempt && this._manualHold !== current.index && this._bandPreempts(current, model, advisorModel)) {
         const next = this._selectNext(exclude, model, advisorModel);
         if (next && next.index !== current.index) {
+          // As a rollover does: a later availability hop inside this request
+          // must not hand the traffic straight back to the account it left.
+          if (this._selectionDecision) (this._selectionDecision.rolledOff ??= new Set()).add(current.index);
           console.log(`[TeamClaude] Rebalanced "${current.name}" → "${next.name}": ${this._bandWhy(current, next, model)}`);
           return next;
         }
@@ -5540,6 +5553,7 @@ export class AccountManager {
     // Session pins are positions in the same list and shift the same way, and so
     // are the rollover observations hanging off them and off the current account.
     const remap = idx => (idx === index ? null : idx > index ? idx - 1 : idx);
+    if (this._manualHold != null) this._manualHold = remap(this._manualHold);
     this.sessionTracker.remapAccounts(remap);
     this.burnRateLearner.remapAccounts(remap);
     this.outsideSpend.remapAccounts(remap);

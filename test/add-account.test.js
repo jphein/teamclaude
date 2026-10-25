@@ -218,12 +218,20 @@ test('a superseded or cancelled session never saves, even when its callback land
   assert.equal(sessions[2].session.exchanged, null);
 });
 
-test('status() never carries the authorize URL: a poller cannot complete the operator\'s sign-in', async () => {
+test('status() never carries the authorize URL or its PKCE state: a poller cannot complete the operator\'s sign-in', async () => {
   const { mgr, sessions } = makeManager();
-  await mgr.start();
-  const text = JSON.stringify(mgr.status());
-  assert.ok(!text.includes(sessions[0].session.authUrl));
-  assert.ok(!/authUrl|state":"st"/.test(text.replace('"state":"pending"', '')));
+  sessions.length = 0;
+  const secretState = 'pkce-state-7f3a9c';
+  const mgr2 = createAddAccountManager({
+    createSession: async () => { const s = fakeSession(); s.session.state = secretState; s.session.authUrl = `https://claude.ai/oauth/authorize?code_challenge=ch-5b1e&state=${secretState}`; sessions.push(s); return s.session; },
+    saveAccount: async () => ({ action: 'added', name: 'x' }), reload: async () => {}, log: () => {},
+  });
+  await mgr2.start();
+  const text = JSON.stringify(mgr2.status());
+  assert.ok(!text.includes(secretState), 'the PKCE state');
+  assert.ok(!text.includes('ch-5b1e'), 'the code challenge');
+  assert.ok(!text.includes('oauth/authorize'), 'the authorize URL');
+  assert.equal(mgr.status().state, 'idle');
 });
 
 // xreview fixes (gpt-6.1-sol, 2026-10-25).
@@ -298,4 +306,43 @@ test('a name with a control character or over 128 characters is refused, in the 
     assert.equal(res.status, 400);
     assert.equal(started, 0);
   } finally { proxy.close(); }
+});
+
+// Oracle fixes (2026-10-25).
+test('a requested name already in use is refused before any session opens', async () => {
+  const sessions = [];
+  const mgr = createAddAccountManager({
+    createSession: async () => { const s = fakeSession(); sessions.push(s); return s.session; },
+    saveAccount: async () => ({ action: 'added', name: 'x' }), reload: async () => {}, log: () => {},
+    nameTaken: (n) => n === 'alice@x.com',
+  });
+  await assert.rejects(mgr.start({ name: 'alice@x.com' }), e => e.status === 409 && /Reauth/.test(e.message));
+  assert.equal(sessions.length, 0);
+  await mgr.start({ name: 'bob@x.com' });
+  assert.equal(sessions.length, 1);
+});
+
+test('a session that fails to open does not leave a dead one pending', async () => {
+  let fail = false;
+  const mgr = createAddAccountManager({
+    createSession: async () => { if (fail) throw new Error('port in use'); return fakeSession().session; },
+    saveAccount: async () => ({ action: 'added', name: 'x' }), reload: async () => {}, log: () => {},
+  });
+  await mgr.start();
+  fail = true;
+  await assert.rejects(mgr.start(), /port in use/);
+  assert.equal(mgr.pending(), false, 'Reauth is not held off by the closed session');
+  assert.equal(mgr.status().state, 'idle');
+});
+
+test('a reload that fails after the save says the account was saved', async () => {
+  const mgr = createAddAccountManager({
+    createSession: async () => fakeSession().session,
+    saveAccount: async () => ({ action: 'added', name: 'new@x.com' }),
+    reload: async () => { throw new Error('reload boom'); }, log: () => {},
+  });
+  await mgr.start();
+  const st = await mgr.submitCode('c');
+  assert.equal(st.state, 'error');
+  assert.match(st.error, /saved "new@x\.com".*reload boom/);
 });

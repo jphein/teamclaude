@@ -33,6 +33,7 @@ function httpError(status, message) {
  * @param {() => Promise<unknown>} opts.reload  propagate the saved row into the running fleet
  * @param {() => Promise<any>} [opts.createSession]
  * @param {() => boolean} [opts.otherSessionPending]  true while a reauth is pending
+ * @param {(name: string) => boolean} [opts.nameTaken]  true when an account already has this name
  * @param {(msg: string) => void} [opts.log]
  */
 export function createAddAccountManager({
@@ -40,6 +41,7 @@ export function createAddAccountManager({
   reload,
   createSession = createOAuthSession,
   otherSessionPending = () => false,
+  nameTaken = () => false,
   log = console.log,
 }) {
   /** @typedef {{ requestedName: string | null, name: string | null, session: any, state: 'pending' | 'done' | 'error',
@@ -74,7 +76,11 @@ export function createAddAccountManager({
       // asked for nothing to be saved, so nothing is (xreview, 2026-10-25).
       if (current !== ctx) { ctx.session.close(); return; }
       const outcome = await saveAccount(creds, ctx.requestedName);
-      await reload();
+      try {
+        await reload();
+      } catch (err) {
+        throw new Error(`saved "${outcome.name}", but reloading the fleet failed — it joins on the next reload: ${/** @type {any} */ (err)?.message || String(err)}`);
+      }
       ctx.state = 'done';
       ctx.name = outcome.name;
       ctx.action = outcome.action;
@@ -96,8 +102,15 @@ export function createAddAccountManager({
       if (otherSessionPending()) throw httpError(409, 'a reauth is already waiting for a browser approval — finish or cancel it first');
       const requestedName = typeof name === 'string' && name.trim() ? name.trim() : null;
       if (requestedName && !validName(requestedName)) throw httpError(400, 'a name is at most 128 characters, without control characters');
+      // A name match is how the upsert finds a row when the profile cannot be
+      // read, so an existing name could land another sign-in's tokens on that
+      // seat (Oracle, 2026-10-25). Re-signing an existing seat is Reauth's job.
+      if (requestedName && nameTaken(requestedName)) throw httpError(409, `an account named "${requestedName}" already exists — use Reauth on its card`);
 
-      if (current) current.session.close(); // supersede any prior session
+      // Supersede any prior session, and let go of it: if creating the new one
+      // fails, a dead session left in `current` would read as pending and hold
+      // Reauth off until someone cancelled.
+      if (current) { current.session.close(); current = null; }
 
       const mine = ++generation;
       starting++;

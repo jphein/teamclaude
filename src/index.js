@@ -984,6 +984,7 @@ async function serverCommand() {
     saveAccount: (creds, name) => upsertOAuthAccount(name, creds, 'login', null, false, { fatal: false, notify: false }),
     reload: reloadAccounts,
     otherSessionPending: () => !!hooks.reauth?.pending(),
+    nameTaken: (/** @type {string} */ name) => accountManager.accounts.some(a => a.name === name),
   });
 
   // A stored MITM chain that falls short (a host the accounts now need, or

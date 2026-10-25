@@ -91,7 +91,7 @@ export function createReauthManager({
   return {
     status,
 
-    pending: () => !!current && current.state === 'pending',
+    pending: () => status().state === 'pending',
 
     async start(name) {
       if (otherSessionPending()) throw httpError(409, 'an add-account sign-in is already waiting for a browser approval — finish or cancel it first');

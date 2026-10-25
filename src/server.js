@@ -469,6 +469,13 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   // anything.
   ['/teamclaude/account', 'a client key cannot change accounts'],
   ['/teamclaude/restart', 'a client key cannot restart the service'],
+  // Add account (review, 2026-10-25): unlike Reauth there is no identity to
+  // check a new seat against, so a tenant could add a Claude account it controls
+  // and have other tenants' prompts routed through it. The code and cancel
+  // routes belong to the operator's pending sign-in, so they are refused too.
+  ['/teamclaude/add-account', 'a client key cannot add accounts'],
+  ['/teamclaude/add-account/code', 'a client key cannot add accounts'],
+  ['/teamclaude/add-account/cancel', 'a client key cannot add accounts'],
 ]);
 
 /**
@@ -937,7 +944,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           console.log(`[TeamClaude] Add account started via UI${name ? ` as "${name}"` : ''}`);
           emitActivity({ type: 'add-account', name: name || null });
           json(res, 200, { ok: true, authUrl });
-        } catch (err) { json(res, err.status || 500, { error: err.message }); }
+        } catch (err) { const e = /** @type {{ status?: number, message: string }} */ (err); json(res, e.status || 500, { error: e.message }); }
         return;
       }
       if (req.method === 'POST' && req.url === '/teamclaude/add-account/code') {
@@ -945,7 +952,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         try {
           const { code } = JSON.parse((await readControlBody(req)) || '{}');
           json(res, 200, await hooks.addAccount.submitCode(code));
-        } catch (err) { json(res, err.status || 500, { error: err.message }); }
+        } catch (err) { const e = /** @type {{ status?: number, message: string }} */ (err); json(res, e.status || 500, { error: e.message }); }
         return;
       }
       if (req.method === 'POST' && req.url === '/teamclaude/add-account/cancel') {

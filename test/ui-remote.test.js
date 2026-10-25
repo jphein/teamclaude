@@ -72,6 +72,13 @@ function spies() {
       cancel: () => { calls.push('reauth/cancel'); },
       status: () => ({ state: 'idle' }),
     },
+    addAccount: {
+      start: async () => { calls.push('add-account'); return { authUrl: 'https://example.invalid/auth' }; },
+      submitCode: async () => { calls.push('add-account/code'); return { state: 'pending' }; },
+      cancel: () => { calls.push('add-account/cancel'); },
+      status: () => ({ state: 'idle' }),
+      pending: () => false,
+    },
   };
   return { calls, hooks };
 }
@@ -85,6 +92,9 @@ const MUTATIONS = [
   ['/teamclaude/reauth', { name: 'a' }],
   ['/teamclaude/reauth/code', { code: 'x' }],
   ['/teamclaude/reauth/cancel', undefined],
+  ['/teamclaude/add-account', {}],
+  ['/teamclaude/add-account/code', { code: 'x' }],
+  ['/teamclaude/add-account/cancel', undefined],
   ['/teamclaude/restart', undefined],
   ['/teamclaude/probe', undefined],
   ['/teamclaude/reload', undefined],
@@ -178,7 +188,10 @@ test('a remote caller with the key reaches each mutating endpoint (restart exclu
   const { server, am } = makeServer(hooks);
   // A client key is refused the account and restart controls (they retire or
   // stop the fleet for every tenant); the shared key below still reaches them.
-  const OPERATOR_ONLY = new Set(['/teamclaude/account', '/teamclaude/restart']);
+  // Adding an account is operator-only: unlike Reauth there is no identity to
+  // check a new seat against.
+  const ADD = ['/teamclaude/add-account', '/teamclaude/add-account/code', '/teamclaude/add-account/cancel'];
+  const OPERATOR_ONLY = new Set(['/teamclaude/account', '/teamclaude/restart', ...ADD]);
   for (const [url, body] of MUTATIONS.filter(([u]) => u !== '/teamclaude/restart')) {
     const res = await request(server, { method: 'POST', url, headers: { ...JSON_HEADERS, 'x-api-key': KEY }, body: body ? JSON.stringify(body) : '' });
     assert.equal(res.status, OPERATOR_ONLY.has(url) ? 403 : 200, url + ' ' + res.chunks);
@@ -186,6 +199,11 @@ test('a remote caller with the key reaches each mutating endpoint (restart exclu
   const shared = await request(server, { method: 'POST', url: '/teamclaude/account', headers: { ...JSON_HEADERS, 'x-api-key': PROXY.apiKey }, body: JSON.stringify({ name: 'a', disabled: true }) });
   assert.equal(shared.status, 200, 'the shared key still reaches /account');
   calls.splice(calls.indexOf('account'), 1);
+  for (const url of ADD) {
+    const res = await request(server, { method: 'POST', url, headers: { ...JSON_HEADERS, 'x-api-key': PROXY.apiKey }, body: url.endsWith('/code') ? JSON.stringify({ code: 'x' }) : '{}' });
+    assert.equal(res.status, 200, 'the shared key reaches ' + url);
+  }
+  for (const c of ['add-account', 'add-account/code', 'add-account/cancel']) calls.splice(calls.indexOf(c), 1);
   assert.deepEqual(calls.sort(), ['probe', 'reauth', 'reauth/cancel', 'reauth/code', 'reload']);
   assert.equal(am.currentIndex, 1);
 });

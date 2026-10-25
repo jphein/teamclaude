@@ -201,3 +201,27 @@ test('routes answer 501 when the hook is absent', async () => {
     assert.equal((await post(port, '/teamclaude/add-account', {})).status, 501);
   });
 });
+
+// Review additions (2026-10-25): guards the suite did not yet pin down.
+test('a superseded or cancelled session never saves, even when its callback lands late', async () => {
+  const { mgr, sessions, saved } = makeManager();
+  await mgr.start();
+  await mgr.start();                      // supersedes the first
+  assert.equal(sessions[0].session.closed, true);
+  sessions[0].resolveCode('late-1');
+  await mgr.start();                      // and this one is cancelled
+  mgr.cancel();
+  sessions[2].resolveCode('late-3');
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(saved.length, 0);
+  assert.equal(sessions[0].session.exchanged, null);
+  assert.equal(sessions[2].session.exchanged, null);
+});
+
+test('status() never carries the authorize URL: a poller cannot complete the operator\'s sign-in', async () => {
+  const { mgr, sessions } = makeManager();
+  await mgr.start();
+  const text = JSON.stringify(mgr.status());
+  assert.ok(!text.includes(sessions[0].session.authUrl));
+  assert.ok(!/authUrl|state":"st"/.test(text.replace('"state":"pending"', '')));
+});

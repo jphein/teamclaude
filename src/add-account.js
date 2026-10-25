@@ -14,13 +14,14 @@
 
 import { createOAuthSession, parseAuthCodeInput } from './oauth.js';
 
+/** @param {number} status @param {string} message */
 function httpError(status, message) {
   return Object.assign(new Error(message), { status });
 }
 
 /**
  * @param {object} opts
- * @param {(creds: any, name: string | null) => Promise<{ action: 'added' | 'updated', name: string }>} opts.saveAccount
+ * @param {(creds: any, name: string | null) => Promise<{ action: 'added' | 'updated', name: string, email?: string | null }>} opts.saveAccount
  *   persists the credentials as a new (or, when the identity already exists,
  *   updated) account entry and returns what happened; throws with a message
  *   for the person when the account cannot be identified or saved
@@ -36,6 +37,9 @@ export function createAddAccountManager({
   otherSessionPending = () => false,
   log = console.log,
 }) {
+  /** @typedef {{ requestedName: string | null, name: string | null, session: any, state: 'pending' | 'done' | 'error',
+   *   email: string | null, action: 'added' | 'updated' | null, error: string | null, settled: boolean }} Ctx */
+  /** @type {Ctx | null} */
   let current = null;
 
   function status() {
@@ -43,12 +47,14 @@ export function createAddAccountManager({
     return { state: current.state, name: current.name, email: current.email, action: current.action, error: current.error };
   }
 
+  /** @param {Ctx} ctx @param {string} message */
   function fail(ctx, message) {
     ctx.state = 'error';
     ctx.error = message;
     ctx.session.close();
   }
 
+  /** @param {Ctx} ctx @param {string} code */
   async function complete(ctx, code) {
     if (ctx.settled) return;
     ctx.settled = true;
@@ -63,7 +69,7 @@ export function createAddAccountManager({
       ctx.session.close();
       log(`[TeamClaude] ${outcome.action === 'updated' ? 'Updated' : 'Added'} account "${outcome.name}" via dashboard`);
     } catch (err) {
-      fail(ctx, err.message || String(err));
+      fail(ctx, /** @type {any} */ (err)?.message || String(err));
     }
   }
 
@@ -80,12 +86,13 @@ export function createAddAccountManager({
       if (current) current.session.close(); // supersede any prior session
 
       const session = await createSession();
+      /** @type {Ctx} */
       const ctx = { requestedName, name: requestedName, session, state: 'pending', email: null, action: null, error: null, settled: false };
       current = ctx;
 
       session.codePromise.then(
-        code => { if (current === ctx && !ctx.settled) return complete(ctx, code); },
-        err => {
+        (/** @type {string} */ code) => { if (current === ctx && !ctx.settled) return complete(ctx, code); },
+        (/** @type {any} */ err) => {
           if (current === ctx && !ctx.settled) {
             ctx.settled = true;
             fail(ctx, err.message || String(err));
@@ -97,6 +104,7 @@ export function createAddAccountManager({
       return { authUrl: session.authUrl };
     },
 
+    /** @param {string} text */
     async submitCode(text) {
       const ctx = current;
       if (!ctx || ctx.state !== 'pending') throw httpError(409, 'no add-account session pending');
@@ -106,7 +114,7 @@ export function createAddAccountManager({
         code = parseAuthCodeInput(text, ctx.session.state);
       } catch (err) {
         ctx.settled = true;
-        fail(ctx, err.message);
+        fail(ctx, /** @type {any} */ (err)?.message || String(err));
         return status();
       }
       if (!code) throw httpError(400, 'no authorization code in input');

@@ -240,6 +240,18 @@
   }
   .reauth-panel input:focus { outline: none; border-color: var(--accent); }
   .reauth-panel .btn-ghost { padding: 0.3rem 0.6rem; font-size: 0.8rem; }
+
+  /* ── Add-account panel (own box above the cards while a sign-in is pending) ── */
+  .add-panel {
+    margin: 0 0 0.875rem;
+    padding: 0.7rem 1rem;
+    border: 1px dashed var(--accent);
+    border-radius: 8px;
+    background: var(--panel);
+    border-top-style: dashed;
+  }
+  .add-panel .add-title { font-weight: 600; flex-basis: 100%; }
+  .add-panel input[type=text].add-name { flex: 0 1 14rem; }
   .card .name {
     font-size: 1.05rem;
     font-weight: 600;
@@ -600,6 +612,7 @@
     <div class="svc-actions">
       <span id="svcMsg" class="restart-status"></span>
       <button id="probeBtn" class="btn-svc" title="Re-read every account's quota from the zero-spend usage endpoint — use after a plan change or upgrade">↻ Refresh quotas</button>
+      <button id="addAcctBtn" class="btn-svc" title="Sign in to another Claude account in the browser and add it to the pool — same as `teamclaude login`">＋ Add account</button>
       <button id="reloadBtn" class="btn-svc" title="Re-sync accounts from the config file without a restart (picks up new accounts, tokens, priorities)">⟲ Reload config</button>
       <button id="restartBtn" class="btn-restart" title="systemctl --user restart teamclaude">Restart</button>
       <span id="restartStatus" class="restart-status"></span>
@@ -611,6 +624,7 @@
   <div class="set-intro" id="ruleLine" style="margin:0 0 0.875rem 0.25rem"></div>
   <div class="set-intro" id="fableNote" style="display:none;margin:-0.6rem 0 0.875rem 0.25rem;color:var(--warn)"></div>
 
+  <div id="addPanelHost"></div>
   <div class="cards" id="cards"></div>
 
   <details class="panel settings" id="settingsWrap" style="margin-top:0.875rem">
@@ -683,6 +697,8 @@
   const svcMsgEl    = document.getElementById('svcMsg');
   const probeBtn    = document.getElementById('probeBtn');
   const reloadBtn   = document.getElementById('reloadBtn');
+  const addAcctBtn  = document.getElementById('addAcctBtn');
+  const addPanelHost = document.getElementById('addPanelHost');
   const activeReqsEl = document.getElementById('activeReqs');
   const completedLogEl = document.getElementById('completedLog');
   const activeCountEl  = document.getElementById('activeCount');
@@ -1375,6 +1391,141 @@
     stopReauth();
   });
 
+  // ── Add-account flow (browser OAuth sign-in for a new account) ─────
+  // Same two-way race as reauth (localhost callback vs pasted code), but the
+  // panel lives above the cards since there is no card for the account yet.
+  // Before a session starts the panel offers an optional name; left blank, the
+  // server names the account from its profile (email, or "email (Org)").
+  const addCtl = { active: false, started: false, timer: null };
+  const addTitleEl = el('span', { class: 'add-title', text: 'Add a Claude account' });
+  const addMsgEl = el('span', { class: 'reauth-msg' });
+  const addNameEl = el('input', { type: 'text', class: 'add-name', placeholder: 'name (optional — defaults to the login email)', spellcheck: 'false' });
+  const addStartEl = el('button', { class: 'btn-ghost', text: 'Open sign-in' });
+  const addCodeEl = el('input', { type: 'text', placeholder: 'paste code or callback URL', spellcheck: 'false' });
+  const addSubmitEl = el('button', { class: 'btn-ghost', text: 'Submit' });
+  const addCancelEl = el('button', { class: 'btn-ghost', text: 'Cancel' });
+  const addPanel = el('div', { class: 'reauth-panel add-panel' }, [addTitleEl, addMsgEl, addNameEl, addStartEl, addCodeEl, addSubmitEl, addCancelEl]);
+
+  function showAddPanel() {
+    addCtl.active = true;
+    addCtl.started = false;
+    addMsgEl.textContent = 'Sign in as the account you want to add. The name is optional; the pool names it from the login otherwise.';
+    addNameEl.value = '';
+    addCodeEl.value = '';
+    addNameEl.style.display = '';
+    addStartEl.style.display = '';
+    addCodeEl.style.display = 'none';
+    addSubmitEl.style.display = 'none';
+    addPanelHost.appendChild(addPanel);
+    addNameEl.focus();
+  }
+
+  function stopAdd() {
+    addCtl.active = false;
+    addCtl.started = false;
+    if (addCtl.timer) { clearInterval(addCtl.timer); addCtl.timer = null; }
+    addPanel.remove();
+    addCodeEl.value = '';
+    addAcctBtn.disabled = false;
+  }
+
+  function handleAddStatus(st) {
+    if (!addCtl.started) return;
+    if (st.state === 'done') {
+      flashSvcMsg('✓ ' + (st.action === 'updated' ? 'updated' : 'added') + ' ' + (st.name || 'account'));
+      stopAdd();
+      refresh();
+    } else if (st.state === 'error') {
+      showErr('Add account failed: ' + (st.error || 'unknown error'));
+      stopAdd();
+    } else if (st.state === 'idle') {
+      stopAdd(); // cancelled elsewhere, or the service restarted
+    }
+    // 'pending' → keep waiting
+  }
+
+  async function pollAdd() {
+    if (!addCtl.started) return;
+    try {
+      const res = await api('/teamclaude/add-account', { cache: 'no-store' });
+      if (res.ok) handleAddStatus(await res.json());
+    } catch { /* transient — keep polling */ }
+  }
+
+  async function startAdd() {
+    // Open the tab inside the click's user activation so popup blockers allow it.
+    const tab = window.open('about:blank', '_blank');
+    addStartEl.disabled = true;
+    const name = addNameEl.value.trim() || null;
+    try {
+      const res = await api('/teamclaude/add-account', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-teamclaude-control': '1' },
+        body: JSON.stringify({ name }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
+      if (tab) tab.location = data.authUrl;
+      showErr('');
+      addCtl.started = true;
+      addMsgEl.textContent = '';
+      addMsgEl.append(
+        'Approve in the ',
+        el('a', { href: data.authUrl, target: '_blank', text: 'login page' }),
+        ' while logged into claude.ai as the account to add' + (name ? ' (saved as ' + name + ')' : '') + ' — or paste the code it shows:',
+      );
+      addNameEl.style.display = 'none';
+      addStartEl.style.display = 'none';
+      addCodeEl.style.display = '';
+      addSubmitEl.style.display = '';
+      addCodeEl.focus();
+      if (!addCtl.timer) addCtl.timer = setInterval(pollAdd, 2000);
+    } catch (err) {
+      if (tab) tab.close();
+      showErr('Add account failed: ' + err.message);
+    } finally {
+      addStartEl.disabled = false;
+    }
+  }
+
+  async function submitAddCode() {
+    const code = addCodeEl.value.trim();
+    if (!code) return;
+    addSubmitEl.disabled = true;
+    try {
+      const res = await api('/teamclaude/add-account/code', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-teamclaude-control': '1' },
+        body: JSON.stringify({ code }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
+      handleAddStatus(data);
+    } catch (err) {
+      showErr('Add account code submit failed: ' + err.message);
+    } finally {
+      addSubmitEl.disabled = false;
+    }
+  }
+
+  addAcctBtn.addEventListener('click', () => {
+    if (addCtl.active) { addNameEl.focus(); return; }
+    addAcctBtn.disabled = true;
+    showAddPanel();
+  });
+  addStartEl.addEventListener('click', startAdd);
+  addNameEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') startAdd(); });
+  addSubmitEl.addEventListener('click', submitAddCode);
+  addCodeEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitAddCode(); });
+  addCancelEl.addEventListener('click', async () => {
+    if (addCtl.started) {
+      try {
+        await api('/teamclaude/add-account/cancel', { method: 'POST', headers: { 'x-teamclaude-control': '1' } });
+      } catch { /* the server may be gone; reset the UI regardless */ }
+    }
+    stopAdd();
+  });
+
   cardsEl.addEventListener('click', (e) => {
     const btn = e.target.closest('button.reauth-acct');
     if (!btn || btn.disabled) return;
@@ -1827,6 +1978,12 @@
         el('span', { text: 'Reauth started for ' + evt.name }),
       ]);
     }
+    if (evt.type === 'add-account') {
+      return el('div', { class: 'activity-item activity-sys' }, [
+        el('span', { class: 'act-dot act-dot-sys', text: '＋' }),
+        el('span', { text: 'Add account started' + (evt.name ? ' as ' + evt.name : '') }),
+      ]);
+    }
     return el('div', { class: 'activity-item activity-sys' }, [el('span', { text: evt.type })]);
   }
 
@@ -1852,7 +2009,7 @@
       } else if (evt.type === 'req_end') {
         activityMap.delete(evt.id);
         prependCompleted(evt);
-      } else if (evt.type === 'switched' || evt.type === 'threshold' || evt.type === 'reauth') {
+      } else if (evt.type === 'switched' || evt.type === 'threshold' || evt.type === 'reauth' || evt.type === 'add-account') {
         prependCompleted(evt);
       }
       renderActiveReqs();

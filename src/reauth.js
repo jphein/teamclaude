@@ -23,11 +23,15 @@ export function createReauthManager({
   reload,
   createSession = createOAuthSession,
   fetchProfileFn = fetchProfile,
+  otherSessionPending = () => false,
   log = console.log,
 }) {
   // Current session context, or null when idle. `settled` flips exactly once:
   // the callback and a pasted code can race, and only the first may complete.
   let current = null;
+  // Starts awaiting their session: counted so the Add account flow's exclusion
+  // check sees them before `current` is published.
+  let starting = 0;
 
   function status() {
     if (!current) return { state: 'idle', account: null, email: null, error: null };
@@ -90,14 +94,19 @@ export function createReauthManager({
   return {
     status,
 
+    pending: () => starting > 0 || status().state === 'pending',
+
     async start(name) {
+      if (otherSessionPending()) throw httpError(409, 'an add-account sign-in is already waiting for a browser approval — finish or cancel it first');
       const account = accountManager.accounts.find(a => a.name === name);
       if (!account) throw httpError(404, `account "${name}" not found`);
       if (account.type !== 'oauth') throw httpError(400, `account "${name}" is not an OAuth account`);
 
       if (current) current.session.close(); // supersede any prior session
 
-      const session = await createSession();
+      starting++;
+      let session;
+      try { session = await createSession(); } finally { starting--; }
       const ctx = { name, account, session, state: 'pending', email: null, error: null, settled: false };
       current = ctx;
 

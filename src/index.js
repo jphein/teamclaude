@@ -23,6 +23,7 @@ import {
   oauthIdentityFields,
 } from './identity.js';
 import { createReauthManager } from './reauth.js';
+import { createAddAccountManager } from './add-account.js';
 import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex, startCodexLogin } from './codex-auth.js';
 import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-flow.js';
@@ -972,6 +973,18 @@ async function serverCommand() {
       }
     }),
     reload: reloadAccounts,
+    otherSessionPending: () => !!hooks.addAccount?.pending(),
+  });
+  // Browser-driven sign-in for a new account (the dashboard's Add account
+  // button). The save goes through the same upsert as `teamclaude login`, so
+  // naming, dedup and the callback.net record match a CLI login; the reload
+  // then brings the row into the running fleet. notify:false — this IS the
+  // running server, so it reloads itself instead of poking its own port.
+  hooks.addAccount = createAddAccountManager({
+    saveAccount: (creds, name) => upsertOAuthAccount(name, creds, 'login', null, false, { fatal: false, notify: false }),
+    reload: reloadAccounts,
+    otherSessionPending: () => !!hooks.reauth?.pending(),
+    nameTaken: (/** @type {string} */ name) => accountManager.accounts.some(a => a.name === name),
   });
 
   // A stored MITM chain that falls short (a host the accounts now need, or

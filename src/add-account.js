@@ -1,0 +1,167 @@
+// Browser-driven sign-in for a NEW account — the engine behind the dashboard's
+// "Add account" button (the /teamclaude/add-account* control endpoints). The
+// session half is the same as reauth.js: a PKCE flow started server-side, the
+// browser opens the authorize URL, and completion races the localhost callback
+// against a code pasted into the dashboard. The save half is what differs: a
+// reauth writes tokens into a row it already knows, while this hands the fresh
+// credentials to the same upsert `teamclaude login` uses, so profile-based
+// naming, account+org dedup, the multi-org " (Org)" disambiguation and the
+// callback.net record all come out the same as a CLI login would.
+//
+// One session at a time, and never alongside a reauth: both are single-human
+// control surfaces, and two PKCE listeners racing for one browser is exactly
+// the confusion a dashboard exists to avoid.
+
+import { createOAuthSession, parseAuthCodeInput } from './oauth.js';
+
+/** A display name the logs and the config can carry as one plain line. @param {string} name */
+export function validName(name) {
+  return name.length <= 128 && !/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(name);
+}
+
+/** @param {number} status @param {string} message */
+function httpError(status, message) {
+  return Object.assign(new Error(message), { status });
+}
+
+/**
+ * @param {object} opts
+ * @param {(creds: any, name: string | null) => Promise<{ action: 'added' | 'updated', name: string, email?: string | null }>} opts.saveAccount
+ *   persists the credentials as a new (or, when the identity already exists,
+ *   updated) account entry and returns what happened; throws with a message
+ *   for the person when the account cannot be identified or saved
+ * @param {() => Promise<unknown>} opts.reload  propagate the saved row into the running fleet
+ * @param {() => Promise<any>} [opts.createSession]
+ * @param {() => boolean} [opts.otherSessionPending]  true while a reauth is pending
+ * @param {(name: string) => boolean} [opts.nameTaken]  true when an account already has this name
+ * @param {(msg: string) => void} [opts.log]
+ */
+export function createAddAccountManager({
+  saveAccount,
+  reload,
+  createSession = createOAuthSession,
+  otherSessionPending = () => false,
+  nameTaken = () => false,
+  log = console.log,
+}) {
+  /** @typedef {{ requestedName: string | null, name: string | null, session: any, state: 'pending' | 'done' | 'error',
+   *   email: string | null, action: 'added' | 'updated' | null, error: string | null, settled: boolean }} Ctx */
+  /** @type {Ctx | null} */
+  let current = null;
+  // Starts between their exclusion check and their session being published:
+  // counted so the other flow's check sees them, and generation-numbered so
+  // a start that lost a race closes its own listener instead of orphaning it.
+  let starting = 0;
+  let generation = 0;
+
+  function status() {
+    if (!current) return { state: 'idle', name: null, email: null, action: null, error: null };
+    return { state: current.state, name: current.name, email: current.email, action: current.action, error: current.error };
+  }
+
+  /** @param {Ctx} ctx @param {string} message */
+  function fail(ctx, message) {
+    ctx.state = 'error';
+    ctx.error = message;
+    ctx.session.close();
+  }
+
+  /** @param {Ctx} ctx @param {string} code */
+  async function complete(ctx, code) {
+    if (ctx.settled) return;
+    ctx.settled = true;
+    try {
+      const creds = await ctx.session.exchange(code);
+      // Cancelled or superseded while the exchange was in flight: the person
+      // asked for nothing to be saved, so nothing is (xreview, 2026-10-25).
+      if (current !== ctx) { ctx.session.close(); return; }
+      const outcome = await saveAccount(creds, ctx.requestedName);
+      try {
+        await reload();
+      } catch (err) {
+        throw new Error(`saved "${outcome.name}", but reloading the fleet failed — it joins on the next reload: ${/** @type {any} */ (err)?.message || String(err)}`);
+      }
+      ctx.state = 'done';
+      ctx.name = outcome.name;
+      ctx.action = outcome.action;
+      ctx.email = outcome.email || null;
+      ctx.session.close();
+      log(`[TeamClaude] ${outcome.action === 'updated' ? 'Updated' : 'Added'} account "${outcome.name}" via dashboard`);
+    } catch (err) {
+      fail(ctx, /** @type {any} */ (err)?.message || String(err));
+    }
+  }
+
+  return {
+    status,
+
+    pending: () => starting > 0 || status().state === 'pending',
+
+    /** @param {{ name?: string | null }} [opts] */
+    async start({ name = null } = {}) {
+      if (otherSessionPending()) throw httpError(409, 'a reauth is already waiting for a browser approval — finish or cancel it first');
+      const requestedName = typeof name === 'string' && name.trim() ? name.trim() : null;
+      if (requestedName && !validName(requestedName)) throw httpError(400, 'a name is at most 128 characters, without control characters');
+      // A name match is how the upsert finds a row when the profile cannot be
+      // read, so an existing name could land another sign-in's tokens on that
+      // seat (Oracle, 2026-10-25). Re-signing an existing seat is Reauth's job.
+      if (requestedName && nameTaken(requestedName)) throw httpError(409, `an account named "${requestedName}" already exists — use Reauth on its card`);
+
+      // Supersede any prior session, and let go of it: if creating the new one
+      // fails, a dead session left in `current` would read as pending and hold
+      // Reauth off until someone cancelled.
+      if (current) { current.session.close(); current = null; }
+
+      const mine = ++generation;
+      starting++;
+      let session;
+      try { session = await createSession(); } finally { starting--; }
+      if (mine !== generation) {
+        session.close();
+        throw httpError(409, 'a newer Add account start superseded this one');
+      }
+      /** @type {Ctx} */
+      const ctx = { requestedName, name: requestedName, session, state: 'pending', email: null, action: null, error: null, settled: false };
+      current = ctx;
+
+      session.codePromise.then(
+        (/** @type {string} */ code) => { if (current === ctx && !ctx.settled) return complete(ctx, code); },
+        (/** @type {any} */ err) => {
+          if (current === ctx && !ctx.settled) {
+            ctx.settled = true;
+            fail(ctx, err.message || String(err));
+          }
+        },
+      );
+
+      log(`[TeamClaude] Add account started${requestedName ? ` as "${requestedName}"` : ''} — waiting for browser approval`);
+      return { authUrl: session.authUrl };
+    },
+
+    /** @param {string} text */
+    async submitCode(text) {
+      const ctx = current;
+      if (!ctx || ctx.state !== 'pending') throw httpError(409, 'no add-account session pending');
+
+      let code;
+      try {
+        code = parseAuthCodeInput(text, ctx.session.state);
+      } catch (err) {
+        ctx.settled = true;
+        fail(ctx, /** @type {any} */ (err)?.message || String(err));
+        return status();
+      }
+      if (!code) throw httpError(400, 'no authorization code in input');
+
+      await complete(ctx, code);
+      return status();
+    },
+
+    cancel() {
+      if (current) {
+        current.session.close();
+        current = null;
+      }
+    },
+  };
+}

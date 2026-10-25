@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { validName as validAccountName } from './add-account.js';
 import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, countLocalTokens, estimateInputTokens, MIN_ANSWER_TOKENS, FailoverState } from './failover.js';
 import { FableStats } from './fable-policy.js';
 import { TunnelStats } from './tunnel-stats.js';
@@ -469,6 +470,13 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   // anything.
   ['/teamclaude/account', 'a client key cannot change accounts'],
   ['/teamclaude/restart', 'a client key cannot restart the service'],
+  // Add account (review, 2026-10-25): unlike Reauth there is no identity to
+  // check a new seat against, so a tenant could add a Claude account it controls
+  // and have other tenants' prompts routed through it. The code and cancel
+  // routes belong to the operator's pending sign-in, so they are refused too.
+  ['/teamclaude/add-account', 'a client key cannot add accounts'],
+  ['/teamclaude/add-account/code', 'a client key cannot add accounts'],
+  ['/teamclaude/add-account/cancel', 'a client key cannot add accounts'],
 ]);
 
 /**
@@ -916,6 +924,44 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         if (!hooks.reauth) { json(res, 501, { error: 'reauth not supported' }); return; }
         hooks.reauth.cancel();
         json(res, 200, hooks.reauth.status());
+        return;
+      }
+
+      // ── Add account: browser-driven OAuth sign-in for a NEW account. Same
+      //    shape as reauth (start / code / cancel / GET poll); the save goes
+      //    through the CLI login's upsert, so the name comes from the profile
+      //    unless the dashboard passed one. ──
+      if (req.url === '/teamclaude/add-account' && req.method === 'GET') {
+        if (!hooks.addAccount) { json(res, 501, { error: 'add-account not supported' }); return; }
+        json(res, 200, hooks.addAccount.status());
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/teamclaude/add-account') {
+        if (!hooks.addAccount) { json(res, 501, { error: 'add-account not supported' }); return; }
+        try {
+          const { name } = JSON.parse((await readControlBody(req)) || '{}');
+          if (name != null && typeof name !== 'string') { json(res, 400, { error: '"name" must be a string' }); return; }
+          // Logged below and written to the config: one plain line or nothing.
+          if (name && !validAccountName(name.trim())) { json(res, 400, { error: 'a name is at most 128 characters, without control characters' }); return; }
+          const { authUrl } = await hooks.addAccount.start({ name });
+          console.log(`[TeamClaude] Add account started via UI${name ? ` as "${name}"` : ''}`);
+          emitActivity({ type: 'add-account', name: name || null });
+          json(res, 200, { ok: true, authUrl });
+        } catch (err) { const e = /** @type {{ status?: number, message: string }} */ (err); json(res, e.status || 500, { error: e.message }); }
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/teamclaude/add-account/code') {
+        if (!hooks.addAccount) { json(res, 501, { error: 'add-account not supported' }); return; }
+        try {
+          const { code } = JSON.parse((await readControlBody(req)) || '{}');
+          json(res, 200, await hooks.addAccount.submitCode(code));
+        } catch (err) { const e = /** @type {{ status?: number, message: string }} */ (err); json(res, e.status || 500, { error: e.message }); }
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/teamclaude/add-account/cancel') {
+        if (!hooks.addAccount) { json(res, 501, { error: 'add-account not supported' }); return; }
+        hooks.addAccount.cancel();
+        json(res, 200, hooks.addAccount.status());
         return;
       }
 

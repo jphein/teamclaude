@@ -79,7 +79,7 @@ Step-by-step lifecycle: [docs/routing.md](docs/routing.md#request-lifecycle).
 
 Runs as a systemd user service on a headless box and is driven from a browser. On top of upstream it adds:
 
-- **Web dashboard** at `/ui` — accounts, per-family weekly buckets sorted by soonest expiry, live activity and log streaming, threshold slider, enable/disable, probe, restart, and per-account OAuth **reauth** from the browser.
+- **Web dashboard** at `/ui` — accounts, per-family weekly buckets sorted by soonest expiry, live activity and log streaming, threshold slider, enable/disable, probe, restart, per-account OAuth **reauth**, and **adding a new account** from the browser (same sign-in as `teamclaude login`: a browser tab, or paste the code back).
 - **DNS cache** (`src/dns-cache.js`) on every upstream dial — cached, coalesced resolves with serve-stale so a resolver blip can't turn into an `ENOTFOUND` flood.
 - **Graceful MITM drain** on rotation and shutdown, least-in-flight load balancing, burst-limit tracking.
 - **`noProxy` config** — fixed `NO_PROXY` entries merged into `teamclaude env` so homelab traffic never routes through the proxy.

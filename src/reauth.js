@@ -23,6 +23,7 @@ export function createReauthManager({
   reload,
   createSession = createOAuthSession,
   fetchProfileFn = fetchProfile,
+  otherSessionPending = () => false,
   log = console.log,
 }) {
   // Current session context, or null when idle. `settled` flips exactly once:
@@ -90,7 +91,10 @@ export function createReauthManager({
   return {
     status,
 
+    pending: () => !!current && current.state === 'pending',
+
     async start(name) {
+      if (otherSessionPending()) throw httpError(409, 'an add-account sign-in is already waiting for a browser approval — finish or cancel it first');
       const account = accountManager.accounts.find(a => a.name === name);
       if (!account) throw httpError(404, `account "${name}" not found`);
       if (account.type !== 'oauth') throw httpError(400, `account "${name}" is not an OAuth account`);

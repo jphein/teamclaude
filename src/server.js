@@ -919,6 +919,42 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // ── Add account: browser-driven OAuth sign-in for a NEW account. Same
+      //    shape as reauth (start / code / cancel / GET poll); the save goes
+      //    through the CLI login's upsert, so the name comes from the profile
+      //    unless the dashboard passed one. ──
+      if (req.url === '/teamclaude/add-account' && req.method === 'GET') {
+        if (!hooks.addAccount) { json(res, 501, { error: 'add-account not supported' }); return; }
+        json(res, 200, hooks.addAccount.status());
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/teamclaude/add-account') {
+        if (!hooks.addAccount) { json(res, 501, { error: 'add-account not supported' }); return; }
+        try {
+          const { name } = JSON.parse((await readControlBody(req)) || '{}');
+          if (name != null && typeof name !== 'string') { json(res, 400, { error: '"name" must be a string' }); return; }
+          const { authUrl } = await hooks.addAccount.start({ name });
+          console.log(`[TeamClaude] Add account started via UI${name ? ` as "${name}"` : ''}`);
+          emitActivity({ type: 'add-account', name: name || null });
+          json(res, 200, { ok: true, authUrl });
+        } catch (err) { json(res, err.status || 500, { error: err.message }); }
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/teamclaude/add-account/code') {
+        if (!hooks.addAccount) { json(res, 501, { error: 'add-account not supported' }); return; }
+        try {
+          const { code } = JSON.parse((await readControlBody(req)) || '{}');
+          json(res, 200, await hooks.addAccount.submitCode(code));
+        } catch (err) { json(res, err.status || 500, { error: err.message }); }
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/teamclaude/add-account/cancel') {
+        if (!hooks.addAccount) { json(res, 501, { error: 'add-account not supported' }); return; }
+        hooks.addAccount.cancel();
+        json(res, 200, hooks.addAccount.status());
+        return;
+      }
+
       // GET /teamclaude/activity — SSE stream of request lifecycle + control
       // events. Replays recent terminal events so a fresh page isn't blank.
       if (req.method === 'GET' && req.url === '/teamclaude/activity') {

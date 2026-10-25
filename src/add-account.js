@@ -14,6 +14,11 @@
 
 import { createOAuthSession, parseAuthCodeInput } from './oauth.js';
 
+/** A display name the logs and the config can carry as one plain line. @param {string} name */
+export function validName(name) {
+  return name.length <= 128 && !/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(name);
+}
+
 /** @param {number} status @param {string} message */
 function httpError(status, message) {
   return Object.assign(new Error(message), { status });
@@ -41,6 +46,11 @@ export function createAddAccountManager({
    *   email: string | null, action: 'added' | 'updated' | null, error: string | null, settled: boolean }} Ctx */
   /** @type {Ctx | null} */
   let current = null;
+  // Starts between their exclusion check and their session being published:
+  // counted so the other flow's check sees them, and generation-numbered so
+  // a start that lost a race closes its own listener instead of orphaning it.
+  let starting = 0;
+  let generation = 0;
 
   function status() {
     if (!current) return { state: 'idle', name: null, email: null, action: null, error: null };
@@ -60,6 +70,9 @@ export function createAddAccountManager({
     ctx.settled = true;
     try {
       const creds = await ctx.session.exchange(code);
+      // Cancelled or superseded while the exchange was in flight: the person
+      // asked for nothing to be saved, so nothing is (xreview, 2026-10-25).
+      if (current !== ctx) { ctx.session.close(); return; }
       const outcome = await saveAccount(creds, ctx.requestedName);
       await reload();
       ctx.state = 'done';
@@ -76,16 +89,24 @@ export function createAddAccountManager({
   return {
     status,
 
-    pending: () => !!current && current.state === 'pending',
+    pending: () => starting > 0 || status().state === 'pending',
 
     /** @param {{ name?: string | null }} [opts] */
     async start({ name = null } = {}) {
       if (otherSessionPending()) throw httpError(409, 'a reauth is already waiting for a browser approval — finish or cancel it first');
       const requestedName = typeof name === 'string' && name.trim() ? name.trim() : null;
+      if (requestedName && !validName(requestedName)) throw httpError(400, 'a name is at most 128 characters, without control characters');
 
       if (current) current.session.close(); // supersede any prior session
 
-      const session = await createSession();
+      const mine = ++generation;
+      starting++;
+      let session;
+      try { session = await createSession(); } finally { starting--; }
+      if (mine !== generation) {
+        session.close();
+        throw httpError(409, 'a newer Add account start superseded this one');
+      }
       /** @type {Ctx} */
       const ctx = { requestedName, name: requestedName, session, state: 'pending', email: null, action: null, error: null, settled: false };
       current = ctx;

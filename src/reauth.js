@@ -29,6 +29,9 @@ export function createReauthManager({
   // Current session context, or null when idle. `settled` flips exactly once:
   // the callback and a pasted code can race, and only the first may complete.
   let current = null;
+  // Starts awaiting their session: counted so the Add account flow's exclusion
+  // check sees them before `current` is published.
+  let starting = 0;
 
   function status() {
     if (!current) return { state: 'idle', account: null, email: null, error: null };
@@ -91,7 +94,7 @@ export function createReauthManager({
   return {
     status,
 
-    pending: () => status().state === 'pending',
+    pending: () => starting > 0 || status().state === 'pending',
 
     async start(name) {
       if (otherSessionPending()) throw httpError(409, 'an add-account sign-in is already waiting for a browser approval — finish or cancel it first');
@@ -101,7 +104,9 @@ export function createReauthManager({
 
       if (current) current.session.close(); // supersede any prior session
 
-      const session = await createSession();
+      starting++;
+      let session;
+      try { session = await createSession(); } finally { starting--; }
       const ctx = { name, account, session, state: 'pending', email: null, error: null, settled: false };
       current = ctx;
 

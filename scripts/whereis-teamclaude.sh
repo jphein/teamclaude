@@ -21,13 +21,15 @@ for pid in $pids; do
   cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline")
   case "$cmd" in *whereis-teamclaude*|*pgrep*) continue;; esac
   echo "--- pid $pid (user $(stat -c %U /proc/$pid))"
-  echo "cmd:  $cmd"
+  # Arguments and env values can carry a credential in a URL (http://user:pass@…):
+  # redact any userinfo, and print only the first three arguments.
+  echo "cmd:  $(printf '%s' "$cmd" | cut -d' ' -f1-3 | sed -E 's#//[^/@ ]+@#//<redacted>@#g')"
   echo "cwd:  $(readlink /proc/$pid/cwd 2>/dev/null)"
   echo "unit: $(grep -o '[^/]*\.service' /proc/$pid/cgroup 2>/dev/null | tail -1)"
   echo "env:"
   tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
     | grep -E '^(TEAMCLAUDE_|TEAMROUTER_|HOME=|XDG_CONFIG_HOME=|USER=)' \
-    | grep -viE 'KEY|TOKEN|SECRET' | sed 's/^/  /'
+    | grep -viE 'KEY|TOKEN|SECRET|PASS|AUTH|PROXY' | sed -E 's#//[^/@ ]+@#//<redacted>@#g; s/^/  /'
 done
 [ -z "$pids" ] && echo "no teamclaude/teamrouter process found"
 
@@ -39,7 +41,7 @@ done
 for f in ~/.config/systemd/user/*.service /etc/systemd/system/*.service /etc/systemd/user/*.service; do
   [ -f "$f" ] && grep -qiE 'teamclaude|teamrouter' "$f" && {
     echo "--- $f"
-    grep -E '^(ExecStart|Environment|WorkingDirectory|User)=' "$f" | grep -viE 'KEY|TOKEN|SECRET'
+    grep -E '^(ExecStart|Environment|WorkingDirectory|User)=' "$f" | grep -viE 'KEY|TOKEN|SECRET|PASS|AUTH|PROXY' | sed -E 's#//[^/@ ]+@#//<redacted>@#g'
   }
 done
 # Units started by a process manager other than systemd
@@ -64,7 +66,7 @@ for f in $cands; do
     const a = c.accounts || [];
     console.log(`  ${a.length} accounts; top-level keys: ${Object.keys(c).join(", ")}`);
     for (const x of a) console.log(`  - ${x.name}  type=${x.type}${x.provider ? " provider=" + x.provider : ""}${x.email ? " email=" + x.email : ""}${x.disabled || x.enabled === false ? " DISABLED" : ""}  fields=${Object.keys(x).filter(k => !/token|key|secret/i.test(k)).join(",")}`);
-  ' "$f" 2>&1 | sed 's/^/ /'
+  ' "$f" 2>/dev/null | sed 's/^/ /' || echo "  (config unreadable or not JSON)"
 done
 
 hr "control endpoint"

@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { validName as validAccountName } from './add-account.js';
 import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, countLocalTokens, estimateInputTokens, MIN_ANSWER_TOKENS, FailoverState } from './failover.js';
 import { FableStats } from './fable-policy.js';
 import { TunnelStats } from './tunnel-stats.js';
@@ -940,6 +941,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         try {
           const { name } = JSON.parse((await readControlBody(req)) || '{}');
           if (name != null && typeof name !== 'string') { json(res, 400, { error: '"name" must be a string' }); return; }
+          // Logged below and written to the config: one plain line or nothing.
+          if (name && !validAccountName(name.trim())) { json(res, 400, { error: 'a name is at most 128 characters, without control characters' }); return; }
           const { authUrl } = await hooks.addAccount.start({ name });
           console.log(`[TeamClaude] Add account started via UI${name ? ` as "${name}"` : ''}`);
           emitActivity({ type: 'add-account', name: name || null });

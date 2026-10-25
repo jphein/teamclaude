@@ -225,3 +225,77 @@ test('status() never carries the authorize URL: a poller cannot complete the ope
   assert.ok(!text.includes(sessions[0].session.authUrl));
   assert.ok(!/authUrl|state":"st"/.test(text.replace('"state":"pending"', '')));
 });
+
+// xreview fixes (gpt-6.1-sol, 2026-10-25).
+test('a session cancelled while its code is being exchanged saves nothing', async () => {
+  let releaseExchange;
+  const gate = new Promise(r => { releaseExchange = r; });
+  const saved = [];
+  const mgr = createAddAccountManager({
+    createSession: async () => {
+      const { session } = fakeSession();
+      session.exchange = async () => { await gate; return { accessToken: 'AT', refreshToken: 'RT', expiresAt: Date.now() + 3_600_000 }; };
+      return session;
+    },
+    saveAccount: async (creds, name) => { saved.push(name); return { action: 'added', name: 'x' }; },
+    reload: async () => {},
+    log: () => {},
+  });
+  await mgr.start();
+  const submitting = mgr.submitCode('code');
+  mgr.cancel();                     // the person cancels while the exchange is in flight
+  releaseExchange();
+  await submitting;
+  assert.equal(saved.length, 0);
+  assert.equal(mgr.status().state, 'idle');
+});
+
+test('two starts racing: the one that lost closes its own listener and is told so', async () => {
+  const opened = [];
+  const mgr = createAddAccountManager({
+    createSession: async () => { const s = fakeSession(); opened.push(s); await new Promise(r => setTimeout(r, 5)); return s.session; },
+    saveAccount: async () => ({ action: 'added', name: 'x' }),
+    reload: async () => {},
+    log: () => {},
+  });
+  const results = await Promise.allSettled([mgr.start(), mgr.start()]);
+  assert.equal(results.filter(r => r.status === 'rejected' && r.reason.status === 409).length, 1);
+  assert.equal(opened.filter(s => s.session.closed).length, 1, 'exactly the losing session is closed');
+  assert.equal(mgr.status().state, 'pending');
+});
+
+test('a start in progress counts as pending for the other flow', async () => {
+  let release;
+  const mgr = createAddAccountManager({
+    createSession: async () => { await new Promise(r => { release = r; }); return fakeSession().session; },
+    saveAccount: async () => ({ action: 'added', name: 'x' }),
+    reload: async () => {},
+    log: () => {},
+  });
+  const starting = mgr.start();
+  await new Promise(r => setTimeout(r, 0));
+  assert.equal(mgr.pending(), true, 'between the check and the published session');
+  release();
+  await starting;
+});
+
+test('a name with a control character or over 128 characters is refused, in the manager and at the route', async () => {
+  const { mgr, sessions } = makeManager();
+  for (const name of ['a\nb', 'x\u001b[31m', 'y'.repeat(129)]) {
+    await assert.rejects(mgr.start({ name }), e => e.status === 400, JSON.stringify(name).slice(0, 20));
+  }
+  assert.equal(sessions.length, 0);
+  let started = 0;
+  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3_600_000 }], 0.98);
+  const proxy = createProxyServer(am, { upstream: 'https://api.anthropic.com' }, {
+    addAccount: { start: async () => { started++; return { authUrl: 'u' }; }, status: () => ({ state: 'idle' }), pending: () => false },
+  });
+  await new Promise(r => proxy.listen(0, '127.0.0.1', r));
+  try {
+    const res = await fetch(`http://127.0.0.1:${proxy.address().port}/teamclaude/add-account`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-teamclaude-control': '1' }, body: JSON.stringify({ name: 'forged\n[TeamClaude] Added account' }),
+    });
+    assert.equal(res.status, 400);
+    assert.equal(started, 0);
+  } finally { proxy.close(); }
+});

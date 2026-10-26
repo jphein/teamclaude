@@ -766,10 +766,14 @@
     if (sentKey && !ssoSession) {
       if (keylessTry) return;
       keylessTry = true;
-      api('/teamclaude/status', { cache: 'no-store' }, '')
-        .then(r => {
+      // Only a status reply that names the signed-in user counts: an expired
+      // session is a redirect to the sign-in page (refused here) or that page
+      // itself, never proof (xreview, 2026-10-26).
+      api('/teamclaude/status', { cache: 'no-store', redirect: 'error' }, '')
+        .then(r => (r.ok ? r.json() : null))
+        .then(d => {
           keylessTry = false;
-          if (!r.ok) { askForKey(); return; }
+          if (!(d && d.caller && typeof d.caller.sso === 'string' && d.caller.sso)) { askForKey(); return; }
           ssoSession = true;
           refresh(); connectActivity(); connectLogs();
         }, () => { keylessTry = false; askForKey(); });

@@ -393,7 +393,7 @@ async function bootPage({ storageThrows = false, readOnlyStorage = null, href = 
       };
   const page = { elements, store, fetches: [], auto401, replacedUrl: null };
   const fetchStub = (url, init) => {
-    const call = { url, key: init?.headers?.['x-api-key'] ?? null, body: init?.body ?? null };
+    const call = { url, key: init?.headers?.['x-api-key'] ?? null, body: init?.body ?? null, redirect: init?.redirect ?? null };
     page.fetches.push(call);
     if (page.auto401) return Promise.resolve({ status: 401, ok: false, json: async () => ({}), body: null });
     return new Promise((resolve) => {
@@ -495,7 +495,7 @@ test('behind SSO a stale saved key is dropped without asking: the page carries o
   // reconnects without a key.
   const probe = page.take();
   assert.deepEqual(probe.map(({ url, key }) => ({ url, key })), [{ url: '/teamclaude/status', key: null }]);
-  probe[0].answer(200, {});
+  probe[0].answer(200, { caller: { kind: 'operator', sso: 'jp' } });
   await page.settle();
   assert.notEqual(page.elements.get('keybox').style.display, 'block');
   assert.equal(page.store.has(KEY_STORAGE), false, 'the stale key is gone');
@@ -512,11 +512,26 @@ test('signed in by SSO, the page sends no key — not even one read-only storage
   await page.settle();
   const probe = page.take();
   assert.deepEqual(probe.map(({ url, key }) => ({ url, key })), [{ url: '/teamclaude/status', key: null }]);
-  probe[0].answer(200, {});
+  probe[0].answer(200, { caller: { kind: 'operator', sso: 'jp' } });
   await page.settle();
   const again = page.take();
   assert.ok(again.length > 0);
   assert.ok(again.every(f => f.key === null), JSON.stringify(again));
+});
+
+test('the keyless try refuses redirects, and a 200 that does not name an SSO user is not a sign-in', async () => {
+  const page = await bootPage({ auto401: false });
+  page.take();
+  await page.unlock('stale-key');
+  page.take()[0].answer(401);
+  await page.settle();
+  const probe = page.take();
+  assert.equal(probe.length, 1);
+  assert.equal(probe[0].redirect, 'error', 'an expired session redirects to the portal: that is a failure');
+  // The sign-in page itself (or a loopback status with no SSO) answers 200 too.
+  probe[0].answer(200, { caller: { kind: 'operator', client: null, refused: [] } });
+  await page.settle();
+  assert.equal(page.elements.get('keybox').style.display, 'block', 'the key box comes up');
 });
 
 test('with localStorage blocked the entered key still works for the page', async () => {

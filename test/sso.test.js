@@ -21,11 +21,11 @@ after(() => rmSync(dirname(/** @type {string} */ (process.env.TEAMCLAUDE_CONFIG)
 
 const SECRET = 's'.repeat(SSO_MIN_SECRET);
 const SSO = { users: ['jp'], from: ['127.0.0.1'], secret: SECRET };
-const HOP = { 'x-teamclaude-sso': SECRET, 'remote-user': 'jp' };
+const HOP = { 'x-teamclaude-sso': SECRET, 'remote-user': 'jp', 'sec-fetch-site': 'same-origin' };
 
 /** A request as the gate sees it. */
-const req = ({ headers = HOP, url = '/teamclaude/status', peer = '127.0.0.1', tls = true } = {}) =>
-  ({ headers, url, socket: { remoteAddress: peer, encrypted: tls || undefined } });
+const req = ({ headers = HOP, url = '/teamclaude/status', method = 'GET', peer = '127.0.0.1', tls = true } = {}) =>
+  ({ headers, url, method, socket: { remoteAddress: peer, encrypted: tls || undefined } });
 
 test('ssoPolicy: off until users, from and a long enough secret are all set', () => {
   for (const off of [undefined, {}, { sso: null }, { sso: { ...SSO, users: [] } }, { sso: { ...SSO, from: [] } },
@@ -36,6 +36,10 @@ test('ssoPolicy: off until users, from and a long enough secret are all set', ()
   assert.deepEqual([...p.from], ['10.0.6.11'], 'v4-mapped written either way');
   assert.equal(p.requireTls, true, 'TLS required unless switched off');
   assert.equal(ssoPolicy({ sso: { ...SSO, requireTls: false } }).requireTls, false);
+  // Plain HTTP only from this machine: across the LAN the secret would travel in clear.
+  assert.equal(ssoPolicy({ sso: { ...SSO, from: ['10.0.6.11'], requireTls: false } }), null);
+  assert.equal(ssoPolicy({ sso: { ...SSO, from: ['127.0.0.1', '10.0.6.11'], requireTls: false } }), null);
+  assert.ok(ssoPolicy({ sso: { ...SSO, from: ['::1', '127.0.0.2'], requireTls: false } }));
 });
 
 test('ssoEligiblePath: the dashboard\'s control plane only', () => {
@@ -61,7 +65,15 @@ test('the gate believes Remote-User only when every condition holds', () => {
   assert.equal(sso(req({ headers: { ...HOP, 'remote-user': 'mallory' } }), cfg), null, 'not an allowed user');
   assert.equal(sso(req({ headers: { ...HOP, 'remote-user': 'jp, mallory' } }), cfg), null, 'joined duplicate headers');
   assert.equal(sso(req({ headers: { ...HOP, 'remote-user': 'jp\nforged' } }), cfg), null, 'control characters');
-  assert.equal(sso(req({ headers: { 'x-teamclaude-sso': SECRET } }), cfg), null, 'no user');
+  assert.equal(sso(req({ headers: { 'x-teamclaude-sso': SECRET, 'sec-fetch-site': 'same-origin' } }), cfg), null, 'no user');
+  // The cookie is the parent domain's: only the dashboard page itself counts.
+  const site = (v, method = 'GET') => sso(req({ method, headers: { 'x-teamclaude-sso': SECRET, 'remote-user': 'jp', ...(v ? { 'sec-fetch-site': v } : {}) } }), cfg);
+  assert.equal(site(undefined), null, 'no fetch metadata (not a browser page): refused');
+  assert.equal(site('same-site'), null, 'a sibling *.realm.watch page');
+  assert.equal(site('cross-site'), null);
+  assert.equal(site('none'), 'jp', 'an address the person typed may read');
+  assert.equal(site('none', 'POST'), null, '…not write');
+  assert.equal(site('same-origin', 'POST'), 'jp');
   assert.equal(sso(req(), {}), null, 'SSO not configured');
   // Refusals are logged once a minute per reason, and say nothing of the values.
   assert.ok(logs.some((l) => /refused: wrong hop secret/.test(l)));
@@ -75,16 +87,16 @@ test('the gate believes Remote-User only when every condition holds', () => {
 const listen = (s) => new Promise((r) => s.listen(0, '127.0.0.1', () => r(s.address().port)));
 
 /** A proxy whose only way in from loopback is a key or SSO (trustLoopback off). */
-function proxyWith(sso, hooks = {}) {
-  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3_600_000 }], 0.98);
+function proxyWith(sso, hooks = {}, upstream = 'http://127.0.0.1:9') {
+  const am = new AccountManager([{ name: 'a', type: 'apikey', apiKey: 'sk-test' }], 0.98);
   return createProxyServer(am, {
     proxy: { apiKey: 'shared-k', clientKeys: [{ name: 'lane', key: 'k-lane' }], trustLoopback: false, sso },
-    upstream: 'http://127.0.0.1:9',
+    upstream,
   }, hooks);
 }
 
-async function plain(sso, fn, hooks) {
-  const proxy = proxyWith(sso, hooks);
+async function plain(sso, fn, hooks, upstream) {
+  const proxy = proxyWith(sso, hooks, upstream);
   const port = await listen(proxy);
   const call = (path, { method = 'GET', headers = {}, body } = {}) => fetch(`http://127.0.0.1:${port}${path}`, { method, headers, body });
   try { await fn({ call, port }); } finally { proxy.close(); }
@@ -107,8 +119,9 @@ test('over plain HTTP with requireTls off: SSO is the operator on the dashboard 
     // nor does a stale key that rode along with it.
     assert.equal((await call('/teamclaude/ui-ticket', { method: 'POST', headers: HOP })).status, 400);
     assert.equal((await call('/teamclaude/ui-ticket', { method: 'POST', headers: { ...HOP, 'x-api-key': 'stale' } })).status, 400);
-    // A page on another origin rides the browser's cookie: refused, reads included.
-    assert.equal((await call('/teamclaude/status', { headers: { ...HOP, origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' } })).status, 403);
+    // A page on a sibling site rides the parent-domain cookie: not signed in, reads included.
+    assert.equal((await call('/teamclaude/status', { headers: { ...HOP, origin: 'https://plan.realm.watch', 'sec-fetch-site': 'same-site' } })).status, 401);
+    assert.equal((await call('/teamclaude/account', { method: 'POST', headers: { ...HOP, origin: 'https://plan.realm.watch', 'sec-fetch-site': 'same-site' }, body: '{}' })).status, 401);
     // Wrong hop secret or user: the plain key gate answers.
     assert.equal((await call('/teamclaude/status', { headers: { ...HOP, 'x-teamclaude-sso': 'x'.repeat(32) } })).status, 401);
     assert.equal((await call('/teamclaude/status', { headers: { ...HOP, 'remote-user': 'mallory' } })).status, 401);
@@ -126,15 +139,38 @@ test('a valid key still decides: a client key with SSO headers stays that client
 });
 
 test('from an address not in sso.from, the headers count for nothing', async () => {
-  await plain({ ...SSO, from: ['10.0.6.11'], requireTls: false }, async ({ call }) => {
+  await plain({ ...SSO, from: ['127.0.0.2'], requireTls: false }, async ({ call }) => {
     assert.equal((await call('/teamclaude/status', { headers: HOP })).status, 401);
   });
+});
+
+test('the front proxy\'s headers are never relayed upstream', async () => {
+  const seen = [];
+  const up = (await import('node:http')).createServer((rq, rs) => {
+    seen.push(rq.headers);
+    rs.writeHead(200, { 'content-type': 'application/json' });
+    rs.end(JSON.stringify({ id: 'm', type: 'message', role: 'assistant', model: 'claude-x', content: [{ type: 'text', text: 'hi' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const upPort = await listen(up);
+  try {
+    await plain({ ...SSO, requireTls: false }, async ({ call }) => {
+      const r = await call('/v1/messages', {
+        method: 'POST',
+        headers: { ...HOP, 'x-api-key': 'shared-k', 'remote-groups': 'admins', 'remote-email': 'e@x', 'remote-name': 'J', 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model: 'claude-x', max_tokens: 5, messages: [{ role: 'user', content: 'hi' }] }),
+      });
+      await r.text();
+      assert.equal(r.status, 200);
+    }, undefined, `http://127.0.0.1:${upPort}`);
+    assert.equal(seen.length, 1, 'the request reached the stub upstream');
+    for (const h of ['x-teamclaude-sso', 'remote-user', 'remote-groups', 'remote-email', 'remote-name']) assert.equal(seen[0][h], undefined, h);
+  } finally { up.close(); }
 });
 
 test('duplicate Remote-User lines on the wire are refused', async () => {
   await plain({ ...SSO, requireTls: false }, async ({ port }) => {
     const raw = await new Promise((resolve, reject) => {
-      const s = net.connect(port, '127.0.0.1', () => s.end(`GET /teamclaude/status HTTP/1.1\r\nHost: x\r\nX-Teamclaude-Sso: ${SECRET}\r\nRemote-User: jp\r\nRemote-User: mallory\r\nConnection: close\r\n\r\n`));
+      const s = net.connect(port, '127.0.0.1', () => s.end(`GET /teamclaude/status HTTP/1.1\r\nHost: x\r\nSec-Fetch-Site: same-origin\r\nX-Teamclaude-Sso: ${SECRET}\r\nRemote-User: jp\r\nRemote-User: mallory\r\nConnection: close\r\n\r\n`));
       let buf = ''; s.on('data', (d) => { buf += d; }); s.on('end', () => resolve(buf)); s.on('error', reject);
     });
     assert.match(raw, /^HTTP\/1\.1 401/);

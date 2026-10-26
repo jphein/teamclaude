@@ -13,7 +13,8 @@
 //     front proxy on the same host;
 //   - it carries `X-Teamclaude-Sso: <proxy.sso.secret>`, a value only the front
 //     proxy holds (at least 32 characters, compared in constant time).
-// And the named user must be one of `proxy.sso.users`.
+// And the named user must be one of `proxy.sso.users`, and the browser must
+// say the dashboard page itself sent the request (Sec-Fetch-Site: same-origin).
 //
 // Only the dashboard's own routes honour it (/teamclaude/*, apart from the MCP
 // endpoint): /v1/* and everything else stay key-only. A valid x-api-key still
@@ -24,6 +25,10 @@ import { timingSafeEqual } from 'node:crypto';
 export const SSO_SECRET_HEADER = 'x-teamclaude-sso';
 export const SSO_USER_HEADER = 'remote-user';
 export const SSO_MIN_SECRET = 32;
+// Everything the front proxy may write about the person. Deleted from every
+// request once the gate has read them, so none is ever relayed onward (the
+// hop secret above all: Anthropic must never see it).
+export const FRONT_PROXY_HEADERS = [SSO_SECRET_HEADER, SSO_USER_HEADER, 'remote-groups', 'remote-name', 'remote-email'];
 
 /**
  * The SSO settings, or null when they are incomplete (then nobody is admitted
@@ -39,7 +44,36 @@ export function ssoPolicy(proxyConfig) {
   const users = strings(s.users);
   if (!from.length || !users.length) return null;
   if (typeof s.secret !== 'string' || s.secret.length < SSO_MIN_SECRET) return null;
-  return { from: new Set(from), users: new Set(users), secret: s.secret, requireTls: s.requireTls !== false };
+  const requireTls = s.requireTls !== false;
+  // Plain HTTP is for a front proxy on this machine only: across the network
+  // the secret and the name would travel in clear (xreview, 2026-10-26).
+  if (!requireTls && !from.every(isLoopbackAddress)) return null;
+  return { from: new Set(from), users: new Set(users), secret: s.secret, requireTls };
+}
+
+/** @param {string} addr */
+function isLoopbackAddress(addr) {
+  return addr === '::1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(addr);
+}
+
+/**
+ * Whether a request carrying the sign-in shows positive proof that the
+ * dashboard page itself sent it. The sign-in is a cookie scoped to the parent
+ * domain, so a page on any sibling site (plan.realm.watch, …) rides it too:
+ * `same-site` is not enough, and neither is the absence of browser headers —
+ * which the key gate accepts from curl — since every browser sends them.
+ * A navigation the person typed (`none`) may read, not write.
+ * @param {import('node:http').IncomingMessage} req
+ */
+export function ssoSameOrigin(req) {
+  const site = req.headers['sec-fetch-site'];
+  if (site === 'same-origin') return true;
+  return site === 'none' && (req.method === 'GET' || req.method === 'HEAD');
+}
+
+/** Deletes the front proxy's headers from a request (see FRONT_PROXY_HEADERS). @param {import('node:http').IncomingHttpHeaders} headers */
+export function stripFrontProxyHeaders(headers) {
+  for (const h of FRONT_PROXY_HEADERS) delete headers[h];
 }
 
 /** Constant-time string equality (not imported from server.js, which imports this). @param {string} a @param {string} b */
@@ -100,6 +134,7 @@ export function createSsoGate(log = console.log) {
     if (!ssoEligiblePath(req.url)) return refuse('not a dashboard route');
     if (!policy.from.has(peer)) return refuse('not from a proxy.sso.from address');
     if (policy.requireTls && !(/** @type {any} */ (req.socket)?.encrypted)) return refuse('not over TLS (requireTls)');
+    if (!ssoSameOrigin(req)) return refuse('not sent by the dashboard page (Sec-Fetch-Site)');
     if (typeof presented !== 'string' || !sameSecret(presented, policy.secret)) return refuse('wrong hop secret');
     const user = req.headers[SSO_USER_HEADER];
     // Compared whole, so joined duplicates ("jp, mallory") never match; only a

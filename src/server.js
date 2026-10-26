@@ -7,7 +7,7 @@ import { FAMILIES, familyPolicy, rewriteFamilyBody, familyModelIn, isFamilyModel
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
 import { createUiTicketStore } from './ui-ticket.js';
-import { createSsoGate } from './sso.js';
+import { createSsoGate, stripFrontProxyHeaders } from './sso.js';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
 import { readFile, readdir, stat, unlink } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
@@ -714,9 +714,12 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       const isLocal = loopbackExempt(req.headers, req.socket.remoteAddress, config.proxy);
       // A valid key decides on its own. Without one, a dashboard SSO sign-in
       // relayed by the front proxy (sso.js: its address, TLS, the hop secret,
-      // an allowed user) stands in as the operator — on /teamclaude/* only.
+      // an allowed user, sent by the dashboard page itself) stands in as the
+      // operator — on /teamclaude/* only. The front proxy's headers are then
+      // dropped, so nothing below can relay them.
       const keyAuth = resolveClientAuth(config.proxy, clientKey);
       const sso = keyAuth.ok ? null : ssoUser(req, config.proxy);
+      stripFrontProxyHeaders(req.headers);
       const auth = sso ? { ok: true, client: null } : keyAuth;
       if (!auth.ok && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -746,13 +749,6 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // requirement, which would also close the hole but would break the
       // documented `curl -X POST .../teamclaude/reload` that sends no body.
       const crossOrigin = !isSameOriginControlRequest(req);
-      // An SSO sign-in is a browser cookie, as ambient as the loopback
-      // exemption: a page on another origin rides it just the same. Refused
-      // for every method, like the key-less caller below.
-      if (crossOrigin && sso) {
-        json(res, 403, { ok: false, error: 'cross-origin request refused: a web page cannot use the dashboard sign-in' });
-        return;
-      }
       if (crossOrigin && req.method === 'POST' && (req.url || '').startsWith('/teamclaude/')) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -1545,6 +1541,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // but it is a way to reach the upstream on this host's address and
       // bandwidth. A deployment on a public hostname hands that to anyone.
       const auth = resolveUpgradeAuth(req, socket, config.proxy, boundHost());
+      // SSO never opens a WebSocket; its headers are not relayed either.
+      stripFrontProxyHeaders(req.headers);
       if (!auth.ok) {
         // Logged as well as answered: a WebSocket client discards the status
         // line, so the 401 alone leaves an operator with a channel that is

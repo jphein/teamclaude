@@ -145,6 +145,11 @@ test('only GET reaches the pre-gate /ui handler', async () => {
   const { server } = makeServer();
   assert.equal((await request(server, { method: 'POST', url: '/ui' })).status, 401);
   assert.equal((await request(server, { url: '/ui?x=1' })).status, 401, 'exact paths only');
+  // The one query the page itself is opened with: the launcher's ticket.
+  assert.equal((await request(server, { url: '/ui?ticket=' + 'T'.repeat(43) })).status, 200, 'a well-formed ticket');
+  for (const url of ['/ui?ticket=short', '/ui?ticket=' + 'T'.repeat(43) + '&x=1', '/ui?x=1&ticket=' + 'T'.repeat(43), '/ui?ticket=' + 'T'.repeat(40) + '%2F..']) {
+    assert.equal((await request(server, { url })).status, 401, url);
+  }
 });
 
 // ── The data and control endpoints behind it ──────────────────

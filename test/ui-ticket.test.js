@@ -114,3 +114,33 @@ test('two redemptions racing for one ticket: exactly one gets the key', async ()
     assert.deepEqual(res.map(r => r.status).sort(), [200, 404, 404]);
   } finally { proxy.close(); }
 });
+
+// Oracle (2026-10-25): the launcher opens /ui WITH a query string; the route
+// once matched the exact URL, so this address fell through to the gate.
+test('/ui?ticket=… serves the page itself, with no referrer, to a remote and a loopback caller alike', async () => {
+  let upstreamHits = 0;
+  const upstream = (await import('node:http')).createServer((req, res) => { upstreamHits++; res.end('upstream'); });
+  const upPort = await listen(upstream);
+  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3_600_000 }], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'shared-k' }, upstream: `http://127.0.0.1:${upPort}` });
+  const port = await listen(proxy);
+  try {
+    for (const headers of [{}, { 'x-forwarded-for': '10.0.6.158' }]) {
+      const res = await fetch(`http://127.0.0.1:${port}/ui?ticket=${'T'.repeat(43)}`, { headers });
+      assert.equal(res.status, 200, JSON.stringify(headers));
+      assert.equal(res.headers.get('referrer-policy'), 'no-referrer');
+      assert.match(await res.text(), /launchTicket/);
+    }
+    assert.equal(upstreamHits, 0, 'the ticket never travels upstream');
+  } finally { proxy.close(); upstream.close(); }
+});
+
+test('with no keys configured there is nothing to hand over: no ticket is minted', async () => {
+  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3_600_000 }], 0.98);
+  const proxy = createProxyServer(am, { upstream: 'https://api.anthropic.com' });
+  const port = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/ui-ticket`, { method: 'POST', headers: { 'x-api-key': 'anything' } });
+    assert.equal(res.status, 400);
+  } finally { proxy.close(); }
+});

@@ -656,7 +656,14 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // the key it keeps in localStorage. Gated, a remote browser could never
       // load it at all. Same headers as the dashboard; uiCsp() says why /ui
       // needs one allowance more. Cached with its policy after the first read.
-      if (req.method === 'GET' && (req.url === '/ui' || req.url === '/ui/' || req.url === '/ui/index.html')) {
+      // Exact paths only, plus exactly one query: the desktop launcher's
+      // ?ticket=<token>. Missing it here, that address fell through to the gate
+      // — a 401 for a remote browser, and for key-less loopback a forward
+      // upstream carrying the live ticket (Oracle, 2026-10-25). Any other query
+      // still meets the gate.
+      const [uiPath, uiQuery] = req.method === 'GET' ? (req.url || '').split(/\?(.*)/s, 2) : [''];
+      const uiQueryOk = uiQuery === undefined || /^ticket=[A-Za-z0-9_-]{16,128}$/.test(uiQuery);
+      if (uiQueryOk && (uiPath === '/ui' || uiPath === '/ui/' || uiPath === '/ui/index.html')) {
         try {
           const uiPage = await loadUiPage();
           res.writeHead(200, {
@@ -956,7 +963,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // presented key into /ui (the desktop launcher). Client keys are refused
       // above; a key-less loopback caller has no key to hand over.
       if (req.method === 'POST' && req.url === '/teamclaude/ui-ticket') {
-        if (!auth.ok || typeof clientKey !== 'string') { json(res, 400, { ok: false, error: 'present the key the dashboard should use (x-api-key)' }); return; }
+        // With no keys configured every caller is "authenticated" and the page
+        // needs no key at all: nothing to hand over, and no slots to fill.
+        const keysConfigured = !resolveClientAuth(config.proxy, undefined).ok;
+        if (!keysConfigured || !auth.ok || typeof clientKey !== 'string') { json(res, 400, { ok: false, error: 'present the key the dashboard should use (x-api-key)' }); return; }
         const ticket = uiTickets.mint(clientKey);
         if (!ticket) { json(res, 429, { ok: false, error: 'too many unredeemed tickets; try again in a minute' }); return; }
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });

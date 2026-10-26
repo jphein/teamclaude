@@ -810,8 +810,11 @@
     const RELOAD_SLOT = 'teamclaude-dashboard-signin-reload';
     let last = 0;
     try { last = Number(sessionStorage.getItem(RELOAD_SLOT)) || 0; } catch { /* storage blocked */ }
-    if (Date.now() - last < 60_000) { showErr('The sign-in has expired: reload the page to sign in again.'); return; }
-    try { sessionStorage.setItem(RELOAD_SLOT, String(Date.now())); } catch { /* storage blocked */ }
+    const expired = () => showErr('The sign-in has expired: reload the page to sign in again.');
+    if (Date.now() - last < 60_000) { expired(); return; }
+    // Only a reload whose time is recorded can be limited: without storage the
+    // next page would read 0 and reload again, so ask instead.
+    try { sessionStorage.setItem(RELOAD_SLOT, String(Date.now())); } catch { expired(); return; }
     try { location.reload(); } catch { /* no location: nothing to reload */ }
   }
   function unlock() {

@@ -517,7 +517,9 @@ function problemFor(f, v, cfg) {
 export const SSO_EDITABLE = new Set([
   'switchThreshold', 'quotaProbeSeconds', 'holdSeconds', 'blockedModels', 'stormRamp',
   'distributeSessions', 'adaptiveDistribution', 'expiryRouting', 'routes', 'advisorEligibility',
-  'failover.enabled', 'failover.model', 'failover.afterSeconds', 'failover.maxConcurrent', 'failover.contextTokens',
+  // Not failover.model: behind a gateway (LiteLLM) an alias can name an
+  // outside provider, so the model is a destination too (xreview, 2026-10-26).
+  'failover.enabled', 'failover.afterSeconds', 'failover.maxConcurrent', 'failover.contextTokens',
   'failover.maxPromptTokens', 'failover.templateTokens', 'failover.timeoutSeconds', 'failover.excludeClients',
   'fable.allow', 'fable.model', 'fable.fallbackOnCapacity', 'mythos.allow', 'mythos.model', 'mythos.fallbackOnCapacity',
   'warmOnExhaustion', 'warmupSeconds', 'warmupSchedule',

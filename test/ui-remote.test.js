@@ -357,7 +357,7 @@ test('script hashes are taken over LF-normalised text, as a browser computes the
 // Runs the real /ui scripts in a vm with a stub DOM, storage and fetch. Every
 // fetch is recorded with the key it carried; `auto401` answers each with a 401
 // at once, otherwise the call stays pending until the test settles it.
-async function bootPage({ storageThrows = false, readOnlyStorage = null, href = null, auto401 = true } = {}) {
+async function bootPage({ storageThrows = false, readOnlyStorage = null, href = null, auto401 = true, sessionThrows = false } = {}) {
   const html = injectUiHelpers(await readFile(UI, 'utf8'));
   const elements = new Map();
   const makeEl = (id) => {
@@ -409,7 +409,9 @@ async function bootPage({ storageThrows = false, readOnlyStorage = null, href = 
     ...(href ? {
       URL,
       location: { href, reload: () => { page.reloads++; } },
-      sessionStorage: { getItem: (k) => page.session.get(k) ?? null, setItem: (k, v) => page.session.set(k, String(v)) },
+      sessionStorage: sessionThrows
+        ? { getItem: () => { throw new Error('SecurityError'); }, setItem: () => { throw new Error('SecurityError'); } }
+        : { getItem: (k) => page.session.get(k) ?? null, setItem: (k, v) => page.session.set(k, String(v)) },
       history: { replaceState: (_s, _t, u) => { page.replacedUrl = u; } },
     } : {}),
   });
@@ -550,6 +552,13 @@ test('a keyless page whose sign-in expired (a redirect to the portal) reloads on
   calls[1].answerRaw(expired());
   await page.settle();
   assert.equal(page.reloads, 1, 'no reload loop');
+});
+
+test('with sessionStorage blocked an expired sign-in asks instead of reloading (a reload could not be limited)', async () => {
+  const page = await bootPage({ auto401: false, href: 'https://tc.realm.watch/ui', sessionThrows: true });
+  page.take()[0].answerRaw({ type: 'opaqueredirect', status: 0, ok: false, json: async () => ({}), body: null });
+  await page.settle();
+  assert.equal(page.reloads, 0);
 });
 
 test('with localStorage blocked the entered key still works for the page', async () => {

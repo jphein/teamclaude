@@ -161,6 +161,7 @@ test('an SSO sign-in may not change danger settings or add accounts; the key sti
         { set: { 'sx.apiKey': 'x' } }, { set: { warmTransport: 'claude' } }, { set: { logLevel: 'debug' } },
         { accounts: [{ id: 'a', modelMap: {} }] }, { accounts: [{ id: 'a', maxSpend: 1000 }] },
         { set: {}, somethingElse: 1 },
+        { set: { 'failover.model': 'openai/gpt-x' } },
       ]) {
         const r = await post('/teamclaude/settings', body);
         assert.equal(r.status, 403, JSON.stringify(body));

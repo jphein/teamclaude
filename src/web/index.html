@@ -614,7 +614,7 @@
       <button id="probeBtn" class="btn-svc" title="Re-read every account's quota from the zero-spend usage endpoint — use after a plan change or upgrade">↻ Refresh quotas</button>
       <button id="addAcctBtn" class="btn-svc" title="Sign in to another Claude account in the browser and add it to the pool — same as `teamclaude login`">＋ Add account</button>
       <button id="reloadBtn" class="btn-svc" title="Re-sync accounts from the config file without a restart (picks up new accounts, tokens, priorities)">⟲ Reload config</button>
-      <button id="restartBtn" class="btn-restart" title="systemctl --user restart teamclaude">Restart</button>
+      <button id="restartBtn" class="btn-restart" title="Restart the proxy: it stops and its service manager starts it again (config service.restart)">Restart</button>
       <span id="restartStatus" class="restart-status"></span>
     </div>
   </div>
@@ -684,6 +684,20 @@
 /*__TC_SHARED_HELPERS__*/
 </script>
 <script>
+  // A desktop launcher opens /ui?ticket=… (POST /teamclaude/ui-ticket). The
+  // ticket leaves the address bar before anything else runs, so it is never
+  // bookmarked, shared or sent anywhere; it is redeemed for the key at boot.
+  const launchTicket = (() => {
+    try {
+      const u = new URL(location.href);
+      const t = u.searchParams.get('ticket');
+      if (!t) return null;
+      u.searchParams.delete('ticket');
+      history.replaceState(null, '', u.pathname + u.search + u.hash);
+      return t;
+    } catch { return null; }
+  })();
+
   // All DOM construction uses createElement + textContent — never innerHTML with untrusted data.
 
   const cardsEl     = document.getElementById('cards');
@@ -756,6 +770,10 @@
   function unlock() {
     const v = keyInputEl.value.trim();
     if (!v) return;
+    useKey(v);
+  }
+  // Take `v` as the key, exactly as if it had been typed into the key box.
+  function useKey(v) {
     pageKey = v;
     try { localStorage.setItem(KEY_STORAGE, v); } catch { /* storage blocked: pageKey carries it for this page */ }
     keyInputEl.value = '';
@@ -2018,7 +2036,8 @@
   }
 
   setInterval(renderActiveReqs, 1000);
-  connectActivity();
+  // With a launcher ticket the streams wait for its key (useKey connects them).
+  if (!launchTicket) connectActivity();
 
   // ── Logs panel ───────────────────────────────────────────────
   let logAutoScroll = true;
@@ -2053,10 +2072,29 @@
     });
   }
 
-  connectLogs();
+  if (!launchTicket) connectLogs();
 
   // ── Boot ─────────────────────────────────────────────────────
-  refresh();
+  if (launchTicket) {
+    // Same-origin POST; the reply is the key the launcher presented. A dead or
+    // spent ticket falls back to the normal path: stored key, else the key box.
+    // Through api() like every request; the route sits ahead of the key check,
+    // so whatever key api() attaches is never read.
+    api('/teamclaude/ui-ticket/redeem', {
+      method: 'POST', cache: 'no-store',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ticket: launchTicket }),
+    })
+      .then(r => (r.ok ? r.json() : null))
+      .catch(() => null)
+      .then(d => {
+        if (d && typeof d.key === 'string' && d.key) { useKey(d.key); return; }
+        showErr('That launcher link has expired; opening with the saved key, if any.');
+        refresh(); connectActivity(); connectLogs();
+      });
+  } else {
+    refresh();
+  }
   // No polling behind the key prompt: every poll would only 401 again.
   setInterval(() => { if (!needKey) refresh(); }, 2000);
 </script>

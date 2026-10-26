@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Open the teamclaude dashboard already signed in — the target of a desktop
+# launcher. The operator key never appears in a URL, an argument list, shell
+# history or the launcher file: it is read from a 0600 file, handed to curl as
+# a config on stdin to mint a one-time ticket (POST /teamclaude/ui-ticket), and
+# only that ticket — single use, 60 s — goes into the address the browser
+# opens. The page drops it from the address bar and trades it for the key.
+#
+#   key file: ~/.config/teamclaude/service.key (0600; the shared proxy.apiKey)
+#   env:      TEAMCLAUDE_DASH_URL (default https://tc.realm.watch)
+#             TEAMCLAUDE_DASH_KEY_FILE
+set -euo pipefail
+
+BASE="${TEAMCLAUDE_DASH_URL:-https://tc.realm.watch}"
+KEY_FILE="${TEAMCLAUDE_DASH_KEY_FILE:-$HOME/.config/teamclaude/service.key}"
+
+say() { notify-send -i teamclaude "teamclaude" "$1" 2>/dev/null || printf 'teamclaude-dash: %s\n' "$1" >&2; }
+plain() { say "$1 — opening the dashboard without a ticket"; exec xdg-open "$BASE/ui"; }
+
+[ -r "$KEY_FILE" ] || plain "no key file at $KEY_FILE"
+[ "$(stat -c %a "$KEY_FILE")" = 600 ] || plain "$KEY_FILE must be mode 600"
+key=$(tr -d '\r\n' < "$KEY_FILE")
+# A key goes into a quoted curl config line: only plain token characters.
+[[ "$key" =~ ^[A-Za-z0-9._~+/=-]{8,256}$ ]] || plain "the key file does not hold a plain key"
+
+# Straight to the dashboard host: a proxy in the environment would see the key.
+resp=$(printf 'header = "x-api-key: %s"\n' "$key" \
+  | env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy \
+    curl -sS --noproxy '*' -m 10 -K - -X POST -H 'content-type: application/json' "$BASE/teamclaude/ui-ticket" 2>/dev/null) \
+  || plain "could not reach $BASE"
+unset key
+ticket=$(printf '%s' "$resp" | python3 -c 'import json,sys; t=json.load(sys.stdin).get("ticket"); print(t) if isinstance(t,str) and t.replace("-","").replace("_","").isalnum() else sys.exit(1)' 2>/dev/null) \
+  || plain "the proxy did not issue a ticket"
+exec xdg-open "$BASE/ui?ticket=$ticket"

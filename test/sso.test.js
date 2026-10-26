@@ -186,6 +186,28 @@ test('an SSO sign-in may not change danger settings or add accounts; the key sti
   } finally { console.log = orig; }
 });
 
+test('the gate reads the live config on every request: a reload rotates, narrows or removes SSO at once', async () => {
+  const am = new AccountManager([{ name: 'a', type: 'apikey', apiKey: 'sk-test' }], 0.98);
+  const config = { proxy: { apiKey: 'shared-k', trustLoopback: false, sso: { ...SSO, requireTls: false } }, upstream: 'http://127.0.0.1:9' };
+  const proxy = createProxyServer(am, config, {});
+  const port = await listen(proxy);
+  const status = (headers) => fetch(`http://127.0.0.1:${port}/teamclaude/status`, { headers }).then(r => r.status);
+  const NEW = 'n'.repeat(SSO_MIN_SECRET);
+  try {
+    assert.equal(await status(HOP), 200);
+    // What index.js's reload does: replace proxy.sso on the same object.
+    config.proxy.sso = { ...SSO, secret: NEW, requireTls: false };
+    assert.equal(await status(HOP), 401, 'the old secret is refused at once');
+    assert.equal(await status({ ...HOP, 'x-teamclaude-sso': NEW }), 200, 'the new one admits');
+    config.proxy.sso = { ...SSO, users: ['someone-else'], secret: NEW, requireTls: false };
+    assert.equal(await status({ ...HOP, 'x-teamclaude-sso': NEW }), 401, 'a removed user is refused at once');
+    for (const off of [undefined, { users: ['jp'] }, { ...SSO, secret: 'short', requireTls: false }]) {
+      config.proxy.sso = off;
+      assert.equal(await status({ ...HOP, 'x-teamclaude-sso': NEW }), 401, `missing or malformed is off: ${JSON.stringify(off)}`);
+    }
+  } finally { proxy.close(); }
+});
+
 test('a valid key still decides: a client key with SSO headers stays that client', async () => {
   await plain({ ...SSO, requireTls: false }, async ({ call }) => {
     const st = await call('/teamclaude/status', { headers: { ...HOP, 'x-api-key': 'k-lane' } });

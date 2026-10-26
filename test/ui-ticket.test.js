@@ -97,3 +97,20 @@ test('/ui is served with no referrer, so a ticket in the address bar cannot leak
     assert.match(html, /searchParams\.delete\('ticket'\)/, 'the page strips the ticket from the address bar');
   } finally { proxy.close(); }
 });
+
+test('a cross-origin page cannot mint a ticket even with the operator key', async () => {
+  const { proxy, post } = await server();
+  try {
+    const res = await post('/teamclaude/ui-ticket', { headers: { 'x-api-key': 'shared-k', origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' } });
+    assert.equal(res.status, 403);
+  } finally { proxy.close(); }
+});
+
+test('two redemptions racing for one ticket: exactly one gets the key', async () => {
+  const { proxy, post } = await server();
+  try {
+    const { ticket } = await (await post('/teamclaude/ui-ticket', { headers: { 'x-api-key': 'shared-k' } })).json();
+    const res = await Promise.all([1, 2, 3].map(() => post('/teamclaude/ui-ticket/redeem', { body: { ticket } })));
+    assert.deepEqual(res.map(r => r.status).sort(), [200, 404, 404]);
+  } finally { proxy.close(); }
+});

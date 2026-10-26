@@ -685,8 +685,10 @@
 </script>
 <script>
   // A desktop launcher opens /ui?ticket=… (POST /teamclaude/ui-ticket). The
-  // ticket leaves the address bar before anything else runs, so it is never
-  // bookmarked, shared or sent anywhere; it is redeemed for the key at boot.
+  // ticket leaves the address bar before this page sends any request, and is
+  // redeemed for the key at boot. The navigation that opened the page still
+  // carried it (browser history, the launch argument): a dead ticket by then —
+  // single use, 60 s — and /ui is served with Referrer-Policy: no-referrer.
   const launchTicket = (() => {
     try {
       const u = new URL(location.href);

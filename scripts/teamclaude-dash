@@ -3,8 +3,9 @@
 # launcher. The operator key never appears in a URL, an argument list, shell
 # history or the launcher file: it is read from a 0600 file, handed to curl as
 # a config on stdin to mint a one-time ticket (POST /teamclaude/ui-ticket), and
-# only that ticket — single use, 60 s — goes into the address the browser
-# opens. The page drops it from the address bar and trades it for the key.
+# only that ticket — single use, 60 s — reaches the browser, through a 0600
+# file (never an argument list). The page drops it from the address bar and
+# trades it for the key.
 #
 #   key file: ~/.config/teamclaude/service.key (0600; the shared proxy.apiKey)
 #   env:      TEAMCLAUDE_DASH_URL (default https://tc.realm.watch)
@@ -17,6 +18,13 @@ KEY_FILE="${TEAMCLAUDE_DASH_KEY_FILE:-$HOME/.config/teamclaude/service.key}"
 say() { notify-send -i teamclaude "teamclaude" "$1" 2>/dev/null || printf 'teamclaude-dash: %s\n' "$1" >&2; }
 plain() { say "$1 — opening the dashboard without a ticket"; exec xdg-open "$BASE/ui"; }
 
+# BASE is written into a page below: plain URL characters only.
+[[ "$BASE" =~ ^https?://[A-Za-z0-9.:-]+$ ]] || { say "TEAMCLAUDE_DASH_URL must be a bare origin like https://tc.realm.watch"; exit 1; }
+# The key is only ever sent over TLS (plain http only to this machine itself).
+case "$BASE" in
+  https://*|http://127.0.0.1|http://127.0.0.1:*|http://localhost|http://localhost:*) ;;
+  *) say "TEAMCLAUDE_DASH_URL must be https://"; exit 1 ;;
+esac
 [ -r "$KEY_FILE" ] || plain "no key file at $KEY_FILE"
 [ "$(stat -c %a "$KEY_FILE")" = 600 ] || plain "$KEY_FILE must be mode 600"
 key=$(tr -d '\r\n' < "$KEY_FILE")
@@ -24,11 +32,23 @@ key=$(tr -d '\r\n' < "$KEY_FILE")
 [[ "$key" =~ ^[A-Za-z0-9._~+/=-]{8,256}$ ]] || plain "the key file does not hold a plain key"
 
 # Straight to the dashboard host: a proxy in the environment would see the key.
+# -q first: no ~/.curlrc (a trace or a redirect setting there would carry the key).
 resp=$(printf 'header = "x-api-key: %s"\n' "$key" \
   | env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy \
-    curl -sS --noproxy '*' -m 10 -K - -X POST -H 'content-type: application/json' "$BASE/teamclaude/ui-ticket" 2>/dev/null) \
+    curl -q -sS --noproxy '*' --proto '=https,http' --max-redirs 0 -m 10 -K - -X POST -H 'content-type: application/json' "$BASE/teamclaude/ui-ticket" 2>/dev/null) \
   || plain "could not reach $BASE"
 unset key
 ticket=$(printf '%s' "$resp" | python3 -c 'import json,sys; t=json.load(sys.stdin).get("ticket"); print(t) if isinstance(t,str) and t.replace("-","").replace("_","").isalnum() else sys.exit(1)' 2>/dev/null) \
   || plain "the proxy did not issue a ticket"
-exec xdg-open "$BASE/ui?ticket=$ticket"
+# Not `xdg-open "$BASE/ui?ticket=…"`: a live ticket in an argument list is
+# readable by every local user (ps) for as long as it takes the browser to
+# redeem it. The ticket goes into a 0600 page in the user's private runtime
+# directory instead; the browser is handed only that file's path, and the page
+# forwards itself to the dashboard. Gone again after 30 s (the ticket after 60).
+dir="${XDG_RUNTIME_DIR:-$HOME/.cache}/teamclaude-dash"
+mkdir -p -m 700 "$dir"
+page=$(mktemp "$dir/open-XXXXXX.html")
+chmod 600 "$page"
+printf '<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>teamclaude</title><script>location.replace("%s/ui?ticket=%s")</script>\n' "$BASE" "$ticket" > "$page"
+( sleep 30; rm -f "$page" ) >/dev/null 2>&1 &
+exec xdg-open "file://$page"

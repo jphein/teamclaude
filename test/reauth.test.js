@@ -351,3 +351,17 @@ test('mutating reauth endpoints are CSRF-guarded (403 for a cross-origin page)',
     assert.equal(started, false);
   });
 });
+
+test('strict start (client key or SSO) refuses an entry with no identity to check; the operator may', async () => {
+  const legacy = () => ({ name: 'seat6', type: 'oauth' });
+  const { mgr } = makeManager({ accounts: [legacy()], profile: PROFILE_OK });
+  await assert.rejects(mgr.start('seat6', { strict: true }), (e) => e.status === 403 && /no stored identity/.test(e.message));
+  assert.equal(mgr.status().state, 'idle', 'nothing started');
+  // Strict still reauths an account it can check.
+  const { mgr: m2 } = makeManager({ accounts: [OAUTH_ACCT(), { name: 'old@x.com', type: 'oauth' }], profile: PROFILE_OK });
+  assert.ok((await m2.start('jp@x.com', { strict: true })).authUrl);
+  assert.ok((await m2.start('old@x.com', { strict: true })).authUrl, 'an email-shaped name is checked by email');
+  // The key-holding operator keeps the old behaviour.
+  const { mgr: m3 } = makeManager({ accounts: [legacy()], profile: PROFILE_OK });
+  assert.ok((await m3.start('seat6')).authUrl);
+});

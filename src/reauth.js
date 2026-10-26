@@ -49,6 +49,12 @@ export function createReauthManager({
   // the classic relogin footgun. UUID-bearing entries use the same account+org
   // identity rule as the account list; legacy entries (no stored uuid) fall
   // back to the email-ish display name and get their uuids backfilled.
+  // An entry with neither a stored uuid nor an email-shaped name: any sign-in
+  // would be accepted for it, so only the operator holding the key may reauth it.
+  function unverifiable(account) {
+    return !account.accountUuid && !emailOf(account).includes('@');
+  }
+
   function identityMatches(account, profile) {
     if (account.accountUuid) {
       return sameIdentity(account, {
@@ -96,11 +102,18 @@ export function createReauthManager({
 
     pending: () => starting > 0 || status().state === 'pending',
 
-    async start(name) {
+    /**
+     * @param {string} name
+     * @param {{ strict?: boolean }} [opts]  strict: the caller is not the
+     *   key-holding operator (a client key, or a dashboard SSO sign-in), so an
+     *   account whose identity cannot be checked is refused.
+     */
+    async start(name, { strict = false } = {}) {
       if (otherSessionPending()) throw httpError(409, 'an add-account sign-in is already waiting for a browser approval — finish or cancel it first');
       const account = accountManager.accounts.find(a => a.name === name);
       if (!account) throw httpError(404, `account "${name}" not found`);
       if (account.type !== 'oauth') throw httpError(400, `account "${name}" is not an OAuth account`);
+      if (strict && unverifiable(account)) throw httpError(403, `account "${name}" has no stored identity to check a sign-in against; reauth it with the proxy key (the desktop launcher)`);
 
       if (current) current.session.close(); // supersede any prior session
 

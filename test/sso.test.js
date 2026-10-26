@@ -133,7 +133,11 @@ test('over plain HTTP with requireTls off: SSO is the operator on the dashboard 
 
 test('an SSO sign-in may not change danger settings or add accounts; the key still may', async () => {
   const saved = [];
-  const settings = { getSettings: async () => ({}), saveSettings: async (c) => { saved.push(c); return { applied: Object.keys(c.set || {}), needsRestart: [] }; } };
+  const reauthCalls = [];
+  const settings = {
+    getSettings: async () => ({}), saveSettings: async (c) => { saved.push(c); return { applied: Object.keys(c.set || {}), needsRestart: [] }; },
+    reauth: { start: async (...a) => { reauthCalls.push(a); return { authUrl: 'https://claude.ai/x' }; }, status: () => ({}) },
+  };
   const logs = [];
   const orig = console.log;
   console.log = (...a) => { logs.push(a.join(' ')); };
@@ -142,13 +146,21 @@ test('an SSO sign-in may not change danger settings or add accounts; the key sti
       const post = (path, body, headers = HOP) => call(path, { method: 'POST', headers: { ...headers, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' }, body: JSON.stringify(body) });
       const st = await (await call('/teamclaude/status', { headers: HOP })).json();
       assert.deepEqual(st.caller.refused.sort(), ['/teamclaude/add-account', '/teamclaude/add-account/cancel', '/teamclaude/add-account/code', '/teamclaude/ui-ticket']);
-      assert.equal((await (await call('/teamclaude/settings', { headers: HOP })).json()).dangerNeedsKey, true);
+      assert.ok((await (await call('/teamclaude/settings', { headers: HOP })).json()).ssoEditable.includes('switchThreshold'));
       for (const body of [
         { set: { 'service.restart': { command: ['/bin/true'] } } },
         { set: { upstream: 'https://evil.example' } },
         { set: { 'proxy.sso.users': ['mallory'] } },
         { set: { switchThreshold: 0.9, 'proxy.apiKey': 'x'.repeat(40) } },
         { accounts: [{ id: 'a', upstream: 'https://evil.example' }] },
+        // Oracle round 3, both confirmed live before the allowlist:
+        { set: { 'service.logs': { file: '/home/jp/.config/teamclaude.json' } } },
+        { set: { 'proxy.clientKeys': [{ name: 'mine', key: 'k'.repeat(40) }] } },
+        // …and the rest of what a blocklist kept missing:
+        { set: { autoUpdate: true } }, { set: { 'egress.checkUrl': 'https://evil.example' } }, { set: { noProxy: ['*'] } },
+        { set: { 'sx.apiKey': 'x' } }, { set: { warmTransport: 'claude' } }, { set: { logLevel: 'debug' } },
+        { accounts: [{ id: 'a', modelMap: {} }] }, { accounts: [{ id: 'a', maxSpend: 1000 }] },
+        { set: {}, somethingElse: 1 },
       ]) {
         const r = await post('/teamclaude/settings', body);
         assert.equal(r.status, 403, JSON.stringify(body));
@@ -156,8 +168,14 @@ test('an SSO sign-in may not change danger settings or add accounts; the key sti
       assert.equal(saved.length, 0, 'nothing dangerous was saved');
       // An ordinary setting is fine, and the log names the SSO user.
       assert.equal((await post('/teamclaude/settings', { set: { switchThreshold: 0.9 } })).status, 200);
+      assert.equal((await post('/teamclaude/settings', { accounts: [{ id: 'a', priority: 2, disabled: false }], order: ['a'] })).status, 200);
       assert.ok(logs.some((l) => /Settings saved via SSO as "jp": switchThreshold/.test(l)), logs.join('|'));
       assert.equal((await post('/teamclaude/add-account', {})).status, 403);
+      // Reauth is open to SSO, but strict: the hook is told so.
+      assert.equal((await post('/teamclaude/reauth', { name: 'a' })).status, 200);
+      assert.deepEqual(reauthCalls.at(-1), ['a', { strict: true }]);
+      assert.equal((await post('/teamclaude/reauth', { name: 'a' }, { 'x-api-key': 'shared-k' })).status, 200);
+      assert.deepEqual(reauthCalls.at(-1), ['a', { strict: false }]);
       // The shared key may do both.
       const keyed = { 'x-api-key': 'shared-k' };
       assert.equal((await post('/teamclaude/settings', { set: { upstream: 'https://api.anthropic.com' } }, keyed)).status, 200);

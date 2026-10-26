@@ -391,7 +391,7 @@ async function bootPage({ storageThrows = false, readOnlyStorage = null, href = 
         setItem: (k, v) => store.set(k, String(v)),
         removeItem: (k) => store.delete(k),
       };
-  const page = { elements, store, fetches: [], auto401, replacedUrl: null, reloads: 0 };
+  const page = { elements, store, fetches: [], auto401, replacedUrl: null, reloads: 0, session: new Map() };
   const fetchStub = (url, init) => {
     const call = { url, key: init?.headers?.['x-api-key'] ?? null, body: init?.body ?? null, redirect: init?.redirect ?? null };
     page.fetches.push(call);
@@ -409,6 +409,7 @@ async function bootPage({ storageThrows = false, readOnlyStorage = null, href = 
     ...(href ? {
       URL,
       location: { href, reload: () => { page.reloads++; } },
+      sessionStorage: { getItem: (k) => page.session.get(k) ?? null, setItem: (k, v) => page.session.set(k, String(v)) },
       history: { replaceState: (_s, _t, u) => { page.replacedUrl = u; } },
     } : {}),
   });
@@ -434,7 +435,7 @@ test('the /ui script sends no key on loopback, prompts on 401, then sends the ke
   // Every network call in the page script goes through api() (one raw fetch: api's own).
   const pageScript = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)][1][1];
   assert.equal(pageScript.match(/\bfetch\(/g).length, 1);
-  assert.match(pageScript, /await fetch\(path, withKey\(ssoSession && !sent \? \{ redirect: 'manual', \.\.\.init \} : init, sent\)\)/);
+  assert.match(pageScript, /await fetch\(path, withKey\(!sent \? \{ redirect: 'manual', \.\.\.init \} : init, sent\)\)/);
 
   const page = await bootPage();
   // Boot: status + both streams, all keyless (a loopback page needs none).
@@ -535,19 +536,20 @@ test('the keyless try refuses redirects, and a 200 that does not name an SSO use
   assert.equal(page.elements.get('keybox').style.display, 'block', 'the key box comes up');
 });
 
-test('signed in by SSO, an expired session (a redirect to the portal) reloads the page instead of retrying forever', async () => {
+test('a keyless page whose sign-in expired (a redirect to the portal) reloads once, not in a loop', async () => {
+  // The ordinary SSO page: a fresh browser, no key stored, nothing refused yet.
   const page = await bootPage({ auto401: false, href: 'https://tc.realm.watch/ui' });
-  page.take();
-  await page.unlock('stale-key');
-  page.take()[0].answer(401);
-  await page.settle();
-  page.take()[0].answer(200, { caller: { kind: 'operator', sso: 'jp' } });
-  await page.settle();
   const calls = page.take();
-  assert.ok(calls.length > 0 && calls.every(c => c.redirect === 'manual'), JSON.stringify(calls));
-  calls[0].answerRaw({ type: 'opaqueredirect', status: 0, ok: false, json: async () => ({}), body: null });
+  assert.ok(calls.length > 0 && calls.every(c => c.key === null && c.redirect === 'manual'), JSON.stringify(calls));
+  const expired = () => ({ type: 'opaqueredirect', status: 0, ok: false, json: async () => ({}), body: null });
+  calls[0].answerRaw(expired());
   await page.settle();
-  assert.equal(page.reloads, 1);
+  assert.equal(page.reloads, 1, 'reloads through the portal');
+  // Another one within the minute (a front proxy that lets the page through
+  // but redirects its requests) shows the error instead of reloading again.
+  calls[1].answerRaw(expired());
+  await page.settle();
+  assert.equal(page.reloads, 1, 'no reload loop');
 });
 
 test('with localStorage blocked the entered key still works for the page', async () => {

@@ -8,7 +8,7 @@ import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
 import { createUiTicketStore } from './ui-ticket.js';
 import { createSsoGate, stripFrontProxyHeaders } from './sso.js';
-import { dangerousChanges } from './settings.js';
+import { ssoForbiddenChanges, SSO_EDITABLE, SSO_EDITABLE_ACCOUNT } from './settings.js';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
 import { readFile, readdir, stat, unlink } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
@@ -488,8 +488,9 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
 // What a dashboard SSO sign-in may not do although it is the operator
 // (Oracle, 2026-10-26): its proof rests on the front proxy and the hop to
 // Authelia, so the controls that would hand a stranger the fleet — a new seat
-// its own prompts route through, the key itself — still need the key. The
-// danger settings are refused in the settings route (dangerousChanges).
+// its own prompts route through, the key itself — still need the key. In
+// the settings route it may change only the operational knobs in
+// settings.js SSO_EDITABLE (ssoForbiddenChanges).
 const SSO_REFUSED_PATHS = new Map([
   ['/teamclaude/add-account', 'adding an account needs the proxy key (use the desktop launcher)'],
   ['/teamclaude/add-account/code', 'adding an account needs the proxy key (use the desktop launcher)'],
@@ -921,15 +922,15 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           ? auth.client == null
           : isLocal && isSameOriginControlRequest(req) && isLocalHostHeader(req.headers.host ?? req.headers[':authority'], config.proxy?.host);
         if (req.method === 'GET') {
-          try { json(res, 200, { ...(await sh.getSettings()), canEdit: admin, ...(sso ? { dangerNeedsKey: true } : {}) }); }
+          try { json(res, 200, { ...(await sh.getSettings()), canEdit: admin, ...(sso ? { ssoEditable: [...SSO_EDITABLE], ssoEditableAccount: [...SSO_EDITABLE_ACCOUNT] } : {}) }); }
           catch (err) { console.error('[TeamClaude] Settings read failed:', /** @type {Error} */ (err).message); json(res, 500, { error: 'settings unavailable; see the proxy log' }); }
           return;
         }
         if (!admin) { json(res, 403, { error: 'saving settings needs the shared proxy key (or the dashboard opened on the proxy\'s own host); a client key can only view them' }); return; }
         let changes;
         try { changes = JSON.parse((await readControlBody(req, 1024 * 1024)) || '{}'); } catch { json(res, 400, { error: 'body must be JSON (at most 1 MiB)' }); return; }
-        const dangerous = sso ? dangerousChanges(changes) : [];
-        if (dangerous.length) { json(res, 403, { ok: false, problems: dangerous.map((k) => `${k}: changing this needs the proxy key, not the SSO sign-in (it decides where traffic or tokens go, or what runs)`) }); return; }
+        const forbidden = sso ? ssoForbiddenChanges(changes) : [];
+        if (forbidden.length) { json(res, 403, { ok: false, problems: forbidden.map((k) => `${k}: changing this needs the proxy key, not the SSO sign-in`) }); return; }
         try {
           const result = await sh.saveSettings(changes);
           console.log(`[TeamClaude] Settings saved ${viaWhom(req)}: ${[...result.applied, ...result.needsRestart].join(', ') || 'no changes'}`);
@@ -976,7 +977,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         try {
           const { name } = JSON.parse((await readControlBody(req)) || '{}');
           if (!name) { json(res, 400, { error: 'Missing "name"' }); return; }
-          const { authUrl } = await hooks.reauth.start(name);
+          // Strict for anyone but the key-holding operator: an entry with no
+          // stored identity would accept any sign-in (security review, 2026-10-26).
+          const { authUrl } = await hooks.reauth.start(name, { strict: !!(req.tcClient || req.tcSso) });
           console.log(`[TeamClaude] Reauth started for "${name}" ${viaWhom(req)}`);
           emitActivity({ type: 'reauth', name });
           json(res, 200, { ok: true, authUrl });

@@ -789,13 +789,15 @@
     keyInputEl.focus();
   }
   async function api(path, init, sent = storedKey()) {
-    // Signed in by SSO, an expired session answers with a redirect to the
-    // sign-in portal, which a fetch cannot follow (another origin): it would
-    // fail as a network error and every stream would retry forever. Caught as
-    // a redirect instead, it reloads the page, which goes through the portal.
-    const res = await fetch(path, withKey(ssoSession && !sent ? { redirect: 'manual', ...init } : init, sent));
+    // Behind the SSO front proxy, a request without a key whose session has
+    // expired is redirected to the sign-in portal, which a fetch cannot follow
+    // (another origin): it would fail as a network error and every stream
+    // would retry forever. Caught as a redirect instead, it reloads the page,
+    // which goes through the portal — at most once a minute, so a front proxy
+    // that lets the page through but redirects its requests cannot loop it.
+    const res = await fetch(path, withKey(!sent ? { redirect: 'manual', ...init } : init, sent));
     if (res.type === 'opaqueredirect') {
-      try { location.reload(); } catch { /* no location: nothing to reload */ }
+      reloadForSignIn();
       throw new Error('sign-in expired');
     }
     if (res.status === 401) {
@@ -803,6 +805,14 @@
       throw new Error('proxy key required');
     }
     return res;
+  }
+  function reloadForSignIn() {
+    const RELOAD_SLOT = 'teamclaude-dashboard-signin-reload';
+    let last = 0;
+    try { last = Number(sessionStorage.getItem(RELOAD_SLOT)) || 0; } catch { /* storage blocked */ }
+    if (Date.now() - last < 60_000) { showErr('The sign-in has expired: reload the page to sign in again.'); return; }
+    try { sessionStorage.setItem(RELOAD_SLOT, String(Date.now())); } catch { /* storage blocked */ }
+    try { location.reload(); } catch { /* no location: nothing to reload */ }
   }
   function unlock() {
     const v = keyInputEl.value.trim();

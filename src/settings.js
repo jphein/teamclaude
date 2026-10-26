@@ -174,7 +174,7 @@ export const FIELDS = [
     help: 'Interface to listen on. 127.0.0.1 = this host only; 0.0.0.0 = the network (then a proxy key is required). TEAMCLAUDE_HOST overrides it.' },
   { key: 'proxy.apiKey', group: 'Proxy & access', label: 'Proxy key (admin)', type: 'secret', apply: 'hot', def: null, danger: true,
     help: 'The shared key clients present. It also unlocks this Settings view. Write-only; cannot be cleared here.' },
-  { key: 'proxy.clientKeys', group: 'Proxy & access', label: 'Client keys', type: 'secretList', apply: 'hot', def: [],
+  { key: 'proxy.clientKeys', group: 'Proxy & access', label: 'Client keys', type: 'secretList', apply: 'hot', def: [], danger: true,
     help: 'Per-client keys ({ name, key }); usage is booked per name. Keys are write-only; a masked key means keep it.' },
   { key: 'proxy.trustLoopback', group: 'Proxy & access', label: 'Trust loopback', type: 'bool', apply: 'restart', def: true, danger: true,
     help: 'Let callers on this host skip the key. Turn off behind a reverse proxy on the same host.' },
@@ -243,7 +243,7 @@ export const FIELDS = [
     check: (v) => (v == null || isObj(v) ? null : 'must be an object { enabled, width, projectsDir }') },
 
   // ── Dashboard service ───────────────────────────────────────────────────
-  { key: 'service.logs', group: 'Dashboard service', label: 'Logs panel source', type: 'json', apply: 'restart', def: 'journald',
+  { key: 'service.logs', group: 'Dashboard service', label: 'Logs panel source', type: 'json', apply: 'restart', danger: true, def: 'journald',
     help: 'Where the Logs panel reads: "journald", { "file": "/path" }, or false.',
     check: (v) => { const r = /** @type {any} */ (resolveLogSource({ service: { logs: v } })); return v === false || r.kind !== 'off' ? null : r.reason; } },
   { key: 'service.restart', group: 'Dashboard service', label: 'Restart button', type: 'json', apply: 'restart', def: 'systemd', danger: true,
@@ -508,20 +508,38 @@ function problemFor(f, v, cfg) {
   return f.check ? f.check(v, cfg) : null;
 }
 
+// What a dashboard SSO sign-in may change (server.js): an allowlist, since a
+// blocklist of `danger` fields missed two that hand over the fleet
+// (service.logs streams any readable file; proxy.clientKeys mints a lasting
+// key — Oracle, 2026-10-26). Rotation, routing among the fleet's own
+// accounts, rationing, keep-warm timing and display only: nothing that names
+// a network destination, a file, a program, a credential or money.
+export const SSO_EDITABLE = new Set([
+  'switchThreshold', 'quotaProbeSeconds', 'holdSeconds', 'blockedModels', 'stormRamp',
+  'distributeSessions', 'adaptiveDistribution', 'expiryRouting', 'routes', 'advisorEligibility',
+  'failover.enabled', 'failover.model', 'failover.afterSeconds', 'failover.maxConcurrent', 'failover.contextTokens',
+  'failover.maxPromptTokens', 'failover.templateTokens', 'failover.timeoutSeconds', 'failover.excludeClients',
+  'fable.allow', 'fable.model', 'fable.fallbackOnCapacity', 'mythos.allow', 'mythos.model', 'mythos.fallbackOnCapacity',
+  'warmOnExhaustion', 'warmupSeconds', 'warmupSchedule',
+  'proxy.sessionDetail', 'quotaBarPercent', 'accountSort',
+]);
+export const SSO_EDITABLE_ACCOUNT = new Set(['priority', 'disabled', 'maxUsage', 'switchThreshold', 'displayOrder']);
+
 /**
- * The settings a save would change that are marked `danger` — where traffic or
- * tokens go, or what program runs. A dashboard SSO sign-in may not save these
- * (server.js): only the shared proxy key may. Listed by key; an account field
- * as `accounts[].<field>`.
- * @param {{ set?: Record<string, any>, accounts?: any[] }} changes
+ * The parts of a settings save a dashboard SSO sign-in may not make: every
+ * key outside SSO_EDITABLE (an account field as `accounts[].<field>`). The
+ * account order is allowed; anything else in `changes` is refused by name.
+ * @param {any} changes
  * @returns {string[]}
  */
-export function dangerousChanges(changes) {
-  const byKey = new Map(FIELDS.map((f) => [f.key, f]));
-  const out = Object.keys(changes?.set || {}).filter((k) => byKey.get(k)?.danger);
-  const acctDanger = ACCOUNT_FIELDS.filter((f) => f.danger).map((f) => f.key);
-  for (const a of Array.isArray(changes?.accounts) ? changes.accounts : []) {
-    for (const k of acctDanger) if (isObj(a) && k in a && !out.includes(`accounts[].${k}`)) out.push(`accounts[].${k}`);
+export function ssoForbiddenChanges(changes) {
+  if (!isObj(changes)) return [];
+  const out = Object.keys(changes).filter((k) => !['set', 'accounts', 'order'].includes(k));
+  out.push(...Object.keys(isObj(changes.set) ? changes.set : {}).filter((k) => !SSO_EDITABLE.has(k)));
+  for (const a of Array.isArray(changes.accounts) ? changes.accounts : []) {
+    for (const k of Object.keys(isObj(a) ? a : {})) {
+      if (k !== 'id' && !SSO_EDITABLE_ACCOUNT.has(k) && !out.includes(`accounts[].${k}`)) out.push(`accounts[].${k}`);
+    }
   }
   return out;
 }

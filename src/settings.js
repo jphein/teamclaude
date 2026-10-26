@@ -511,20 +511,22 @@ function problemFor(f, v, cfg) {
 // What a dashboard SSO sign-in may change (server.js): an allowlist, since a
 // blocklist of `danger` fields missed two that hand over the fleet
 // (service.logs streams any readable file; proxy.clientKeys mints a lasting
-// key — Oracle, 2026-10-26). Rotation, routing among the fleet's own
-// accounts, rationing, keep-warm timing and display only: nothing that names
-// a network destination, a file, a program, a credential or money.
+// key — Oracle, 2026-10-26). Rotation and distribution, failover timing,
+// rationing, keep-warm timing and display only: nothing that names a network
+// destination, a file, a program, a credential or money.
 export const SSO_EDITABLE = new Set([
-  'switchThreshold', 'quotaProbeSeconds', 'holdSeconds', 'blockedModels', 'stormRamp',
-  'distributeSessions', 'adaptiveDistribution', 'expiryRouting', 'routes', 'advisorEligibility',
-  // Not failover.model: behind a gateway (LiteLLM) an alias can name an
-  // outside provider, so the model is a destination too (xreview, 2026-10-26).
+  'switchThreshold', 'holdSeconds', 'blockedModels', 'stormRamp',
+  'distributeSessions', 'adaptiveDistribution', 'expiryRouting', 'advisorEligibility',
   'failover.enabled', 'failover.afterSeconds', 'failover.maxConcurrent', 'failover.contextTokens',
-  'failover.maxPromptTokens', 'failover.templateTokens', 'failover.timeoutSeconds', 'failover.excludeClients',
+  'failover.maxPromptTokens', 'failover.templateTokens', 'failover.timeoutSeconds',
   'fable.allow', 'fable.model', 'fable.fallbackOnCapacity', 'mythos.allow', 'mythos.model', 'mythos.fallbackOnCapacity',
   'warmOnExhaustion', 'warmupSeconds', 'warmupSchedule',
-  'proxy.sessionDetail', 'quotaBarPercent', 'accountSort',
+  'quotaBarPercent', 'accountSort',
 ]);
+// Left to the key on purpose (Oracle round 4): failover.excludeClients (who
+// may be answered by a stand-in — the #39 protection), proxy.sessionDetail
+// (shows every client every conversation), quotaProbeSeconds (a 1 s probe of
+// every seat), routes (a free-form object stored verbatim).
 export const SSO_EDITABLE_ACCOUNT = new Set(['priority', 'disabled', 'maxUsage', 'switchThreshold', 'displayOrder']);
 
 /**

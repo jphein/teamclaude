@@ -162,6 +162,8 @@ test('an SSO sign-in may not change danger settings or add accounts; the key sti
         { accounts: [{ id: 'a', modelMap: {} }] }, { accounts: [{ id: 'a', maxSpend: 1000 }] },
         { set: {}, somethingElse: 1 },
         { set: { 'failover.model': 'openai/gpt-x' } },
+        { set: { 'failover.excludeClients': [] } }, { set: { 'proxy.sessionDetail': true } },
+        { set: { quotaProbeSeconds: 1 } }, { set: { routes: [{ name: 'r', match: ['*'], upstream: 'https://evil.example' }] } },
       ]) {
         const r = await post('/teamclaude/settings', body);
         assert.equal(r.status, 403, JSON.stringify(body));

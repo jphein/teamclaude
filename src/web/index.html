@@ -742,9 +742,14 @@
   // a full quota still holding an old key) cannot make the page send anything
   // but what the operator just typed.
   let pageKey = '';
+  // Set once a request without a key was answered: the SSO front proxy signs
+  // this page in, so no key is sent — not even one storage cannot forget.
+  let ssoSession = false;
+  let keylessTry = false; // that one try is in flight (concurrent 401s share it)
 
   function storedKey() {
     if (pageKey) return pageKey;
+    if (ssoSession) return '';
     try { return localStorage.getItem(KEY_STORAGE) || ''; } catch { return ''; }
   }
   // `sentKey` is the key the refused request carried. Requests are concurrent,
@@ -755,13 +760,31 @@
     pageKey = '';
     try { localStorage.removeItem(KEY_STORAGE); } catch { /* storage blocked */ }
     if (needKey) return;
+    // Behind the SSO front proxy the browser's session signs in a request that
+    // carries no key, so a refused saved key is no reason to ask yet: try once
+    // without one. Refused too (or no SSO in front), the key box comes up.
+    if (sentKey && !ssoSession) {
+      if (keylessTry) return;
+      keylessTry = true;
+      api('/teamclaude/status', { cache: 'no-store' }, '')
+        .then(r => {
+          keylessTry = false;
+          if (!r.ok) { askForKey(); return; }
+          ssoSession = true;
+          refresh(); connectActivity(); connectLogs();
+        }, () => { keylessTry = false; askForKey(); });
+      return;
+    }
+    askForKey();
+  }
+  function askForKey() {
+    if (needKey || pageKey) return;
     needKey = true;
     appEl.style.display = 'none';
     keyboxEl.style.display = 'block';
     keyInputEl.focus();
   }
-  async function api(path, init) {
-    const sent = storedKey();
+  async function api(path, init, sent = storedKey()) {
     const res = await fetch(path, withKey(init, sent));
     if (res.status === 401) {
       onUnauthorized(sent);
@@ -777,6 +800,7 @@
   // Take `v` as the key, exactly as if it had been typed into the key box.
   function useKey(v) {
     pageKey = v;
+    ssoSession = false;
     try { localStorage.setItem(KEY_STORAGE, v); } catch { /* storage blocked: pageKey carries it for this page */ }
     keyInputEl.value = '';
     needKey = false;

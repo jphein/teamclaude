@@ -178,6 +178,17 @@ export const FIELDS = [
     help: 'Per-client keys ({ name, key }); usage is booked per name. Keys are write-only; a masked key means keep it.' },
   { key: 'proxy.trustLoopback', group: 'Proxy & access', label: 'Trust loopback', type: 'bool', apply: 'restart', def: true, danger: true,
     help: 'Let callers on this host skip the key. Turn off behind a reverse proxy on the same host.' },
+  // Dashboard SSO through a front proxy (sso.js). All three of users, from and
+  // secret must be set before anyone is admitted this way.
+  { key: 'proxy.sso.users', group: 'Proxy & access', label: 'SSO users', type: 'list', apply: 'hot', def: [], danger: true,
+    help: 'Remote-User names the front proxy (Authelia) may sign in to the dashboard as the operator. Empty = SSO off.' },
+  { key: 'proxy.sso.from', group: 'Proxy & access', label: 'SSO front proxy', type: 'list', apply: 'hot', def: [], danger: true,
+    help: 'Addresses of the front proxy (e.g. Caddy) whose Remote-User header is believed. A socket address, never a forwarded one.' },
+  { key: 'proxy.sso.secret', group: 'Proxy & access', label: 'SSO hop secret', type: 'secret', apply: 'hot', def: null, danger: true,
+    help: 'The X-Teamclaude-Sso value only the front proxy sends (32+ characters). Write-only.',
+    check: (v) => (typeof v === 'string' && v.length < 32 ? 'must be at least 32 characters' : null) },
+  { key: 'proxy.sso.requireTls', group: 'Proxy & access', label: 'SSO over TLS only', type: 'bool', apply: 'hot', def: true, danger: true,
+    help: 'Believe the SSO headers only on the TLS listener, so the hop secret never crosses the network in clear.' },
   { key: 'proxy.usageDimensions', group: 'Proxy & access', label: 'Usage dimensions', type: 'json', apply: 'hot', def: [],
     help: 'Book token usage by request header, e.g. [{ "name": "project", "header": "x-teamclaude-project" }].',
     check: (v) => (Array.isArray(v) && v.every((d) => isObj(d) && typeof d.name === 'string' && typeof d.header === 'string') ? null : 'must be an array of { name, header }') },
@@ -397,7 +408,16 @@ export function publicSettings(config) {
   const tops = new Set([...known].map((k) => k.split(".")[0]).concat("accounts"));
   const unknown = Object.keys(config || {}).filter((k) => !tops.has(k));
   for (const parent of ["proxy", "egress", "sx", "service", "mitm", "fable", "mythos", "failover"]) {
-    for (const k of Object.keys(isObj(config?.[parent]) ? config[parent] : {})) if (!known.has(`${parent}.${k}`)) unknown.push(`${parent}.${k}`);
+    for (const k of Object.keys(isObj(config?.[parent]) ? config[parent] : {})) {
+      const path = `${parent}.${k}`;
+      // A section whose fields are listed one by one (proxy.sso.*).
+      if (known.has(path)) continue;
+      if (isObj(config[parent][k]) && [...known].some((f) => f.startsWith(`${path}.`))) {
+        for (const kk of Object.keys(config[parent][k])) if (!known.has(`${path}.${kk}`)) unknown.push(`${path}.${kk}`);
+        continue;
+      }
+      unknown.push(path);
+    }
   }
   return {
     fields,

@@ -331,7 +331,11 @@ test('sseFrames parses complete events and keeps the partial tail', () => {
 test('an entered key wins over storage that still holds an old key and will not change', async () => {
   const page = await bootPage({ readOnlyStorage: 'stale-key' });
   const boot = page.take();
-  assert.ok(boot.every(f => f.key === 'stale-key'), 'boots with what storage holds');
+  // Boots with what storage holds; refused, it tries once with no key (an SSO
+  // session would answer) — refused as well, so the key box comes up.
+  const keyless = boot.filter(f => f.key === null);
+  assert.deepEqual(keyless.map(f => f.url), ['/teamclaude/status'], 'one keyless try');
+  assert.ok(boot.filter(f => f.key !== null).every(f => f.key === 'stale-key'), 'boots with what storage holds');
   assert.equal(page.elements.get('keybox').style.display, 'block');
   page.auto401 = false;
   await page.unlock('fresh-key');
@@ -461,8 +465,13 @@ test('a late 401 for an old key does not erase the key entered since', async () 
   await page.unlock('old-key');
   const oldCalls = page.take();
   assert.ok(oldCalls.every(f => f.key === 'old-key'));
-  // The operator rotates: a 401 on one call brings the prompt back…
+  // The operator rotates: a 401 on one call brings the prompt back — after one
+  // try without a key (an SSO session would have answered it), refused too…
   oldCalls[0].answer(401);
+  await page.settle();
+  const probe = page.take();
+  assert.deepEqual(probe.map(({ url, key }) => ({ url, key })), [{ url: '/teamclaude/status', key: null }]);
+  probe[0].answer(401);
   await page.settle();
   assert.equal(page.elements.get('keybox').style.display, 'block');
   assert.equal(page.store.has(KEY_STORAGE), false);
@@ -473,6 +482,41 @@ test('a late 401 for an old key does not erase the key entered since', async () 
   await page.settle();
   assert.equal(page.store.get(KEY_STORAGE), 'new-key', 'a refusal of the old key leaves the new one');
   assert.equal(page.elements.get('keybox').style.display, 'none');
+});
+
+test('behind SSO a stale saved key is dropped without asking: the page carries on keyless', async () => {
+  const page = await bootPage({ auto401: false });
+  page.take();
+  await page.unlock('stale-key');
+  const keyed = page.take();
+  keyed[0].answer(401);
+  await page.settle();
+  // One keyless try; the SSO session answers it, so no prompt, and the page
+  // reconnects without a key.
+  const probe = page.take();
+  assert.deepEqual(probe.map(({ url, key }) => ({ url, key })), [{ url: '/teamclaude/status', key: null }]);
+  probe[0].answer(200, {});
+  await page.settle();
+  assert.notEqual(page.elements.get('keybox').style.display, 'block');
+  assert.equal(page.store.has(KEY_STORAGE), false, 'the stale key is gone');
+  const again = page.take();
+  assert.deepEqual(again.map(f => f.url).sort(), BOOT_URLS);
+  assert.ok(again.every(f => f.key === null), JSON.stringify(again));
+});
+
+test('signed in by SSO, the page sends no key — not even one read-only storage keeps returning', async () => {
+  const page = await bootPage({ readOnlyStorage: 'stale-key', auto401: false });
+  const boot = page.take();
+  assert.ok(boot.every(f => f.key === 'stale-key'));
+  boot[0].answer(401);
+  await page.settle();
+  const probe = page.take();
+  assert.deepEqual(probe.map(({ url, key }) => ({ url, key })), [{ url: '/teamclaude/status', key: null }]);
+  probe[0].answer(200, {});
+  await page.settle();
+  const again = page.take();
+  assert.ok(again.length > 0);
+  assert.ok(again.every(f => f.key === null), JSON.stringify(again));
 });
 
 test('with localStorage blocked the entered key still works for the page', async () => {

@@ -5,7 +5,8 @@
 # a config on stdin to mint a one-time ticket (POST /teamclaude/ui-ticket), and
 # only that ticket — single use, 60 s — reaches the browser, through a 0600
 # file (never an argument list). The page drops it from the address bar and
-# trades it for the key.
+# trades it for the key. Behind the SSO front proxy (Authelia) none of this is
+# needed: the browser's own sign-in opens /ui, so the launcher just opens it.
 #
 #   key file: ~/.config/teamclaude/service.key (0600; the shared proxy.apiKey)
 #   env:      TEAMCLAUDE_DASH_URL (default https://tc.realm.watch)
@@ -24,6 +25,17 @@ plain() { say "$1 — opening the dashboard without a ticket"; exec xdg-open "$B
 case "$BASE" in
   https://*|http://127.0.0.1|http://127.0.0.1:*|http://localhost|http://localhost:*) ;;
   *) say "TEAMCLAUDE_DASH_URL must be https://"; exit 1 ;;
+esac
+
+# Behind the SSO front proxy (Authelia via Caddy), a browser request for /ui
+# without a key is sent to the sign-in portal: the browser's own session opens
+# the dashboard, so no ticket and no key are needed. Asked without a key and
+# without following the redirect; a redirect to another origin is the portal's.
+probe=$(env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy -u ALL_PROXY -u all_proxy \
+  curl -q -sS --noproxy '*' --proto '=https,http' --max-redirs 0 -m 5 -o /dev/null \
+    -H 'accept: text/html' -w '%{http_code} %{redirect_url}' "$BASE/ui" 2>/dev/null) || probe=''
+case "$probe" in
+  30[1237]\ https://*) [[ "${probe#* }" == "$BASE"/* ]] || exec xdg-open "$BASE/ui" ;;
 esac
 [ -r "$KEY_FILE" ] || plain "no key file at $KEY_FILE"
 [ "$(stat -c %a "$KEY_FILE")" = 600 ] || plain "$KEY_FILE must be mode 600"

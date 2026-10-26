@@ -7,6 +7,7 @@ import { FAMILIES, familyPolicy, rewriteFamilyBody, familyModelIn, isFamilyModel
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
 import { createUiTicketStore } from './ui-ticket.js';
+import { createSsoGate } from './sso.js';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
 import { readFile, readdir, stat, unlink } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
@@ -491,10 +492,11 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
  * and the shared proxy.apiKey are the operator; only a client key is refused.
  *
  * @param {string|null|undefined} client  the client-key name, or null
- * @returns {{ kind: 'operator'|'client', client: string|null, refused: string[] }}
+ * @param {string|null} [sso]  the user a dashboard SSO sign-in named (sso.js), when that admitted the request
+ * @returns {{ kind: 'operator'|'client', client: string|null, refused: string[], sso?: string }}
  */
-export function callerView(client) {
-  if (!client) return { kind: 'operator', client: null, refused: [] };
+export function callerView(client, sso = null) {
+  if (!client) return { kind: 'operator', client: null, refused: [], ...(sso ? { sso } : {}) };
   return { kind: 'client', client, refused: [...CLIENT_KEY_REFUSED_PATHS.keys()] };
 }
 
@@ -547,6 +549,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   let uiPagePromise = null;
   // One-time /ui tickets (the desktop launcher's way in; see ui-ticket.js).
   const uiTickets = /** @type {any} */ (hooks).uiTickets || createUiTicketStore();
+  // Dashboard SSO through the front proxy (sso.js).
+  const ssoUser = createSsoGate();
   const loadUiPage = () => {
     if (!uiPagePromise) {
       const p = readFile(/** @type {any} */ (hooks).uiPagePath || join(__dirname, 'web', 'index.html'), 'utf-8')
@@ -708,7 +712,12 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // are read live further down the pipeline.
       const clientKey = req.headers['x-api-key'];
       const isLocal = loopbackExempt(req.headers, req.socket.remoteAddress, config.proxy);
-      const auth = resolveClientAuth(config.proxy, clientKey);
+      // A valid key decides on its own. Without one, a dashboard SSO sign-in
+      // relayed by the front proxy (sso.js: its address, TLS, the hop secret,
+      // an allowed user) stands in as the operator — on /teamclaude/* only.
+      const keyAuth = resolveClientAuth(config.proxy, clientKey);
+      const sso = keyAuth.ok ? null : ssoUser(req, config.proxy);
+      const auth = sso ? { ok: true, client: null } : keyAuth;
       if (!auth.ok && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -737,6 +746,13 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // requirement, which would also close the hole but would break the
       // documented `curl -X POST .../teamclaude/reload` that sends no body.
       const crossOrigin = !isSameOriginControlRequest(req);
+      // An SSO sign-in is a browser cookie, as ambient as the loopback
+      // exemption: a page on another origin rides it just the same. Refused
+      // for every method, like the key-less caller below.
+      if (crossOrigin && sso) {
+        json(res, 403, { ok: false, error: 'cross-origin request refused: a web page cannot use the dashboard sign-in' });
+        return;
+      }
       if (crossOrigin && req.method === 'POST' && (req.url || '').startsWith('/teamclaude/')) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -817,7 +833,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const fable = familyStatus(config, 'fable', familyStats.fable);
         const mythos = familyStatus(config, 'mythos', familyStats.mythos);
         const failover = failoverState.snapshot(failoverPolicy(config));
-        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient), fable, mythos, failover, tunnels: tunnelStats.snapshot(), upstreamPool: upstreamPoolStatus() }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient, sso), fable, mythos, failover, tunnels: tunnelStats.snapshot(), upstreamPool: upstreamPoolStatus() }, null, 2));
         return;
       }
 
@@ -967,7 +983,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // With no keys configured every caller is "authenticated" and the page
         // needs no key at all: nothing to hand over, and no slots to fill.
         const keysConfigured = !resolveClientAuth(config.proxy, undefined).ok;
-        if (!keysConfigured || !auth.ok || typeof clientKey !== 'string') { json(res, 400, { ok: false, error: 'present the key the dashboard should use (x-api-key)' }); return; }
+        if (!keysConfigured || !keyAuth.ok || typeof clientKey !== 'string') { json(res, 400, { ok: false, error: 'present the key the dashboard should use (x-api-key)' }); return; }
         const ticket = uiTickets.mint(clientKey);
         if (!ticket) { json(res, 429, { ok: false, error: 'too many unredeemed tickets; try again in a minute' }); return; }
         console.log('[TeamClaude] Dashboard ticket issued (launcher)');

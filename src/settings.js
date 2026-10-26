@@ -174,10 +174,21 @@ export const FIELDS = [
     help: 'Interface to listen on. 127.0.0.1 = this host only; 0.0.0.0 = the network (then a proxy key is required). TEAMCLAUDE_HOST overrides it.' },
   { key: 'proxy.apiKey', group: 'Proxy & access', label: 'Proxy key (admin)', type: 'secret', apply: 'hot', def: null, danger: true,
     help: 'The shared key clients present. It also unlocks this Settings view. Write-only; cannot be cleared here.' },
-  { key: 'proxy.clientKeys', group: 'Proxy & access', label: 'Client keys', type: 'secretList', apply: 'hot', def: [],
+  { key: 'proxy.clientKeys', group: 'Proxy & access', label: 'Client keys', type: 'secretList', apply: 'hot', def: [], danger: true,
     help: 'Per-client keys ({ name, key }); usage is booked per name. Keys are write-only; a masked key means keep it.' },
   { key: 'proxy.trustLoopback', group: 'Proxy & access', label: 'Trust loopback', type: 'bool', apply: 'restart', def: true, danger: true,
     help: 'Let callers on this host skip the key. Turn off behind a reverse proxy on the same host.' },
+  // Dashboard SSO through a front proxy (sso.js). All three of users, from and
+  // secret must be set before anyone is admitted this way.
+  { key: 'proxy.sso.users', group: 'Proxy & access', label: 'SSO users', type: 'list', apply: 'hot', def: [], danger: true,
+    help: 'Remote-User names the front proxy (Authelia) may sign in to the dashboard as the operator. Empty = SSO off.' },
+  { key: 'proxy.sso.from', group: 'Proxy & access', label: 'SSO front proxy', type: 'list', apply: 'hot', def: [], danger: true,
+    help: 'Addresses of the front proxy (e.g. Caddy) whose Remote-User header is believed. A socket address, never a forwarded one.' },
+  { key: 'proxy.sso.secret', group: 'Proxy & access', label: 'SSO hop secret', type: 'secret', apply: 'hot', def: null, danger: true,
+    help: 'The X-Teamclaude-Sso value only the front proxy sends (32+ characters). Write-only.',
+    check: (v) => (typeof v === 'string' && v.length < 32 ? 'must be at least 32 characters' : null) },
+  { key: 'proxy.sso.requireTls', group: 'Proxy & access', label: 'SSO over TLS only', type: 'bool', apply: 'hot', def: true, danger: true,
+    help: 'Believe the SSO headers only on the TLS listener, so the hop secret never crosses the network in clear.' },
   { key: 'proxy.usageDimensions', group: 'Proxy & access', label: 'Usage dimensions', type: 'json', apply: 'hot', def: [],
     help: 'Book token usage by request header, e.g. [{ "name": "project", "header": "x-teamclaude-project" }].',
     check: (v) => (Array.isArray(v) && v.every((d) => isObj(d) && typeof d.name === 'string' && typeof d.header === 'string') ? null : 'must be an array of { name, header }') },
@@ -232,7 +243,7 @@ export const FIELDS = [
     check: (v) => (v == null || isObj(v) ? null : 'must be an object { enabled, width, projectsDir }') },
 
   // ── Dashboard service ───────────────────────────────────────────────────
-  { key: 'service.logs', group: 'Dashboard service', label: 'Logs panel source', type: 'json', apply: 'restart', def: 'journald',
+  { key: 'service.logs', group: 'Dashboard service', label: 'Logs panel source', type: 'json', apply: 'restart', danger: true, def: 'journald',
     help: 'Where the Logs panel reads: "journald", { "file": "/path" }, or false.',
     check: (v) => { const r = /** @type {any} */ (resolveLogSource({ service: { logs: v } })); return v === false || r.kind !== 'off' ? null : r.reason; } },
   { key: 'service.restart', group: 'Dashboard service', label: 'Restart button', type: 'json', apply: 'restart', def: 'systemd', danger: true,
@@ -397,7 +408,16 @@ export function publicSettings(config) {
   const tops = new Set([...known].map((k) => k.split(".")[0]).concat("accounts"));
   const unknown = Object.keys(config || {}).filter((k) => !tops.has(k));
   for (const parent of ["proxy", "egress", "sx", "service", "mitm", "fable", "mythos", "failover"]) {
-    for (const k of Object.keys(isObj(config?.[parent]) ? config[parent] : {})) if (!known.has(`${parent}.${k}`)) unknown.push(`${parent}.${k}`);
+    for (const k of Object.keys(isObj(config?.[parent]) ? config[parent] : {})) {
+      const path = `${parent}.${k}`;
+      // A section whose fields are listed one by one (proxy.sso.*).
+      if (known.has(path)) continue;
+      if (isObj(config[parent][k]) && [...known].some((f) => f.startsWith(`${path}.`))) {
+        for (const kk of Object.keys(config[parent][k])) if (!known.has(`${path}.${kk}`)) unknown.push(`${path}.${kk}`);
+        continue;
+      }
+      unknown.push(path);
+    }
   }
   return {
     fields,
@@ -486,6 +506,46 @@ function problemFor(f, v, cfg) {
   if ((f.type === 'int' || f.type === 'number') && f.min != null && v < f.min) return `must be at least ${f.min}`;
   if ((f.type === 'int' || f.type === 'number') && f.max != null && v > f.max) return `must be at most ${f.max}`;
   return f.check ? f.check(v, cfg) : null;
+}
+
+// What a dashboard SSO sign-in may change (server.js): an allowlist, since a
+// blocklist of `danger` fields missed two that hand over the fleet
+// (service.logs streams any readable file; proxy.clientKeys mints a lasting
+// key — Oracle, 2026-10-26). Rotation and distribution, failover timing,
+// rationing, keep-warm timing and display only: nothing that names a network
+// destination, a file, a program, a credential or money.
+export const SSO_EDITABLE = new Set([
+  'switchThreshold', 'holdSeconds', 'blockedModels', 'stormRamp',
+  'distributeSessions', 'adaptiveDistribution', 'expiryRouting', 'advisorEligibility',
+  'failover.enabled', 'failover.afterSeconds', 'failover.maxConcurrent', 'failover.contextTokens',
+  'failover.maxPromptTokens', 'failover.templateTokens', 'failover.timeoutSeconds',
+  'fable.allow', 'fable.model', 'fable.fallbackOnCapacity', 'mythos.allow', 'mythos.model', 'mythos.fallbackOnCapacity',
+  'warmOnExhaustion', 'warmupSeconds', 'warmupSchedule',
+  'quotaBarPercent', 'accountSort',
+]);
+// Left to the key on purpose (Oracle round 4): failover.excludeClients (who
+// may be answered by a stand-in — the #39 protection), proxy.sessionDetail
+// (shows every client every conversation), quotaProbeSeconds (a 1 s probe of
+// every seat), routes (a free-form object stored verbatim).
+export const SSO_EDITABLE_ACCOUNT = new Set(['priority', 'disabled', 'maxUsage', 'switchThreshold', 'displayOrder']);
+
+/**
+ * The parts of a settings save a dashboard SSO sign-in may not make: every
+ * key outside SSO_EDITABLE (an account field as `accounts[].<field>`). The
+ * account order is allowed; anything else in `changes` is refused by name.
+ * @param {any} changes
+ * @returns {string[]}
+ */
+export function ssoForbiddenChanges(changes) {
+  if (!isObj(changes)) return [];
+  const out = Object.keys(changes).filter((k) => !['set', 'accounts', 'order'].includes(k));
+  out.push(...Object.keys(isObj(changes.set) ? changes.set : {}).filter((k) => !SSO_EDITABLE.has(k)));
+  for (const a of Array.isArray(changes.accounts) ? changes.accounts : []) {
+    for (const k of Object.keys(isObj(a) ? a : {})) {
+      if (k !== 'id' && !SSO_EDITABLE_ACCOUNT.has(k) && !out.includes(`accounts[].${k}`)) out.push(`accounts[].${k}`);
+    }
+  }
+  return out;
 }
 
 /** Thrown with every problem a save had, so the UI can show them all at once. */

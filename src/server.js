@@ -7,6 +7,8 @@ import { FAMILIES, familyPolicy, rewriteFamilyBody, familyModelIn, isFamilyModel
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
 import { createUiTicketStore } from './ui-ticket.js';
+import { createSsoGate, stripFrontProxyHeaders } from './sso.js';
+import { ssoForbiddenChanges, SSO_EDITABLE, SSO_EDITABLE_ACCOUNT } from './settings.js';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
 import { readFile, readdir, stat, unlink } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
@@ -483,6 +485,24 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/ui-ticket', 'a client key cannot mint dashboard tickets'],
 ]);
 
+// What a dashboard SSO sign-in may not do although it is the operator
+// (Oracle, 2026-10-26): its proof rests on the front proxy and the hop to
+// Authelia, so the controls that would hand a stranger the fleet — a new seat
+// its own prompts route through, the key itself — still need the key. In
+// the settings route it may change only the operational knobs in
+// settings.js SSO_EDITABLE (ssoForbiddenChanges).
+const SSO_REFUSED_PATHS = new Map([
+  ['/teamclaude/add-account', 'adding an account needs the proxy key (use the desktop launcher)'],
+  ['/teamclaude/add-account/code', 'adding an account needs the proxy key (use the desktop launcher)'],
+  ['/teamclaude/add-account/cancel', 'adding an account needs the proxy key (use the desktop launcher)'],
+  ['/teamclaude/ui-ticket', 'a dashboard ticket carries a key; an SSO sign-in has none'],
+]);
+
+/** How a control-plane log line names its caller. @param {any} req */
+function viaWhom(req) {
+  return req?.tcSso ? `via SSO as "${req.tcSso}"` : 'via UI';
+}
+
 /**
  * The caller of /teamclaude/status as the control plane sees it, so the
  * dashboard can hide the controls this key would be refused instead of letting
@@ -491,9 +511,11 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
  * and the shared proxy.apiKey are the operator; only a client key is refused.
  *
  * @param {string|null|undefined} client  the client-key name, or null
- * @returns {{ kind: 'operator'|'client', client: string|null, refused: string[] }}
+ * @param {string|null} [sso]  the user a dashboard SSO sign-in named (sso.js), when that admitted the request
+ * @returns {{ kind: 'operator'|'client', client: string|null, refused: string[], sso?: string }}
  */
-export function callerView(client) {
+export function callerView(client, sso = null) {
+  if (sso) return { kind: 'operator', client: null, refused: [...SSO_REFUSED_PATHS.keys()], sso };
   if (!client) return { kind: 'operator', client: null, refused: [] };
   return { kind: 'client', client, refused: [...CLIENT_KEY_REFUSED_PATHS.keys()] };
 }
@@ -547,6 +569,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   let uiPagePromise = null;
   // One-time /ui tickets (the desktop launcher's way in; see ui-ticket.js).
   const uiTickets = /** @type {any} */ (hooks).uiTickets || createUiTicketStore();
+  // Dashboard SSO through the front proxy (sso.js).
+  const ssoUser = createSsoGate();
   const loadUiPage = () => {
     if (!uiPagePromise) {
       const p = readFile(/** @type {any} */ (hooks).uiPagePath || join(__dirname, 'web', 'index.html'), 'utf-8')
@@ -708,7 +732,18 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // are read live further down the pipeline.
       const clientKey = req.headers['x-api-key'];
       const isLocal = loopbackExempt(req.headers, req.socket.remoteAddress, config.proxy);
-      const auth = resolveClientAuth(config.proxy, clientKey);
+      // A valid key decides on its own. Without one, a dashboard SSO sign-in
+      // relayed by the front proxy (sso.js: its address, TLS, the hop secret,
+      // an allowed user, sent by the dashboard page itself) stands in as the
+      // operator — on /teamclaude/* only. The front proxy's headers are then
+      // dropped, so nothing below can relay them.
+      const keyAuth = resolveClientAuth(config.proxy, clientKey);
+      // Never on a path with dot-segments: the SSO scope is a prefix test, and
+      // such a path means one thing here and another wherever it is resolved.
+      const sso = keyAuth.ok || hasDotSegment(req.url) ? null : ssoUser(req, config.proxy);
+      stripFrontProxyHeaders(req.headers);
+      req.tcSso = sso;
+      const auth = sso ? { ok: true, client: null } : keyAuth;
       if (!auth.ok && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -762,6 +797,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.end(JSON.stringify({ ok: false, error: clientKeyRefusal }));
         return;
       }
+      const ssoRefusal = sso && req.method === 'POST' ? SSO_REFUSED_PATHS.get(req.url || '') : undefined;
+      if (ssoRefusal) { json(res, 403, { ok: false, error: ssoRefusal }); return; }
 
       // Forward-proxy request (HTTP_PROXY): an absolute-form URL is a tool
       // proxying plain HTTP to some host. Account logic is only for hosts we
@@ -817,7 +854,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const fable = familyStatus(config, 'fable', familyStats.fable);
         const mythos = familyStatus(config, 'mythos', familyStats.mythos);
         const failover = failoverState.snapshot(failoverPolicy(config));
-        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient), fable, mythos, failover, tunnels: tunnelStats.snapshot(), upstreamPool: upstreamPoolStatus() }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient, sso), fable, mythos, failover, tunnels: tunnelStats.snapshot(), upstreamPool: upstreamPoolStatus() }, null, 2));
         return;
       }
 
@@ -885,16 +922,18 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           ? auth.client == null
           : isLocal && isSameOriginControlRequest(req) && isLocalHostHeader(req.headers.host ?? req.headers[':authority'], config.proxy?.host);
         if (req.method === 'GET') {
-          try { json(res, 200, { ...(await sh.getSettings()), canEdit: admin }); }
+          try { json(res, 200, { ...(await sh.getSettings()), canEdit: admin, ...(sso ? { ssoEditable: [...SSO_EDITABLE], ssoEditableAccount: [...SSO_EDITABLE_ACCOUNT] } : {}) }); }
           catch (err) { console.error('[TeamClaude] Settings read failed:', /** @type {Error} */ (err).message); json(res, 500, { error: 'settings unavailable; see the proxy log' }); }
           return;
         }
         if (!admin) { json(res, 403, { error: 'saving settings needs the shared proxy key (or the dashboard opened on the proxy\'s own host); a client key can only view them' }); return; }
         let changes;
         try { changes = JSON.parse((await readControlBody(req, 1024 * 1024)) || '{}'); } catch { json(res, 400, { error: 'body must be JSON (at most 1 MiB)' }); return; }
+        const forbidden = sso ? ssoForbiddenChanges(changes) : [];
+        if (forbidden.length) { json(res, 403, { ok: false, problems: forbidden.map((k) => `${k}: changing this needs the proxy key, not the SSO sign-in`) }); return; }
         try {
           const result = await sh.saveSettings(changes);
-          console.log(`[TeamClaude] Settings saved via UI: ${[...result.applied, ...result.needsRestart].join(', ') || 'no changes'}`);
+          console.log(`[TeamClaude] Settings saved ${viaWhom(req)}: ${[...result.applied, ...result.needsRestart].join(', ') || 'no changes'}`);
           emitActivity({ type: 'settings', applied: result.applied, needsRestart: result.needsRestart });
           json(res, 200, { ok: true, ...result });
         } catch (caught) {
@@ -918,7 +957,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           if (idx < 0) { json(res, 404, { error: `account "${name}" not found` }); return; }
           accountManager.setDisabled(idx, !!disabled);
           await hooks.persistAccountDisabled?.(name, !!disabled);
-          console.log(`[TeamClaude] Account "${name}" ${disabled ? 'disabled' : 'enabled'} via UI`);
+          console.log(`[TeamClaude] Account "${name}" ${disabled ? 'disabled' : 'enabled'} ${viaWhom(req)}`);
           emitActivity({ type: 'account', name, disabled: !!disabled });
           json(res, 200, { name, disabled: !!disabled });
         } catch (err) { json(res, 400, { error: err.message }); }
@@ -938,8 +977,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         try {
           const { name } = JSON.parse((await readControlBody(req)) || '{}');
           if (!name) { json(res, 400, { error: 'Missing "name"' }); return; }
-          const { authUrl } = await hooks.reauth.start(name);
-          console.log(`[TeamClaude] Reauth started for "${name}" via UI`);
+          // Strict for anyone but the key-holding operator: an entry with no
+          // stored identity would accept any sign-in (security review, 2026-10-26).
+          const { authUrl } = await hooks.reauth.start(name, { strict: !!(req.tcClient || req.tcSso) });
+          console.log(`[TeamClaude] Reauth started for "${name}" ${viaWhom(req)}`);
           emitActivity({ type: 'reauth', name });
           json(res, 200, { ok: true, authUrl });
         } catch (err) { json(res, err.status || 500, { error: err.message }); }
@@ -967,7 +1008,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // With no keys configured every caller is "authenticated" and the page
         // needs no key at all: nothing to hand over, and no slots to fill.
         const keysConfigured = !resolveClientAuth(config.proxy, undefined).ok;
-        if (!keysConfigured || !auth.ok || typeof clientKey !== 'string') { json(res, 400, { ok: false, error: 'present the key the dashboard should use (x-api-key)' }); return; }
+        if (!keysConfigured || !keyAuth.ok || typeof clientKey !== 'string') { json(res, 400, { ok: false, error: 'present the key the dashboard should use (x-api-key)' }); return; }
         const ticket = uiTickets.mint(clientKey);
         if (!ticket) { json(res, 429, { ok: false, error: 'too many unredeemed tickets; try again in a minute' }); return; }
         console.log('[TeamClaude] Dashboard ticket issued (launcher)');
@@ -993,7 +1034,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           // Logged below and written to the config: one plain line or nothing.
           if (name && !validAccountName(name.trim())) { json(res, 400, { error: 'a name is at most 128 characters, without control characters' }); return; }
           const { authUrl } = await hooks.addAccount.start({ name });
-          console.log(`[TeamClaude] Add account started via UI${name ? ` as "${name}"` : ''}`);
+          console.log(`[TeamClaude] Add account started ${viaWhom(req)}${name ? ` as "${name}"` : ''}`);
           emitActivity({ type: 'add-account', name: name || null });
           json(res, 200, { ok: true, authUrl });
         } catch (err) { const e = /** @type {{ status?: number, message: string }} */ (err); json(res, e.status || 500, { error: e.message }); }
@@ -1111,7 +1152,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // later the restart did not happen, so allow another try.
         setTimeout(() => { restartInFlight = false; }, RESTART_RETRY_MS).unref?.();
         if (method.kind === 'exit') {
-          console.log(`[TeamClaude] Restart requested via UI: exiting with status ${EXIT_FOR_RESTART} for the supervisor to restart`);
+          console.log(`[TeamClaude] Restart requested ${viaWhom(req)}: exiting with status ${EXIT_FOR_RESTART} for the supervisor to restart`);
           json(res, 200, { restarting: true });
           res.on('finish', () => setTimeout(() => (/** @type {any} */ (hooks).exitProcess || process.exit)(EXIT_FOR_RESTART), 250));
           return;
@@ -1119,7 +1160,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const started = await startRestartCommand(method.argv, { spawnFn: /** @type {any} */ (hooks).spawnFn });
         if (!started.ok) {
           restartInFlight = false;
-          console.error(`[TeamClaude] Restart via UI failed: ${started.error}`);
+          console.error(`[TeamClaude] Restart ${viaWhom(req)} failed: ${started.error}`);
           json(res, started.status || 500, { restarting: false, error: started.error });
           return;
         }
@@ -1448,6 +1489,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.end(JSON.stringify({ error: 'unknown teamclaude control route (check the path and the method)' }));
         return;
       }
+      // A dashboard sign-in never reaches the forwarder, whatever the path
+      // turned out to be: it carries no key and must spend no quota.
+      if (/** @type {any} */ (req).tcSso) { json(res, 404, { error: 'not a dashboard route' }); return; }
 
       return forward(req, res);
     } catch (err) {
@@ -1529,6 +1573,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // but it is a way to reach the upstream on this host's address and
       // bandwidth. A deployment on a public hostname hands that to anyone.
       const auth = resolveUpgradeAuth(req, socket, config.proxy, boundHost());
+      // SSO never opens a WebSocket; its headers are not relayed either.
+      stripFrontProxyHeaders(req.headers);
       if (!auth.ok) {
         // Logged as well as answered: a WebSocket client discards the status
         // line, so the 401 alone leaves an operator with a channel that is

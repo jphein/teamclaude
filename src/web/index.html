@@ -742,9 +742,14 @@
   // a full quota still holding an old key) cannot make the page send anything
   // but what the operator just typed.
   let pageKey = '';
+  // Set once a request without a key was answered: the SSO front proxy signs
+  // this page in, so no key is sent — not even one storage cannot forget.
+  let ssoSession = false;
+  let keylessTry = false; // that one try is in flight (concurrent 401s share it)
 
   function storedKey() {
     if (pageKey) return pageKey;
+    if (ssoSession) return '';
     try { return localStorage.getItem(KEY_STORAGE) || ''; } catch { return ''; }
   }
   // `sentKey` is the key the refused request carried. Requests are concurrent,
@@ -755,19 +760,62 @@
     pageKey = '';
     try { localStorage.removeItem(KEY_STORAGE); } catch { /* storage blocked */ }
     if (needKey) return;
+    // Behind the SSO front proxy the browser's session signs in a request that
+    // carries no key, so a refused saved key is no reason to ask yet: try once
+    // without one. Refused too (or no SSO in front), the key box comes up.
+    if (sentKey && !ssoSession) {
+      if (keylessTry) return;
+      keylessTry = true;
+      // Only a status reply that names the signed-in user counts: an expired
+      // session is a redirect to the sign-in page (refused here) or that page
+      // itself, never proof (xreview, 2026-10-26).
+      api('/teamclaude/status', { cache: 'no-store', redirect: 'error' }, '')
+        .then(r => (r.ok ? r.json() : null))
+        .then(d => {
+          keylessTry = false;
+          if (!(d && d.caller && typeof d.caller.sso === 'string' && d.caller.sso)) { askForKey(); return; }
+          ssoSession = true;
+          refresh(); connectActivity(); connectLogs();
+        }, () => { keylessTry = false; askForKey(); });
+      return;
+    }
+    askForKey();
+  }
+  function askForKey() {
+    if (needKey || pageKey) return;
     needKey = true;
     appEl.style.display = 'none';
     keyboxEl.style.display = 'block';
     keyInputEl.focus();
   }
-  async function api(path, init) {
-    const sent = storedKey();
-    const res = await fetch(path, withKey(init, sent));
+  async function api(path, init, sent = storedKey()) {
+    // Behind the SSO front proxy, a request without a key whose session has
+    // expired is redirected to the sign-in portal, which a fetch cannot follow
+    // (another origin): it would fail as a network error and every stream
+    // would retry forever. Caught as a redirect instead, it reloads the page,
+    // which goes through the portal — at most once a minute, so a front proxy
+    // that lets the page through but redirects its requests cannot loop it.
+    const res = await fetch(path, withKey(!sent ? { redirect: 'manual', ...init } : init, sent));
+    if (res.type === 'opaqueredirect') {
+      reloadForSignIn();
+      throw new Error('sign-in expired');
+    }
     if (res.status === 401) {
       onUnauthorized(sent);
       throw new Error('proxy key required');
     }
     return res;
+  }
+  function reloadForSignIn() {
+    const RELOAD_SLOT = 'teamclaude-dashboard-signin-reload';
+    let last = 0;
+    try { last = Number(sessionStorage.getItem(RELOAD_SLOT)) || 0; } catch { /* storage blocked */ }
+    const expired = () => showErr('The sign-in has expired: reload the page to sign in again.');
+    if (Date.now() - last < 60_000) { expired(); return; }
+    // Only a reload whose time is recorded can be limited: without storage the
+    // next page would read 0 and reload again, so ask instead.
+    try { sessionStorage.setItem(RELOAD_SLOT, String(Date.now())); } catch { expired(); return; }
+    try { location.reload(); } catch { /* no location: nothing to reload */ }
   }
   function unlock() {
     const v = keyInputEl.value.trim();
@@ -777,6 +825,7 @@
   // Take `v` as the key, exactly as if it had been typed into the key box.
   function useKey(v) {
     pageKey = v;
+    ssoSession = false;
     try { localStorage.setItem(KEY_STORAGE, v); } catch { /* storage blocked: pageKey carries it for this page */ }
     keyInputEl.value = '';
     needKey = false;

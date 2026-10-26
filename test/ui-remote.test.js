@@ -331,7 +331,11 @@ test('sseFrames parses complete events and keeps the partial tail', () => {
 test('an entered key wins over storage that still holds an old key and will not change', async () => {
   const page = await bootPage({ readOnlyStorage: 'stale-key' });
   const boot = page.take();
-  assert.ok(boot.every(f => f.key === 'stale-key'), 'boots with what storage holds');
+  // Boots with what storage holds; refused, it tries once with no key (an SSO
+  // session would answer) — refused as well, so the key box comes up.
+  const keyless = boot.filter(f => f.key === null);
+  assert.deepEqual(keyless.map(f => f.url), ['/teamclaude/status'], 'one keyless try');
+  assert.ok(boot.filter(f => f.key !== null).every(f => f.key === 'stale-key'), 'boots with what storage holds');
   assert.equal(page.elements.get('keybox').style.display, 'block');
   page.auto401 = false;
   await page.unlock('fresh-key');
@@ -353,7 +357,7 @@ test('script hashes are taken over LF-normalised text, as a browser computes the
 // Runs the real /ui scripts in a vm with a stub DOM, storage and fetch. Every
 // fetch is recorded with the key it carried; `auto401` answers each with a 401
 // at once, otherwise the call stays pending until the test settles it.
-async function bootPage({ storageThrows = false, readOnlyStorage = null, href = null, auto401 = true } = {}) {
+async function bootPage({ storageThrows = false, readOnlyStorage = null, href = null, auto401 = true, sessionThrows = false } = {}) {
   const html = injectUiHelpers(await readFile(UI, 'utf8'));
   const elements = new Map();
   const makeEl = (id) => {
@@ -387,13 +391,14 @@ async function bootPage({ storageThrows = false, readOnlyStorage = null, href = 
         setItem: (k, v) => store.set(k, String(v)),
         removeItem: (k) => store.delete(k),
       };
-  const page = { elements, store, fetches: [], auto401, replacedUrl: null };
+  const page = { elements, store, fetches: [], auto401, replacedUrl: null, reloads: 0, session: new Map() };
   const fetchStub = (url, init) => {
-    const call = { url, key: init?.headers?.['x-api-key'] ?? null, body: init?.body ?? null };
+    const call = { url, key: init?.headers?.['x-api-key'] ?? null, body: init?.body ?? null, redirect: init?.redirect ?? null };
     page.fetches.push(call);
     if (page.auto401) return Promise.resolve({ status: 401, ok: false, json: async () => ({}), body: null });
     return new Promise((resolve) => {
       call.answer = (status, payload = {}) => resolve({ status, ok: status < 300, json: async () => payload, body: null });
+      call.answerRaw = (r) => resolve(r);
     });
   };
   const ctx = vm.createContext({
@@ -403,7 +408,10 @@ async function bootPage({ storageThrows = false, readOnlyStorage = null, href = 
     // Only when a test names the address the page was opened at (the launcher).
     ...(href ? {
       URL,
-      location: { href },
+      location: { href, reload: () => { page.reloads++; } },
+      sessionStorage: sessionThrows
+        ? { getItem: () => { throw new Error('SecurityError'); }, setItem: () => { throw new Error('SecurityError'); } }
+        : { getItem: (k) => page.session.get(k) ?? null, setItem: (k, v) => page.session.set(k, String(v)) },
       history: { replaceState: (_s, _t, u) => { page.replacedUrl = u; } },
     } : {}),
   });
@@ -429,7 +437,7 @@ test('the /ui script sends no key on loopback, prompts on 401, then sends the ke
   // Every network call in the page script goes through api() (one raw fetch: api's own).
   const pageScript = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)][1][1];
   assert.equal(pageScript.match(/\bfetch\(/g).length, 1);
-  assert.match(pageScript, /await fetch\(path, withKey\(init, sent\)\)/);
+  assert.match(pageScript, /await fetch\(path, withKey\(!sent \? \{ redirect: 'manual', \.\.\.init \} : init, sent\)\)/);
 
   const page = await bootPage();
   // Boot: status + both streams, all keyless (a loopback page needs none).
@@ -461,8 +469,13 @@ test('a late 401 for an old key does not erase the key entered since', async () 
   await page.unlock('old-key');
   const oldCalls = page.take();
   assert.ok(oldCalls.every(f => f.key === 'old-key'));
-  // The operator rotates: a 401 on one call brings the prompt back…
+  // The operator rotates: a 401 on one call brings the prompt back — after one
+  // try without a key (an SSO session would have answered it), refused too…
   oldCalls[0].answer(401);
+  await page.settle();
+  const probe = page.take();
+  assert.deepEqual(probe.map(({ url, key }) => ({ url, key })), [{ url: '/teamclaude/status', key: null }]);
+  probe[0].answer(401);
   await page.settle();
   assert.equal(page.elements.get('keybox').style.display, 'block');
   assert.equal(page.store.has(KEY_STORAGE), false);
@@ -473,6 +486,79 @@ test('a late 401 for an old key does not erase the key entered since', async () 
   await page.settle();
   assert.equal(page.store.get(KEY_STORAGE), 'new-key', 'a refusal of the old key leaves the new one');
   assert.equal(page.elements.get('keybox').style.display, 'none');
+});
+
+test('behind SSO a stale saved key is dropped without asking: the page carries on keyless', async () => {
+  const page = await bootPage({ auto401: false });
+  page.take();
+  await page.unlock('stale-key');
+  const keyed = page.take();
+  keyed[0].answer(401);
+  await page.settle();
+  // One keyless try; the SSO session answers it, so no prompt, and the page
+  // reconnects without a key.
+  const probe = page.take();
+  assert.deepEqual(probe.map(({ url, key }) => ({ url, key })), [{ url: '/teamclaude/status', key: null }]);
+  probe[0].answer(200, { caller: { kind: 'operator', sso: 'jp' } });
+  await page.settle();
+  assert.notEqual(page.elements.get('keybox').style.display, 'block');
+  assert.equal(page.store.has(KEY_STORAGE), false, 'the stale key is gone');
+  const again = page.take();
+  assert.deepEqual(again.map(f => f.url).sort(), BOOT_URLS);
+  assert.ok(again.every(f => f.key === null), JSON.stringify(again));
+});
+
+test('signed in by SSO, the page sends no key — not even one read-only storage keeps returning', async () => {
+  const page = await bootPage({ readOnlyStorage: 'stale-key', auto401: false });
+  const boot = page.take();
+  assert.ok(boot.every(f => f.key === 'stale-key'));
+  boot[0].answer(401);
+  await page.settle();
+  const probe = page.take();
+  assert.deepEqual(probe.map(({ url, key }) => ({ url, key })), [{ url: '/teamclaude/status', key: null }]);
+  probe[0].answer(200, { caller: { kind: 'operator', sso: 'jp' } });
+  await page.settle();
+  const again = page.take();
+  assert.ok(again.length > 0);
+  assert.ok(again.every(f => f.key === null), JSON.stringify(again));
+});
+
+test('the keyless try refuses redirects, and a 200 that does not name an SSO user is not a sign-in', async () => {
+  const page = await bootPage({ auto401: false });
+  page.take();
+  await page.unlock('stale-key');
+  page.take()[0].answer(401);
+  await page.settle();
+  const probe = page.take();
+  assert.equal(probe.length, 1);
+  assert.equal(probe[0].redirect, 'error', 'an expired session redirects to the portal: that is a failure');
+  // The sign-in page itself (or a loopback status with no SSO) answers 200 too.
+  probe[0].answer(200, { caller: { kind: 'operator', client: null, refused: [] } });
+  await page.settle();
+  assert.equal(page.elements.get('keybox').style.display, 'block', 'the key box comes up');
+});
+
+test('a keyless page whose sign-in expired (a redirect to the portal) reloads once, not in a loop', async () => {
+  // The ordinary SSO page: a fresh browser, no key stored, nothing refused yet.
+  const page = await bootPage({ auto401: false, href: 'https://tc.realm.watch/ui' });
+  const calls = page.take();
+  assert.ok(calls.length > 0 && calls.every(c => c.key === null && c.redirect === 'manual'), JSON.stringify(calls));
+  const expired = () => ({ type: 'opaqueredirect', status: 0, ok: false, json: async () => ({}), body: null });
+  calls[0].answerRaw(expired());
+  await page.settle();
+  assert.equal(page.reloads, 1, 'reloads through the portal');
+  // Another one within the minute (a front proxy that lets the page through
+  // but redirects its requests) shows the error instead of reloading again.
+  calls[1].answerRaw(expired());
+  await page.settle();
+  assert.equal(page.reloads, 1, 'no reload loop');
+});
+
+test('with sessionStorage blocked an expired sign-in asks instead of reloading (a reload could not be limited)', async () => {
+  const page = await bootPage({ auto401: false, href: 'https://tc.realm.watch/ui', sessionThrows: true });
+  page.take()[0].answerRaw({ type: 'opaqueredirect', status: 0, ok: false, json: async () => ({}), body: null });
+  await page.settle();
+  assert.equal(page.reloads, 0);
 });
 
 test('with localStorage blocked the entered key still works for the page', async () => {

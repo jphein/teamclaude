@@ -144,6 +144,7 @@ test('every account out of quota: served by the local model at once, tagged and 
     const body = await res.json();
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('x-teamclaude-failover'), `local/${LOCAL}`);
+    assert.equal(res.headers.get('content-type'), 'application/json');
     assert.equal(body.model, FAILOVER_LABEL, 'agents can see they are on the local model');
     assert.equal(body.content[0].text, `${failoverWarning(LOCAL)}\n\n`, 'the warning is the first thing in the answer');
     assert.ok(body.content.every((b) => b.type === 'text'), 'the stand-in\'s tool call reached the client as text only');

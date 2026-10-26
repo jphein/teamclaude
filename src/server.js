@@ -3461,7 +3461,8 @@ async function serveFromFailover(req, res, body, ctx) {
     const who = ctx.client ? `"${safeLine(ctx.client, 64)}"` : '(shared key)';
     console.log(`[TeamClaude] FAILOVER: no Claude account can serve — served by local model "${safeLine(p.model, 64)}" for ${who}${ctx.families?.fable?.allowedClient ? ' (a Fable-allowed client: JP\'s own session is on the local model)' : ''}`);
     res.writeHead(200, {
-      'Content-Type': contentType,
+      // A whole answer was rebuilt as JSON here, whatever the local server called it.
+      'Content-Type': whole != null ? 'application/json' : contentType,
       'x-teamclaude-failover': `local/${p.model}`,
       'Cache-Control': 'no-cache',
     });

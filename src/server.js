@@ -718,8 +718,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // operator — on /teamclaude/* only. The front proxy's headers are then
       // dropped, so nothing below can relay them.
       const keyAuth = resolveClientAuth(config.proxy, clientKey);
-      const sso = keyAuth.ok ? null : ssoUser(req, config.proxy);
+      // Never on a path with dot-segments: the SSO scope is a prefix test, and
+      // such a path means one thing here and another wherever it is resolved.
+      const sso = keyAuth.ok || hasDotSegment(req.url) ? null : ssoUser(req, config.proxy);
       stripFrontProxyHeaders(req.headers);
+      req.tcSso = sso;
       const auth = sso ? { ok: true, client: null } : keyAuth;
       if (!auth.ok && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -1460,6 +1463,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.end(JSON.stringify({ error: 'unknown teamclaude control route (check the path and the method)' }));
         return;
       }
+      // A dashboard sign-in never reaches the forwarder, whatever the path
+      // turned out to be: it carries no key and must spend no quota.
+      if (/** @type {any} */ (req).tcSso) { json(res, 404, { error: 'not a dashboard route' }); return; }
 
       return forward(req, res);
     } catch (err) {

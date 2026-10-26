@@ -167,6 +167,46 @@ test('the front proxy\'s headers are never relayed upstream', async () => {
   } finally { up.close(); }
 });
 
+/** One raw HTTP/1.1 request, exactly as written (fetch would normalise the path). */
+const rawGet = (port, path, extra = '') => new Promise((resolve, reject) => {
+  const s = net.connect(port, '127.0.0.1', () => s.end(`GET ${path} HTTP/1.1\r\nHost: x\r\nSec-Fetch-Site: same-origin\r\nX-Teamclaude-Sso: ${SECRET}\r\nRemote-User: jp\r\n${extra}Connection: close\r\n\r\n`));
+  let buf = ''; s.on('data', (d) => { buf += d; }); s.on('end', () => resolve(buf)); s.on('error', reject);
+});
+
+test('a dot-segment path is never signed in, and nothing SSO-admitted reaches the forwarder', async () => {
+  let hits = 0;
+  const up = (await import('node:http')).createServer((rq, rs) => { hits++; rs.end('{}'); });
+  const upPort = await listen(up);
+  try {
+    await plain({ ...SSO, requireTls: false }, async ({ port }) => {
+      assert.match(await rawGet(port, '/teamclaude/status'), /^HTTP\/1\.1 200/, 'positive control');
+      for (const p of ['/teamclaude/../v1/messages', '/teamclaude/%2e%2e/v1/messages', '/teamclaude/..%2fv1/messages', '/teamclaude/../teamclaude/mcp', '/teamclaude/./status']) {
+        assert.match(await rawGet(port, p), /^HTTP\/1\.1 401/, p);
+      }
+      assert.match(await rawGet(port, '/teamclaude/no-such-route'), /^HTTP\/1\.1 404/);
+    }, undefined, `http://127.0.0.1:${upPort}`);
+    assert.equal(hits, 0, 'the upstream was never reached');
+  } finally { up.close(); }
+});
+
+test('a WebSocket upgrade relays none of the front proxy\'s headers', async () => {
+  const seen = [];
+  const up = (await import('node:http')).createServer();
+  up.on('upgrade', (rq, sock) => { seen.push(rq.headers); sock.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); });
+  const upPort = await listen(up);
+  try {
+    await plain({ ...SSO, requireTls: false }, async ({ port }) => {
+      await new Promise((resolve, reject) => {
+        const s = net.connect(port, '127.0.0.1', () => s.write(`GET /v1/sessions/ws HTTP/1.1\r\nHost: x\r\nX-Api-Key: shared-k\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nX-Teamclaude-Sso: ${SECRET}\r\nRemote-User: jp\r\nRemote-Groups: admins\r\n\r\n`));
+        s.on('data', () => s.destroy()); s.on('close', resolve); s.on('error', reject);
+        setTimeout(() => s.destroy(), 3000);
+      });
+    }, undefined, `http://127.0.0.1:${upPort}`);
+    assert.equal(seen.length, 1, 'the handshake reached the stub upstream');
+    for (const h of ['x-teamclaude-sso', 'remote-user', 'remote-groups']) assert.equal(seen[0][h], undefined, h);
+  } finally { up.close(); }
+});
+
 test('duplicate Remote-User lines on the wire are refused', async () => {
   await plain({ ...SSO, requireTls: false }, async ({ port }) => {
     const raw = await new Promise((resolve, reject) => {

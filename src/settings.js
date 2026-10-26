@@ -508,6 +508,24 @@ function problemFor(f, v, cfg) {
   return f.check ? f.check(v, cfg) : null;
 }
 
+/**
+ * The settings a save would change that are marked `danger` — where traffic or
+ * tokens go, or what program runs. A dashboard SSO sign-in may not save these
+ * (server.js): only the shared proxy key may. Listed by key; an account field
+ * as `accounts[].<field>`.
+ * @param {{ set?: Record<string, any>, accounts?: any[] }} changes
+ * @returns {string[]}
+ */
+export function dangerousChanges(changes) {
+  const byKey = new Map(FIELDS.map((f) => [f.key, f]));
+  const out = Object.keys(changes?.set || {}).filter((k) => byKey.get(k)?.danger);
+  const acctDanger = ACCOUNT_FIELDS.filter((f) => f.danger).map((f) => f.key);
+  for (const a of Array.isArray(changes?.accounts) ? changes.accounts : []) {
+    for (const k of acctDanger) if (isObj(a) && k in a && !out.includes(`accounts[].${k}`)) out.push(`accounts[].${k}`);
+  }
+  return out;
+}
+
 /** Thrown with every problem a save had, so the UI can show them all at once. */
 export class SettingsError extends Error {
   /** @param {string[]} problems */

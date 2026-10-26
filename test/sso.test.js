@@ -107,7 +107,10 @@ test('over plain HTTP with requireTls off: SSO is the operator on the dashboard 
   await plain({ ...SSO, requireTls: false }, async ({ call }) => {
     const st = await call('/teamclaude/status', { headers: HOP });
     assert.equal(st.status, 200);
-    assert.deepEqual((await st.json()).caller, { kind: 'operator', client: null, refused: [], sso: 'jp' });
+    const caller = (await st.json()).caller;
+    assert.equal(caller.kind, 'operator');
+    assert.equal(caller.sso, 'jp');
+    assert.ok(caller.refused.includes('/teamclaude/add-account'), 'what SSO may not do is listed, so the page hides it');
     assert.equal((await (await call('/teamclaude/settings', { headers: HOP })).json()).canEdit, true, 'the operator may edit settings');
     // An operator-only control passes every gate (404: no such account).
     const acct = await call('/teamclaude/account', { method: 'POST', headers: { ...HOP, 'sec-fetch-site': 'same-origin' }, body: JSON.stringify({ name: 'zz', disabled: true }) });
@@ -117,8 +120,8 @@ test('over plain HTTP with requireTls off: SSO is the operator on the dashboard 
     assert.equal(v1.status, 401);
     // A ticket carries a key into /ui; an SSO sign-in has none to hand over —
     // nor does a stale key that rode along with it.
-    assert.equal((await call('/teamclaude/ui-ticket', { method: 'POST', headers: HOP })).status, 400);
-    assert.equal((await call('/teamclaude/ui-ticket', { method: 'POST', headers: { ...HOP, 'x-api-key': 'stale' } })).status, 400);
+    assert.equal((await call('/teamclaude/ui-ticket', { method: 'POST', headers: HOP })).status, 403);
+    assert.equal((await call('/teamclaude/ui-ticket', { method: 'POST', headers: { ...HOP, 'x-api-key': 'stale' } })).status, 403);
     // A page on a sibling site rides the parent-domain cookie: not signed in, reads included.
     assert.equal((await call('/teamclaude/status', { headers: { ...HOP, origin: 'https://plan.realm.watch', 'sec-fetch-site': 'same-site' } })).status, 401);
     assert.equal((await call('/teamclaude/account', { method: 'POST', headers: { ...HOP, origin: 'https://plan.realm.watch', 'sec-fetch-site': 'same-site' }, body: '{}' })).status, 401);
@@ -126,6 +129,40 @@ test('over plain HTTP with requireTls off: SSO is the operator on the dashboard 
     assert.equal((await call('/teamclaude/status', { headers: { ...HOP, 'x-teamclaude-sso': 'x'.repeat(32) } })).status, 401);
     assert.equal((await call('/teamclaude/status', { headers: { ...HOP, 'remote-user': 'mallory' } })).status, 401);
   }, settings);
+});
+
+test('an SSO sign-in may not change danger settings or add accounts; the key still may', async () => {
+  const saved = [];
+  const settings = { getSettings: async () => ({}), saveSettings: async (c) => { saved.push(c); return { applied: Object.keys(c.set || {}), needsRestart: [] }; } };
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => { logs.push(a.join(' ')); };
+  try {
+    await plain({ ...SSO, requireTls: false }, async ({ call }) => {
+      const post = (path, body, headers = HOP) => call(path, { method: 'POST', headers: { ...headers, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      const st = await (await call('/teamclaude/status', { headers: HOP })).json();
+      assert.deepEqual(st.caller.refused.sort(), ['/teamclaude/add-account', '/teamclaude/add-account/cancel', '/teamclaude/add-account/code', '/teamclaude/ui-ticket']);
+      assert.equal((await (await call('/teamclaude/settings', { headers: HOP })).json()).dangerNeedsKey, true);
+      for (const body of [
+        { set: { 'service.restart': { command: ['/bin/true'] } } },
+        { set: { upstream: 'https://evil.example' } },
+        { set: { 'proxy.sso.users': ['mallory'] } },
+        { set: { switchThreshold: 0.9, 'proxy.apiKey': 'x'.repeat(40) } },
+        { accounts: [{ id: 'a', upstream: 'https://evil.example' }] },
+      ]) {
+        const r = await post('/teamclaude/settings', body);
+        assert.equal(r.status, 403, JSON.stringify(body));
+      }
+      assert.equal(saved.length, 0, 'nothing dangerous was saved');
+      // An ordinary setting is fine, and the log names the SSO user.
+      assert.equal((await post('/teamclaude/settings', { set: { switchThreshold: 0.9 } })).status, 200);
+      assert.ok(logs.some((l) => /Settings saved via SSO as "jp": switchThreshold/.test(l)), logs.join('|'));
+      assert.equal((await post('/teamclaude/add-account', {})).status, 403);
+      // The shared key may do both.
+      const keyed = { 'x-api-key': 'shared-k' };
+      assert.equal((await post('/teamclaude/settings', { set: { upstream: 'https://api.anthropic.com' } }, keyed)).status, 200);
+    }, settings);
+  } finally { console.log = orig; }
 });
 
 test('a valid key still decides: a client key with SSO headers stays that client', async () => {

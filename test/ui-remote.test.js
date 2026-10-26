@@ -391,13 +391,14 @@ async function bootPage({ storageThrows = false, readOnlyStorage = null, href = 
         setItem: (k, v) => store.set(k, String(v)),
         removeItem: (k) => store.delete(k),
       };
-  const page = { elements, store, fetches: [], auto401, replacedUrl: null };
+  const page = { elements, store, fetches: [], auto401, replacedUrl: null, reloads: 0 };
   const fetchStub = (url, init) => {
     const call = { url, key: init?.headers?.['x-api-key'] ?? null, body: init?.body ?? null, redirect: init?.redirect ?? null };
     page.fetches.push(call);
     if (page.auto401) return Promise.resolve({ status: 401, ok: false, json: async () => ({}), body: null });
     return new Promise((resolve) => {
       call.answer = (status, payload = {}) => resolve({ status, ok: status < 300, json: async () => payload, body: null });
+      call.answerRaw = (r) => resolve(r);
     });
   };
   const ctx = vm.createContext({
@@ -407,7 +408,7 @@ async function bootPage({ storageThrows = false, readOnlyStorage = null, href = 
     // Only when a test names the address the page was opened at (the launcher).
     ...(href ? {
       URL,
-      location: { href },
+      location: { href, reload: () => { page.reloads++; } },
       history: { replaceState: (_s, _t, u) => { page.replacedUrl = u; } },
     } : {}),
   });
@@ -433,7 +434,7 @@ test('the /ui script sends no key on loopback, prompts on 401, then sends the ke
   // Every network call in the page script goes through api() (one raw fetch: api's own).
   const pageScript = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)][1][1];
   assert.equal(pageScript.match(/\bfetch\(/g).length, 1);
-  assert.match(pageScript, /await fetch\(path, withKey\(init, sent\)\)/);
+  assert.match(pageScript, /await fetch\(path, withKey\(ssoSession && !sent \? \{ redirect: 'manual', \.\.\.init \} : init, sent\)\)/);
 
   const page = await bootPage();
   // Boot: status + both streams, all keyless (a loopback page needs none).
@@ -532,6 +533,21 @@ test('the keyless try refuses redirects, and a 200 that does not name an SSO use
   probe[0].answer(200, { caller: { kind: 'operator', client: null, refused: [] } });
   await page.settle();
   assert.equal(page.elements.get('keybox').style.display, 'block', 'the key box comes up');
+});
+
+test('signed in by SSO, an expired session (a redirect to the portal) reloads the page instead of retrying forever', async () => {
+  const page = await bootPage({ auto401: false, href: 'https://tc.realm.watch/ui' });
+  page.take();
+  await page.unlock('stale-key');
+  page.take()[0].answer(401);
+  await page.settle();
+  page.take()[0].answer(200, { caller: { kind: 'operator', sso: 'jp' } });
+  await page.settle();
+  const calls = page.take();
+  assert.ok(calls.length > 0 && calls.every(c => c.redirect === 'manual'), JSON.stringify(calls));
+  calls[0].answerRaw({ type: 'opaqueredirect', status: 0, ok: false, json: async () => ({}), body: null });
+  await page.settle();
+  assert.equal(page.reloads, 1);
 });
 
 test('with localStorage blocked the entered key still works for the page', async () => {

@@ -789,7 +789,15 @@
     keyInputEl.focus();
   }
   async function api(path, init, sent = storedKey()) {
-    const res = await fetch(path, withKey(init, sent));
+    // Signed in by SSO, an expired session answers with a redirect to the
+    // sign-in portal, which a fetch cannot follow (another origin): it would
+    // fail as a network error and every stream would retry forever. Caught as
+    // a redirect instead, it reloads the page, which goes through the portal.
+    const res = await fetch(path, withKey(ssoSession && !sent ? { redirect: 'manual', ...init } : init, sent));
+    if (res.type === 'opaqueredirect') {
+      try { location.reload(); } catch { /* no location: nothing to reload */ }
+      throw new Error('sign-in expired');
+    }
     if (res.status === 401) {
       onUnauthorized(sent);
       throw new Error('proxy key required');

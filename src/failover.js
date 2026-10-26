@@ -172,7 +172,10 @@ export function failoverEligibility(a) {
   if (a.method !== 'POST' || !/^\/v1\/messages(\?|$)/.test(a.url || '')) return { ok: false, why: 'not a messages request' };
   if (a.provider && a.provider !== 'anthropic') return { ok: false, why: 'not an Anthropic request' };
   if (a.pinned) return { ok: false, why: 'pinned to one account' };
-  if (a.client && policy.excludeClients?.includes(a.client)) return { ok: false, why: `client "${a.client}" is excluded from failover` };
+  // Named as everywhere else (fable.allow): a client-key name, or "(shared key)"
+  // for the shared proxy key and key-less loopback.
+  const who = a.client || '(shared key)';
+  if (policy.excludeClients?.includes(who)) return { ok: false, why: `client "${who}" is excluded from failover` };
   if (a.contentEncoding && a.contentEncoding !== 'identity') return { ok: false, why: 'compressed body' };
   if (!a.allQuota && a.unservableMs < policy.afterSeconds * 1000) return { ok: false, why: `fleet unservable for ${Math.round(a.unservableMs / 1000)}s < ${policy.afterSeconds}s` };
   // Best effort, not a guarantee (see estimateInputTokens). A request that
@@ -209,6 +212,7 @@ export function bodyForFailover(body, model, contextTokens = 131072, inputTokens
   delete obj.tools;
   delete obj.tool_choice;
   delete obj.mcp_servers;
+  delete obj.container;
   flattenToolBlocks(obj);
   obj.system = withStandInNote(obj.system, model);
   return Buffer.from(JSON.stringify(obj), 'utf8');

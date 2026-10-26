@@ -146,6 +146,8 @@ test('every account out of quota: served by the local model at once, tagged and 
     assert.equal(res.headers.get('x-teamclaude-failover'), `local/${LOCAL}`);
     assert.equal(body.model, FAILOVER_LABEL, 'agents can see they are on the local model');
     assert.equal(body.content[0].text, `${failoverWarning(LOCAL)}\n\n`, 'the warning is the first thing in the answer');
+    assert.ok(body.content.every((b) => b.type === 'text'), 'the stand-in\'s tool call reached the client as text only');
+    assert.notEqual(body.stop_reason, 'tool_use');
     assert.equal(t.localSeen[0].body.model, LOCAL);
     assert.equal(t.localSeen[0].auth, 'lk');
     assert.ok(t.logs.some((l) => /FAILOVER: no Claude account can serve — served by local model "qwen36-coder"/.test(l)), t.logs.join('\n'));
@@ -415,7 +417,10 @@ test('policy: excludeClients takes names only; eligibility refuses an excluded c
   const base = { policy, state: { inFlight: 0 }, method: 'POST', url: '/v1/messages', allQuota: true, unservableMs: 0, bodyBytes: 10 };
   assert.deepEqual(failoverEligibility({ ...base, client: 'familiar' }), { ok: false, why: 'client "familiar" is excluded from failover' });
   assert.equal(failoverEligibility({ ...base, client: 'jp-wakizashi' }).ok, true);
-  assert.equal(failoverEligibility({ ...base, client: null }).ok, true, 'the shared key is not a client');
+  assert.equal(failoverEligibility({ ...base, client: null }).ok, true, 'the shared key is not excluded unless named');
+  const shared = failoverPolicy({ failover: { enabled: true, url: 'http://x', excludeClients: ['(shared key)'] } });
+  assert.deepEqual(failoverEligibility({ ...base, policy: shared, client: null }), { ok: false, why: 'client "(shared key)" is excluded from failover' });
+  assert.equal(failoverEligibility({ ...base, policy: shared, client: 'familiar' }).ok, true);
 });
 
 test('end to end, streamed: the client sees the warning first; the local model never saw a tool', async () => {

@@ -59,8 +59,10 @@ test('every config key the code reads has a Settings entry', async () => {
   }
   assert.ok(seen.size > 25, `scan found only ${seen.size} keys — did the code stop using config.X?`);
   // A nested key matched without its sub-key ("config.proxy" alone) is fine;
-  // a nested key's own members are covered by matching the prefix.
-  const missing = [...seen].filter(([k]) => !KEYS.has(k) && !NESTED.includes(k)).map(([k, f]) => `${k} (${f})`);
+  // a nested key's own members are covered by matching the prefix, and so is
+  // a section whose fields are listed one by one (proxy.sso → proxy.sso.users …).
+  const section = (k) => [...KEYS].some(x => x.startsWith(`${k}.`));
+  const missing = [...seen].filter(([k]) => !KEYS.has(k) && !NESTED.includes(k) && !section(k)).map(([k, f]) => `${k} (${f})`);
   assert.deepEqual(missing, [], `read by the code but missing from src/settings.js FIELDS: ${missing.join(', ')}`);
 });
 
@@ -393,4 +395,14 @@ test('same-destination check uses the URL parser (backslash quirks cannot fake a
   assert.throws(() => applySettingsChanges(c, { set: { upstreamProxy: `socks5://${MASK}@proxy.example\\relay.attacker.example` } }), /destination changed/);
   const h = { upstreamProxy: 'http://user:zzS@squid:3128/a', accounts: [] };
   assert.throws(() => applySettingsChanges(h, { set: { upstreamProxy: `http://${MASK}@squid:3128\\@evil.example` } }), /destination changed|retype/);
+});
+
+test('every hot proxy.* setting is re-read by the reload path', async () => {
+  // A field marked hot that the reload never copies only applies after a
+  // restart while the dashboard says otherwise (proxy.sso, 2026-10-26).
+  const { FIELDS } = await import('../src/settings.js');
+  const src = await readFile(join(ROOT, 'src', 'index.js'), 'utf8');
+  const missing = [...new Set(FIELDS.filter(f => f.apply === 'hot' && f.key.startsWith('proxy.')).map(f => f.key.split('.')[1]))]
+    .filter(sub => !new RegExp(`config\\.proxy\\.${sub} = diskConfig\\.proxy\\??\\.${sub}`).test(src));
+  assert.deepEqual(missing, [], `hot in settings.js but not re-read on reload: ${missing.map(s => 'proxy.' + s).join(', ')}`);
 });

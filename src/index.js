@@ -578,6 +578,9 @@ async function serverCommand() {
       // The shared key is read per request too, so a rotated key on disk
       // takes effect on reload the same way.
       config.proxy.apiKey = diskConfig.proxy.apiKey;
+      // Dashboard SSO (sso.js) is read per request too: a reload turns it on,
+      // rotates its hop secret or narrows its users without a restart.
+      config.proxy.sso = diskConfig.proxy.sso;
     }
     // The MCP endpoint's mode: read per request, so this is what opens,
     // narrows or closes it without a restart. Outside the guard above on

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
-import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, FailoverState, createFailoverRewriter, failoverWarning, standInNote, FAILOVER_LABEL } from '../src/failover.js';
+import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, FailoverState, createFailoverRewriter, rewriteFailoverJson, failoverWarning, standInNote, FAILOVER_LABEL } from '../src/failover.js';
 
 // Local-model failover (JP, 2026-10-12): when no Claude account can serve,
 // answer from the local model instead of stopping; back to Claude as soon as
@@ -88,6 +88,7 @@ async function setup({ failover = {}, exhausted = true, localStatus = 200, claud
       localSeen.push({ body: JSON.parse(raw), auth: req.headers['x-api-key'] ?? null });
       if (localMode === 'redirect') { res.writeHead(307, { location: redirectTo }); res.end(); return; }
       if (localMode === 'cut') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write('event: message_start\ndata: {"type":"message_start"}\n\n'); setTimeout(() => res.socket.destroy(), 50); return; }
+      if (localMode === 'garbage') { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('I posted to #events and added Sam to the group.'); return; }
       if (localMode === 'sse') {
         res.writeHead(200, { 'content-type': 'text/event-stream' });
         for (const [type, data] of SSE_EVENTS) res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -356,8 +357,8 @@ const parseSse = (text) => text.split('\n\n').filter(Boolean).map((ev) => {
 
 test('the rewriter puts the warning first in a stream, shifts the real blocks, relabels the model — however the bytes are split', () => {
   const raw = SSE_EVENTS.map(([t, d]) => `event: ${t}\ndata: ${JSON.stringify(d)}\n\n`).join('');
-  const whole = (() => { const r = createFailoverRewriter(LOCAL, 'text/event-stream'); return r.push(raw) + r.end(); })();
-  const bytewise = (() => { const r = createFailoverRewriter(LOCAL, 'text/event-stream; charset=utf-8'); let o = ''; for (const ch of raw) o += r.push(ch); return o + r.end(); })();
+  const whole = (() => { const r = createFailoverRewriter(LOCAL); return r.push(raw) + r.end(); })();
+  const bytewise = (() => { const r = createFailoverRewriter(LOCAL); let o = ''; for (const ch of raw) o += r.push(ch); return o + r.end(); })();
   assert.equal(bytewise, whole, 'chunk boundaries do not matter');
   const ev = parseSse(whole);
   assert.equal(ev[0].data.message.model, FAILOVER_LABEL);
@@ -368,15 +369,17 @@ test('the rewriter puts the warning first in a stream, shifts the real blocks, r
   assert.deepEqual(ev.slice(7).map((e) => e.type), ['message_delta', 'message_stop']);
 });
 
-test('the rewriter prepends the warning to a JSON answer and leaves an error alone', () => {
-  const r = createFailoverRewriter(LOCAL, 'application/json');
-  r.push(JSON.stringify({ type: 'message', model: LOCAL, content: [{ type: 'text', text: 'hi' }] }));
-  const out = JSON.parse(r.end());
+test('a JSON answer: warning first, model relabelled, any tool call turned to text; anything else is refused (null)', () => {
+  const out = JSON.parse(rewriteFailoverJson(LOCAL, JSON.stringify({ type: 'message', model: LOCAL, stop_reason: 'tool_use',
+    content: [{ type: 'text', text: 'hi' }, { type: 'tool_use', id: 't', name: 'Bash', input: { command: 'rm -rf /' } }] })));
   assert.equal(out.model, FAILOVER_LABEL);
-  assert.deepEqual(out.content.map((b) => b.text), [`${failoverWarning(LOCAL)}\n\n`, 'hi']);
-  const e = createFailoverRewriter(LOCAL, 'application/json');
-  e.push('{"type":"error","error":{"type":"x"}}');
-  assert.deepEqual(JSON.parse(e.end()), { type: 'error', error: { type: 'x' } });
+  assert.deepEqual(out.content.map((b) => b.type), ['text', 'text', 'text'], 'no tool_use reaches the client');
+  assert.equal(out.content[0].text, `${failoverWarning(LOCAL)}\n\n`);
+  assert.equal(out.content[2].text, '[the stand-in tried to call Bash; nothing ran]');
+  assert.equal(out.stop_reason, 'end_turn');
+  for (const bad of ['not json', '{"type":"error","error":{"type":"x"}}', '[]', '{"type":"message"}', 'I posted to #events.']) {
+    assert.equal(rewriteFailoverJson(LOCAL, bad), null, bad);
+  }
 });
 
 test('bodyForFailover: no tools, earlier tool traffic as plain text, and the stand-in note in the system prompt', () => {
@@ -438,5 +441,69 @@ test('an excluded client gets the honest no-capacity answer, never a stand-in', 
     assert.ok(t.logs.some((l) => /failover not used: client "familiar" is excluded/.test(l)), t.logs.join('\n'));
     const other = await t.post(MSG);
     assert.equal(other.status, 200, 'the shared key still gets the stand-in');
+  } finally { t.close(); }
+});
+
+// ── fail-closed (cross-vendor review, 2026-10-25) ─────────────────────────
+
+const runSse = (raw, split = null) => {
+  const r = createFailoverRewriter(LOCAL);
+  if (!split) return r.push(raw) + r.end();
+  let o = ''; for (let i = 0; i < raw.length; i += split) o += r.push(raw.slice(i, i + split)); return o + r.end();
+};
+
+test('CRLF framing split at every possible boundary still yields the warning and the same output', () => {
+  const lf = SSE_EVENTS.map(([t, d]) => `event: ${t}\ndata: ${JSON.stringify(d)}\n\n`).join('');
+  const crlf = lf.replace(/\n/g, '\r\n');
+  const want = runSse(lf);
+  for (let cut = 1; cut < crlf.length; cut++) {
+    const r = createFailoverRewriter(LOCAL);
+    const got = r.push(crlf.slice(0, cut)) + r.push(crlf.slice(cut)) + r.end();
+    assert.equal(got, want, `split at ${cut}`);
+  }
+});
+
+test('a stream with no message_start still opens with the warning, and its blocks are shifted', () => {
+  const ev = parseSse(runSse(SSE_EVENTS.slice(1).map(([t, d]) => `event: ${t}\ndata: ${JSON.stringify(d)}\n\n`).join('')));
+  assert.equal(ev[1].data.delta.text, `${failoverWarning(LOCAL)}\n\n`);
+  assert.equal(ev[4].data.delta.text, 'I posted to #events.');
+  assert.equal(ev[4].data.index, 1);
+});
+
+test('an event whose data is not JSON is dropped, never passed through', () => {
+  const out = runSse('event: message_start\ndata: ' + JSON.stringify(SSE_EVENTS[0][1]) + '\n\nevent: content_block_delta\ndata: I posted to #events {broken\n\n: comment\n\n');
+  assert.doesNotMatch(out, /I posted/);
+  assert.match(out, /FAILOVER/);
+});
+
+test('a tool call in the stream reaches the client as text: input dropped, stop_reason end_turn', () => {
+  const events = [
+    SSE_EVENTS[0],
+    ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'x', name: 'SlackPost', input: {} } }],
+    ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"channel":"#events"' } }],
+    ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+    ['message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 3 } }],
+    ['message_stop', { type: 'message_stop' }],
+  ];
+  const out = runSse(events.map(([t, d]) => `event: ${t}\ndata: ${JSON.stringify(d)}\n\n`).join(''), 7);
+  assert.doesNotMatch(out, /tool_use"|input_json_delta|#events/);
+  const ev = parseSse(out);
+  const block = ev.find((e) => e.type === 'content_block_start' && e.data.index === 1);
+  assert.equal(block.data.content_block.type, 'text');
+  assert.ok(ev.some((e) => e.data.delta?.text === '[the stand-in tried to call SlackPost; nothing ran]'));
+  assert.equal(ev.find((e) => e.type === 'message_delta').data.delta.stop_reason, 'end_turn');
+});
+
+test('an event larger than the limit stops the stream rather than being held', () => {
+  const r = createFailoverRewriter(LOCAL);
+  assert.throws(() => r.push('data: ' + 'x'.repeat(1024 * 1024 + 10)), /size limit/);
+});
+
+test('end to end: a local answer that is not a message gets the usual 429, never a 200', async () => {
+  const t = await setup({ localStatus: 200, localMode: 'garbage' });
+  try {
+    const res = await t.post(MSG);
+    assert.equal(res.status, 429);
+    assert.equal(res.headers.get('x-teamclaude-failover'), null);
   } finally { t.close(); }
 });

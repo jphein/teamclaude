@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { validName as validAccountName } from './add-account.js';
-import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, countLocalTokens, estimateInputTokens, MIN_ANSWER_TOKENS, FailoverState, createFailoverRewriter } from './failover.js';
+import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, countLocalTokens, estimateInputTokens, MIN_ANSWER_TOKENS, FailoverState, createFailoverRewriter, rewriteFailoverJson, FAILOVER_JSON_LIMIT } from './failover.js';
 import { FableStats } from './fable-policy.js';
 import { TunnelStats } from './tunnel-stats.js';
 import { FAMILIES, familyPolicy, rewriteFamilyBody, familyModelIn, isFamilyModel, clientAllowed, FamilyStats, isFamilyRefusal } from './family-policy.js';
@@ -3370,6 +3370,23 @@ async function maybeFailover(req, res, body, ctx, accountManager, { immediate })
 }
 
 /**
+ * A response body as text, or null past `limit` bytes (the body is cancelled).
+ * @param {Response} r @param {number} limit @param {AbortSignal} signal
+ */
+async function readBounded(r, limit, signal) {
+  if (!r.body) return '';
+  const decoder = new TextDecoder();
+  let text = ''; let bytes = 0;
+  for await (const chunk of r.body) {
+    if (signal.aborted) throw new Error('timed out reading the local answer');
+    bytes += chunk.length;
+    if (bytes > limit) { await r.body.cancel().catch(() => {}); return null; }
+    text += decoder.decode(chunk, { stream: true });
+  }
+  return text + decoder.decode();
+}
+
+/**
  * Serve one request from the local failover model. Returns false — having
  * written nothing — when the local server cannot be reached or answers with an
  * error, so the caller falls back to today's 429 (a client is better served by
@@ -3420,23 +3437,47 @@ async function serveFromFailover(req, res, body, ctx) {
       console.error(`[TeamClaude] Failover: the local model answered ${r.status}; answering 429 instead`);
       return false;
     }
+    const contentType = r.headers.get('content-type') || 'application/json';
+    const streamed = /text\/event-stream/i.test(contentType);
+    // A whole (non-SSE) answer is read and checked BEFORE any header goes out:
+    // one that is not a usable message becomes the usual 429, so nothing
+    // without the warning ever reaches the client.
+    let whole = null;
+    if (!streamed) {
+      const text = await readBounded(r, FAILOVER_JSON_LIMIT, signal).catch(() => null);
+      whole = text == null ? null : rewriteFailoverJson(p.model, text);
+      // Recorded either way, as the stream path does: the fail-back repair keys
+      // on the ids the local model wrote, whatever reached the client.
+      if (text != null) st.noteLocalToolIds(text);
+      if (whole == null) {
+        st.refused++;
+        console.error(`[TeamClaude] Failover: the local model's answer was not a usable message (${safeLine(contentType, 60)}); answering 429 instead`);
+        return false;
+      }
+    }
     st.served++; st.lastAt = Date.now(); st.lastClient = ctx.client ?? null;
     st.noteServedSession(ctx.sessionId);
     ctx.status = 200; ctx.account = `(failover: ${p.model})`; ctx.model = p.model;
     const who = ctx.client ? `"${safeLine(ctx.client, 64)}"` : '(shared key)';
     console.log(`[TeamClaude] FAILOVER: no Claude account can serve — served by local model "${safeLine(p.model, 64)}" for ${who}${ctx.families?.fable?.allowedClient ? ' (a Fable-allowed client: JP\'s own session is on the local model)' : ''}`);
-    const contentType = r.headers.get('content-type') || 'application/json';
     res.writeHead(200, {
       'Content-Type': contentType,
       'x-teamclaude-failover': `local/${p.model}`,
       'Cache-Control': 'no-cache',
     });
-    // Every stand-in answer says what it is before anything else: the warning
-    // line as its first block, and the model reported as FAILOVER_LABEL.
-    const rewriter = createFailoverRewriter(p.model, contentType);
+    if (whole != null) {
+      res.end(whole);
+      ctx.delivered = true;
+      return true;
+    }
+    // Every streamed stand-in answer says what it is before anything else (see
+    // createFailoverRewriter): the warning block, the relabelled model, and no
+    // tool call the client could run.
+    const rewriter = createFailoverRewriter(p.model);
     // The local model's tool_use ids, recorded so a later fail-back repair acts
-    // only on turns it really wrote (none now that it gets no tools; kept for
-    // conversations from before). Bounded; decoding is per chunk.
+    // only on turns it really wrote (it gets no tools now, and a call it makes
+    // anyway reaches the client as text; kept for older conversations).
+    // Bounded; decoding is per chunk.
     const decoder = new TextDecoder();
     let seen = '';
     try {

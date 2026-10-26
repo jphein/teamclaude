@@ -208,6 +208,7 @@ export function bodyForFailover(body, model, contextTokens = 131072, inputTokens
   // without a schema for them.
   delete obj.tools;
   delete obj.tool_choice;
+  delete obj.mcp_servers;
   flattenToolBlocks(obj);
   obj.system = withStandInNote(obj.system, model);
   return Buffer.from(JSON.stringify(obj), 'utf8');
@@ -245,7 +246,7 @@ function flattenToolBlocks(obj) {
     if (!Array.isArray(m?.content)) continue;
     m.content = m.content.map((/** @type {any} */ b) => {
       const t = b?.type;
-      if (t === 'tool_use' || t === 'server_tool_use') {
+      if (typeof t === 'string' && t.endsWith('tool_use')) {
         return { type: 'text', text: `[earlier tool call ${String(b.name ?? '')}: ${clip(JSON.stringify(b.input ?? {}), 2000)}]` };
       }
       if (t === 'tool_result' || (typeof t === 'string' && t.endsWith('_tool_result'))) {
@@ -266,59 +267,96 @@ export function failoverWarning(model) {
   return `⚠ FAILOVER: local ${model} served this turn; no tools ran; treat as unavailable`;
 }
 
+/** Largest single SSE event, and largest JSON answer, the rewriter will hold. */
+export const FAILOVER_EVENT_LIMIT = 1024 * 1024;
+export const FAILOVER_JSON_LIMIT = 8 * 1024 * 1024;
+
+/** A tool call the stand-in tried to make, as text: shown, never run. @param {any} block */
+const triedTool = (block) => `[the stand-in tried to call ${String(block?.name ?? 'a tool')}; nothing ran]`;
+
 /**
- * Rewrites the local model's answer on its way to the client: its `model` is
- * FAILOVER_LABEL, and its first content block is the warning line. A stream
- * gets a new text block 0 right after message_start, every later content block
- * index shifted by one; a JSON answer gets the block prepended. Streaming is
- * per SSE event: nothing is held beyond the event in progress.
- * @param {string} model @param {string|null} contentType
+ * The local model's whole JSON answer, rewritten: its `model` is
+ * FAILOVER_LABEL, the warning is its first block, and any tool call it made is
+ * text. Null when the body is not a successful message — the caller then
+ * answers as if failover had not run, so nothing unlabelled ever reaches the
+ * client (it is called before any header is sent).
+ * @param {string} model @param {string} text @returns {string|null}
+ */
+export function rewriteFailoverJson(model, text) {
+  let obj;
+  try { obj = JSON.parse(text); } catch { return null; }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj) || obj.type !== 'message' || !Array.isArray(obj.content)) return null;
+  obj.model = FAILOVER_LABEL;
+  obj.content = [
+    { type: 'text', text: `${failoverWarning(model)}\n\n` },
+    ...obj.content.map((/** @type {any} */ b) => (typeof b?.type === 'string' && b.type.endsWith('tool_use') ? { type: 'text', text: triedTool(b) } : b)),
+  ];
+  if (obj.stop_reason === 'tool_use') obj.stop_reason = 'end_turn';
+  return JSON.stringify(obj);
+}
+
+/**
+ * Rewrites the local model's SSE answer on its way to the client, per event:
+ *   * the warning is a new text block 0, emitted after message_start (or, if a
+ *     stream skips it, before the first content event) — every later
+ *     content-block index is shifted by one;
+ *   * message.model is FAILOVER_LABEL;
+ *   * a tool_use block becomes a text block saying the call was not run, its
+ *     input deltas are dropped, and stop_reason tool_use becomes end_turn — the
+ *     client still knows its tools, and would run a call it was handed;
+ *   * an event whose data is not JSON is dropped, never passed through.
+ * Line endings are normalised on the held text, so a CRLF split across chunks
+ * still ends an event. An event over FAILOVER_EVENT_LIMIT throws: the caller
+ * cuts the stream rather than hold it.
+ * @param {string} model
  * @returns {{ push: (text: string) => string, end: () => string }}
  */
-export function createFailoverRewriter(model, contentType) {
+export function createFailoverRewriter(model) {
   const warning = `${failoverWarning(model)}\n\n`;
-  if (!/text\/event-stream/i.test(contentType || '')) {
-    let whole = '';
-    return {
-      push(text) { whole += text; return ''; },
-      end() {
-        let obj;
-        try { obj = JSON.parse(whole); } catch { return whole; }
-        if (obj && typeof obj === 'object' && !Array.isArray(obj) && obj.type !== 'error') {
-          obj.model = FAILOVER_LABEL;
-          obj.content = [{ type: 'text', text: warning }, ...(Array.isArray(obj.content) ? obj.content : [])];
-        }
-        return JSON.stringify(obj);
-      },
-    };
-  }
   let pending = '';
   let injected = false;
+  /** @type {Set<number>} upstream indices of tool_use blocks turned into text */
+  const toolBlocks = new Set();
   /** @param {string} type @param {any} data */
   const sse = (type, data) => `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+  const warningBlock = () => sse('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
+    + sse('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: warning } })
+    + sse('content_block_stop', { type: 'content_block_stop', index: 0 });
   /** @param {string} ev */
   function rewrite(ev) {
     const lines = ev.split('\n');
     const dataLines = lines.filter(l => l.startsWith('data:'));
-    if (!dataLines.length) return `${ev}\n\n`;
+    if (!dataLines.length) return '';   // comments and bare event names carry nothing to show
     let obj;
-    try { obj = JSON.parse(dataLines.map(l => l.replace(/^data: ?/, '')).join('\n')); } catch { return `${ev}\n\n`; }
+    try { obj = JSON.parse(dataLines.map(l => l.replace(/^data: ?/, '')).join('\n')); } catch { return ''; }
+    const type = String(obj?.type ?? '');
+    let before = '';
     let after = '';
-    if (obj?.type === 'message_start' && obj.message && !injected) {
+    if (type === 'message_start' && obj.message && !injected) {
       injected = true;
       obj.message.model = FAILOVER_LABEL;
-      after = sse('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
-        + sse('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: warning } })
-        + sse('content_block_stop', { type: 'content_block_stop', index: 0 });
-    } else if (injected && typeof obj?.index === 'number' && /^content_block_/.test(String(obj.type))) {
-      obj.index += 1;
+      after = warningBlock();
+    } else if (type.startsWith('content_block_') && typeof obj.index === 'number') {
+      if (!injected) { injected = true; before = warningBlock(); }
+      const upstream = obj.index;
+      if (type === 'content_block_start' && typeof obj.content_block?.type === 'string' && obj.content_block.type.endsWith('tool_use')) {
+        toolBlocks.add(upstream);
+        const tried = triedTool(obj.content_block);
+        obj.content_block = { type: 'text', text: '' };
+        after = sse('content_block_delta', { type: 'content_block_delta', index: upstream + 1, delta: { type: 'text_delta', text: tried } });
+      } else if (type === 'content_block_delta' && toolBlocks.has(upstream)) {
+        return '';   // the call's input: never shown, never run
+      }
+      obj.index = upstream + 1;
+    } else if (type === 'message_delta' && obj.delta?.stop_reason === 'tool_use') {
+      obj.delta.stop_reason = 'end_turn';
     }
     const event = lines.find(l => l.startsWith('event:'));
-    return `${event ? `${event}\n` : ''}data: ${JSON.stringify(obj)}\n\n${after}`;
+    return `${before}${event ? `${event}\n` : ''}data: ${JSON.stringify(obj)}\n\n${after}`;
   }
   return {
     push(text) {
-      pending += text.replace(/\r\n/g, '\n');
+      pending = (pending + text).replace(/\r\n/g, '\n');
       let out = '';
       let i;
       while ((i = pending.indexOf('\n\n')) >= 0) {
@@ -326,10 +364,11 @@ export function createFailoverRewriter(model, contentType) {
         pending = pending.slice(i + 2);
         if (ev.trim()) out += rewrite(ev);
       }
+      if (pending.length > FAILOVER_EVENT_LIMIT) throw new Error('an event from the local model exceeded the size limit');
       return out;
     },
     end() {
-      const rest = pending;
+      const rest = pending.replace(/\r$/, '');
       pending = '';
       return rest.trim() ? rewrite(rest) : '';
     },

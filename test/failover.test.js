@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
-import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, FailoverState } from '../src/failover.js';
+import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, FailoverState, createFailoverRewriter, failoverWarning, standInNote, FAILOVER_LABEL } from '../src/failover.js';
 
 // Local-model failover (JP, 2026-10-12): when no Claude account can serve,
 // answer from the local model instead of stopping; back to Claude as soon as
@@ -44,7 +44,7 @@ test('bodyForFailover: local model name, thinking off, unsigned thinking strippe
   assert.equal(out.thinking, undefined);
   assert.deepEqual(out.chat_template_kwargs, { enable_thinking: false });
   assert.deepEqual(out.messages[1].content, [{ type: 'text', text: 'yo' }]);
-  assert.equal(out.tools.length, 1);
+  assert.equal('tools' in out, false, 'a stand-in gets no tools (2026-10-25)');
   assert.equal(out.stream, true);
   const big = JSON.parse(bodyForFailover(Buffer.from(JSON.stringify({ model: 'm', max_tokens: 64000, messages: [{ role: 'user', content: 'x'.repeat(400_000) }] })), LOCAL, 131072).toString());
   assert.ok(big.max_tokens <= 131072 - 100_000 && big.max_tokens >= 1024, `clamped to the room left: ${big.max_tokens}`);
@@ -88,6 +88,12 @@ async function setup({ failover = {}, exhausted = true, localStatus = 200, claud
       localSeen.push({ body: JSON.parse(raw), auth: req.headers['x-api-key'] ?? null });
       if (localMode === 'redirect') { res.writeHead(307, { location: redirectTo }); res.end(); return; }
       if (localMode === 'cut') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write('event: message_start\ndata: {"type":"message_start"}\n\n'); setTimeout(() => res.socket.destroy(), 50); return; }
+      if (localMode === 'sse') {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        for (const [type, data] of SSE_EVENTS) res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+        res.end();
+        return;
+      }
       if (localStatus !== 200) { res.writeHead(localStatus, { 'content-type': 'application/json' }); res.end('{"error":{"message":"context too long"}}'); return; }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ id: 'l1', type: 'message', role: 'assistant', model: LOCAL, content: [{ type: 'text', text: 'local says hi' }, { type: 'tool_use', id: 'LoCaL123', name: 'Read', input: { p: 'x' } }], stop_reason: 'tool_use', usage: { input_tokens: 1, output_tokens: 1 } }));
@@ -113,7 +119,7 @@ async function setup({ failover = {}, exhausted = true, localStatus = 200, claud
   const port = await listen(proxy);
   return {
     am, localSeen, claudeHits, logs,
-    post: (body, session = null) => fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 'k', ...(session ? { 'x-claude-code-session-id': session } : {}) }, body: JSON.stringify(body) }),
+    post: (body, session = null, key = 'k') => fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': key, ...(session ? { 'x-claude-code-session-id': session } : {}) }, body: JSON.stringify(body) }),
     state: () => proxy,
     status: () => fetch(`http://127.0.0.1:${port}/teamclaude/status`, { headers: { 'x-api-key': 'k' } }).then((r) => r.json()),
     signal: (key = 'k') => fetch(`http://127.0.0.1:${port}/teamclaude/failover`, { headers: key ? { 'x-api-key': key } : {} }),
@@ -121,6 +127,14 @@ async function setup({ failover = {}, exhausted = true, localStatus = 200, claud
   };
 }
 const MSG = { model: 'claude-opus-5-5', max_tokens: 20, messages: [{ role: 'user', content: 'hi' }] };
+const SSE_EVENTS = [
+  ['message_start', { type: 'message_start', message: { id: 'l1', type: 'message', role: 'assistant', model: LOCAL, content: [] } }],
+  ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }],
+  ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'I posted to #events.' } }],
+  ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+  ['message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 } }],
+  ['message_stop', { type: 'message_stop' }],
+];
 
 test('every account out of quota: served by the local model at once, tagged and counted', async () => {
   const t = await setup({ failover: { apiKey: 'lk' } });
@@ -129,7 +143,8 @@ test('every account out of quota: served by the local model at once, tagged and 
     const body = await res.json();
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('x-teamclaude-failover'), `local/${LOCAL}`);
-    assert.equal(body.model, LOCAL, 'agents can see they are on the local model');
+    assert.equal(body.model, FAILOVER_LABEL, 'agents can see they are on the local model');
+    assert.equal(body.content[0].text, `${failoverWarning(LOCAL)}\n\n`, 'the warning is the first thing in the answer');
     assert.equal(t.localSeen[0].body.model, LOCAL);
     assert.equal(t.localSeen[0].auth, 'lk');
     assert.ok(t.logs.some((l) => /FAILOVER: no Claude account can serve — served by local model "qwen36-coder"/.test(l)), t.logs.join('\n'));
@@ -221,7 +236,7 @@ test('the last account answering 429 with a long retry-after fails over at once 
     const res = await t.post(MSG);
     const body = await res.json();
     assert.equal(res.status, 200);
-    assert.equal(body.model, LOCAL);
+    assert.equal(body.model, FAILOVER_LABEL);
     assert.equal(t.claudeHits.length, 1, 'Claude was tried first');
     assert.equal(t.localSeen.length, 1);
   } finally { t.close(); }
@@ -325,5 +340,103 @@ test('GET /teamclaude/failover: false until the local model serves, then true; k
     assert.deepEqual(Object.keys(body).sort(), ['inFlight', 'lastAt', 'local_failover_active', 'since'], 'no account details');
     assert.equal((await t.signal('wrong')).status, 401);
     assert.equal((await t.signal(null)).status, 401);
+  } finally { t.close(); }
+});
+
+// ── 2026-10-25: a stand-in must never pass for the session it answers ───────
+// The local model answered the lead's scheduled prompts as the lead: it asked
+// JP for credentials and reported posting to #events and adding someone to a
+// group. None of it happened.
+
+/** Parse an SSE text into [{ type, data }]. */
+const parseSse = (text) => text.split('\n\n').filter(Boolean).map((ev) => {
+  const lines = ev.split('\n');
+  return { type: lines.find((l) => l.startsWith('event:'))?.slice(7), data: JSON.parse(lines.find((l) => l.startsWith('data:')).slice(5)) };
+});
+
+test('the rewriter puts the warning first in a stream, shifts the real blocks, relabels the model — however the bytes are split', () => {
+  const raw = SSE_EVENTS.map(([t, d]) => `event: ${t}\ndata: ${JSON.stringify(d)}\n\n`).join('');
+  const whole = (() => { const r = createFailoverRewriter(LOCAL, 'text/event-stream'); return r.push(raw) + r.end(); })();
+  const bytewise = (() => { const r = createFailoverRewriter(LOCAL, 'text/event-stream; charset=utf-8'); let o = ''; for (const ch of raw) o += r.push(ch); return o + r.end(); })();
+  assert.equal(bytewise, whole, 'chunk boundaries do not matter');
+  const ev = parseSse(whole);
+  assert.equal(ev[0].data.message.model, FAILOVER_LABEL);
+  assert.deepEqual(ev.slice(1, 4).map((e) => [e.type, e.data.index]), [['content_block_start', 0], ['content_block_delta', 0], ['content_block_stop', 0]]);
+  assert.equal(ev[2].data.delta.text, `${failoverWarning(LOCAL)}\n\n`);
+  assert.deepEqual(ev.slice(4, 7).map((e) => e.data.index), [1, 1, 1], 'the local model\'s own block moved to index 1');
+  assert.equal(ev[5].data.delta.text, 'I posted to #events.');
+  assert.deepEqual(ev.slice(7).map((e) => e.type), ['message_delta', 'message_stop']);
+});
+
+test('the rewriter prepends the warning to a JSON answer and leaves an error alone', () => {
+  const r = createFailoverRewriter(LOCAL, 'application/json');
+  r.push(JSON.stringify({ type: 'message', model: LOCAL, content: [{ type: 'text', text: 'hi' }] }));
+  const out = JSON.parse(r.end());
+  assert.equal(out.model, FAILOVER_LABEL);
+  assert.deepEqual(out.content.map((b) => b.text), [`${failoverWarning(LOCAL)}\n\n`, 'hi']);
+  const e = createFailoverRewriter(LOCAL, 'application/json');
+  e.push('{"type":"error","error":{"type":"x"}}');
+  assert.deepEqual(JSON.parse(e.end()), { type: 'error', error: { type: 'x' } });
+});
+
+test('bodyForFailover: no tools, earlier tool traffic as plain text, and the stand-in note in the system prompt', () => {
+  const body = {
+    model: 'claude-opus-5-5', max_tokens: 100, system: [{ type: 'text', text: 'You are the lead.' }],
+    tools: [{ name: 'Bash', input_schema: { type: 'object' } }], tool_choice: { type: 'auto' },
+    messages: [
+      { role: 'user', content: 'check the queue' },
+      { role: 'assistant', content: [{ type: 'text', text: 'ok' }, { type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ask list' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: [{ type: 'text', text: '3 open asks' }] }] },
+    ],
+  };
+  const out = JSON.parse(bodyForFailover(Buffer.from(JSON.stringify(body)), LOCAL).toString());
+  assert.equal('tools' in out, false);
+  assert.equal('tool_choice' in out, false);
+  const blocks = out.messages.flatMap((m) => (Array.isArray(m.content) ? m.content : []));
+  assert.ok(blocks.every((b) => b.type === 'text'), JSON.stringify(blocks));
+  assert.match(blocks[1].text, /earlier tool call Bash: \{"command":"ask list"\}/);
+  assert.match(blocks[2].text, /earlier tool result\]\n3 open asks/);
+  assert.equal(out.system.at(-1).text, standInNote(LOCAL));
+  assert.match(standInNote(LOCAL), /NO tools/);
+  assert.match(standInNote(LOCAL), /never ask for credentials/);
+  for (const [system, check] of [['Be brief.', (s) => s.startsWith('Be brief.') && s.endsWith(standInNote(LOCAL))], [undefined, (s) => s === standInNote(LOCAL)]]) {
+    const o = JSON.parse(bodyForFailover(Buffer.from(JSON.stringify({ ...MSG, ...(system ? { system } : {}) })), LOCAL).toString());
+    assert.ok(check(o.system), JSON.stringify(o.system));
+  }
+});
+
+test('policy: excludeClients takes names only; eligibility refuses an excluded client and says why', () => {
+  assert.deepEqual(failoverPolicy({ failover: { enabled: true, url: 'http://x' } }).excludeClients, []);
+  const policy = failoverPolicy({ failover: { enabled: true, url: 'http://x', excludeClients: ['familiar', 7, '', null, 'lane'] } });
+  assert.deepEqual(policy.excludeClients, ['familiar', 'lane']);
+  const base = { policy, state: { inFlight: 0 }, method: 'POST', url: '/v1/messages', allQuota: true, unservableMs: 0, bodyBytes: 10 };
+  assert.deepEqual(failoverEligibility({ ...base, client: 'familiar' }), { ok: false, why: 'client "familiar" is excluded from failover' });
+  assert.equal(failoverEligibility({ ...base, client: 'jp-wakizashi' }).ok, true);
+  assert.equal(failoverEligibility({ ...base, client: null }).ok, true, 'the shared key is not a client');
+});
+
+test('end to end, streamed: the client sees the warning first; the local model never saw a tool', async () => {
+  const t = await setup({ localMode: 'sse' });
+  try {
+    const res = await t.post({ ...MSG, stream: true, tools: [{ name: 'Bash', input_schema: { type: 'object' } }] });
+    assert.equal(res.status, 200);
+    const ev = parseSse(await res.text());
+    assert.equal(ev[0].data.message.model, FAILOVER_LABEL);
+    assert.equal(ev[2].data.delta.text, `${failoverWarning(LOCAL)}\n\n`);
+    assert.equal('tools' in t.localSeen[0].body, false);
+  } finally { t.close(); }
+});
+
+test('an excluded client gets the honest no-capacity answer, never a stand-in', async () => {
+  const t = await setup({ failover: { excludeClients: ['familiar'] }, proxyConf: { clientKeys: [{ name: 'familiar', key: 'k-familiar' }] } });
+  try {
+    const res = await t.post(MSG, null, 'k-familiar');
+    assert.equal(res.status, 429);
+    assert.ok(res.headers.get('retry-after'), 'when to come back');
+    assert.equal(res.headers.get('x-teamclaude-failover'), null);
+    assert.equal(t.localSeen.length, 0, 'nothing was sent to the local model');
+    assert.ok(t.logs.some((l) => /failover not used: client "familiar" is excluded/.test(l)), t.logs.join('\n'));
+    const other = await t.post(MSG);
+    assert.equal(other.status, 200, 'the shared key still gets the stand-in');
   } finally { t.close(); }
 });

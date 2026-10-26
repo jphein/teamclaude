@@ -37,6 +37,11 @@ export function failoverPolicy(config) {
     // voice). Stays 64000; raise to 120000 only when BOTH hold: HA enforces an
     // entity allow-list, and a gpu1 HA config passes the safety gate ×10.
     maxPromptTokens: Number.isInteger(f?.maxPromptTokens) && f.maxPromptTokens > 0 ? f.maxPromptTokens : 64000,
+    // Client-key names that never get a stand-in: they get the honest "no
+    // capacity until <reset>" answer instead. 2026-10-25: the local model,
+    // answering the lead's scheduled prompts as the lead, asked JP for
+    // credentials and reported actions nobody took.
+    excludeClients: Array.isArray(f?.excludeClients) ? f.excludeClients.filter((/** @type {unknown} */ c) => typeof c === 'string' && c) : [],
   };
 }
 
@@ -158,7 +163,7 @@ export class FailoverState {
  * Whether this request may fail over now, and if not, why (for the log).
  * @param {{ policy: ReturnType<typeof failoverPolicy>, state: FailoverState, method?: string, url?: string,
  *   provider?: string, pinned?: boolean, allQuota: boolean, unservableMs: number, bodyBytes: number,
- *   maxTokens?: number, contentEncoding?: string|null }} a
+ *   maxTokens?: number, contentEncoding?: string|null, client?: string|null }} a
  * @returns {{ ok: true } | { ok: false, why: string }}
  */
 export function failoverEligibility(a) {
@@ -167,6 +172,7 @@ export function failoverEligibility(a) {
   if (a.method !== 'POST' || !/^\/v1\/messages(\?|$)/.test(a.url || '')) return { ok: false, why: 'not a messages request' };
   if (a.provider && a.provider !== 'anthropic') return { ok: false, why: 'not an Anthropic request' };
   if (a.pinned) return { ok: false, why: 'pinned to one account' };
+  if (a.client && policy.excludeClients?.includes(a.client)) return { ok: false, why: `client "${a.client}" is excluded from failover` };
   if (a.contentEncoding && a.contentEncoding !== 'identity') return { ok: false, why: 'compressed body' };
   if (!a.allQuota && a.unservableMs < policy.afterSeconds * 1000) return { ok: false, why: `fleet unservable for ${Math.round(a.unservableMs / 1000)}s < ${policy.afterSeconds}s` };
   // Best effort, not a guarantee (see estimateInputTokens). A request that
@@ -196,7 +202,138 @@ export function bodyForFailover(body, model, contextTokens = 131072, inputTokens
   delete obj.thinking;
   obj.chat_template_kwargs = { ...(obj.chat_template_kwargs || {}), enable_thinking: false };
   stripUnsignedThinking(obj);
+  // No tools, ever: a stand-in that can call tools (or describe calling them)
+  // reads as the real session acting. Earlier tool traffic stays in the
+  // conversation as plain text, so the local server never sees tool blocks
+  // without a schema for them.
+  delete obj.tools;
+  delete obj.tool_choice;
+  flattenToolBlocks(obj);
+  obj.system = withStandInNote(obj.system, model);
   return Buffer.from(JSON.stringify(obj), 'utf8');
+}
+
+/** The system note every stand-in turn carries. @param {string} model */
+export function standInNote(model) {
+  return `You are ${model}, a local stand-in model answering only because every Claude account is out of quota. `
+    + 'You have NO tools: you cannot read files, run commands, browse, send messages, post anywhere or change anything, '
+    + 'and nothing you write is acted on. Never claim or imply that you did any of those things, and never ask for '
+    + 'credentials or secrets. Answer briefly from the conversation alone, and say plainly what you could not do.';
+}
+
+/** @param {unknown} system @param {string} model */
+function withStandInNote(system, model) {
+  const note = standInNote(model);
+  if (typeof system === 'string' && system) return `${system}\n\n${note}`;
+  if (Array.isArray(system)) return [...system, { type: 'text', text: note }];
+  return note;
+}
+
+/** @param {string} s @param {number} n */
+const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}… [${s.length - n} more characters]` : s);
+
+/** A tool result's content as text. @param {unknown} content */
+function toolResultText(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map((/** @type {any} */ b) => (b?.type === 'text' ? String(b.text ?? '') : `[${b?.type || 'block'} omitted]`)).join('\n');
+}
+
+/** Rewrite every tool block in the conversation as a text block. @param {any} obj */
+function flattenToolBlocks(obj) {
+  for (const m of Array.isArray(obj?.messages) ? obj.messages : []) {
+    if (!Array.isArray(m?.content)) continue;
+    m.content = m.content.map((/** @type {any} */ b) => {
+      const t = b?.type;
+      if (t === 'tool_use' || t === 'server_tool_use') {
+        return { type: 'text', text: `[earlier tool call ${String(b.name ?? '')}: ${clip(JSON.stringify(b.input ?? {}), 2000)}]` };
+      }
+      if (t === 'tool_result' || (typeof t === 'string' && t.endsWith('_tool_result'))) {
+        return { type: 'text', text: `[earlier tool result${b.is_error ? ' (error)' : ''}]\n${clip(toolResultText(b.content), 8000)}` };
+      }
+      return b;
+    });
+  }
+}
+
+// ── Answer rewriting: the stand-in says what it is, first ──────────────
+
+/** The model name a stand-in answer reports. */
+export const FAILOVER_LABEL = 'qwen (failover)';
+
+/** The fixed first line of every stand-in answer. @param {string} model */
+export function failoverWarning(model) {
+  return `⚠ FAILOVER: local ${model} served this turn; no tools ran; treat as unavailable`;
+}
+
+/**
+ * Rewrites the local model's answer on its way to the client: its `model` is
+ * FAILOVER_LABEL, and its first content block is the warning line. A stream
+ * gets a new text block 0 right after message_start, every later content block
+ * index shifted by one; a JSON answer gets the block prepended. Streaming is
+ * per SSE event: nothing is held beyond the event in progress.
+ * @param {string} model @param {string|null} contentType
+ * @returns {{ push: (text: string) => string, end: () => string }}
+ */
+export function createFailoverRewriter(model, contentType) {
+  const warning = `${failoverWarning(model)}\n\n`;
+  if (!/text\/event-stream/i.test(contentType || '')) {
+    let whole = '';
+    return {
+      push(text) { whole += text; return ''; },
+      end() {
+        let obj;
+        try { obj = JSON.parse(whole); } catch { return whole; }
+        if (obj && typeof obj === 'object' && !Array.isArray(obj) && obj.type !== 'error') {
+          obj.model = FAILOVER_LABEL;
+          obj.content = [{ type: 'text', text: warning }, ...(Array.isArray(obj.content) ? obj.content : [])];
+        }
+        return JSON.stringify(obj);
+      },
+    };
+  }
+  let pending = '';
+  let injected = false;
+  /** @param {string} type @param {any} data */
+  const sse = (type, data) => `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+  /** @param {string} ev */
+  function rewrite(ev) {
+    const lines = ev.split('\n');
+    const dataLines = lines.filter(l => l.startsWith('data:'));
+    if (!dataLines.length) return `${ev}\n\n`;
+    let obj;
+    try { obj = JSON.parse(dataLines.map(l => l.replace(/^data: ?/, '')).join('\n')); } catch { return `${ev}\n\n`; }
+    let after = '';
+    if (obj?.type === 'message_start' && obj.message && !injected) {
+      injected = true;
+      obj.message.model = FAILOVER_LABEL;
+      after = sse('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
+        + sse('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: warning } })
+        + sse('content_block_stop', { type: 'content_block_stop', index: 0 });
+    } else if (injected && typeof obj?.index === 'number' && /^content_block_/.test(String(obj.type))) {
+      obj.index += 1;
+    }
+    const event = lines.find(l => l.startsWith('event:'));
+    return `${event ? `${event}\n` : ''}data: ${JSON.stringify(obj)}\n\n${after}`;
+  }
+  return {
+    push(text) {
+      pending += text.replace(/\r\n/g, '\n');
+      let out = '';
+      let i;
+      while ((i = pending.indexOf('\n\n')) >= 0) {
+        const ev = pending.slice(0, i);
+        pending = pending.slice(i + 2);
+        if (ev.trim()) out += rewrite(ev);
+      }
+      return out;
+    },
+    end() {
+      const rest = pending;
+      pending = '';
+      return rest.trim() ? rewrite(rest) : '';
+    },
+  };
 }
 
 /** Remove thinking blocks with no signature from every message. @param {any} obj @returns {boolean} changed */

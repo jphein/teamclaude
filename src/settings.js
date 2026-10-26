@@ -144,6 +144,8 @@ export const FIELDS = [
     help: 'The local model\'s context window; larger requests are not sent there (they get a 429).' },
   { key: 'failover.maxPromptTokens', group: 'Failover', label: 'Largest prompt to serve (tokens)', type: 'int', apply: 'hot', def: 64000, min: 1024,
     help: 'Prompts larger than this get a 429 instead: a cold prefill would hold the shared GPU for minutes and stall HA voice. Keep at 64000. Raise to 120000 only when BOTH hold: HA enforces an entity allow-list, AND a gpu1 HA config passes the safety gate ×10 (ops/bench/b60/ha_eval.py SAFETY rows).' },
+  { key: 'failover.excludeClients', group: 'Failover', label: 'Never stand in for', type: 'list', apply: 'hot', def: [],
+    help: 'Client-key names that never get a local stand-in answer: they get the usual 429 with the reset time instead. Set it for clients whose replies a person reads as authoritative (familiar\'s lanes: the lead\'s scheduled prompts).' },
   { key: 'failover.templateTokens', group: 'Failover', label: 'Template allowance (tokens)', type: 'int', apply: 'hot', def: 2048, min: 0,
     help: 'Tokens added to the local count for the chat template\'s framing when deciding whether a request fits the local window.' },
   { key: 'failover.timeoutSeconds', group: 'Failover', label: 'Local timeout (s)', type: 'int', apply: 'hot', def: 600, min: 10,

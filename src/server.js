@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { validName as validAccountName } from './add-account.js';
-import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, countLocalTokens, estimateInputTokens, MIN_ANSWER_TOKENS, FailoverState } from './failover.js';
+import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, countLocalTokens, estimateInputTokens, MIN_ANSWER_TOKENS, FailoverState, createFailoverRewriter } from './failover.js';
 import { FableStats } from './fable-policy.js';
 import { TunnelStats } from './tunnel-stats.js';
 import { FAMILIES, familyPolicy, rewriteFamilyBody, familyModelIn, isFamilyModel, clientAllowed, FamilyStats, isFamilyRefusal } from './family-policy.js';
@@ -3357,6 +3357,7 @@ async function maybeFailover(req, res, body, ctx, accountManager, { immediate })
     policy: ctx.failover, state: ctx.failoverState, method: req.method, url: req.url, provider: ctx.provider,
     pinned: ctx.pinnedIndex != null, allQuota: allQuota || immediate, unservableMs, bodyBytes: body.length, maxTokens: Number(maxTokens) || 0,
     contentEncoding: /** @type {string|undefined} */ (req.headers['content-encoding']) ?? null,
+    client: ctx.client ?? null,
   });
   if (!el.ok) {
     if (Date.now() - (ctx.failoverState.lastSkipLogAt || 0) > 30_000) {
@@ -3424,29 +3425,38 @@ async function serveFromFailover(req, res, body, ctx) {
     ctx.status = 200; ctx.account = `(failover: ${p.model})`; ctx.model = p.model;
     const who = ctx.client ? `"${safeLine(ctx.client, 64)}"` : '(shared key)';
     console.log(`[TeamClaude] FAILOVER: no Claude account can serve — served by local model "${safeLine(p.model, 64)}" for ${who}${ctx.families?.fable?.allowedClient ? ' (a Fable-allowed client: JP\'s own session is on the local model)' : ''}`);
+    const contentType = r.headers.get('content-type') || 'application/json';
     res.writeHead(200, {
-      'Content-Type': r.headers.get('content-type') || 'application/json',
+      'Content-Type': contentType,
       'x-teamclaude-failover': `local/${p.model}`,
       'Cache-Control': 'no-cache',
     });
+    // Every stand-in answer says what it is before anything else: the warning
+    // line as its first block, and the model reported as FAILOVER_LABEL.
+    const rewriter = createFailoverRewriter(p.model, contentType);
     // The local model's tool_use ids, recorded so a later fail-back repair acts
-    // only on turns it really wrote. Bounded; decoding is per chunk.
+    // only on turns it really wrote (none now that it gets no tools; kept for
+    // conversations from before). Bounded; decoding is per chunk.
     const decoder = new TextDecoder();
     let seen = '';
     try {
       if (r.body) {
         for await (const chunk of r.body) {
           if (clientGone(res)) { ctx.abandoned = true; break; }
-          if (seen.length < 8 * 1024 * 1024) seen += decoder.decode(chunk, { stream: true });
+          const text = decoder.decode(chunk, { stream: true });
+          if (seen.length < 8 * 1024 * 1024) seen += text;
+          const out = rewriter.push(text);
           // Backpressure: a slow client must not make this buffer the whole
           // answer — and a client that stops reading must not hold the slot
           // past the timeout.
-          if (!res.write(chunk)) {
+          if (out && !res.write(out)) {
             await waitForDrain(res, signal);
             if (signal.aborted) throw new Error('the client stopped reading until the timeout');
           }
         }
       }
+      const tail = rewriter.push(decoder.decode()) + rewriter.end();
+      if (tail && !clientGone(res)) res.write(tail);
       st.noteLocalToolIds(seen);
       if (!res.writableEnded && !clientGone(res)) res.end();
       if (!ctx.abandoned) ctx.delivered = true;   // a served session, not a starved one

@@ -402,7 +402,10 @@ test('every hot proxy.* setting is re-read by the reload path', async () => {
   // restart while the dashboard says otherwise (proxy.sso, 2026-10-26).
   const { FIELDS } = await import('../src/settings.js');
   const src = await readFile(join(ROOT, 'src', 'index.js'), 'utf8');
+  // A lint-style check (it reads the text, not the behaviour); sso.test.js
+  // shows the gate honours a replaced proxy.sso on the very next request.
+  const code = src.split('\n').filter(l => !/^\s*\/\//.test(l)).join('\n');
   const missing = [...new Set(FIELDS.filter(f => f.apply === 'hot' && f.key.startsWith('proxy.')).map(f => f.key.split('.')[1]))]
-    .filter(sub => !new RegExp(`config\\.proxy\\.${sub} = diskConfig\\.proxy\\??\\.${sub}`).test(src));
+    .filter(sub => !new RegExp(`config\\.proxy\\.${sub} = diskConfig\\.proxy\\??\\.${sub}`).test(code));
   assert.deepEqual(missing, [], `hot in settings.js but not re-read on reload: ${missing.map(s => 'proxy.' + s).join(', ')}`);
 });

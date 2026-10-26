@@ -578,10 +578,13 @@ async function serverCommand() {
       // The shared key is read per request too, so a rotated key on disk
       // takes effect on reload the same way.
       config.proxy.apiKey = diskConfig.proxy.apiKey;
-      // Dashboard SSO (sso.js) is read per request too: a reload turns it on,
-      // rotates its hop secret or narrows its users without a restart.
-      config.proxy.sso = diskConfig.proxy.sso;
     }
+    // Dashboard SSO (sso.js) is read per request too: a reload turns it on,
+    // rotates its hop secret or narrows its users without a restart. Outside
+    // the guard above for the reason given for mcp below: a file with no proxy
+    // section (or none of sso) must switch SSO off, never leave the old users
+    // and secret admitted. Incomplete or malformed, ssoPolicy() reads it as off.
+    if (config.proxy) config.proxy.sso = diskConfig.proxy?.sso;
     // The MCP endpoint's mode: read per request, so this is what opens,
     // narrows or closes it without a restart. Outside the guard above on
     // purpose: an operator who deletes the whole `proxy` section has asked for

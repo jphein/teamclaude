@@ -95,6 +95,7 @@ const MUTATIONS = [
   ['/teamclaude/add-account', {}],
   ['/teamclaude/add-account/code', { code: 'x' }],
   ['/teamclaude/add-account/cancel', undefined],
+  ['/teamclaude/ui-ticket', undefined],
   ['/teamclaude/restart', undefined],
   ['/teamclaude/probe', undefined],
   ['/teamclaude/reload', undefined],
@@ -144,6 +145,11 @@ test('only GET reaches the pre-gate /ui handler', async () => {
   const { server } = makeServer();
   assert.equal((await request(server, { method: 'POST', url: '/ui' })).status, 401);
   assert.equal((await request(server, { url: '/ui?x=1' })).status, 401, 'exact paths only');
+  // The one query the page itself is opened with: the launcher's ticket.
+  assert.equal((await request(server, { url: '/ui?ticket=' + 'T'.repeat(43) })).status, 200, 'a well-formed ticket');
+  for (const url of ['/ui?ticket=short', '/ui?ticket=' + 'T'.repeat(43) + '&x=1', '/ui?x=1&ticket=' + 'T'.repeat(43), '/ui?ticket=' + 'T'.repeat(40) + '%2F..']) {
+    assert.equal((await request(server, { url })).status, 401, url);
+  }
 });
 
 // ── The data and control endpoints behind it ──────────────────
@@ -191,7 +197,8 @@ test('a remote caller with the key reaches each mutating endpoint (restart exclu
   // Adding an account is operator-only: unlike Reauth there is no identity to
   // check a new seat against.
   const ADD = ['/teamclaude/add-account', '/teamclaude/add-account/code', '/teamclaude/add-account/cancel'];
-  const OPERATOR_ONLY = new Set(['/teamclaude/account', '/teamclaude/restart', ...ADD]);
+  // A /ui ticket carries the minting key into the dashboard: operator-only.
+  const OPERATOR_ONLY = new Set(['/teamclaude/account', '/teamclaude/restart', ...ADD, '/teamclaude/ui-ticket']);
   for (const [url, body] of MUTATIONS.filter(([u]) => u !== '/teamclaude/restart')) {
     const res = await request(server, { method: 'POST', url, headers: { ...JSON_HEADERS, 'x-api-key': KEY }, body: body ? JSON.stringify(body) : '' });
     assert.equal(res.status, OPERATOR_ONLY.has(url) ? 403 : 200, url + ' ' + res.chunks);
@@ -204,6 +211,8 @@ test('a remote caller with the key reaches each mutating endpoint (restart exclu
     assert.equal(res.status, 200, 'the shared key reaches ' + url);
   }
   for (const c of ['add-account', 'add-account/code', 'add-account/cancel']) calls.splice(calls.indexOf(c), 1);
+  const sharedTicket = await request(server, { method: 'POST', url: '/teamclaude/ui-ticket', headers: { ...JSON_HEADERS, 'x-api-key': PROXY.apiKey }, body: '' });
+  assert.equal(sharedTicket.status, 200, 'the shared key mints a /ui ticket');
   assert.deepEqual(calls.sort(), ['probe', 'reauth', 'reauth/cancel', 'reauth/code', 'reload']);
   assert.equal(am.currentIndex, 1);
 });
@@ -344,7 +353,7 @@ test('script hashes are taken over LF-normalised text, as a browser computes the
 // Runs the real /ui scripts in a vm with a stub DOM, storage and fetch. Every
 // fetch is recorded with the key it carried; `auto401` answers each with a 401
 // at once, otherwise the call stays pending until the test settles it.
-async function bootPage({ storageThrows = false, readOnlyStorage = null } = {}) {
+async function bootPage({ storageThrows = false, readOnlyStorage = null, href = null, auto401 = true } = {}) {
   const html = injectUiHelpers(await readFile(UI, 'utf8'));
   const elements = new Map();
   const makeEl = (id) => {
@@ -378,9 +387,9 @@ async function bootPage({ storageThrows = false, readOnlyStorage = null } = {}) 
         setItem: (k, v) => store.set(k, String(v)),
         removeItem: (k) => store.delete(k),
       };
-  const page = { elements, store, fetches: [], auto401: true };
+  const page = { elements, store, fetches: [], auto401, replacedUrl: null };
   const fetchStub = (url, init) => {
-    const call = { url, key: init?.headers?.['x-api-key'] ?? null };
+    const call = { url, key: init?.headers?.['x-api-key'] ?? null, body: init?.body ?? null };
     page.fetches.push(call);
     if (page.auto401) return Promise.resolve({ status: 401, ok: false, json: async () => ({}), body: null });
     return new Promise((resolve) => {
@@ -391,6 +400,12 @@ async function bootPage({ storageThrows = false, readOnlyStorage = null } = {}) 
     document, localStorage, fetch: fetchStub, window: { open: () => null },
     setInterval: () => 0, clearInterval() {}, setTimeout: () => 0, clearTimeout() {},
     AbortController, TextDecoder, console, Date, Math, JSON, Map, Set, Promise, Error, Number, String, Object, Array, RegExp,
+    // Only when a test names the address the page was opened at (the launcher).
+    ...(href ? {
+      URL,
+      location: { href },
+      history: { replaceState: (_s, _t, u) => { page.replacedUrl = u; } },
+    } : {}),
   });
   for (const m of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) vm.runInContext(m[1], ctx);
   page.settle = async () => { for (let i = 0; i < 10; i++) await new Promise(r => setImmediate(r)); };
@@ -514,4 +529,29 @@ test('a stale 401 after unlock does not leave the restart button stuck', async (
   await page.settle();
   assert.equal(page.elements.get('restartBtn').disabled, false);
   assert.notEqual(page.elements.get('restartStatus').textContent, 'Restarting…');
+});
+
+// ── Desktop launcher: /ui?ticket=… ─────────────────────────────
+
+test('a launcher ticket leaves the address bar first, is redeemed before anything else, and its key is used from then on', async () => {
+  const page = await bootPage({ href: 'https://tc.realm.watch/ui?ticket=TICKET-abc123', auto401: false });
+  assert.equal(page.replacedUrl, '/ui', 'the ticket is gone from the address bar');
+  const boot = page.take();
+  assert.deepEqual(boot.map(f => f.url), ['/teamclaude/ui-ticket/redeem'], 'nothing else goes out before the ticket is redeemed');
+  assert.equal(JSON.parse(boot[0].body).ticket, 'TICKET-abc123');
+  boot[0].answer(200, { ok: true, key: 'operator-key' });
+  await page.settle();
+  assert.equal(page.store.get(KEY_STORAGE), 'operator-key');
+  const after = page.take();
+  assert.deepEqual(after.map(f => f.url).sort(), BOOT_URLS);
+  assert.ok(after.every(f => f.key === 'operator-key'), JSON.stringify(after));
+});
+
+test('a spent launcher ticket falls back to the normal boot', async () => {
+  const page = await bootPage({ href: 'https://tc.realm.watch/ui?ticket=SPENT', auto401: false });
+  const [redeem] = page.take();
+  redeem.answer(404, { ok: false });
+  await page.settle();
+  assert.equal(page.store.has(KEY_STORAGE), false);
+  assert.deepEqual(page.take().map(f => f.url).sort(), BOOT_URLS);
 });

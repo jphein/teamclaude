@@ -6,6 +6,7 @@ import { TunnelStats } from './tunnel-stats.js';
 import { FAMILIES, familyPolicy, rewriteFamilyBody, familyModelIn, isFamilyModel, clientAllowed, FamilyStats, isFamilyRefusal } from './family-policy.js';
 import https from 'node:https';
 import { timingSafeEqual } from 'node:crypto';
+import { createUiTicketStore } from './ui-ticket.js';
 import { createWriteStream, mkdirSync, writeSync } from 'node:fs';
 import { readFile, readdir, stat, unlink } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
@@ -477,6 +478,9 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/add-account', 'a client key cannot add accounts'],
   ['/teamclaude/add-account/code', 'a client key cannot add accounts'],
   ['/teamclaude/add-account/cancel', 'a client key cannot add accounts'],
+  // A /ui ticket hands over the key that minted it; only the operator's key
+  // is worth carrying into the dashboard (desktop launcher, 2026-10-25).
+  ['/teamclaude/ui-ticket', 'a client key cannot mint dashboard tickets'],
 ]);
 
 /**
@@ -541,6 +545,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // read and a log line.
   /** @type {Promise<{ html: string, csp: string }> | null} */
   let uiPagePromise = null;
+  // One-time /ui tickets (the desktop launcher's way in; see ui-ticket.js).
+  const uiTickets = /** @type {any} */ (hooks).uiTickets || createUiTicketStore();
   const loadUiPage = () => {
     if (!uiPagePromise) {
       const p = readFile(/** @type {any} */ (hooks).uiPagePath || join(__dirname, 'web', 'index.html'), 'utf-8')
@@ -650,7 +656,14 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // the key it keeps in localStorage. Gated, a remote browser could never
       // load it at all. Same headers as the dashboard; uiCsp() says why /ui
       // needs one allowance more. Cached with its policy after the first read.
-      if (req.method === 'GET' && (req.url === '/ui' || req.url === '/ui/' || req.url === '/ui/index.html')) {
+      // Exact paths only, plus exactly one query: the desktop launcher's
+      // ?ticket=<token>. Missing it here, that address fell through to the gate
+      // — a 401 for a remote browser, and for key-less loopback a forward
+      // upstream carrying the live ticket (Oracle, 2026-10-25). Any other query
+      // still meets the gate.
+      const [uiPath, uiQuery] = req.method === 'GET' ? (req.url || '').split(/\?(.*)/s, 2) : [''];
+      const uiQueryOk = uiQuery === undefined || /^ticket=[A-Za-z0-9_-]{16,128}$/.test(uiQuery);
+      if (uiQueryOk && (uiPath === '/ui' || uiPath === '/ui/' || uiPath === '/ui/index.html')) {
         try {
           const uiPage = await loadUiPage();
           res.writeHead(200, {
@@ -658,6 +671,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
             'Cache-Control': 'no-store',
             'Content-Security-Policy': uiPage.csp,
             'X-Content-Type-Options': 'nosniff',
+            // The address can carry a one-time ticket for an instant before the
+            // page drops it; nothing the page links to should ever see it.
+            'Referrer-Policy': 'no-referrer',
           });
           res.end(uiPage.html);
         } catch {
@@ -666,6 +682,23 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           // and holds the failure for UI_RETRY_MS.
           json(res, 500, { error: 'dashboard page unavailable; see the proxy log' });
         }
+        return;
+      }
+
+      // POST /teamclaude/ui-ticket/redeem — the one control route served BEFORE
+      // the auth gate: the page holding a ticket has no key yet, and the ticket
+      // is the credential (256 random bits, single use, 60 s; see ui-ticket.js).
+      // Skipping the gate means doing its cross-origin check here: only the
+      // dashboard page itself, or a client sending no Origin at all, may redeem.
+      if (req.method === 'POST' && req.url === '/teamclaude/ui-ticket/redeem') {
+        if (!isSameOriginControlRequest(req)) { json(res, 403, { ok: false, error: 'cross-origin request refused' }); return; }
+        let ticket;
+        try { ({ ticket } = JSON.parse((await readControlBody(req, 1024)) || '{}')); } catch { json(res, 400, { ok: false, error: 'expected {"ticket": "…"}' }); return; }
+        const key = uiTickets.redeem(ticket);
+        if (key == null) { json(res, 404, { ok: false, error: 'no such ticket, or it was already used or expired' }); return; }
+        console.log('[TeamClaude] Dashboard ticket redeemed — /ui is signed in');
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: true, key }));
         return;
       }
 
@@ -924,6 +957,22 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         if (!hooks.reauth) { json(res, 501, { error: 'reauth not supported' }); return; }
         hooks.reauth.cancel();
         json(res, 200, hooks.reauth.status());
+        return;
+      }
+
+      // POST /teamclaude/ui-ticket — mint a one-time ticket that carries the
+      // presented key into /ui (the desktop launcher). Client keys are refused
+      // above; a key-less loopback caller has no key to hand over.
+      if (req.method === 'POST' && req.url === '/teamclaude/ui-ticket') {
+        // With no keys configured every caller is "authenticated" and the page
+        // needs no key at all: nothing to hand over, and no slots to fill.
+        const keysConfigured = !resolveClientAuth(config.proxy, undefined).ok;
+        if (!keysConfigured || !auth.ok || typeof clientKey !== 'string') { json(res, 400, { ok: false, error: 'present the key the dashboard should use (x-api-key)' }); return; }
+        const ticket = uiTickets.mint(clientKey);
+        if (!ticket) { json(res, 429, { ok: false, error: 'too many unredeemed tickets; try again in a minute' }); return; }
+        console.log('[TeamClaude] Dashboard ticket issued (launcher)');
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: true, ticket, expiresInMs: 60_000 }));
         return;
       }
 

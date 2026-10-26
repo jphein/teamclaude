@@ -696,6 +696,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         try { ({ ticket } = JSON.parse((await readControlBody(req, 1024)) || '{}')); } catch { json(res, 400, { ok: false, error: 'expected {"ticket": "…"}' }); return; }
         const key = uiTickets.redeem(ticket);
         if (key == null) { json(res, 404, { ok: false, error: 'no such ticket, or it was already used or expired' }); return; }
+        console.log('[TeamClaude] Dashboard ticket redeemed — /ui is signed in');
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({ ok: true, key }));
         return;
@@ -969,6 +970,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         if (!keysConfigured || !auth.ok || typeof clientKey !== 'string') { json(res, 400, { ok: false, error: 'present the key the dashboard should use (x-api-key)' }); return; }
         const ticket = uiTickets.mint(clientKey);
         if (!ticket) { json(res, 429, { ok: false, error: 'too many unredeemed tickets; try again in a minute' }); return; }
+        console.log('[TeamClaude] Dashboard ticket issued (launcher)');
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({ ok: true, ticket, expiresInMs: 60_000 }));
         return;

@@ -38,7 +38,7 @@ resp=$(printf 'header = "x-api-key: %s"\n' "$key" \
     curl -q -sS --noproxy '*' --proto '=https,http' --max-redirs 0 -m 10 -K - -X POST -H 'content-type: application/json' "$BASE/teamclaude/ui-ticket" 2>/dev/null) \
   || plain "could not reach $BASE"
 unset key
-ticket=$(printf '%s' "$resp" | python3 -c 'import json,sys; t=json.load(sys.stdin).get("ticket"); print(t) if isinstance(t,str) and t.replace("-","").replace("_","").isalnum() else sys.exit(1)' 2>/dev/null) \
+ticket=$(printf '%s' "$resp" | python3 -c 'import json,re,sys; t=json.load(sys.stdin).get("ticket"); print(t) if isinstance(t,str) and re.fullmatch(r"[A-Za-z0-9_-]{16,128}", t) else sys.exit(1)' 2>/dev/null) \
   || plain "the proxy did not issue a ticket"
 # Not `xdg-open "$BASE/ui?ticket=…"`: a live ticket in an argument list is
 # readable by every local user (ps) for as long as it takes the browser to
@@ -46,7 +46,7 @@ ticket=$(printf '%s' "$resp" | python3 -c 'import json,sys; t=json.load(sys.stdi
 # directory instead; the browser is handed only that file's path, and the page
 # forwards itself to the dashboard. Gone again after 30 s (the ticket after 60).
 dir="${XDG_RUNTIME_DIR:-$HOME/.cache}/teamclaude-dash"
-mkdir -p -m 700 "$dir"
+mkdir -p "$dir" && chmod 700 "$dir"
 page=$(mktemp "$dir/open-XXXXXX.html")
 chmod 600 "$page"
 printf '<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>teamclaude</title><script>location.replace("%s/ui?ticket=%s")</script>\n' "$BASE" "$ticket" > "$page"

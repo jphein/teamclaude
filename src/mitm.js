@@ -283,6 +283,9 @@ export function upgradeUpstreamFor(hostHeader, config, upstream) {
   return null;
 }
 
+// Hosts whose blind tunnels the per-client cap counts but never refuses.
+const CAP_EXEMPT_HOST = /(^|\.)(anthropic\.com|claude\.ai|claude\.com)\.?$/i;
+
 /**
  * Build a `connect` event handler implementing the terminating MITM described at
  * the top of this file.
@@ -487,8 +490,11 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       // CONNECT, so a reload changes the cap at once.
       // Checked and counted with no await between, so concurrent CONNECTs
       // cannot all pass the check before any of them is counted.
+      // Claude Code's own hosts outside the intercepted API (OAuth refresh and
+      // login, MCP proxy, updates) are counted but never refused: a full bucket
+      // must not fail a token refresh (Oracle, 2026-10-27).
       const cap = maxTunnelsPerClient(/** @type {any} */ (config).proxy);
-      if (cap > 0 && tunnelStats.active(auth.client) >= cap) {
+      if (cap > 0 && !CAP_EXEMPT_HOST.test(host) && tunnelStats.active(auth.client) >= cap) {
         tunnelStats.refuse(auth.client);
         logCapOnce(TunnelStats.key(auth.client), () => log(`[TeamClaude] CONNECT ${host}:${port} refused for ${TunnelStats.key(auth.client)}: ${cap} blind tunnels already open (proxy.maxTunnelsPerClient)`));
         // end() flushes the status line; a client that never reads it loses the
@@ -530,8 +536,12 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
           return;
         }
         established = true;
+        clientSocket.off('data', holdEarly);
+        clientSocket.off('end', earlyEnd);
         reply200Raw(clientSocket);
         if (head && head.length) up.write(head);
+        for (const chunk of early) up.write(chunk);
+        early.length = 0;
         up.pipe(clientSocket); clientSocket.pipe(up);
       });
       up.on('error', (/** @type {CodedError} */ err) => {
@@ -547,6 +557,22 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       // dial from the client's view — surface a 502 rather than a silent drop.
       up.on('close', () => teardown('502 Bad Gateway'));
       clientSocket.on('close', () => teardown()); // client gone: nothing to write
+      // Until the tunnel is live nothing reads the client socket, so a client
+      // that gives up on a slow dial goes unnoticed and holds its slot (and two
+      // descriptors) until the 30 s timeout (Oracle, 2026-10-27). Read it now:
+      // its end tears down at once, and anything it pipelined is kept (64 KiB
+      // at most) and replayed into the tunnel once it opens.
+      /** @type {Buffer[]} */
+      const early = [];
+      let earlyBytes = 0;
+      const holdEarly = (/** @type {Buffer} */ chunk) => {
+        earlyBytes += chunk.length;
+        if (earlyBytes > 65_536) { teardown('413 Payload Too Large'); return; }
+        early.push(chunk);
+      };
+      const earlyEnd = () => teardown();
+      clientSocket.on('data', holdEarly);
+      clientSocket.on('end', earlyEnd);
       up.setTimeout(30_000, () => teardown('504 Gateway Timeout')); // bound a stalled connect/idle tunnel
       return;
     }

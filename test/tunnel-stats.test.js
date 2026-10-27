@@ -215,3 +215,62 @@ test('a handler built without shared stats still enforces the cap', async () => 
     first.sock.destroy();
   } finally { srv.close(); echo.close(); }
 });
+
+test('a client that gives up on a slow dial frees its slot at once, not after the 30 s timeout', async () => {
+  const { proxy, port, status } = await cappedProxy(5);
+  try {
+    // A blackholed address: the dial hangs (where the network instead refuses
+    // at once, the slot comes back by that path, and the test still holds).
+    const s = net.connect(port, '127.0.0.1');
+    await new Promise((r) => s.on('connect', r));
+    s.write('CONNECT 10.255.255.1:443 HTTP/1.1\r\nProxy-Authorization: Bearer k-lane\r\n\r\n');
+    await new Promise((r) => setTimeout(r, 150));
+    s.end();
+    let st = await status();
+    for (let i = 0; i < 25 && (st.tunnels.active.lane || 0) > 0; i++) { await new Promise((r) => setTimeout(r, 40)); st = await status(); }
+    assert.equal(st.tunnels.active.lane, undefined, 'released within a second of the client leaving');
+  } finally { proxy.close(); }
+});
+
+// Bytes in the CONNECT's own packet arrive as `head`; the early buffer covers a
+// later packet during a slow dial, which a loopback dial is too fast to show.
+test('bytes a client pipelines before the 200 reach the tunnel', async () => {
+  const { proxy, port } = await cappedProxy(5);
+  const echo = net.createServer((c) => c.pipe(c)); const echoPort = await listen(echo);
+  try {
+    const got = await new Promise((resolve, reject) => {
+      const s = net.connect(port, '127.0.0.1', () => s.write(`CONNECT 127.0.0.1:${echoPort} HTTP/1.1\r\nProxy-Authorization: Bearer k-lane\r\n\r\nhello-early`));
+      let buf = '';
+      s.on('data', (d) => { buf += d; if (buf.includes('hello-early')) { s.destroy(); resolve(buf); } });
+      s.on('error', reject);
+      setTimeout(() => { s.destroy(); resolve(buf); }, 3000);
+    });
+    assert.match(got, /^HTTP\/1\.1 200[\s\S]*hello-early/);
+  } finally { proxy.close(); echo.close(); }
+});
+
+test('Anthropic and Claude hosts are counted but never refused at the cap', async () => {
+  const { createConnectHandler } = await import('../src/mitm.js');
+  const am = { accounts: [] };
+  const config = { proxy: { maxTunnelsPerClient: 1 }, upstream: 'https://api.anthropic.com' };
+  const { TunnelStats: TS } = await import('../src/tunnel-stats.js');
+  const stats = new TS();
+  const handler = createConnectHandler({ config, accountManager: am, ensureLeaf: async () => null, tunnelStats: stats });
+  const srv = (await import('node:http')).createServer();
+  srv.on('connect', handler);
+  allowLoopbackForward(srv);
+  const port = await listen(srv);
+  const echo = net.createServer((c) => c.pipe(c)); const echoPort = await listen(echo);
+  try {
+    const first = await connectRaw(port, `127.0.0.1:${echoPort}`, 'k');
+    assert.match(first.head, /^HTTP\/1\.1 200/);
+    // At the cap: an ordinary host is refused, a Claude host is not (whatever its dial does after).
+    assert.match((await connectRaw(port, `127.0.0.1:${echoPort}`, 'k')).head, /^HTTP\/1\.1 429/);
+    for (const h of ['platform.claude.com:443', 'claude.ai:443', 'console.anthropic.com:443']) {
+      const r = await connectRaw(port, h, 'k');
+      assert.doesNotMatch(r.head, /^HTTP\/1\.1 429/, h);
+      r.sock.destroy();
+    }
+    first.sock.destroy();
+  } finally { srv.close(); echo.close(); }
+});

@@ -6,8 +6,24 @@
 // fix, but its number has to be measured, not guessed: every lane on familiar
 // arrives as ONE client ("familiar"), so a healthy peak is unknown. This
 // records it. In memory: a restart starts the counts again.
+//
+// Measured 2026-10-22 → 10-27: familiar's 24 h peak was 33, 52 and 82 across
+// windows of normal work. The cap (proxy.maxTunnelsPerClient, default
+// DEFAULT_MAX_TUNNELS_PER_CLIENT) is about 4× the highest — room for a busy
+// day, far short of the 4096 descriptors one burst once used up.
 
 const HOUR_MS = 3_600_000;
+export const DEFAULT_MAX_TUNNELS_PER_CLIENT = 320;
+
+/**
+ * The per-client cap on open blind tunnels: proxy.maxTunnelsPerClient, 0 for
+ * none, the default when unset or not a whole number ≥ 0.
+ * @param {any} proxyConfig
+ */
+export function maxTunnelsPerClient(proxyConfig) {
+  const v = proxyConfig?.maxTunnelsPerClient;
+  return Number.isInteger(v) && v >= 0 ? v : DEFAULT_MAX_TUNNELS_PER_CLIENT;
+}
 
 export class TunnelStats {
   constructor(now = () => Date.now()) {
@@ -18,6 +34,17 @@ export class TunnelStats {
     this._peak = new Map();
     /** @type {Map<number, Map<string, number>>} hour index → client → most open at once in that hour */
     this._hours = new Map();
+    /** @type {Map<string, number>} client → tunnels refused by the cap since start */
+    this._refused = new Map();
+  }
+
+  /** Tunnels this client has open now. @param {string|null|undefined} client */
+  active(client) { return this._active.get(TunnelStats.key(client)) || 0; }
+
+  /** A tunnel refused by the cap. @param {string|null|undefined} client */
+  refuse(client) {
+    const k = TunnelStats.key(client);
+    this._refused.set(k, (this._refused.get(k) || 0) + 1);
   }
 
   /** @param {string|null|undefined} client */
@@ -58,6 +85,7 @@ export class TunnelStats {
       active: Object.fromEntries(this._active),
       peakSinceStart: Object.fromEntries(this._peak),
       peak24h,
+      refusedSinceStart: Object.fromEntries(this._refused),
     };
   }
 }

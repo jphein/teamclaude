@@ -194,6 +194,8 @@ export const FIELDS = [
     check: (v) => (Array.isArray(v) && v.every((d) => isObj(d) && typeof d.name === 'string' && typeof d.header === 'string') ? null : 'must be an array of { name, header }') },
   { key: 'proxy.sessionDetail', group: 'Proxy & access', label: 'Per-session detail', type: 'bool', apply: 'hot', def: false,
     help: 'Show one row per session (client, project, tokens) in status and on the dashboard.' },
+  { key: 'proxy.maxTunnelsPerClient', group: 'Proxy & access', label: 'Max tunnels per client', type: 'int', apply: 'hot', def: 320, min: 0,
+    help: 'Most blind tunnels (CONNECTs the proxy does not intercept) one client key may hold open; more get 429. 0 = no cap. Intercepted API traffic is never counted; Anthropic and Claude hosts get 32 more.' },
   { key: 'proxy.maxBodyBytes', group: 'Proxy & access', label: 'Max request body (bytes)', type: 'int', apply: 'restart', def: 64 * 1024 * 1024, min: 0,
     help: 'Largest request body accepted. 0 = no limit.' },
   { key: 'proxy.tls', group: 'Proxy & access', label: 'TLS listener', type: 'json', apply: 'restart', def: null, danger: true,

@@ -25,6 +25,7 @@ import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpg
 import { interceptHostsFor, isNeverIntercepted, providerForPath, DEFAULT_PROVIDER } from './provider.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { safeLine } from './safe-text.js';
+import { TunnelStats, maxTunnelsPerClient } from './tunnel-stats.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 const CA_CERT = 'teamclaude-ca.pem';
@@ -282,6 +283,14 @@ export function upgradeUpstreamFor(hostHeader, config, upstream) {
   return null;
 }
 
+// Claude Code's own hosts outside the intercepted API (OAuth refresh and
+// login, MCP proxy, updates) get this much room past the per-client cap, so a
+// full bucket cannot fail a token refresh — bounded, so a runaway client
+// cannot use the exemption to open unlimited tunnels either (security review,
+// 2026-10-27).
+const CAP_HEADROOM_HOST = /(^|\.)(anthropic\.com|claude\.ai|claude\.com)\.?$/i;
+const CAP_HEADROOM = 32;
+
 /**
  * Build a `connect` event handler implementing the terminating MITM described at
  * the top of this file.
@@ -297,9 +306,23 @@ export function upgradeUpstreamFor(hostHeader, config, upstream) {
  * @param {Object|null} [opts.clientUsage]
  * @param {Object|null} [opts.dimensionUsage]
  * @param {import('./tunnel-stats.js').TunnelStats|null} [opts.tunnelStats]  counts blind tunnels per client
+ * @param {Function} [opts.dialLookup]  the DNS lookup a blind tunnel dials with (tests delay it)
  */
-export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null, tunnelStats = null }) {
+export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null, tunnelStats: givenStats = null, dialLookup = cachedLookup }) {
+  // The cap is enforced from these counts, so a handler built without shared
+  // stats still keeps its own (one listener's worth) rather than none.
+  const tunnelStats = givenStats || new TunnelStats();
   const upstream = config.upstream || 'https://api.anthropic.com';
+  // A capped burst refuses many tunnels a second: one log line per client a minute.
+  /** @type {Map<string, number>} */
+  const capLogged = new Map();
+  const logCapOnce = (/** @type {string} */ who, /** @type {() => void} */ emit) => {
+    const now = Date.now();
+    if (now - (capLogged.get(who) || 0) < 60_000) return;
+    if (capLogged.size > 1000) capLogged.clear();
+    capLogged.set(who, now);
+    emit();
+  };
   const holdMs = (config.holdSeconds || 0) * 1000;
 
   // One terminating h2/h1 server per pin, minted lazily on the first intercepted
@@ -466,10 +489,29 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       // the client reports "Proxy connection ended before receiving CONNECT
       // response" — so before the tunnel is live, surface failures as a real
       // proxy error status instead of a silent drop.
+      // One client's burst must not use up the descriptors every other
+      // connection needs, Claude's included (2026-10-21: 636 × EMFILE). Refused
+      // before the dial, so a refused tunnel costs nothing but this socket.
+      // 429 + Retry-After: a client that honours it backs off; read per
+      // CONNECT, so a reload changes the cap at once.
+      // Checked and counted with no await between, so concurrent CONNECTs
+      // cannot all pass the check before any of them is counted.
+      const cap = maxTunnelsPerClient(/** @type {any} */ (config).proxy);
+      const limit = cap > 0 && CAP_HEADROOM_HOST.test(host) ? cap + CAP_HEADROOM : cap;
+      if (cap > 0 && tunnelStats.active(auth.client) >= limit) {
+        tunnelStats.refuse(auth.client);
+        logCapOnce(TunnelStats.key(auth.client), () => log(`[TeamClaude] CONNECT ${host}:${port} refused for ${TunnelStats.key(auth.client)}: ${cap} blind tunnels already open (proxy.maxTunnelsPerClient)`));
+        // end() flushes the status line; a client that never reads it loses the
+        // socket after 5 s instead of keeping a descriptor the cap exists to save.
+        try { clientSocket.end('HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
+        setTimeout(() => clientSocket.destroy(), 5_000).unref?.();
+        return;
+      }
       let established = false, closed = false;
       // Counted from the dial, not the 200: a burst that never connects (the
-      // EMFILE case) still holds a socket per attempt.
-      const tunnelClosed = tunnelStats ? tunnelStats.open(auth.client) : () => {};
+      // EMFILE case) still holds a socket per attempt. Released exactly once by
+      // teardown(), which every exit below goes through.
+      const tunnelClosed = tunnelStats.open(auth.client);
       // Tear down BOTH sockets when either errors or closes, so a one-sided
       // failure can't leave the paired socket lingering (FD leak). The `closed`
       // guard makes it idempotent (error+close both fire) and ensures we write
@@ -483,7 +525,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         }
         up.destroy(); clientSocket.destroy();
       };
-      const up = net.connect({ port, host, lookup: guardedLookup(clientSocket, { lookup: /** @type {any} */ (cachedLookup) }) }, () => {
+      const up = net.connect({ port, host, lookup: guardedLookup(clientSocket, { lookup: /** @type {any} */ (dialLookup) }) }, () => {
         // The lookup already vetted every resolved address; this re-checks the
         // one actually connected (cheap, and independent of how the dial got
         // there). A tunnel back to our own listener — any local address, our
@@ -498,8 +540,12 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
           return;
         }
         established = true;
+        clientSocket.off('data', holdEarly);
+        clientSocket.off('end', earlyEnd);
         reply200Raw(clientSocket);
         if (head && head.length) up.write(head);
+        for (const chunk of early) up.write(chunk);
+        early.length = 0;
         up.pipe(clientSocket); clientSocket.pipe(up);
       });
       up.on('error', (/** @type {CodedError} */ err) => {
@@ -515,6 +561,28 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       // dial from the client's view — surface a 502 rather than a silent drop.
       up.on('close', () => teardown('502 Bad Gateway'));
       clientSocket.on('close', () => teardown()); // client gone: nothing to write
+      // Until the tunnel is live nothing reads the client socket, so a client
+      // that gives up on a slow dial goes unnoticed and holds its slot (and two
+      // descriptors) until the 30 s timeout (Oracle, 2026-10-27). Read it now:
+      // its end tears down at once, and anything it pipelined is kept (64 KiB
+      // at most, the CONNECT's own trailing bytes included) and replayed into
+      // the tunnel once it opens. A FIN before the 200 is taken as giving up:
+      // from here an abandoning client and one that half-closes after
+      // pipelining its whole request look the same, and no TLS client does the
+      // latter — so that one is refused, by design, rather than every
+      // abandoned dial holding its slot.
+      /** @type {Buffer[]} */
+      const early = [];
+      let earlyBytes = head ? head.length : 0; // what came with the CONNECT counts too
+      const holdEarly = (/** @type {Buffer} */ chunk) => {
+        earlyBytes += chunk.length;
+        if (earlyBytes > 65_536) { teardown('413 Payload Too Large'); return; }
+        early.push(chunk);
+      };
+      const earlyEnd = () => teardown();
+      if (earlyBytes > 65_536) { teardown('413 Payload Too Large'); return; }
+      clientSocket.on('data', holdEarly);
+      clientSocket.on('end', earlyEnd);
       up.setTimeout(30_000, () => teardown('504 Gateway Timeout')); // bound a stalled connect/idle tunnel
       return;
     }

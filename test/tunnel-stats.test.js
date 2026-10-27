@@ -152,7 +152,9 @@ async function cappedProxy(cap) {
 
 test('every failed or abandoned tunnel releases its slot: dial refused, client gone mid-dial, upstream closing', async () => {
   const { proxy, port, settled } = await cappedProxy(2);
-  const dead = net.createServer(); const deadPort = await listen(dead); dead.close();
+  // Port 1: binding it needs root, so nothing listens there and the dial is
+  // refused every time (a closed ephemeral port can be reused by another test).
+  const deadPort = 1;
   const slam = net.createServer((s) => s.destroy()); const slamPort = await listen(slam);
   const echo = net.createServer((s) => s.pipe(s)); const echoPort = await listen(echo);
   try {

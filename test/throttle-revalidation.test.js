@@ -72,11 +72,15 @@ test('clearRateLimited is a no-op on accounts that are not throttled', () => {
 });
 
 test('constructor floor option is honored', () => {
-  const am = new AccountManager([oauth('a')], 0.98, { throttleProbeFloorMs: 5 });
+  // A 1 s floor, not a few ms: under a loaded full-suite run more than 5 ms
+  // passed between the mark and the first read, and "inside the floor" failed
+  // (2026-10-27). The floor is still far below the 3600 s hold, so the option
+  // is what decides.
+  const am = new AccountManager([oauth('a')], 0.98, { throttleProbeFloorMs: 1000 });
   am.markRateLimited(0, 3600);
-  assert.equal(am.getActiveAccount(), null, 'inside the tiny floor');
-  am.accounts[0].throttledAt = Date.now() - 6;
-  assert.ok(am.getActiveAccount(), 'past the tiny floor');
+  assert.equal(am.getActiveAccount(), null, 'inside the floor');
+  am.accounts[0].throttledAt = Date.now() - 1001;
+  assert.ok(am.getActiveAccount(), 'past the floor');
 });
 
 test('natural hold expiry still clears state fully', () => {

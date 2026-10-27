@@ -271,11 +271,91 @@ test('Anthropic and Claude hosts get bounded headroom past the cap', async () =>
       assert.doesNotMatch(r.head, /^HTTP\/1\.1 429/, h);
       r.sock.destroy();
     }
+    for (const h of ['evil-anthropic.com:443', 'anthropic.com.evil:443', 'xclaude.ai:443', 'claude.com.attacker.example:443']) {
+      assert.match((await connectRaw(port, h, 'k')).head, /^HTTP\/1\.1 429/, `lookalike ${h} gets no headroom`);
+    }
     // Bounded: with the bucket filled past cap + headroom, a Claude host is refused too.
     const fill = [];
     for (let i = 0; i < 40; i++) fill.push(stats.open(null)); // no keys configured: the caller is '(shared key)'
     assert.match((await connectRaw(port, 'platform.claude.com:443', 'k')).head, /^HTTP\/1\.1 429/, 'the headroom is finite');
     for (const close of fill) close();
     first.sock.destroy();
+  } finally { srv.close(); echo.close(); }
+});
+
+/** A connect handler whose blind-tunnel dials wait `ms` in DNS first: a genuinely pending dial. */
+async function slowDialProxy(ms, cap = 5) {
+  const { createConnectHandler } = await import('../src/mitm.js');
+  const { TunnelStats: TS } = await import('../src/tunnel-stats.js');
+  const dns = await import('node:dns');
+  const stats = new TS();
+  const dialLookup = (host, opts, cb) => setTimeout(() => dns.lookup(host, opts, cb), ms);
+  const handler = createConnectHandler({ config: { proxy: { maxTunnelsPerClient: cap } }, accountManager: { accounts: [] }, ensureLeaf: async () => null, tunnelStats: stats, dialLookup });
+  const srv = (await import('node:http')).createServer();
+  srv.on('connect', handler);
+  allowLoopbackForward(srv);
+  const port = await listen(srv);
+  return { srv, port, stats };
+}
+
+test('a pending dial: head, early chunks and post-200 bytes arrive once and in order', async () => {
+  const { srv, port } = await slowDialProxy(300);
+  const echo = net.createServer((c) => c.pipe(c)); const echoPort = await listen(echo);
+  try {
+    const got = await new Promise((resolve, reject) => {
+      const s = net.connect(port, '127.0.0.1', async () => {
+        s.write(`CONNECT localhost:${echoPort} HTTP/1.1\r\n\r\nH1`);
+        await new Promise((r) => setTimeout(r, 60)); s.write('E2');
+        await new Promise((r) => setTimeout(r, 60)); s.write('E3');
+      });
+      let buf = '';
+      s.on('data', (d) => {
+        buf += d;
+        if (buf.includes('\r\n\r\n') && !buf.includes('P4') && !s.sentPost) { s.sentPost = true; s.write('P4'); }
+        if (buf.endsWith('P4')) { s.destroy(); resolve(buf); }
+      });
+      s.on('error', reject);
+      setTimeout(() => { s.destroy(); resolve(buf); }, 3000);
+    });
+    assert.match(got, /^HTTP\/1\.1 200[^]*\r\n\r\nH1E2E3P4$/, JSON.stringify(got));
+  } finally { srv.close(); echo.close(); }
+});
+
+test('a pending dial: the client leaving frees the slot at once, and a FIN before the 200 is giving up', async () => {
+  const { srv, port, stats } = await slowDialProxy(800);
+  const echo = net.createServer((c) => c.pipe(c)); const echoPort = await listen(echo);
+  try {
+    for (const leave of ['destroy', 'end']) {
+      const s = net.connect(port, '127.0.0.1');
+      await new Promise((r) => s.on('connect', r));
+      s.write(`CONNECT localhost:${echoPort} HTTP/1.1\r\n\r\n`);
+      await new Promise((r) => setTimeout(r, 100));
+      assert.equal(stats.active(null), 1, `${leave}: counted while dialling`);
+      s[leave]();
+      await new Promise((r) => setTimeout(r, 100));
+      assert.equal(stats.active(null), 0, `${leave}: released well before the dial resolves`);
+      s.destroy();
+    }
+  } finally { srv.close(); echo.close(); }
+});
+
+test('a pending dial: more than 64 KiB before the 200 is refused (the CONNECT\'s own trailing bytes count)', async () => {
+  const { srv, port, stats } = await slowDialProxy(300);
+  const echo = net.createServer((c) => c.pipe(c)); const echoPort = await listen(echo);
+  try {
+    for (const split of [false, true]) {
+      const head = await new Promise((resolve, reject) => {
+        const s = net.connect(port, '127.0.0.1', async () => {
+          const big = 'x'.repeat(70_000);
+          if (split) { s.write(`CONNECT localhost:${echoPort} HTTP/1.1\r\n\r\n`); await new Promise((r) => setTimeout(r, 30)); s.write(big); }
+          else s.write(`CONNECT localhost:${echoPort} HTTP/1.1\r\n\r\n${big}`);
+        });
+        let buf = ''; s.on('data', (d) => { buf += d; }); s.on('close', () => resolve(buf)); s.on('error', () => resolve(buf));
+        setTimeout(() => { s.destroy(); reject(new Error('no answer')); }, 3000);
+      });
+      assert.match(head, /^HTTP\/1\.1 413/, split ? 'in later chunks' : 'with the CONNECT');
+    }
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(stats.active(null), 0);
   } finally { srv.close(); echo.close(); }
 });

@@ -306,8 +306,9 @@ const CAP_HEADROOM = 32;
  * @param {Object|null} [opts.clientUsage]
  * @param {Object|null} [opts.dimensionUsage]
  * @param {import('./tunnel-stats.js').TunnelStats|null} [opts.tunnelStats]  counts blind tunnels per client
+ * @param {Function} [opts.dialLookup]  the DNS lookup a blind tunnel dials with (tests delay it)
  */
-export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null, tunnelStats: givenStats = null }) {
+export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null, tunnelStats: givenStats = null, dialLookup = cachedLookup }) {
   // The cap is enforced from these counts, so a handler built without shared
   // stats still keeps its own (one listener's worth) rather than none.
   const tunnelStats = givenStats || new TunnelStats();
@@ -524,7 +525,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         }
         up.destroy(); clientSocket.destroy();
       };
-      const up = net.connect({ port, host, lookup: guardedLookup(clientSocket, { lookup: /** @type {any} */ (cachedLookup) }) }, () => {
+      const up = net.connect({ port, host, lookup: guardedLookup(clientSocket, { lookup: /** @type {any} */ (dialLookup) }) }, () => {
         // The lookup already vetted every resolved address; this re-checks the
         // one actually connected (cheap, and independent of how the dial got
         // there). A tunnel back to our own listener — any local address, our
@@ -564,7 +565,12 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       // that gives up on a slow dial goes unnoticed and holds its slot (and two
       // descriptors) until the 30 s timeout (Oracle, 2026-10-27). Read it now:
       // its end tears down at once, and anything it pipelined is kept (64 KiB
-      // at most) and replayed into the tunnel once it opens.
+      // at most, the CONNECT's own trailing bytes included) and replayed into
+      // the tunnel once it opens. A FIN before the 200 is taken as giving up:
+      // from here an abandoning client and one that half-closes after
+      // pipelining its whole request look the same, and no TLS client does the
+      // latter — so that one is refused, by design, rather than every
+      // abandoned dial holding its slot.
       /** @type {Buffer[]} */
       const early = [];
       let earlyBytes = head ? head.length : 0; // what came with the CONNECT counts too
@@ -574,6 +580,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         early.push(chunk);
       };
       const earlyEnd = () => teardown();
+      if (earlyBytes > 65_536) { teardown('413 Payload Too Large'); return; }
       clientSocket.on('data', holdEarly);
       clientSocket.on('end', earlyEnd);
       up.setTimeout(30_000, () => teardown('504 Gateway Timeout')); // bound a stalled connect/idle tunnel

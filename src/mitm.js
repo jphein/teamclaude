@@ -25,6 +25,7 @@ import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpg
 import { interceptHostsFor, isNeverIntercepted, providerForPath, DEFAULT_PROVIDER } from './provider.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { safeLine } from './safe-text.js';
+import { TunnelStats, maxTunnelsPerClient } from './tunnel-stats.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 const CA_CERT = 'teamclaude-ca.pem';
@@ -300,6 +301,16 @@ export function upgradeUpstreamFor(hostHeader, config, upstream) {
  */
 export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null, tunnelStats = null }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
+  // A capped burst refuses many tunnels a second: one log line per client a minute.
+  /** @type {Map<string, number>} */
+  const capLogged = new Map();
+  const logCapOnce = (/** @type {string} */ who, /** @type {() => void} */ emit) => {
+    const now = Date.now();
+    if (now - (capLogged.get(who) || 0) < 60_000) return;
+    if (capLogged.size > 1000) capLogged.clear();
+    capLogged.set(who, now);
+    emit();
+  };
   const holdMs = (config.holdSeconds || 0) * 1000;
 
   // One terminating h2/h1 server per pin, minted lazily on the first intercepted
@@ -466,6 +477,19 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       // the client reports "Proxy connection ended before receiving CONNECT
       // response" — so before the tunnel is live, surface failures as a real
       // proxy error status instead of a silent drop.
+      // One client's burst must not use up the descriptors every other
+      // connection needs, Claude's included (2026-10-21: 636 × EMFILE). Refused
+      // before the dial, so a refused tunnel costs nothing but this socket.
+      // 429 + Retry-After: a client that honours it backs off; read per
+      // CONNECT, so a reload changes the cap at once.
+      const cap = maxTunnelsPerClient(/** @type {any} */ (config).proxy);
+      if (tunnelStats && cap > 0 && tunnelStats.active(auth.client) >= cap) {
+        tunnelStats.refuse(auth.client);
+        logCapOnce(TunnelStats.key(auth.client), () => log(`[TeamClaude] CONNECT ${host}:${port} refused for ${TunnelStats.key(auth.client)}: ${cap} blind tunnels already open (proxy.maxTunnelsPerClient)`));
+        try { clientSocket.write('HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
+        clientSocket.destroy();
+        return;
+      }
       let established = false, closed = false;
       // Counted from the dial, not the 200: a burst that never connects (the
       // EMFILE case) still holds a socket per attempt.

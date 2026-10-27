@@ -578,6 +578,8 @@ async function serverCommand() {
       // The shared key is read per request too, so a rotated key on disk
       // takes effect on reload the same way.
       config.proxy.apiKey = diskConfig.proxy.apiKey;
+      // The blind-tunnel cap is read per CONNECT (mitm.js).
+      config.proxy.maxTunnelsPerClient = diskConfig.proxy.maxTunnelsPerClient;
     }
     // Dashboard SSO (sso.js) is read per request too: a reload turns it on,
     // rotates its hop secret or narrows its users without a restart. Outside

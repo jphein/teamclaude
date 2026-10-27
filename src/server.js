@@ -14,7 +14,7 @@ import { readFile, readdir, stat, unlink } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
-import { ensureCerts, createConnectHandler, mitmHosts } from './mitm.js';
+import { ensureCerts, createConnectHandler, mitmHosts, proxyAuthorizationAuth } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
@@ -737,7 +737,17 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // an allowed user, sent by the dashboard page itself) stands in as the
       // operator — on /teamclaude/* only. The front proxy's headers are then
       // dropped, so nothing below can relay them.
-      const keyAuth = resolveClientAuth(config.proxy, clientKey);
+      let keyAuth = resolveClientAuth(config.proxy, clientKey);
+      // A plain-HTTP forward request (absolute-form URL: HTTP_PROXY) carries its
+      // key the way a CONNECT does, in Proxy-Authorization — the only place an
+      // HTTP_PROXY=http://<key>@host URL can put it. Accepted for that form
+      // only, and that form goes nowhere but relayHttpForward below (the same
+      // test dispatches it, before any control or credential route); the header
+      // is hop-by-hop and never relayed.
+      if (!keyAuth.ok && /^https?:\/\//i.test(req.url || '') && req.headers['proxy-authorization']) {
+        const viaProxyAuth = proxyAuthorizationAuth(req.headers, config.proxy);
+        if (viaProxyAuth.ok) keyAuth = viaProxyAuth;
+      }
       // Never on a path with dot-segments: the SSO scope is a prefix test, and
       // such a path means one thing here and another wherever it is resolved.
       const sso = keyAuth.ok || hasDotSegment(req.url) ? null : ssoUser(req, config.proxy);

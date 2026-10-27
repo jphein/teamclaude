@@ -342,7 +342,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
   // client), for the same reason. The map is bounded by accounts × client keys,
   // both operator-controlled.
   const serverPromises = new Map();
-  const getServer = (pin = '', client = null) => {
+  const getServer = (pin = '', /** @type {string|null} */ client = null) => {
     const mapKey = `${pin}\u0000${client || ''}`;
     let p = serverPromises.get(mapKey);
     if (p) return p;
@@ -411,7 +411,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         }
         // The CONNECT's client identity is bound to this listener (see getServer),
         // so the channel is attributed the way the requests in the tunnel are.
-        relayUpgrade(req, socket, head, target, sx, { client, clientUsage, log, stripOverage: shouldStripOverageHeaders(config) });
+        relayUpgrade(req, socket, head, target, sx, { client: /** @type {any} */ (client), clientUsage, log, stripOverage: shouldStripOverageHeaders(config) });
       } catch (err) {
         log(`[TeamClaude] MITM: WebSocket upgrade handler failed for ${safeLine(req?.url)}: ${err?.message || err}`);
         try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
@@ -679,6 +679,30 @@ function redactToken(token) {
 }
 
 /**
+ * The client a `Proxy-Authorization` header authenticates as: Bearer <key>,
+ * or Basic where the key is the username or the password (so
+ * `--proxy http://<key>@host:port` works). { ok: false } when the header is
+ * absent or names no key. Shared by the CONNECT gate and the HTTP gate's
+ * absolute-form (plain-HTTP forward) requests.
+ * @param {import('node:http').IncomingHttpHeaders|undefined} headers
+ * @param {any} proxyConfig
+ * @returns {{ ok: boolean, client: string|null }}
+ */
+export function proxyAuthorizationAuth(headers, proxyConfig) {
+  const m = /^\s*(basic|bearer)\s+(.+?)\s*$/i.exec(headers?.['proxy-authorization'] || '');
+  if (!m) return { ok: false, client: null };
+  if (m[1].toLowerCase() !== 'basic') return resolveClientAuth(proxyConfig, m[2]);
+  const dec = Buffer.from(m[2], 'base64').toString('utf8'); // "user:pass"
+  const i = dec.indexOf(':');
+  const user = i >= 0 ? dec.slice(0, i) : dec;
+  const pass = i >= 0 ? dec.slice(i + 1) : '';
+  // Try both slots: the documented remote form carries the key in either.
+  let auth = resolveClientAuth(proxyConfig, pass || user);
+  if (!auth.ok && pass && user) auth = resolveClientAuth(proxyConfig, user);
+  return auth;
+}
+
+/**
  * Authorize a CONNECT and resolve which client identity it carries — the
  * CONNECT-side counterpart of server.js's resolveClientAuth, sharing its
  * semantics: no keys configured → open; loopback exempt (both unattributed);
@@ -686,26 +710,12 @@ function redactToken(token) {
  * `Proxy-Authorization` (Bearer <key>, or Basic where the key is the username
  * or password — so `--proxy http://<key>@host:port` works).
  * Returns { ok, client }.
+ * @returns {{ ok: boolean, client: string|null }}
  */
 export function resolveConnectAuth(req, socket, proxyConfig) {
   const hasKeys = !!(proxyConfig?.apiKey || (Array.isArray(proxyConfig?.clientKeys) && proxyConfig.clientKeys.length));
   if (!hasKeys) return { ok: true, client: null };
-  const m = /^\s*(basic|bearer)\s+(.+?)\s*$/i.exec(req?.headers?.['proxy-authorization'] || '');
-  let auth = { ok: false, client: null };
-  if (m) {
-    let presented = m[2];
-    if (m[1].toLowerCase() === 'basic') {
-      const dec = Buffer.from(m[2], 'base64').toString('utf8'); // "user:pass"
-      const i = dec.indexOf(':');
-      const user = i >= 0 ? dec.slice(0, i) : dec;
-      const pass = i >= 0 ? dec.slice(i + 1) : '';
-      // Try both slots: the documented remote form carries the key in either.
-      auth = resolveClientAuth(proxyConfig, pass || user);
-      if (!auth.ok && pass && user) auth = resolveClientAuth(proxyConfig, user);
-    } else {
-      auth = resolveClientAuth(proxyConfig, presented);
-    }
-  }
+  const auth = proxyAuthorizationAuth(req?.headers, proxyConfig);
   // Loopback is exempt from the key requirement, but a valid key it DID present
   // still names it (matching the HTTP gate, where a local caller with a client
   // key is attributed like any other). Same exemption as the other two gates,

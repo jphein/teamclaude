@@ -342,7 +342,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
   // client), for the same reason. The map is bounded by accounts × client keys,
   // both operator-controlled.
   const serverPromises = new Map();
-  const getServer = (pin = '', client = null) => {
+  const getServer = (pin = '', /** @type {string|null} */ client = null) => {
     const mapKey = `${pin}\u0000${client || ''}`;
     let p = serverPromises.get(mapKey);
     if (p) return p;
@@ -411,7 +411,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
         }
         // The CONNECT's client identity is bound to this listener (see getServer),
         // so the channel is attributed the way the requests in the tunnel are.
-        relayUpgrade(req, socket, head, target, sx, { client, clientUsage, log, stripOverage: shouldStripOverageHeaders(config) });
+        relayUpgrade(req, socket, head, target, sx, { client: /** @type {any} */ (client), clientUsage, log, stripOverage: shouldStripOverageHeaders(config) });
       } catch (err) {
         log(`[TeamClaude] MITM: WebSocket upgrade handler failed for ${safeLine(req?.url)}: ${err?.message || err}`);
         try { socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
@@ -710,6 +710,7 @@ export function proxyAuthorizationAuth(headers, proxyConfig) {
  * `Proxy-Authorization` (Bearer <key>, or Basic where the key is the username
  * or password — so `--proxy http://<key>@host:port` works).
  * Returns { ok, client }.
+ * @returns {{ ok: boolean, client: string|null }}
  */
 export function resolveConnectAuth(req, socket, proxyConfig) {
   const hasKeys = !!(proxyConfig?.apiKey || (Array.isArray(proxyConfig?.clientKeys) && proxyConfig.clientKeys.length));

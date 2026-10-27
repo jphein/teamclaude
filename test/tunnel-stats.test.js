@@ -249,7 +249,7 @@ test('bytes a client pipelines before the 200 reach the tunnel', async () => {
   } finally { proxy.close(); echo.close(); }
 });
 
-test('Anthropic and Claude hosts are counted but never refused at the cap', async () => {
+test('Anthropic and Claude hosts get bounded headroom past the cap', async () => {
   const { createConnectHandler } = await import('../src/mitm.js');
   const am = { accounts: [] };
   const config = { proxy: { maxTunnelsPerClient: 1 }, upstream: 'https://api.anthropic.com' };
@@ -271,6 +271,11 @@ test('Anthropic and Claude hosts are counted but never refused at the cap', asyn
       assert.doesNotMatch(r.head, /^HTTP\/1\.1 429/, h);
       r.sock.destroy();
     }
+    // Bounded: with the bucket filled past cap + headroom, a Claude host is refused too.
+    const fill = [];
+    for (let i = 0; i < 40; i++) fill.push(stats.open(null)); // no keys configured: the caller is '(shared key)'
+    assert.match((await connectRaw(port, 'platform.claude.com:443', 'k')).head, /^HTTP\/1\.1 429/, 'the headroom is finite');
+    for (const close of fill) close();
     first.sock.destroy();
   } finally { srv.close(); echo.close(); }
 });

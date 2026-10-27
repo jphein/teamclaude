@@ -283,8 +283,13 @@ export function upgradeUpstreamFor(hostHeader, config, upstream) {
   return null;
 }
 
-// Hosts whose blind tunnels the per-client cap counts but never refuses.
-const CAP_EXEMPT_HOST = /(^|\.)(anthropic\.com|claude\.ai|claude\.com)\.?$/i;
+// Claude Code's own hosts outside the intercepted API (OAuth refresh and
+// login, MCP proxy, updates) get this much room past the per-client cap, so a
+// full bucket cannot fail a token refresh — bounded, so a runaway client
+// cannot use the exemption to open unlimited tunnels either (security review,
+// 2026-10-27).
+const CAP_HEADROOM_HOST = /(^|\.)(anthropic\.com|claude\.ai|claude\.com)\.?$/i;
+const CAP_HEADROOM = 32;
 
 /**
  * Build a `connect` event handler implementing the terminating MITM described at
@@ -490,11 +495,9 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       // CONNECT, so a reload changes the cap at once.
       // Checked and counted with no await between, so concurrent CONNECTs
       // cannot all pass the check before any of them is counted.
-      // Claude Code's own hosts outside the intercepted API (OAuth refresh and
-      // login, MCP proxy, updates) are counted but never refused: a full bucket
-      // must not fail a token refresh (Oracle, 2026-10-27).
       const cap = maxTunnelsPerClient(/** @type {any} */ (config).proxy);
-      if (cap > 0 && !CAP_EXEMPT_HOST.test(host) && tunnelStats.active(auth.client) >= cap) {
+      const limit = cap > 0 && CAP_HEADROOM_HOST.test(host) ? cap + CAP_HEADROOM : cap;
+      if (cap > 0 && tunnelStats.active(auth.client) >= limit) {
         tunnelStats.refuse(auth.client);
         logCapOnce(TunnelStats.key(auth.client), () => log(`[TeamClaude] CONNECT ${host}:${port} refused for ${TunnelStats.key(auth.client)}: ${cap} blind tunnels already open (proxy.maxTunnelsPerClient)`));
         // end() flushes the status line; a client that never reads it loses the
@@ -564,7 +567,7 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       // at most) and replayed into the tunnel once it opens.
       /** @type {Buffer[]} */
       const early = [];
-      let earlyBytes = 0;
+      let earlyBytes = head ? head.length : 0; // what came with the CONNECT counts too
       const holdEarly = (/** @type {Buffer} */ chunk) => {
         earlyBytes += chunk.length;
         if (earlyBytes > 65_536) { teardown('413 Payload Too Large'); return; }

@@ -11,6 +11,13 @@ import { setUpstreamProxy, resolveUpstreamProxy, resetUpstreamProxy } from '../s
 // exhausted the proxy's file descriptors). The numbers feed a per-client cap,
 // so they have to be right: counted from the dial, released exactly once.
 
+// The MITM test below mints a leaf: certificates go to a throwaway config dir.
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+process.env.TEAMCLAUDE_CONFIG = join(mkdtempSync(join(tmpdir(), 'tc-tunnelcap-home-')), 'teamclaude.json');
+test.after(() => rmSync(dirname(/** @type {string} */ (process.env.TEAMCLAUDE_CONFIG)), { recursive: true, force: true }));
+
 test.beforeEach(() => setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: false }, {})));
 test.afterEach(() => resetUpstreamProxy());
 
@@ -125,4 +132,86 @@ test('the cap refuses one client\'s next blind tunnel with 429 + Retry-After; ot
     for (const s of open) s.destroy();
     proxy.close(); echo.close();
   }
+});
+
+/** A capped proxy for the lifecycle tests. */
+async function cappedProxy(cap) {
+  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.98);
+  const config = { proxy: { apiKey: 'shared-k', clientKeys: [{ name: 'lane', key: 'k-lane' }], maxTunnelsPerClient: cap }, upstream: 'https://api.anthropic.com' };
+  const proxy = createProxyServer(am, config);
+  allowLoopbackForward(proxy);
+  const port = await listen(proxy);
+  const status = () => fetch(`http://127.0.0.1:${port}/teamclaude/status`, { headers: { 'x-api-key': 'shared-k' } }).then((r) => r.json());
+  const settled = async () => {
+    let st = await status();
+    for (let i = 0; i < 100 && (st.tunnels.active.lane || 0) > 0; i++) { await new Promise((r) => setTimeout(r, 20)); st = await status(); }
+    return st;
+  };
+  return { proxy, port, status, settled };
+}
+
+test('every failed or abandoned tunnel releases its slot: dial refused, client gone mid-dial, upstream closing', async () => {
+  const { proxy, port, settled } = await cappedProxy(2);
+  const dead = net.createServer(); const deadPort = await listen(dead); dead.close();
+  const slam = net.createServer((s) => s.destroy()); const slamPort = await listen(slam);
+  const echo = net.createServer((s) => s.pipe(s)); const echoPort = await listen(echo);
+  try {
+    // Dial refused: a 502 each time, never a 429 — the slots come back.
+    for (let i = 0; i < 5; i++) {
+      const r = await connectRaw(port, `127.0.0.1:${deadPort}`, 'k-lane');
+      assert.match(r.head, /^HTTP\/1\.1 502/, `refused dial ${i}`);
+      r.sock.destroy();
+    }
+    // The client leaves right after asking.
+    await Promise.all([1, 2, 3, 4, 5].map(() => new Promise((resolve) => {
+      const s = net.connect(port, '127.0.0.1', () => { s.write(`CONNECT 127.0.0.1:${echoPort} HTTP/1.1\r\nProxy-Authorization: Bearer k-lane\r\n\r\n`); s.destroy(); resolve(); });
+      s.on('error', resolve);
+    })));
+    // The upstream accepts and hangs up at once.
+    for (let i = 0; i < 4; i++) {
+      const r = await connectRaw(port, `127.0.0.1:${slamPort}`, 'k-lane');
+      r.sock.destroy();
+    }
+    const st = await settled();
+    // (Five at once against a cap of 2: some of the abandoned ones were refused
+    // while others were still counted — correct, and also released.)
+    assert.equal(st.tunnels.active.lane, undefined, 'nothing left counted');
+    // And the full budget is there again.
+    const a = await connectRaw(port, `127.0.0.1:${echoPort}`, 'k-lane');
+    const b = await connectRaw(port, `127.0.0.1:${echoPort}`, 'k-lane');
+    assert.match(a.head + b.head, /^HTTP\/1\.1 200[\s\S]*HTTP\/1\.1 200/);
+    a.sock.destroy(); b.sock.destroy();
+  } finally { proxy.close(); slam.close(); echo.close(); }
+});
+
+test('intercepted Claude traffic takes no slot: at the cap, a CONNECT to the upstream host still opens', async () => {
+  const { proxy, port, status } = await cappedProxy(1);
+  const echo = net.createServer((s) => s.pipe(s)); const echoPort = await listen(echo);
+  try {
+    const blind = await connectRaw(port, `127.0.0.1:${echoPort}`, 'k-lane');
+    assert.match(blind.head, /^HTTP\/1\.1 200/);
+    assert.match((await connectRaw(port, `127.0.0.1:${echoPort}`, 'k-lane')).head, /^HTTP\/1\.1 429/, 'positive control: the cap is reached');
+    const claude = await connectRaw(port, 'api.anthropic.com:443', 'k-lane');
+    assert.match(claude.head, /^HTTP\/1\.1 200/, 'MITM is not a blind tunnel');
+    const st = await status();
+    assert.equal(st.tunnels.active.lane, 1);
+    assert.equal(st.tunnels.refusedSinceStart.lane, 1, 'only the blind one was refused');
+    blind.sock.destroy(); claude.sock.destroy();
+  } finally { proxy.close(); echo.close(); }
+});
+
+test('a handler built without shared stats still enforces the cap', async () => {
+  const { createConnectHandler } = await import('../src/mitm.js');
+  const handler = createConnectHandler({ config: { proxy: { maxTunnelsPerClient: 1 } }, accountManager: { accounts: [] }, ensureLeaf: async () => null });
+  const echo = net.createServer((s) => s.pipe(s)); const echoPort = await listen(echo);
+  const srv = (await import('node:http')).createServer();
+  srv.on('connect', handler);
+  allowLoopbackForward(srv);
+  const port = await listen(srv);
+  try {
+    const first = await connectRaw(port, `127.0.0.1:${echoPort}`, 'any');
+    assert.match(first.head, /^HTTP\/1\.1 200/);
+    assert.match((await connectRaw(port, `127.0.0.1:${echoPort}`, 'any')).head, /^HTTP\/1\.1 429/);
+    first.sock.destroy();
+  } finally { srv.close(); echo.close(); }
 });

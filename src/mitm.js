@@ -299,7 +299,10 @@ export function upgradeUpstreamFor(hostHeader, config, upstream) {
  * @param {Object|null} [opts.dimensionUsage]
  * @param {import('./tunnel-stats.js').TunnelStats|null} [opts.tunnelStats]  counts blind tunnels per client
  */
-export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null, tunnelStats = null }) {
+export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null, tunnelStats: givenStats = null }) {
+  // The cap is enforced from these counts, so a handler built without shared
+  // stats still keeps its own (one listener's worth) rather than none.
+  const tunnelStats = givenStats || new TunnelStats();
   const upstream = config.upstream || 'https://api.anthropic.com';
   // A capped burst refuses many tunnels a second: one log line per client a minute.
   /** @type {Map<string, number>} */
@@ -482,18 +485,23 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       // before the dial, so a refused tunnel costs nothing but this socket.
       // 429 + Retry-After: a client that honours it backs off; read per
       // CONNECT, so a reload changes the cap at once.
+      // Checked and counted with no await between, so concurrent CONNECTs
+      // cannot all pass the check before any of them is counted.
       const cap = maxTunnelsPerClient(/** @type {any} */ (config).proxy);
-      if (tunnelStats && cap > 0 && tunnelStats.active(auth.client) >= cap) {
+      if (cap > 0 && tunnelStats.active(auth.client) >= cap) {
         tunnelStats.refuse(auth.client);
         logCapOnce(TunnelStats.key(auth.client), () => log(`[TeamClaude] CONNECT ${host}:${port} refused for ${TunnelStats.key(auth.client)}: ${cap} blind tunnels already open (proxy.maxTunnelsPerClient)`));
-        try { clientSocket.write('HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
-        clientSocket.destroy();
+        // end() flushes the status line; a client that never reads it loses the
+        // socket after 5 s instead of keeping a descriptor the cap exists to save.
+        try { clientSocket.end('HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
+        setTimeout(() => clientSocket.destroy(), 5_000).unref?.();
         return;
       }
       let established = false, closed = false;
       // Counted from the dial, not the 200: a burst that never connects (the
-      // EMFILE case) still holds a socket per attempt.
-      const tunnelClosed = tunnelStats ? tunnelStats.open(auth.client) : () => {};
+      // EMFILE case) still holds a socket per attempt. Released exactly once by
+      // teardown(), which every exit below goes through.
+      const tunnelClosed = tunnelStats.open(auth.client);
       // Tear down BOTH sockets when either errors or closes, so a one-sided
       // failure can't leave the paired socket lingering (FD leak). The `closed`
       // guard makes it idempotent (error+close both fire) and ensures we write

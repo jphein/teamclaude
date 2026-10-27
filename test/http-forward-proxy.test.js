@@ -183,3 +183,34 @@ test('the link-local range is refused by literal address', async () => {
     proxy.close();
   }
 });
+
+test('a plain-HTTP forward authenticates with Proxy-Authorization (HTTP_PROXY=http://<key>@host), which is never relayed', async () => {
+  const seen = [];
+  const target = http.createServer((req, res) => { seen.push(req.headers); res.writeHead(200); res.end('ok'); });
+  const targetPort = await listen(target);
+  const proxy = createProxyServer(noRouteManager, { proxy: { apiKey: 'shared-k', clientKeys: [{ name: 'lane', key: 'k-lane' }], trustLoopback: false }, upstream: 'https://api.anthropic.com' });
+  allowLoopbackForward(proxy);
+  const proxyPort = await listen(proxy);
+  const basic = (user, pass = '') => `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`;
+  const absoluteUrl = `http://127.0.0.1:${targetPort}/x`;
+  try {
+    assert.equal((await proxyRequest({ proxyPort, absoluteUrl })).status, 401, 'positive control: no key, refused');
+    for (const pa of [basic('k-lane'), basic('', 'k-lane'), basic('k-lane', 'x'), 'Bearer shared-k']) {
+      assert.equal((await proxyRequest({ proxyPort, absoluteUrl, headers: { 'proxy-authorization': pa } })).status, 200, pa.split(' ')[0]);
+    }
+    assert.equal((await proxyRequest({ proxyPort, absoluteUrl, headers: { 'proxy-authorization': basic('wrong') } })).status, 401);
+    assert.equal(seen.length, 4);
+    assert.ok(seen.every(h => h['proxy-authorization'] === undefined), 'the key never reaches the target');
+  } finally { proxy.close(); target.close(); }
+});
+
+test('Proxy-Authorization does not authenticate an ordinary (origin-form) request', async () => {
+  const proxy = createProxyServer(noRouteManager, { proxy: { apiKey: 'shared-k', trustLoopback: false }, upstream: 'https://api.anthropic.com' });
+  const proxyPort = await listen(proxy);
+  try {
+    const r = await new Promise((resolve, reject) => {
+      http.get({ host: '127.0.0.1', port: proxyPort, path: '/teamclaude/status', headers: { 'proxy-authorization': 'Bearer shared-k' } }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); }).on('error', reject);
+    });
+    assert.equal(r, 401);
+  } finally { proxy.close(); }
+});

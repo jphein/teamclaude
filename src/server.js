@@ -741,7 +741,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // A plain-HTTP forward request (absolute-form URL: HTTP_PROXY) carries its
       // key the way a CONNECT does, in Proxy-Authorization — the only place an
       // HTTP_PROXY=http://<key>@host URL can put it. Accepted for that form
-      // only; the header is hop-by-hop and never relayed.
+      // only, and that form goes nowhere but relayHttpForward below (the same
+      // test dispatches it, before any control or credential route); the header
+      // is hop-by-hop and never relayed.
       if (!keyAuth.ok && /^https?:\/\//i.test(req.url || '') && req.headers['proxy-authorization']) {
         const viaProxyAuth = proxyAuthorizationAuth(req.headers, config.proxy);
         if (viaProxyAuth.ok) keyAuth = viaProxyAuth;

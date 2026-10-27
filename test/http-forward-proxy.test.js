@@ -214,3 +214,30 @@ test('Proxy-Authorization does not authenticate an ordinary (origin-form) reques
     assert.equal(r, 401);
   } finally { proxy.close(); }
 });
+
+test('an absolute-form request authenticated by Proxy-Authorization only ever reaches the forwarder', async () => {
+  // noRouteManager throws if anything reaches the account (credential) path.
+  const seen = [];
+  const target = http.createServer((req, res) => { seen.push({ url: req.url, headers: req.headers }); res.writeHead(200); res.end('target'); });
+  const targetPort = await listen(target);
+  const proxy = createProxyServer(noRouteManager, { proxy: { apiKey: 'shared-k', trustLoopback: false }, upstream: 'https://api.anthropic.com' });
+  allowLoopbackForward(proxy);
+  const proxyPort = await listen(proxy);
+  const pa = { 'proxy-authorization': 'Bearer shared-k' };
+  try {
+    // An API path on a forward target is forwarded to that target, never routed.
+    const api = await proxyRequest({ proxyPort, method: 'POST', absoluteUrl: `http://127.0.0.1:${targetPort}/v1/messages`, body: '{}', headers: { ...pa, 'content-type': 'application/json' } });
+    assert.equal(api.status, 200);
+    assert.equal(api.body, 'target');
+    // A control path named through the proxy's own address is refused, not served.
+    const own = await proxyRequest({ proxyPort, absoluteUrl: `http://127.0.0.1:${proxyPort}/teamclaude/status`, headers: pa });
+    assert.notEqual(own.status, 200);
+    assert.doesNotMatch(own.body, /"accounts"/);
+    // A malformed absolute URL is refused, not routed.
+    const bad = await proxyRequest({ proxyPort, absoluteUrl: 'http://', headers: pa });
+    assert.ok(bad.status >= 400, String(bad.status));
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].url, '/v1/messages');
+    assert.equal(seen[0].headers['proxy-authorization'], undefined, 'the key never reaches the target');
+  } finally { proxy.close(); target.close(); }
+});

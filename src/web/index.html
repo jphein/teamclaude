@@ -51,9 +51,12 @@
     background: var(--bg);
     color: var(--text);
     min-height: 100vh;
-    padding: 2rem 1.5rem;
+    /* Fluid: a phone keeps its width for the cards, a wide screen its air. */
+    padding: clamp(0.75rem, 2.5vw, 2rem) clamp(0.625rem, 2vw, 1.5rem);
+    font-size: clamp(14px, 0.35vw + 12.6px, 16px);
   }
-  .wrap { max-width: 1100px; margin: 0 auto; }
+  /* Wide enough for two or three account cards side by side (PR #2). */
+  .wrap { max-width: 1400px; margin: 0 auto; }
 
   /* ── Header ── */
   header {
@@ -68,7 +71,7 @@
   }
   h1 {
     margin: 0;
-    font-size: 1.5rem;
+    font-size: clamp(1.15rem, 1.6vw + 0.6rem, 1.5rem);
     font-weight: 600;
     letter-spacing: -0.01em;
   }
@@ -184,17 +187,27 @@
   .svc-actions { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
 
   /* ── Account cards ── */
-  .cards { display: grid; gap: 0.875rem; }
+  /* As many columns as fit at 420px each; one on a phone (min() keeps a
+     narrow screen from overflowing the 420px floor). */
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr));
+    gap: clamp(0.625rem, 1vw, 0.875rem);
+    align-items: start;
+  }
   .card {
     background: var(--panel);
     border: 1px solid var(--panel-border);
     border-radius: 8px;
-    padding: 1rem 1.125rem;
+    padding: clamp(0.75rem, 1.2vw, 1rem) clamp(0.8rem, 1.4vw, 1.125rem);
     display: grid;
-    grid-template-columns: 1fr auto;
+    grid-template-columns: minmax(0, 1fr) auto;
     gap: 0.75rem 1rem;
     align-items: center;
     transition: box-shadow 0.15s, border-color 0.15s;
+    min-width: 0;
+    /* The card's own width decides its layout (below), not the screen's. */
+    container-type: inline-size;
   }
   .card.active {
     border-color: var(--accent);
@@ -207,7 +220,15 @@
     align-self: start;
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
+    justify-content: flex-end;
     gap: 0.5rem;
+  }
+  /* A narrow card (a phone, or a tight column) puts its buttons under the
+     name instead of pushing them out of the card. */
+  @container (max-width: 460px) {
+    .card { grid-template-columns: minmax(0, 1fr); }
+    .card-actions { grid-row: auto; grid-column: 1; justify-content: flex-start; }
   }
   .card-actions .btn-ghost { padding: 0.3rem 0.6rem; font-size: 0.8rem; }
 
@@ -257,7 +278,19 @@
     font-weight: 600;
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    flex-wrap: wrap;
+    gap: 0.4rem 0.5rem;
+    min-width: 0;
+  }
+  /* A long account name ends in … rather than widening the card; the full
+     name is its tooltip. */
+  .card .name .name-text {
+    min-width: 0;
+    /* The line less the status dot, so the two never wrap apart. */
+    max-width: calc(100% - 1.25rem);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .card .name .badge {
     font-size: 0.7rem;
@@ -1011,7 +1044,7 @@
     const inFlight = acct.inFlight || 0;
     const nameRow = el('div', { class: 'name' }, [
       el('span', { class: 'status-dot status-' + acct.status }),
-      acct.name,
+      el('span', { class: 'name-text', text: acct.name, title: acct.name }),
       isActive ? el('span', { class: 'badge active-badge', text: 'active' }) : null,
       acct.disabled ? el('span', { class: 'badge', style: 'background:transparent;color:var(--bad);border:1px solid var(--bad);', text: 'disabled' }) : null,
       inFlight > 0 ? el('span', { class: 'badge', style: 'background:transparent;color:var(--accent,#4a9eff);', text: inFlight + ' live' }) : null,

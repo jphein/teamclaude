@@ -39,7 +39,7 @@ const WEEKLY_WINDOW_SECONDS = 7 * 24 * 3600;
  * capped account is not priced on quota it is not allowed to use.
  *
  * @typedef {{ index: number, priority: number, utilization: number | null,
- *             resetAt: number | null, limit?: number | null }} BandAccount
+ *             resetAt: number | null, limit?: number | null, rank?: 'pressure' | 'soonest' }} BandAccount
  */
 
 /**
@@ -96,7 +96,12 @@ export function pressureOf(account, now) {
   // A passed reset is a KNOWN pressure of zero, not an absence: worth nothing to
   // spend for expiry reasons is a different claim from nothing being known.
   if (seconds <= 0) return { kind: 'known', value: 0 };
-  const value = spendable / seconds;
+  // rank 'soonest' (fork, JP 2026-10-28: "it was on a monday expiring account
+  // instead of the thursday expiring account like it should have been"): the
+  // seat whose weekly resets soonest wins while it has any headroom left, how
+  // much regardless. The default ranks headroom per second, which can prefer a
+  // later reset holding more quota.
+  const value = account.rank === 'soonest' ? (spendable > 0 ? 1 / seconds : 0) : spendable / seconds;
   return Number.isFinite(value)
     ? { kind: 'known', value }
     : { kind: 'absent', reason: 'utilization-not-finite' };

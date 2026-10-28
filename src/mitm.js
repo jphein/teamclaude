@@ -223,7 +223,8 @@ export async function ensureCerts(host, { keep = false } = {}) {
 
   // Mid-rotation, a chain minted here would be one no client trusts and would
   // overwrite the live slot the rotation is moving: stop and say so instead.
-  if ((await readIf(fpath(SLOT_FILES.next[0]))) || (await readIf(fpath(SLOT_FILES.prev[0]))) || (await readIf(fpath(ROTATION_JOURNAL)))) {
+  const inRotation = await Promise.all([...SLOT_FILES.next, ...SLOT_FILES.prev, ROTATION_JOURNAL].map((n) => readIf(fpath(n))));
+  if (inRotation.some(Boolean)) {
     throw new Error('the live MITM chain cannot be served and a CA rotation is in progress — run `teamclaude certs rotate-mitm --status`, then finish the --commit or --rollback');
   }
   const chain = generateCertChain(hosts, { caCn: mitmCaCn() }); // caKeyPem intentionally discarded
@@ -390,10 +391,11 @@ export async function rotateMitm(action, host, { proxyRunning = null } = {}) {
       await clearSlot(/** @type {any} */ (src));
       await unlink(journalPath).catch((/** @type {any} */ e) => { if (e?.code !== 'ENOENT') throw e; });
     } else if (action === 'finish') {
+      // Anything staged — even an incomplete set — would stay in the trust files.
+      if (await partial('next')) throw new Error('a chain is still staged: --commit it or remove it before --finish');
       const prevFiles = await Promise.all(SLOT_FILES.prev.map((n) => readIf(fpath(n))));
       if (!prevFiles.some(Boolean)) { await refreshCaBundle(); return { ...(await view()), note: 'nothing to finish (trust files refreshed)' }; }
       if (!ok(live)) throw new Error(`the live chain ${slotProblem(live, hosts)}: --rollback, not --finish`);
-      if (next) throw new Error('a chain is still staged: --commit it or remove it before --finish');
       // CA first and then the trust files, so an interrupted finish never
       // leaves the retired CA advertised; the leaf and key go last, and a
       // retry with only some of them left still completes.

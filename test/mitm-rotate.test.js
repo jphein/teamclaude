@@ -366,3 +366,34 @@ test('the stopped-probe: listening on either port is running; refused on all is 
     assert.equal(await probeProxyListening({ bind: '127.0.0.1', ports: [] }), null, 'nothing probed is not "stopped"');
   } finally { a.close(); }
 });
+
+test('start-up refuses to mint while ANY rotation file is present, even a key-only staged set', async () => {
+  reset();
+  await ensureCerts(HOSTS);
+  writeFileSync(join(home, 'teamclaude-leaf.next.key'), generateCertChain(['k.test']).leafKeyPem);
+  writeFileSync(join(home, 'teamclaude-leaf.key'), generateCertChain(['k2.test']).leafKeyPem); // live broken
+  const liveCa = read('teamclaude-ca.pem');
+  await assert.rejects(ensureCerts(HOSTS), /rotation is in progress/);
+  assert.equal(read('teamclaude-ca.pem'), liveCa);
+});
+
+test('finish refuses an incomplete staged set, and with nothing to finish too', async () => {
+  reset();
+  await ensureCerts(HOSTS);
+  await rotateMitm('stage', HOSTS);
+  await rotateMitm('commit', HOSTS, { proxyRunning: false });
+  await rotateMitm('stage', HOSTS);
+  rmSync(join(home, 'teamclaude-leaf.next.key'));
+  await assert.rejects(rotateMitm('finish', HOSTS, { proxyRunning: false }), /still staged/);
+  rmSync(join(home, 'teamclaude-ca.prev.pem')); rmSync(join(home, 'teamclaude-leaf.prev.pem')); rmSync(join(home, 'teamclaude-leaf.prev.key'));
+  await assert.rejects(rotateMitm('finish', HOSTS, { proxyRunning: false }), /still staged/, 'checked before the nothing-to-finish path');
+});
+
+test('the CLI prints usage for an invalid invocation instead of crashing', () => {
+  for (const argv of [['certs'], ['certs', 'rotate-mitm'], ['certs', 'rotate-mitm', '--bogus']]) {
+    const r = spawnSync(process.execPath, ['src/index.js', ...argv], { encoding: 'utf8', env: { ...process.env, TEAMCLAUDE_CONFIG: join(home, 'teamclaude.json') } });
+    assert.equal(r.status, 1, argv.join(' '));
+    assert.match(r.stderr, /Usage: teamclaude certs rotate-mitm/, argv.join(' '));
+    assert.doesNotMatch(r.stderr, /ReferenceError/);
+  }
+});

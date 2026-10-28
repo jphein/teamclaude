@@ -2367,12 +2367,11 @@ async function serviceCommand() {
 
 // ── probe ───────────────────────────────────────────────────
 
-const CERTS_USAGE = 'Usage: teamclaude certs rotate-mitm <--status|--stage|--commit|--rollback|--finish>';
-
 // MITM CA rotation, step by step (docs/superpowers/specs/2026-10-27-mitm-ca-reissue.md).
 // --stage runs with the proxy up; --commit, --rollback and --finish need it
 // stopped. Until --finish every client file can trust both CAs.
 async function certsCommand() {
+  const CERTS_USAGE = 'Usage: teamclaude certs rotate-mitm <--status|--stage|--commit|--rollback|--finish>';
   const steps = ['status', 'stage', 'commit', 'rollback', 'finish'];
   const step = steps.find((s) => args.includes(`--${s}`));
   if (args[1] !== 'rotate-mitm' || !step) { console.error(CERTS_USAGE); process.exit(1); }

@@ -269,3 +269,10 @@ test('a listener chain from before the rename (MITM CA name) is regenerated', as
   assert.equal(c.regenerated, true);
   assert.match(new X509Certificate(await readFile(c.caPath, 'utf8')).subject, new RegExp(`CN=${LISTENER_CA_CN}`));
 });
+
+test('a DNS SAN covers its name in any case (RFC 4343): no needless reissue', async () => {
+  const { generateCertChain } = await import('../src/x509.js');
+  const chain = generateCertChain(['familiar', 'tc.realm.watch']);
+  for (const h of ['familiar', 'Familiar', 'FAMILIAR', 'TC.Realm.Watch']) assert.equal(leafCovers(chain.caCertPem, chain.leafCertPem, [h]), true, h);
+  assert.equal(leafCovers(chain.caCertPem, chain.leafCertPem, ['familiar2']), false, 'positive control: another name is not covered');
+});

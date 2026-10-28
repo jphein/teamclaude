@@ -51,9 +51,10 @@ Every `claude` process must have started **after** stage B, or it will fail its 
 - The proxy keeps serving the old leaf throughout, so nothing breaks during this period.
 
 ### C — cutover (Fri 10/30 07:00–07:30 PDT)
-1. Confirm no `claude` process on familiar, katana or wakizashi predates stage B. If any does, wait or restart it first.
+1. Confirm no `claude` process on familiar, katana or wakizashi predates stage B. If any does, wait or restart it first. One operator only, and no other start of the service during the window: the proxy does not take the rotation lock (a dead step must never block it from starting), so the service-manager stop is what keeps it from reading the chain mid-change.
 2. On the VM, at 0 in-flight: `sudo rc-service teamclaude stop`, then `teamclaude certs rotate-mitm --commit` (it refuses while the proxy listens), then `sudo rc-service teamclaude start`. About 10 s down.
 3. Verify:
+   - make one intercepted request first (`mitm.servedCa` is null until the proxy has loaded its chain), e.g. a `claude -p` from a lane; then `/teamclaude/status` → `mitm.servedCa.fingerprint256` must equal the new CA's (from `--status`). Anything else: stop, `--rollback`, start;
    - the leaf served for `api.anthropic.com` has AKI, and its issuer is `TeamClaude MITM CA <hex>`;
    - Python strict passes: `SSL_CERT_FILE=…python-ca-bundle.pem python3 -c 'import urllib.request…'` gives an HTTP status, not an SSL error;
    - a lane round-trip on each host;

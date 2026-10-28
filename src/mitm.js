@@ -223,7 +223,7 @@ export async function ensureCerts(host, { keep = false } = {}) {
 
   // Mid-rotation, a chain minted here would be one no client trusts and would
   // overwrite the live slot the rotation is moving: stop and say so instead.
-  if ((await readIf(fpath(SLOT_FILES.next[0]))) || (await readIf(fpath(SLOT_FILES.prev[0])))) {
+  if ((await readIf(fpath(SLOT_FILES.next[0]))) || (await readIf(fpath(SLOT_FILES.prev[0]))) || (await readIf(fpath(ROTATION_JOURNAL)))) {
     throw new Error('the live MITM chain cannot be served and a CA rotation is in progress — run `teamclaude certs rotate-mitm --status`, then finish the --commit or --rollback');
   }
   const chain = generateCertChain(hosts, { caCn: mitmCaCn() }); // caKeyPem intentionally discarded
@@ -275,6 +275,10 @@ async function clearSlot(slot) {
 // leftover lock is reported with the path to delete once no step is running
 // (xreview round 3: automatic takeover cannot be made safe between processes).
 const CERT_LOCK = 'teamclaude-certs.lock';
+// A commit or rollback in progress: { op, from, to } (CA fingerprints). Written
+// before the first change and removed after the last, so a retry knows exactly
+// where it stopped rather than guessing from what the slots look like.
+const ROTATION_JOURNAL = 'teamclaude-rotation.json';
 /** @template T @param {() => Promise<T>} fn @returns {Promise<T>} */
 async function withCertLock(fn) {
   await mkdir(certDir(), { recursive: true });
@@ -350,31 +354,41 @@ export async function rotateMitm(action, host, { proxyRunning = null } = {}) {
     const partial = async (slot) => (await Promise.all(SLOT_FILES[slot].map((n) => readIf(fpath(n))))).some(Boolean);
     const ok = (/** @type {any} */ c) => !slotProblem(c, hosts);
     const same = (/** @type {any} */ a, /** @type {any} */ b) => !!a && !!b && a.caCertPem.trim() === b.caCertPem.trim();
-    // Every step below is safe to run again after a crash part-way through:
-    // a recovery slot (.prev on commit, .next on rollback) is only ever written
-    // from a live chain that validates, and never over a valid one.
+    const fpOf = (/** @type {any} */ c) => (ok(c) ? describeCa(c.caCertPem)?.fingerprint256 : null);
+    const journalPath = fpath(ROTATION_JOURNAL);
+    const journal = await readIf(journalPath).then((t) => (t ? JSON.parse(t) : null));
+    if (journal && journal.op !== action) throw new Error(`an interrupted --${journal.op} must be completed first: run --${journal.op} again`);
+    // A recovery slot (.prev on commit, .next on rollback) is only ever written
+    // from a live chain that validates, and never over a valid one; with the
+    // journal, running a step again after a crash resumes where it stopped.
     if (action === 'stage') {
       if (ok(next)) { await refreshCaBundle(); return { ...(await view()), note: 'already staged' }; }
       await writeSlot('next', generateCertChain(hosts, { caCn: mitmCaCn() }));
-    } else if (action === 'commit') {
-      // A commit that died while clearing .next: the new chain is live and
-      // only stray .next files are left — finish the clean-up.
-      if (!next && ok(live) && await partial('next')) { await clearSlot('next'); await refreshCaBundle(); return { ...(await view()), note: 'completed an interrupted commit' }; }
-      if (!ok(next)) throw new Error(`nothing to commit: the staged chain ${slotProblem(next, hosts)} (run --stage first)`);
-      if (ok(prev) && ok(live) && !same(live, next)) throw new Error('the previous rotation is not finished: run --finish (or --rollback) before committing another');
-      if (ok(live) && !ok(prev)) await writeSlot('prev', /** @type {any} */ (live));
-      await writeSlot('live', /** @type {any} */ (next));
-      await clearSlot('next');
-    } else if (action === 'rollback') {
-      // A rollback that died while clearing .prev: the old chain is live again.
-      if (!prev && ok(live) && await partial('prev')) { await clearSlot('prev'); await refreshCaBundle(); return { ...(await view()), note: 'completed an interrupted rollback' }; }
-      if (!ok(prev)) throw new Error(`nothing to roll back to: the previous chain ${slotProblem(prev, hosts)}`);
-      if (ok(next) && ok(live) && !same(live, prev) && !same(live, next)) throw new Error('a chain is staged and the live one is neither it nor the previous one: check --status before rolling back');
-      if (!same(live, prev)) {
-        if (ok(live) && !ok(next)) await writeSlot('next', /** @type {any} */ (live));
-        await writeSlot('live', /** @type {any} */ (prev));
+    } else if (action === 'commit' || action === 'rollback') {
+      // commit: live → .prev, .next → live.  rollback: live → .next, .prev → live.
+      const [src, backup] = action === 'commit' ? ['next', 'prev'] : ['prev', 'next'];
+      const slots = /** @type {Record<string, any>} */ ({ live, next, prev });
+      let j = journal;
+      if (!j) {
+        if (!ok(slots[src])) throw new Error(action === 'commit' ? `nothing to commit: the staged chain ${slotProblem(next, hosts)} (run --stage first)` : `nothing to roll back to: the previous chain ${slotProblem(prev, hosts)}`);
+        if (action === 'commit' && ok(prev) && ok(live) && !same(live, next)) throw new Error('the previous rotation is not finished: run --finish (or --rollback) before committing another');
+        if (action === 'rollback' && ok(next) && ok(live) && !same(live, prev) && !same(live, next)) throw new Error('a chain is staged and the live one is neither it nor the previous one: check --status before rolling back');
+        j = { op: action, from: same(live, slots[src]) ? null : fpOf(live), to: fpOf(slots[src]) };
+        await atomicWrite(journalPath, JSON.stringify(j), 0o600);
       }
-      await clearSlot('prev');
+      // 1. The chain being replaced goes to the backup slot (unless it is there already).
+      if (j.from && fpOf(slots[backup]) !== j.from) {
+        if (fpOf(live) !== j.from) throw new Error(`cannot resume --${action}: the chain it was replacing (${j.from.slice(0, 23)}…) is neither live nor saved`);
+        await writeSlot(/** @type {any} */ (backup), /** @type {any} */ (live));
+      }
+      // 2. The target chain goes live (unless it is live already).
+      if (fpOf(live) !== j.to) {
+        if (fpOf(slots[src]) !== j.to) throw new Error(`cannot resume --${action}: the chain it was installing (${j.to.slice(0, 23)}…) is gone`);
+        await writeSlot('live', slots[src]);
+      }
+      // 3. The source slot is emptied, then the journal goes: done.
+      await clearSlot(/** @type {any} */ (src));
+      await unlink(journalPath).catch((/** @type {any} */ e) => { if (e?.code !== 'ENOENT') throw e; });
     } else if (action === 'finish') {
       const prevFiles = await Promise.all(SLOT_FILES.prev.map((n) => readIf(fpath(n))));
       if (!prevFiles.some(Boolean)) { await refreshCaBundle(); return { ...(await view()), note: 'nothing to finish (trust files refreshed)' }; }
@@ -392,6 +406,25 @@ export async function rotateMitm(action, host, { proxyRunning = null } = {}) {
     await refreshCaBundle();
     return view();
   });
+}
+
+/**
+ * Is a proxy listening on any of `ports` at `bind` (this host for a wildcard
+ * bind)? true when one accepts, false only when every one refuses, null
+ * otherwise (timeout or another error). A diagnostic for the operator's
+ * rotation steps — not an exclusion: see rotateMitm.
+ * @param {{ bind?: string, ports: number[], timeoutMs?: number }} opts
+ * @returns {Promise<boolean|null>}
+ */
+export async function probeProxyListening({ bind = '127.0.0.1', ports, timeoutMs = 2000 }) {
+  const host = ['0.0.0.0', '::', ''].includes(String(bind)) ? '127.0.0.1' : String(bind);
+  const probe = (/** @type {number} */ port) => new Promise((resolve) => {
+    const sock = net.connect({ host, port }, () => { sock.destroy(); resolve(true); });
+    sock.setTimeout(timeoutMs, () => { sock.destroy(); resolve(null); });
+    sock.on('error', (e) => resolve(/** @type {any} */ (e)?.code === 'ECONNREFUSED' ? false : null));
+  });
+  const answers = await Promise.all(ports.map(probe));
+  return answers.some((a) => a === true) ? true : answers.length && answers.every((a) => a === false) ? false : null;
 }
 
 function upstreamHostOf(config) {

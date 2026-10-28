@@ -33,7 +33,7 @@ import { publicSettings, saveSettings } from './settings.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds, accountIdsComplete } from './account-id.js';
 import * as alias from './alias.js';
-import { ensureCerts, mitmHosts, caCertPath, rotateMitm } from './mitm.js';
+import { ensureCerts, mitmHosts, caCertPath, rotateMitm, probeProxyListening } from './mitm.js';
 import { Prober, probeApplicable } from './prober.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
@@ -2378,15 +2378,14 @@ async function certsCommand() {
   if (args[1] !== 'rotate-mitm' || !step) { console.error(CERTS_USAGE); process.exit(1); }
   const config = await loadOrCreateConfig();
   // commit, rollback and finish run only with the proxy stopped: is anything
-  // listening on its port? A refused connection is the one positive 'no'.
+  // listening where this config's proxy would — its bind address (or this host
+  // for a wildcard bind) on the plain port and the TLS listener's? Stopped
+  // only when every probe is refused; any other answer is 'unknown'.
   let proxyRunning = null;
   if (step !== 'status' && step !== 'stage') {
-    const port = config?.proxy?.port || 3456;
-    proxyRunning = await new Promise((resolve) => {
-      const sock = net.connect({ host: '127.0.0.1', port }, () => { sock.destroy(); resolve(true); });
-      sock.setTimeout(2000, () => { sock.destroy(); resolve(null); });
-      sock.on('error', (e) => resolve(/** @type {any} */ (e)?.code === 'ECONNREFUSED' ? false : null));
-    });
+    const ports = [config?.proxy?.port || 3456];
+    try { const tlsPort = resolveTlsConfig(config?.proxy)?.port; if (tlsPort) ports.push(tlsPort); } catch { /* no TLS listener configured */ }
+    proxyRunning = await probeProxyListening({ bind: process.env.TEAMCLAUDE_HOST || config?.proxy?.host || '127.0.0.1', ports });
   }
   let view;
   try { view = await rotateMitm(/** @type {any} */ (step), mitmHosts(config), { proxyRunning }); }

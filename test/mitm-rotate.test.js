@@ -26,7 +26,7 @@ const has = (pem, oid) => new X509Certificate(pem).raw.includes(oid);
 const read = (n) => (existsSync(join(home, n)) ? readFileSync(join(home, n), 'utf8') : null);
 const fp = (pem) => new X509Certificate(pem).fingerprint256;
 const certsIn = (pem) => (pem || '').match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/g)?.map(fp) || [];
-const reset = () => { for (const n of ['teamclaude-ca.pem', 'teamclaude-leaf.pem', 'teamclaude-leaf.key', 'teamclaude-ca.next.pem', 'teamclaude-leaf.next.pem', 'teamclaude-leaf.next.key', 'teamclaude-ca.prev.pem', 'teamclaude-leaf.prev.pem', 'teamclaude-leaf.prev.key', MITM_TRUST, CA_BUNDLE, LISTENER_CA]) rmSync(join(home, n), { force: true }); };
+const reset = () => { for (const n of ['teamclaude-ca.pem', 'teamclaude-leaf.pem', 'teamclaude-leaf.key', 'teamclaude-ca.next.pem', 'teamclaude-leaf.next.pem', 'teamclaude-leaf.next.key', 'teamclaude-ca.prev.pem', 'teamclaude-leaf.prev.pem', 'teamclaude-leaf.prev.key', MITM_TRUST, CA_BUNDLE, LISTENER_CA, 'teamclaude-rotation.json', 'teamclaude-certs.lock']) rmSync(join(home, n), { force: true }); };
 
 test('a new MITM chain has a per-generation CA name and key identifiers', async () => {
   reset();
@@ -269,28 +269,65 @@ test('one step at a time; a leftover lock is reported, never taken over, and nev
   const liveCa = read('teamclaude-ca.pem');
   await assert.rejects(ensureCerts(HOSTS), /rotation is in progress/);
   assert.equal(read('teamclaude-ca.pem'), liveCa, 'nothing was overwritten');
+  // Only the journal left (no .next/.prev files): still mid-rotation, still no mint.
+  for (const n of ['teamclaude-ca.next.pem', 'teamclaude-leaf.next.pem', 'teamclaude-leaf.next.key']) rmSync(join(home, n), { force: true });
+  writeFileSync(join(home, 'teamclaude-rotation.json'), JSON.stringify({ op: 'commit', from: null, to: 'x' }));
+  await assert.rejects(ensureCerts(HOSTS), /rotation is in progress/);
+  assert.equal(read('teamclaude-ca.pem'), liveCa);
 });
 
-test('an interrupted commit or rollback clean-up completes on retry', async () => {
+test('the journal: a commit that died at any point resumes to the same end state; incomplete staging is not mistaken for it', async () => {
+  const STOP = { proxyRunning: false };
+  const journal = join(home, 'teamclaude-rotation.json');
+  const scenario = async (crash) => {
+    reset();
+    const a = await ensureCerts(HOSTS);
+    await rotateMitm('stage', HOSTS);
+    const b = { ca: read('teamclaude-ca.next.pem'), leaf: read('teamclaude-leaf.next.pem'), key: read('teamclaude-leaf.next.key') };
+    // Replay a commit by hand up to the crash point, then let --commit resume.
+    writeFileSync(journal, JSON.stringify({ op: 'commit', from: fp(a.caCertPem), to: fp(b.ca) }));
+    if (crash >= 1) { writeFileSync(join(home, 'teamclaude-leaf.prev.key'), a.leafKeyPem); writeFileSync(join(home, 'teamclaude-leaf.prev.pem'), a.leafCertPem); writeFileSync(join(home, 'teamclaude-ca.prev.pem'), a.caCertPem); }
+    if (crash >= 2) writeFileSync(join(home, 'teamclaude-leaf.key'), b.key); // live half-written
+    if (crash >= 3) { writeFileSync(join(home, 'teamclaude-leaf.pem'), b.leaf); writeFileSync(join(home, 'teamclaude-ca.pem'), b.ca); }
+    if (crash >= 4) rmSync(join(home, 'teamclaude-ca.next.pem')); // clean-up half done
+    // Nothing else may run while it is unfinished.
+    await assert.rejects(rotateMitm('stage', HOSTS), /interrupted --commit/);
+    await assert.rejects(rotateMitm('finish', HOSTS, STOP), /interrupted --commit/);
+    const v = await rotateMitm('commit', HOSTS, STOP);
+    assert.equal(v.live.fingerprint256, fp(b.ca), `crash ${crash}: new chain live`);
+    assert.equal(v.prev.fingerprint256, fp(a.caCertPem), `crash ${crash}: old chain saved`);
+    assert.equal(v.next, null, `crash ${crash}: nothing staged`);
+    assert.equal(existsSync(journal), false, `crash ${crash}: journal gone`);
+    for (const n of ['teamclaude-ca.next.pem', 'teamclaude-leaf.next.pem', 'teamclaude-leaf.next.key']) assert.equal(existsSync(join(home, n)), false, `crash ${crash}: ${n} cleared`);
+  };
+  for (const crash of [0, 1, 2, 3, 4]) await scenario(crash);
+  // Staging that died before writing its CA leaves a partial .next with no
+  // journal: commit refuses (no cut-over happened), and --stage redoes it.
   reset();
-  await ensureCerts(HOSTS);
+  const live = await ensureCerts(HOSTS);
+  writeFileSync(join(home, 'teamclaude-leaf.next.key'), generateCertChain(['p.test']).leafKeyPem);
+  await assert.rejects(rotateMitm('commit', HOSTS, STOP), /nothing to commit/);
+  assert.equal(fp(read('teamclaude-ca.pem')), fp(live.caCertPem), 'nothing changed');
+  assert.ok((await rotateMitm('stage', HOSTS)).next, 'staging again replaces the partial set');
+});
+
+test('a rollback that died part-way resumes too', async () => {
+  const STOP = { proxyRunning: false };
+  reset();
+  const a = await ensureCerts(HOSTS);
   await rotateMitm('stage', HOSTS);
-  const nextLeaf = read('teamclaude-leaf.next.pem'), nextKey = read('teamclaude-leaf.next.key');
-  await rotateMitm('commit', HOSTS, { proxyRunning: false });
-  // Commit died after removing the staged CA but before its leaf and key.
-  writeFileSync(join(home, 'teamclaude-leaf.next.pem'), nextLeaf);
-  writeFileSync(join(home, 'teamclaude-leaf.next.key'), nextKey);
-  let v = await rotateMitm('commit', HOSTS, { proxyRunning: false });
-  assert.match(v.note, /interrupted commit/);
-  assert.equal(existsSync(join(home, 'teamclaude-leaf.next.key')), false);
-  // Rollback died the same way while clearing .prev.
-  const prevLeaf = read('teamclaude-leaf.prev.pem'), prevKey = read('teamclaude-leaf.prev.key');
-  await rotateMitm('rollback', HOSTS, { proxyRunning: false });
-  writeFileSync(join(home, 'teamclaude-leaf.prev.pem'), prevLeaf);
-  writeFileSync(join(home, 'teamclaude-leaf.prev.key'), prevKey);
-  v = await rotateMitm('rollback', HOSTS, { proxyRunning: false });
-  assert.match(v.note, /interrupted rollback/);
-  assert.equal(existsSync(join(home, 'teamclaude-leaf.prev.key')), false);
+  await rotateMitm('commit', HOSTS, STOP);
+  const b = read('teamclaude-ca.pem');
+  // Rollback saved the new chain to .next and died after the live key.
+  writeFileSync(join(home, 'teamclaude-rotation.json'), JSON.stringify({ op: 'rollback', from: fp(b), to: fp(a.caCertPem) }));
+  writeFileSync(join(home, 'teamclaude-leaf.next.key'), read('teamclaude-leaf.key'));
+  writeFileSync(join(home, 'teamclaude-leaf.next.pem'), read('teamclaude-leaf.pem'));
+  writeFileSync(join(home, 'teamclaude-ca.next.pem'), b);
+  writeFileSync(join(home, 'teamclaude-leaf.key'), a.leafKeyPem);
+  const v = await rotateMitm('rollback', HOSTS, STOP);
+  assert.equal(v.live.fingerprint256, fp(a.caCertPem));
+  assert.equal(v.next.fingerprint256, fp(b), 'the new chain is staged again');
+  assert.equal(v.prev, null);
 });
 
 test('/teamclaude/status reports the MITM CA the process actually serves', async () => {
@@ -313,4 +350,19 @@ test('/teamclaude/status reports the MITM CA the process actually serves', async
     for (let i = 0; i < 20 && !st.mitm.servedCa; i++) { await new Promise((r) => setTimeout(r, 50)); st = await status(); }
     assert.equal(st.mitm.servedCa?.fingerprint256, fp(live.caCertPem));
   } finally { proxy.close(); }
+});
+
+test('the stopped-probe: listening on either port is running; refused on all is stopped; a wildcard bind probes this host', async () => {
+  const { probeProxyListening } = await import('../src/mitm.js');
+  const net = await import('node:net');
+  const a = net.createServer(); const b = net.createServer();
+  const pa = await new Promise((r) => a.listen(0, '127.0.0.1', () => r(a.address().port)));
+  const pb = await new Promise((r) => b.listen(0, '127.0.0.1', () => r(b.address().port)));
+  await new Promise((r) => b.close(r)); // pb now refuses
+  try {
+    assert.equal(await probeProxyListening({ bind: '127.0.0.1', ports: [pb, pa] }), true, 'the second (TLS) port alone counts');
+    assert.equal(await probeProxyListening({ bind: '0.0.0.0', ports: [pa] }), true, 'wildcard bind → this host');
+    assert.equal(await probeProxyListening({ bind: '127.0.0.1', ports: [pb] }), false, 'refused everywhere → stopped');
+    assert.equal(await probeProxyListening({ bind: '127.0.0.1', ports: [] }), null, 'nothing probed is not "stopped"');
+  } finally { a.close(); }
 });

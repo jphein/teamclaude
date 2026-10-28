@@ -1790,6 +1790,16 @@ export function relayHttpForward(req, res, stripOverage = false, /** @type {Reco
     res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Malformed forward-proxy URL' } }));
     return;
   }
+  // Credentials in the URL (`http://user:pass@host/`): http.request would turn
+  // them into an Authorization header for the target. RFC 9110 §4.2.4: a sender
+  // must not generate userinfo, and a recipient should treat it as an error —
+  // so refuse rather than relay a credential nobody meant to send this way.
+  // The reply names neither part.
+  if (target.username || target.password) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Forward-proxy URL must not carry credentials (user:password@); send them as a header' } }));
+    return;
+  }
   // Destination policy, same as the CONNECT tunnel's (forward-target.js): a
   // relay may not target this machine's loopback, the unspecified address, or
   // link-local. `GET http://127.0.0.1:<our port>/teamclaude/status` would

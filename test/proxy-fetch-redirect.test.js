@@ -26,7 +26,14 @@ test('a 307 from a token endpoint is returned as-is; the body never reaches the 
     assert.equal(res.status, 307);
     assert.equal(res.ok, false, 'callers treat it as a failure');
     assert.deepEqual(elsewhere, ['refresh_token=control'], 'the secret never left');
-    // A caller that really wants to follow can still say so.
+    assert.equal(res.headers.get('location'), `http://127.0.0.1:${thiefPort}/steal`, 'the real 3xx, not an opaque redirect');
+    // 308 the same, and an explicit undefined still gets the safe default.
+    token.removeAllListeners('request');
+    token.on('request', (req, r) => { req.resume(); r.writeHead(308, { location: `http://127.0.0.1:${thiefPort}/steal` }); r.end(); });
+    assert.equal((await proxyFetch(`http://127.0.0.1:${tokenPort}/t`, { method: 'POST', body: 'code=secret' })).status, 308);
+    assert.equal((await proxyFetch(`http://127.0.0.1:${tokenPort}/t`, { method: 'POST', body: 'code=secret', redirect: undefined })).status, 308);
+    assert.deepEqual(elsewhere, ['refresh_token=control'], 'nothing left on a 308 either');
+    // A caller that really wants to follow can still say so (only for calls that carry no secret).
     const followed = await proxyFetch(`http://127.0.0.1:${tokenPort}/x`, { method: 'POST', body: 'ok', redirect: 'follow' });
     assert.equal(followed.status, 200);
   } finally { token.close(); thief.close(); }

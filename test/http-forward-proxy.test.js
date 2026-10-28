@@ -252,12 +252,15 @@ test('a forward URL carrying credentials (user:pass@) is refused, and nothing re
   try {
     // Positive control: the same URL without userinfo is forwarded.
     assert.equal((await proxyRequest({ proxyPort, absoluteUrl: `http://127.0.0.1:${targetPort}/x` })).status, 200);
-    for (const u of [`http://alice:s3cret@127.0.0.1:${targetPort}/x`, `http://alice@127.0.0.1:${targetPort}/x`, `http://:s3cret@127.0.0.1:${targetPort}/x`]) {
+    // An encoded @ in the path is not userinfo: still forwarded.
+    assert.equal((await proxyRequest({ proxyPort, absoluteUrl: `http://127.0.0.1:${targetPort}/a%40b?c=d%40e` })).status, 200);
+    for (const u of [`http://alice:s3cret@127.0.0.1:${targetPort}/x`, `http://alice@127.0.0.1:${targetPort}/x`, `http://:s3cret@127.0.0.1:${targetPort}/x`,
+      `http://alice%40corp:s3cret@127.0.0.1:${targetPort}/x`, `http://alice:s3cret@[::1]:${targetPort}/x`]) {
       const r = await proxyRequest({ proxyPort, absoluteUrl: u });
       assert.equal(r.status, 400, u);
       assert.doesNotMatch(r.body, /alice|s3cret/, 'the reply does not echo the credential');
     }
-    assert.equal(seen.length, 1, 'only the control request reached the target');
+    assert.equal(seen.length, 2, 'only the two control requests reached the target');
     assert.equal(seen[0].authorization, undefined);
   } finally { proxy.close(); target.close(); }
 });

@@ -12,7 +12,7 @@
 //   api.anthropic.com → terminate + forward,  www.example.org → local test server,
 //   anything else      → blind tunnel (never to this machine — see forward-target.js).
 
-import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename, unlink } from 'node:fs/promises';
 import { X509Certificate, createPublicKey, randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import net from 'node:net';
@@ -31,6 +31,28 @@ import { TunnelStats, maxTunnelsPerClient } from './tunnel-stats.js';
 const CA_CERT = 'teamclaude-ca.pem';
 const LEAF_CERT = 'teamclaude-leaf.pem';
 const LEAF_KEY = 'teamclaude-leaf.key';
+
+// Each MITM chain's CA gets its own name (2026-10-27), as the listener CA's
+// did in #19: a client trusting the old and the new CA side by side during a
+// rotation must never meet two CAs of one name, which is how the 2026-10-08
+// handshakes failed ("certificate signature failure").
+export const MITM_CA_CN = 'TeamClaude MITM CA';
+/** A fresh per-generation MITM CA name. */
+export function mitmCaCn() {
+  return `${MITM_CA_CN} ${randomBytes(6).toString('hex')}`;
+}
+// Every MITM CA in play during a rotation (live, staged, previous) and none of
+// the listener's: what a client's NODE_EXTRA_CA_CERTS file holds.
+export const MITM_TRUST = 'teamclaude-mitm-trust.pem';
+// A rotation's staged (.next) and retired (.prev) chains sit beside the live one.
+/** @param {'next'|'prev'} slot @param {string} name */
+const slotName = (slot, name) => name.replace(/\.(pem|key)$/, `.${slot}.$1`);
+/** @type {Record<'live'|'next'|'prev', string[]>} */
+const SLOT_FILES = {
+  live: [CA_CERT, LEAF_CERT, LEAF_KEY],
+  next: [CA_CERT, LEAF_CERT, LEAF_KEY].map((n) => slotName('next', n)),
+  prev: [CA_CERT, LEAF_CERT, LEAF_KEY].map((n) => slotName('prev', n)),
+};
 
 // A built-in host the MITM proxy always intercepts and answers itself (never
 // forwarded upstream). Lets you verify the proxy + CA end-to-end with no
@@ -145,9 +167,17 @@ export const LISTENER_CA = 'teamclaude-listener-ca.pem';
  * @returns {Promise<string | null>} the bundle path, or null without a listener CA
  */
 export async function refreshCaBundle(dir = certDir()) {
-  const [mitm, listener] = await Promise.all([readIf(join(dir, CA_CERT)), readIf(join(dir, LISTENER_CA))]);
+  // Every MITM CA in play — the live one, and during a rotation the staged or
+  // the retired one too — so a client trusts both sides of a cutover.
+  const [live, next, prev, listener] = await Promise.all([CA_CERT, SLOT_FILES.next[0], SLOT_FILES.prev[0], LISTENER_CA].map((n) => readIf(join(dir, n))));
+  const mitm = [...new Set([live, next, prev].filter((p) => typeof p === 'string' && p).map((p) => /** @type {string} */ (p).trim() + '\n'))];
+  if (mitm.length) {
+    const trustPath = join(dir, MITM_TRUST);
+    const trust = mitm.join('');
+    if ((await readIf(trustPath)) !== trust) await atomicWrite(trustPath, trust, 0o644);
+  }
   if (!listener) return null;
-  const body = [mitm, listener].filter((p) => typeof p === 'string' && p).map((p) => /** @type {string} */ (p).trim() + '\n').join('');
+  const body = [...mitm, listener.trim() + '\n'].join('');
   const path = join(dir, CA_BUNDLE);
   if ((await readIf(path)) !== body) await atomicWrite(path, body, 0o644);
   return path;
@@ -191,7 +221,7 @@ export async function ensureCerts(host, { keep = false } = {}) {
     }
   }
 
-  const chain = generateCertChain(hosts); // caKeyPem intentionally discarded
+  const chain = generateCertChain(hosts, { caCn: mitmCaCn() }); // caKeyPem intentionally discarded
   await mkdir(certDir(), { recursive: true });
   // Key first: a crash after it and before the cert leaves a mismatched pair,
   // which keyMatchesCert above now treats as stale on the next start.
@@ -206,6 +236,106 @@ export async function ensureCerts(host, { keep = false } = {}) {
     leafKeyPem: chain.leafKeyPem,
     renewal: null,
   };
+}
+
+/**
+ * One chain slot (live, next or prev) as stored, or null when any part is
+ * missing. @param {'live'|'next'|'prev'} slot
+ */
+async function readSlot(slot) {
+  const [caCertPem, leafCertPem, leafKeyPem] = await Promise.all(SLOT_FILES[slot].map((n) => readIf(fpath(n))));
+  return caCertPem && leafCertPem && leafKeyPem ? { caCertPem, leafCertPem, leafKeyPem } : null;
+}
+/** @param {'live'|'next'|'prev'} slot @param {{ caCertPem: string, leafCertPem: string, leafKeyPem: string|Buffer }} c */
+async function writeSlot(slot, c) {
+  const [ca, leaf, key] = SLOT_FILES[slot];
+  // Key first, as in ensureCerts: a crash between them leaves a pair
+  // keyMatchesCert rejects rather than one that silently mismatches.
+  await atomicWrite(fpath(key), c.leafKeyPem, 0o600);
+  await atomicWrite(fpath(leaf), c.leafCertPem, 0o644);
+  await atomicWrite(fpath(ca), c.caCertPem, 0o644);
+}
+/** @param {'next'|'prev'} slot */
+async function clearSlot(slot) {
+  for (const n of SLOT_FILES[slot]) await unlink(fpath(n)).catch(() => {});
+}
+
+/** The CA's subject CN and SHA-256 fingerprint, for the operator. @param {string|null|undefined} caCertPem */
+export function describeCa(caCertPem) {
+  if (!caCertPem) return null;
+  try {
+    const ca = new X509Certificate(caCertPem);
+    return { cn: (/CN=([^\n]+)/.exec(ca.subject) || [])[1] || ca.subject, fingerprint256: ca.fingerprint256, validTo: ca.validTo };
+  } catch { return null; }
+}
+
+/** Why a slot's chain cannot be served (null when it can). @param {{ caCertPem: string, leafCertPem: string, leafKeyPem: string }|null} c @param {string[]} hosts */
+function slotProblem(c, hosts) {
+  if (!c) return 'is missing';
+  if (!keyMatchesCert(c.leafCertPem, c.leafKeyPem)) return 'has a key that is not its leaf\'s';
+  const { signed, shortfall } = chainShortfall(c.caCertPem, c.leafCertPem, hosts);
+  if (!signed) return 'has a leaf its CA did not sign';
+  return shortfall ? `has a leaf that ${shortfall}` : null;
+}
+
+/** @param {string|string[]} host */
+function rotationHosts(host) {
+  const hosts = [...new Set((Array.isArray(host) ? host : [host]).filter(Boolean))];
+  if (!hosts.includes(TEST_HOST)) hosts.push(TEST_HOST);
+  return hosts;
+}
+
+/**
+ * MITM CA rotation, in steps the operator runs (2026-10-27 plan:
+ * docs/superpowers/specs/2026-10-27-mitm-ca-reissue.md). The proxy keeps
+ * serving the live chain until it restarts; nothing here touches a running
+ * proxy. Every step refreshes the bundle and MITM_TRUST, which hold every MITM
+ * CA in play, so clients can trust both sides before the switch.
+ *   stage    — mint a new chain (per-generation CA name) into the .next slot.
+ *   commit   — live → .prev, .next → live: served from the next start.
+ *   rollback — .prev → live, and the chain it replaces back to .next.
+ *   finish   — forget .prev: clients then need only the live CA.
+ * @param {'stage'|'commit'|'rollback'|'finish'|'status'} action
+ * @param {string|string[]} host  the hosts the leaf must name (mitmHosts(config))
+ * @returns {Promise<{ live: ReturnType<typeof describeCa>, next: ReturnType<typeof describeCa>, prev: ReturnType<typeof describeCa>, trustPath: string, note?: string }>}
+ */
+export async function rotateMitm(action, host) {
+  const hosts = rotationHosts(host);
+  const view = async () => {
+    const [live, next, prev] = await Promise.all([readSlot('live'), readSlot('next'), readSlot('prev')]);
+    return { live: describeCa(live?.caCertPem), next: describeCa(next?.caCertPem), prev: describeCa(prev?.caCertPem), trustPath: fpath(MITM_TRUST) };
+  };
+  if (action === 'status') return view();
+  await mkdir(certDir(), { recursive: true });
+  if (action === 'stage') {
+    const staged = await readSlot('next');
+    if (!slotProblem(staged, hosts)) { await refreshCaBundle(); return { ...(await view()), note: 'already staged' }; }
+    const chain = generateCertChain(hosts, { caCn: mitmCaCn() });
+    await writeSlot('next', chain);
+  } else if (action === 'commit') {
+    const next = await readSlot('next');
+    const problem = slotProblem(next, hosts);
+    if (problem) throw new Error(`nothing to commit: the staged chain ${problem} (run --stage first)`);
+    const live = await readSlot('live');
+    if (live) await writeSlot('prev', live);
+    await writeSlot('live', /** @type {any} */ (next));
+    await clearSlot('next');
+  } else if (action === 'rollback') {
+    const prev = await readSlot('prev');
+    const problem = slotProblem(prev, hosts);
+    if (problem) throw new Error(`nothing to roll back to: the previous chain ${problem}`);
+    const live = await readSlot('live');
+    if (live) await writeSlot('next', live);
+    await writeSlot('live', /** @type {any} */ (prev));
+    await clearSlot('prev');
+  } else if (action === 'finish') {
+    if (!(await readSlot('prev'))) throw new Error('nothing to finish: no previous chain is kept');
+    await clearSlot('prev');
+  } else {
+    throw new Error(`unknown rotation step: ${action}`);
+  }
+  await refreshCaBundle();
+  return view();
 }
 
 function upstreamHostOf(config) {

@@ -33,7 +33,7 @@ import { publicSettings, saveSettings } from './settings.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds, accountIdsComplete } from './account-id.js';
 import * as alias from './alias.js';
-import { ensureCerts, mitmHosts, caCertPath } from './mitm.js';
+import { ensureCerts, mitmHosts, caCertPath, rotateMitm } from './mitm.js';
 import { Prober, probeApplicable } from './prober.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
@@ -252,6 +252,10 @@ switch (command) {
     break;
   case 'probe':
     await probeCommand();
+    process.exit(0);
+    break;
+  case 'certs':
+    await certsCommand();
     process.exit(0);
     break;
   case 'warmup':
@@ -2363,6 +2367,26 @@ async function serviceCommand() {
 
 // ── probe ───────────────────────────────────────────────────
 
+const CERTS_USAGE = 'Usage: teamclaude certs rotate-mitm <--status|--stage|--commit|--rollback|--finish>';
+
+// MITM CA rotation, step by step (docs/superpowers/specs/2026-10-27-mitm-ca-reissue.md).
+// None of it touches the running proxy: a committed chain is served from the
+// next start, and until --finish every client file can trust both CAs.
+async function certsCommand() {
+  const steps = ['status', 'stage', 'commit', 'rollback', 'finish'];
+  const step = steps.find((s) => args.includes(`--${s}`));
+  if (args[1] !== 'rotate-mitm' || !step) { console.error(CERTS_USAGE); process.exit(1); }
+  const config = await loadOrCreateConfig();
+  let view;
+  try { view = await rotateMitm(/** @type {any} */ (step), mitmHosts(config)); }
+  catch (err) { console.error(`teamclaude certs rotate-mitm --${step}: ${/** @type {Error} */ (err).message}`); process.exit(1); }
+  const line = (/** @type {string} */ label, /** @type {any} */ ca) => console.log(`  ${label.padEnd(5)} ${ca ? `${ca.cn}  sha256 ${ca.fingerprint256}  (to ${ca.validTo})` : '—'}`);
+  console.log(`MITM CA rotation — ${step}${view.note ? ` (${view.note})` : ''}`);
+  line('live', view.live); line('next', view.next); line('prev', view.prev);
+  console.log(`  Clients trust: ${view.trustPath} (every MITM CA above; copy its content into each client's teamclaude-ca.pem)`);
+  if (step === 'commit' || step === 'rollback') console.log('  Takes effect when the proxy next starts (restart it at 0 in-flight).');
+}
+
 async function probeCommand() {
   const config = await loadOrCreateConfig();
   const arg = args[1];
@@ -2994,6 +3018,8 @@ Commands:
   import              Import credentials from Claude Code
   login               OAuth login via browser (over SSH: copy/paste, as --token)
   login --token       OAuth login via copy/paste (no local callback; for headless/remote)
+  certs rotate-mitm   Rotate the MITM CA in steps: --status, --stage, --commit,
+                      --rollback, --finish (served from the next proxy start)
   login --codex       Codex (ChatGPT) login via browser; on a terminal the address
                       the browser lands on can be pasted instead (--no-browser)
   login --api         Add an API key account (a last resort by default:

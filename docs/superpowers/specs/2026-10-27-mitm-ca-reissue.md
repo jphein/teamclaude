@@ -26,7 +26,7 @@ Python ≥ 3.13 verifies in strict X.509 mode. The MITM chain the VM presents fo
 
 ## Stages
 
-### A — code (PR, before Wed 10/28)
+### A — code (PR, before Wed 10/28) — DONE 2026-10-27 (`teamclaude certs rotate-mitm`; clients' file = `teamclaude-mitm-trust.pem`)
 1. The MITM CA gets a per-generation CN, `TeamClaude MITM CA <12hex>`, mirroring `LISTENER_CA_CN`.
 2. A staged rotation, e.g. `teamclaude certs rotate-mitm --stage` (or a script under `scripts/`). It writes the new chain beside the live one (`teamclaude-ca.next.pem`, `teamclaude-leaf.next.{pem,key}`), refreshes `teamclaude-ca-bundle.pem` to hold the **old MITM CA + new MITM CA + listener CA**, and prints the new CA's fingerprint. `--commit` swaps the `.next` files in (keeping `.prev` copies) for the next start. `--rollback` restores `.prev`.
 3. Tests:

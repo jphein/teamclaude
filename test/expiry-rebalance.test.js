@@ -221,3 +221,58 @@ test('the seat a rebalance left is recorded so a hop in the same request cannot 
   captureLog(() => am.getActiveAccount(null, OPUS, null, null, undefined, decision));
   assert.ok(decision.rolledOff?.has(0));
 });
+
+// JP, 2026-10-28 09:2x: "it was on a monday expiring account instead of the
+// thursday expiring account like it should have been". The pressure rank
+// (headroom per second) had moved claude6 (Thursday, 10% left) → jp (Monday,
+// 50% left): 0.46%/h vs 0.37%/h. rank 'soonest' makes the code do what the
+// dashboard's rule line already said: the soonest weekly reset with headroom.
+const SOONEST = { enabled: true, tolerance: 1.2, rebalance: true, rank: 'soonest' };
+
+test('rank soonest: the Thursday seat beats a Monday seat holding more quota (JP 2026-10-28)', () => {
+  const build = (expiryRouting) => {
+    const am = mgr({ names: ['monday', 'thursday'], expiryRouting });
+    seat(am, 0, 0.50, 130);         // Monday: 50% left, ~5.4 days
+    seat(am, 1, 0.90, 27);          // Thursday: 10% left, ~1.1 days
+    am._setCurrent(am.accounts[0]);
+    return am;
+  };
+  // The default rank keeps the Monday seat: more expiring quota per hour.
+  assert.equal(captureLog(() => build({ enabled: true, tolerance: 1.2, rebalance: true }).getActiveAccount(null, OPUS)).value.name, 'monday');
+  const { value, lines } = captureLog(() => build(SOONEST).getActiveAccount(null, OPUS));
+  assert.equal(value.name, 'thursday');
+  assert.ok(lines.some(l => /Rebalanced "monday" → "thursday"/.test(l)), lines.join('|'));
+});
+
+test('rank soonest, same headroom: the Thursday seat wins (as it does under the default rank too)', () => {
+  for (const er of [SOONEST, { enabled: true, tolerance: 1.2, rebalance: true }]) {
+    const am = mgr({ names: ['monday', 'thursday'], expiryRouting: er });
+    seat(am, 0, 0.50, 130);
+    seat(am, 1, 0.50, 27);
+    am._setCurrent(am.accounts[0]);
+    assert.equal(captureLog(() => am.getActiveAccount(null, OPUS)).value.name, 'thursday', er.rank || 'pressure');
+  }
+});
+
+test('rank soonest: a seat with no headroom left is skipped however soon it resets', () => {
+  const am = mgr({ names: ['monday', 'spent-thursday', 'saturday'], expiryRouting: SOONEST });
+  seat(am, 0, 0.50, 130);
+  seat(am, 1, 1.00, 27);            // spent: resets soonest but cannot serve
+  seat(am, 2, 0.60, 60);
+  am._setCurrent(am.accounts[0]);
+  assert.equal(captureLog(() => am.getActiveAccount(null, OPUS)).value.name, 'saturday');
+});
+
+test('rank soonest also governs the session-reset switch (it chose a Monday seat over Thursday on 10-28)', () => {
+  const run = (expiryRouting) => {
+    const am = mgr({ names: ['jp', 'claude3', 'claude6'], expiryRouting });
+    seat(am, 0, 0.50, 131);         // current, Monday
+    seat(am, 1, 0.43, 130);         // Monday, a little sooner
+    seat(am, 2, 0.90, 27);          // Thursday
+    am._setCurrent(am.accounts[0]);
+    captureLog(() => am._switchOnSessionReset(am.accounts, OPUS));
+    return am.accounts[am.currentIndex].name;
+  };
+  assert.equal(run({ enabled: true, tolerance: 1.2, rebalance: true }), 'claude3', 'the default rank picked the other Monday seat');
+  assert.equal(run(SOONEST), 'claude6');
+});

@@ -3135,6 +3135,10 @@ export class AccountManager {
       // over. Fork option, off unless literally true: stickiness is the stock
       // design and its rollover bookkeeping is built on it.
       rebalance: c.rebalance === true,
+      // How the band ranks seats: 'pressure' (headroom ÷ time to the weekly
+      // reset, the default) or 'soonest' (the soonest weekly reset with any
+      // headroom left; fork, JP 2026-10-28). Anything else is the default.
+      rank: c.rank === 'soonest' ? 'soonest' : 'pressure',
     };
     // Nothing survives the knob being off: every observation is dropped when
     // preemption stops and none is written while it is off, so no mechanism
@@ -3378,6 +3382,7 @@ export class AccountManager {
           utilization: typeof used === 'number' ? used : (used == null ? null : NaN),
           resetAt: typeof reset === 'number' && reset ? reset : null,
           limit: this._spendLimit(a, window, used),
+          rank: this.expiryRouting?.rank,
         };
       }),
     };

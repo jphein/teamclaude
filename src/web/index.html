@@ -1118,7 +1118,11 @@
     if (providers.length > 1) {
       for (const p of providers) line.appendChild(el('span', {}, [providerLabel(p) + ' current ', el('b', { text: cur[p] || 'none' })]));
     } else {
-      line.appendChild(el('span', {}, ['current ', el('b', { text: s.currentAccount || 'none' })]));
+      // "active seat: <name>, resets <day>" (JP 2026-10-28): the weekly reset is
+      // what the expires-first rule ranks on, so it sits next to the name.
+      const curAcct = (s.accounts || []).find(a => a.name === s.currentAccount);
+      const wk = curAcct && curAcct.quota ? fmtReset(curAcct.quota.unified7dReset) : null;
+      line.appendChild(el('span', {}, ['current ', el('b', { text: s.currentAccount || 'none' }), wk ? el('span', { title: 'weekly resets ' + wk.full + ' (in ' + wk.rel + ')', text: ' · resets ' + wk.when }) : null]));
     }
     const sess = s.sessions || {};
     line.appendChild(el('span', {}, ['sessions ', el('b', { text: (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known' })]));

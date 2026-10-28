@@ -106,11 +106,29 @@ export function createReauthManager({
   // them could close, cancel or fail (a wrong-state code fails a session) the
   // sign-in the operator is in the middle of. The identity check already
   // stopped a swap; this stops the disruption.
+  //
+  // A start is reserved BEFORE it awaits createSession (the owner and a
+  // generation number), and publishes only if no later start or cancel
+  // happened meanwhile — checking only before the await let a client's slower
+  // start overwrite the operator's newer session (Oracle + xreview, 2026-10-27).
+  /** @type {{ gen: number, owner: string, name: string } | null} a start awaiting its session */
+  let reserved = null;
+  let generation = 0;
+  /** Who holds the flow now: a start in progress, else a pending session. */
+  function holder() {
+    if (reserved) return { owner: reserved.owner, name: reserved.name };
+    if (current && current.state === 'pending') return { owner: current.owner, name: current.name };
+    return null;
+  }
   /** @param {string} who */
   function mayTouch(who) {
-    return !current || who === OPERATOR || current.owner === who;
+    const h = holder();
+    return !h || who === OPERATOR || h.owner === who;
   }
-  const busy = () => httpError(409, `a reauth for "${current?.name}" started by ${current?.owner === OPERATOR ? 'the operator' : 'another client'} is waiting for a browser approval; it can only be replaced or cancelled by whoever started it, or the operator`);
+  const busy = () => {
+    const h = holder();
+    return httpError(409, `a reauth for "${h?.name}" started by ${h?.owner === OPERATOR ? 'the operator' : 'another client'} is waiting for a browser approval; it can only be replaced or cancelled by whoever started it, or the operator`);
+  };
 
   return {
     status,
@@ -131,12 +149,23 @@ export function createReauthManager({
       if (account.type !== 'oauth') throw httpError(400, `account "${name}" is not an OAuth account`);
       if (strict && unverifiable(account)) throw httpError(403, `account "${name}" has no stored identity to check a sign-in against; reauth it with the proxy key (the desktop launcher)`);
 
-      if (current && current.state === 'pending' && !mayTouch(owner)) throw busy();
-      if (current) current.session.close(); // supersede any prior session
+      if (!mayTouch(owner)) throw busy();
+      const gen = ++generation;
+      reserved = { gen, owner, name };
 
       starting++;
       let session;
-      try { session = await createSession(); } finally { starting--; }
+      try { session = await createSession(); } catch (err) {
+        if (reserved?.gen === gen) reserved = null;
+        throw err;
+      } finally { starting--; }
+      // A later start or a cancel took over while this one waited: it lost.
+      if (gen !== generation) {
+        session.close();
+        throw httpError(409, 'this reauth was replaced or cancelled while it was starting');
+      }
+      reserved = null;
+      if (current) current.session.close(); // supersede any prior session
       const ctx = { name, account, session, owner, state: 'pending', email: null, error: null, settled: false };
       current = ctx;
 
@@ -180,7 +209,11 @@ export function createReauthManager({
 
     /** @param {{ owner?: string }} [opts] */
     cancel({ owner = OPERATOR } = {}) {
-      if (current && current.state === 'pending' && !mayTouch(owner)) throw busy();
+      if (!mayTouch(owner)) throw busy();
+      // Not even a finished session's result may be cleared by a stranger.
+      if (current && owner !== OPERATOR && current.owner !== owner) throw httpError(409, 'that reauth was started by someone else; only they or the operator may clear it');
+      generation++; // a start still waiting for its session loses
+      reserved = null;
       if (current) {
         current.session.close();
         current = null;

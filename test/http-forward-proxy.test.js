@@ -241,3 +241,23 @@ test('an absolute-form request authenticated by Proxy-Authorization only ever re
     assert.equal(seen[0].headers['proxy-authorization'], undefined, 'the key never reaches the target');
   } finally { proxy.close(); target.close(); }
 });
+
+test('a forward URL carrying credentials (user:pass@) is refused, and nothing reaches the target', async () => {
+  const seen = [];
+  const target = http.createServer((req, res) => { seen.push(req.headers); res.end('ok'); });
+  const targetPort = await listen(target);
+  const proxy = createProxyServer(noRouteManager, { proxy: {}, upstream: 'https://api.anthropic.com' });
+  allowLoopbackForward(proxy);
+  const proxyPort = await listen(proxy);
+  try {
+    // Positive control: the same URL without userinfo is forwarded.
+    assert.equal((await proxyRequest({ proxyPort, absoluteUrl: `http://127.0.0.1:${targetPort}/x` })).status, 200);
+    for (const u of [`http://alice:s3cret@127.0.0.1:${targetPort}/x`, `http://alice@127.0.0.1:${targetPort}/x`, `http://:s3cret@127.0.0.1:${targetPort}/x`]) {
+      const r = await proxyRequest({ proxyPort, absoluteUrl: u });
+      assert.equal(r.status, 400, u);
+      assert.doesNotMatch(r.body, /alice|s3cret/, 'the reply does not echo the credential');
+    }
+    assert.equal(seen.length, 1, 'only the control request reached the target');
+    assert.equal(seen[0].authorization, undefined);
+  } finally { proxy.close(); target.close(); }
+});

@@ -79,10 +79,16 @@ export function chainShortfall(caCertPem, leafCertPem, hosts, now = Date.now()) 
     const ca = new X509Certificate(caCertPem);
     const leaf = new X509Certificate(leafCertPem);
     if (!leaf.verify(ca.publicKey)) return { signed: false, shortfall: 'is not signed by the stored CA' };
-    const names = (leaf.subjectAltName || '').split(',').map((s) => s.trim());
     // An IP literal is checked against the iPAddress SANs (Node normalises the
-    // spelling); a name against the dNSName entries (fork, #19).
-    const missing = hosts.filter((h) => (net.isIP(h) ? leaf.checkIP(h) === undefined : !names.includes(`DNS:${h}`)));
+    // spelling); a name against the dNSName entries (fork, #19) by OpenSSL's own
+    // matcher — not by splitting the displayed SAN string, where a quoted value
+    // containing a comma could read as a name the cert does not carry (xreview,
+    // 2026-10-27). Literal names only (no wildcards, no subject CN fallback);
+    // case-insensitive, as DNS names are (RFC 4343), so a configured `Familiar`
+    // against a leaf for `familiar` is covered rather than reissued.
+    const missing = hosts.filter((h) => (net.isIP(h)
+      ? leaf.checkIP(h) === undefined
+      : leaf.checkHost(String(h), { subject: 'never', wildcards: false }) === undefined));
     if (missing.length) return { signed: true, shortfall: `does not name ${missing.join(', ')}` };
     for (const cert of [ca, leaf]) {
       const validTo = new Date(cert.validTo).getTime();

@@ -269,3 +269,30 @@ test('a listener chain from before the rename (MITM CA name) is regenerated', as
   assert.equal(c.regenerated, true);
   assert.match(new X509Certificate(await readFile(c.caPath, 'utf8')).subject, new RegExp(`CN=${LISTENER_CA_CN}`));
 });
+
+test('a DNS SAN covers its name in any case (RFC 4343): no needless reissue', async () => {
+  const { generateCertChain } = await import('../src/x509.js');
+  const chain = generateCertChain(['familiar', 'tc.realm.watch']);
+  for (const h of ['familiar', 'Familiar', 'FAMILIAR', 'TC.Realm.Watch']) assert.equal(leafCovers(chain.caCertPem, chain.leafCertPem, [h]), true, h);
+  assert.equal(leafCovers(chain.caCertPem, chain.leafCertPem, ['familiar2']), false, 'positive control: another name is not covered');
+  // Agrees with what a TLS client accepts.
+  const leaf = new X509Certificate(chain.leafCertPem);
+  for (const h of ['Familiar', 'TC.Realm.Watch']) assert.equal(tls.checkServerIdentity(h, { subjectaltname: leaf.subjectAltName, subject: {} }), undefined, h);
+});
+
+// A regression guard, not a reproduced bug: Node 22 escapes a comma inside a
+// quoted SAN (\u002c), so splitting the display string was not fooled either.
+// The check now asks OpenSSL (checkHost) and never parses that string.
+test('a SAN whose value contains a comma does not cover a name embedded in it', async () => {
+  const { generateCertChain } = await import('../src/x509.js');
+  const chain = generateCertChain(['other,DNS:target.example,tail', 'real.example']);
+  assert.equal(leafCovers(chain.caCertPem, chain.leafCertPem, ['real.example']), true, 'positive control');
+  assert.equal(leafCovers(chain.caCertPem, chain.leafCertPem, ['target.example']), false);
+});
+
+test('coverage stays literal: no wildcard, trailing-dot or IDN widening', async () => {
+  const { generateCertChain } = await import('../src/x509.js');
+  const chain = generateCertChain(['*.example', 'xn--bcher-kva.example']);
+  assert.equal(leafCovers(chain.caCertPem, chain.leafCertPem, ['a.example']), false, 'a wildcard SAN does not cover a name');
+  assert.equal(leafCovers(chain.caCertPem, chain.leafCertPem, ['xn--bcher-kva.example']), true);
+});

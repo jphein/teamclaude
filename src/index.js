@@ -2370,37 +2370,32 @@ async function serviceCommand() {
 const CERTS_USAGE = 'Usage: teamclaude certs rotate-mitm <--status|--stage|--commit|--rollback|--finish>';
 
 // MITM CA rotation, step by step (docs/superpowers/specs/2026-10-27-mitm-ca-reissue.md).
-// None of it touches the running proxy: a committed chain is served from the
-// next start, and until --finish every client file can trust both CAs.
+// --stage runs with the proxy up; --commit, --rollback and --finish need it
+// stopped. Until --finish every client file can trust both CAs.
 async function certsCommand() {
   const steps = ['status', 'stage', 'commit', 'rollback', 'finish'];
   const step = steps.find((s) => args.includes(`--${s}`));
   if (args[1] !== 'rotate-mitm' || !step) { console.error(CERTS_USAGE); process.exit(1); }
   const config = await loadOrCreateConfig();
-  // --finish asks the running proxy which MITM CA it serves: retiring that CA
-  // while it is still served would make newly started clients reject it. Only
-  // a positive answer counts; a proxy that cannot be asked is 'unknown'.
-  let servingCa = 'unknown';
-  if (step === 'finish') {
+  // commit, rollback and finish run only with the proxy stopped: is anything
+  // listening on its port? A refused connection is the one positive 'no'.
+  let proxyRunning = null;
+  if (step !== 'status' && step !== 'stage') {
     const port = config?.proxy?.port || 3456;
-    try {
-      const res = await fetch(`http://localhost:${port}/teamclaude/status`, { headers: { 'x-api-key': config.proxy?.apiKey || '' }, signal: AbortSignal.timeout(5000) });
-      const body = res.ok ? await res.json() : null;
-      if (body && body.mitm && 'servedCa' in body.mitm) servingCa = body.mitm.servedCa?.fingerprint256 || 'none';
-    } catch (e) {
-      // Nothing listening: no proxy serves anything.
-      const code = /** @type {any} */ (e)?.cause?.code;
-      if (code === 'ECONNREFUSED') servingCa = 'none';
-    }
+    proxyRunning = await new Promise((resolve) => {
+      const sock = net.connect({ host: '127.0.0.1', port }, () => { sock.destroy(); resolve(true); });
+      sock.setTimeout(2000, () => { sock.destroy(); resolve(null); });
+      sock.on('error', (e) => resolve(/** @type {any} */ (e)?.code === 'ECONNREFUSED' ? false : null));
+    });
   }
   let view;
-  try { view = await rotateMitm(/** @type {any} */ (step), mitmHosts(config), { servingCa }); }
+  try { view = await rotateMitm(/** @type {any} */ (step), mitmHosts(config), { proxyRunning }); }
   catch (err) { console.error(`teamclaude certs rotate-mitm --${step}: ${/** @type {Error} */ (err).message}`); process.exit(1); }
   const line = (/** @type {string} */ label, /** @type {any} */ ca) => console.log(`  ${label.padEnd(5)} ${ca ? `${ca.cn}  sha256 ${ca.fingerprint256}  (to ${ca.validTo})` : '—'}`);
   console.log(`MITM CA rotation — ${step}${view.note ? ` (${view.note})` : ''}`);
   line('live', view.live); line('next', view.next); line('prev', view.prev);
   console.log(`  Clients trust: ${view.trustPath} (every MITM CA above; copy its content into each client's teamclaude-ca.pem — a running client keeps what it loaded at start)`);
-  if (step === 'commit' || step === 'rollback') console.log('  Takes effect when the proxy next starts (restart it at 0 in-flight).');
+  if (step === 'commit' || step === 'rollback') console.log('  Start the proxy again; /teamclaude/status → mitm.servedCa shows the CA it serves.');
 }
 
 async function probeCommand() {

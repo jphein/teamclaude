@@ -577,8 +577,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // Dashboard SSO through the front proxy (sso.js).
   const ssoUser = createSsoGate();
   // The MITM CA this process actually serves, once it has loaded its chain
-  // (null until the first intercepted CONNECT). `certs rotate-mitm --finish`
-  // reads it from /teamclaude/status before retiring a previous CA.
+  // (null until the first intercepted CONNECT): after a CA rotation, the
+  // operator's check that the restarted proxy serves the new one.
   /** @type {ReturnType<typeof describeCa>} */
   let servedMitmCa = null;
   const loadUiPage = () => {

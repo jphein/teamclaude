@@ -12,7 +12,7 @@
 //   api.anthropic.com → terminate + forward,  www.example.org → local test server,
 //   anything else      → blind tunnel (never to this machine — see forward-target.js).
 
-import { readFile, writeFile, mkdir, rename, unlink, link } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename, unlink } from 'node:fs/promises';
 import { X509Certificate, createPublicKey, randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import net from 'node:net';
@@ -204,13 +204,6 @@ export async function refreshCaBundle(dir = certDir()) {
  * @param {{ keep?: boolean }} [opts]
  */
 export async function ensureCerts(host, { keep = false } = {}) {
-  // Under the certificate lock (a rotation step may be writing the chain); a
-  // step that does not finish within 10 s fails this rather than racing it.
-  return withCertLock(() => ensureCertsLocked(host, { keep }), 10_000);
-}
-
-/** @param {string|string[]} host @param {{ keep?: boolean }} opts */
-async function ensureCertsLocked(host, { keep }) {
   const named = Array.isArray(host) ? host : [host];
   const hosts = [...new Set(named.filter(Boolean))];
   if (!hosts.includes(TEST_HOST)) hosts.push(TEST_HOST);
@@ -276,56 +269,24 @@ async function clearSlot(slot) {
   }
 }
 
-// One certificate step at a time — a rotation step, or the proxy reading (and
-// perhaps minting) its chain at start: three files are not written atomically
-// together, so a reader in the middle could see a mismatched set (xreview,
-// 2026-10-27). The lock names its owner (pid:random); it is stale only when
-// that process is gone, taken over by an atomic rename, and released only by
-// its owner.
+// One rotation step at a time. Only the operator's `teamclaude certs` steps
+// take it; the proxy never does, so a lock left by a step that died cannot
+// stop the proxy from starting. It is never taken over automatically: a
+// leftover lock is reported with the path to delete once no step is running
+// (xreview round 3: automatic takeover cannot be made safe between processes).
 const CERT_LOCK = 'teamclaude-certs.lock';
-/** @param {number} pid */
-function pidAlive(pid) {
-  try { process.kill(pid, 0); return true; } catch (e) { return /** @type {any} */ (e)?.code === 'EPERM'; }
-}
-/** @param {number} waitMs @returns {Promise<string>} the owner token */
-async function acquireCertLock(waitMs) {
+/** @template T @param {() => Promise<T>} fn @returns {Promise<T>} */
+async function withCertLock(fn) {
+  await mkdir(certDir(), { recursive: true });
   const lock = fpath(CERT_LOCK);
   const token = `${process.pid}:${randomBytes(6).toString('hex')}`;
-  for (let waited = 0; ; waited += 100) {
-    try { await writeFile(lock, token, { flag: 'wx', mode: 0o600 }); return token; } catch (e) {
-      if (/** @type {any} */ (e)?.code !== 'EEXIST') throw e;
-    }
-    const owner = await readIf(lock);
-    const pid = Number(String(owner || '').split(':')[0]);
-    if (owner && Number.isInteger(pid) && pid > 0 && !pidAlive(pid)) {
-      // Only one taker's rename succeeds. If what it moved aside turns out to
-      // be a newer, live lock (someone took over between the read and the
-      // rename), it goes back with link(), which never overwrites.
-      const aside = `${lock}.stale.${token.replace(':', '.')}`;
-      try {
-        await rename(lock, aside);
-        if ((await readIf(aside)) !== owner) await link(aside, lock).catch(() => {});
-        await unlink(aside).catch(() => {});
-      } catch { /* someone else moved it first */ }
-      continue;
-    }
-    if (waited >= waitMs) throw new Error('another certificate step is running (teamclaude-certs.lock); try again in a moment');
-    await new Promise((r) => setTimeout(r, 100));
+  try { await writeFile(lock, token, { flag: 'wx', mode: 0o600 }); } catch (e) {
+    if (/** @type {any} */ (e)?.code !== 'EEXIST') throw e;
+    throw new Error(`another certificate step is running, or one died holding ${lock}: if no \`teamclaude certs\` is running, delete that file and retry`);
   }
-}
-/** @param {string} token */
-async function releaseCertLock(token) {
-  const lock = fpath(CERT_LOCK);
-  if ((await readIf(lock)) === token) await unlink(lock).catch(() => {});
-}
-/** For tests: the lock's acquire and release, as the steps use them. */
-export const certLockForTests = { acquire: acquireCertLock, release: releaseCertLock };
-
-/** @template T @param {() => Promise<T>} fn @param {number} [waitMs] @returns {Promise<T>} */
-async function withCertLock(fn, waitMs = 0) {
-  await mkdir(certDir(), { recursive: true });
-  const token = await acquireCertLock(waitMs);
-  try { return await fn(); } finally { await releaseCertLock(token); }
+  try { return await fn(); } finally {
+    if ((await readIf(lock)) === token) await unlink(lock).catch(() => {});
+  }
 }
 
 /** The CA's subject CN and SHA-256 fingerprint, for the operator. @param {string|null|undefined} caCertPem */
@@ -363,24 +324,30 @@ function rotationHosts(host) {
  *   commit   — live → .prev, .next → live: served from the next start.
  *   rollback — .prev → live, and the chain it replaces back to .next.
  *   finish   — forget .prev: clients STARTED from then on need only the live
- *              CA (running ones keep what they loaded). Refused unless the
- *              running proxy is known not to serve the previous CA.
+ *              CA (running ones keep what they loaded).
+ * Only stage runs with the proxy up (it writes the .next slot alone).
  * @param {'stage'|'commit'|'rollback'|'finish'|'status'} action
  * @param {string|string[]} host  the hosts the leaf must name (mitmHosts(config))
- * @param {{ servingCa?: string }} [opts]  the CA the running proxy serves: its
- *   SHA-256 fingerprint, 'none' (no proxy, or nothing served yet), or
- *   'unknown' (could not ask) — finish refuses on 'unknown' or a non-live CA
+ * @param {{ proxyRunning?: boolean|null }} [opts]  whether a proxy is listening
+ *   on this config's port (null: could not tell). commit, rollback and finish
+ *   run only with the proxy stopped (false): nothing reads the chain while it
+ *   changes, and no running proxy can be serving a CA they retire.
  * @returns {Promise<{ live: ReturnType<typeof describeCa>, next: ReturnType<typeof describeCa>, prev: ReturnType<typeof describeCa>, trustPath: string, note?: string }>}
  */
-export async function rotateMitm(action, host, { servingCa = 'unknown' } = {}) {
+export async function rotateMitm(action, host, { proxyRunning = null } = {}) {
   const hosts = rotationHosts(host);
   const view = async () => {
     const [live, next, prev] = await Promise.all([readSlot('live'), readSlot('next'), readSlot('prev')]);
     return { live: describeCa(live?.caCertPem), next: describeCa(next?.caCertPem), prev: describeCa(prev?.caCertPem), trustPath: fpath(MITM_TRUST) };
   };
   if (action === 'status') return view();
+  if (action !== 'stage' && proxyRunning !== false) {
+    throw new Error(proxyRunning ? `stop the proxy first (--${action} changes or retires the chain it serves), then start it again after` : `cannot tell whether the proxy is running: stop it, then --${action}`);
+  }
   return withCertLock(async () => {
     const [live, next, prev] = await Promise.all([readSlot('live'), readSlot('next'), readSlot('prev')]);
+    /** @param {'next'|'prev'} slot */
+    const partial = async (slot) => (await Promise.all(SLOT_FILES[slot].map((n) => readIf(fpath(n))))).some(Boolean);
     const ok = (/** @type {any} */ c) => !slotProblem(c, hosts);
     const same = (/** @type {any} */ a, /** @type {any} */ b) => !!a && !!b && a.caCertPem.trim() === b.caCertPem.trim();
     // Every step below is safe to run again after a crash part-way through:
@@ -390,12 +357,17 @@ export async function rotateMitm(action, host, { servingCa = 'unknown' } = {}) {
       if (ok(next)) { await refreshCaBundle(); return { ...(await view()), note: 'already staged' }; }
       await writeSlot('next', generateCertChain(hosts, { caCn: mitmCaCn() }));
     } else if (action === 'commit') {
+      // A commit that died while clearing .next: the new chain is live and
+      // only stray .next files are left — finish the clean-up.
+      if (!next && ok(live) && await partial('next')) { await clearSlot('next'); await refreshCaBundle(); return { ...(await view()), note: 'completed an interrupted commit' }; }
       if (!ok(next)) throw new Error(`nothing to commit: the staged chain ${slotProblem(next, hosts)} (run --stage first)`);
       if (ok(prev) && ok(live) && !same(live, next)) throw new Error('the previous rotation is not finished: run --finish (or --rollback) before committing another');
       if (ok(live) && !ok(prev)) await writeSlot('prev', /** @type {any} */ (live));
       await writeSlot('live', /** @type {any} */ (next));
       await clearSlot('next');
     } else if (action === 'rollback') {
+      // A rollback that died while clearing .prev: the old chain is live again.
+      if (!prev && ok(live) && await partial('prev')) { await clearSlot('prev'); await refreshCaBundle(); return { ...(await view()), note: 'completed an interrupted rollback' }; }
       if (!ok(prev)) throw new Error(`nothing to roll back to: the previous chain ${slotProblem(prev, hosts)}`);
       if (ok(next) && ok(live) && !same(live, prev) && !same(live, next)) throw new Error('a chain is staged and the live one is neither it nor the previous one: check --status before rolling back');
       if (!same(live, prev)) {
@@ -408,15 +380,6 @@ export async function rotateMitm(action, host, { servingCa = 'unknown' } = {}) {
       if (!prevFiles.some(Boolean)) { await refreshCaBundle(); return { ...(await view()), note: 'nothing to finish (trust files refreshed)' }; }
       if (!ok(live)) throw new Error(`the live chain ${slotProblem(live, hosts)}: --rollback, not --finish`);
       if (next) throw new Error('a chain is still staged: --commit it or remove it before --finish');
-      // Retiring the previous CA while a proxy still serves it would make every
-      // newly started client reject that proxy. Only a positive answer lets it
-      // through: no proxy listening, one that has served nothing yet (it will
-      // load the live chain), or one serving the live CA.
-      const liveFp = describeCa(live?.caCertPem)?.fingerprint256;
-      if (servingCa === 'unknown') throw new Error('cannot confirm which CA the running proxy serves (it did not answer /teamclaude/status): stop or restart it, then --finish');
-      if (typeof servingCa === 'string' && servingCa !== 'none' && servingCa !== liveFp) {
-        throw new Error('the running proxy still serves the previous CA: restart it at 0 in-flight, then --finish');
-      }
       // CA first and then the trust files, so an interrupted finish never
       // leaves the retired CA advertised; the leaf and key go last, and a
       // retry with only some of them left still completes.

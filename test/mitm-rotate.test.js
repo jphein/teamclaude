@@ -52,20 +52,20 @@ test('stage → commit → rollback → commit → finish, with every CA in play
   assert.deepEqual(new Set(certsIn(read(CA_BUNDLE))), new Set([oldFp, newFp, listenerFp]));
   assert.equal((await rotateMitm('stage', HOSTS)).next.fingerprint256, newFp, 'staging twice keeps the first staged chain');
 
-  v = await rotateMitm('commit', HOSTS);
+  v = await rotateMitm('commit', HOSTS, { proxyRunning: false });
   assert.equal(v.live.fingerprint256, newFp);
   assert.equal(v.prev.fingerprint256, oldFp);
   assert.equal(v.next, null);
   assert.deepEqual(new Set(certsIn(read(MITM_TRUST))), new Set([oldFp, newFp]), 'still both after the switch');
   assert.equal(fp(read('teamclaude-ca.pem')), newFp, 'the live CA file is one cert, the new one');
 
-  v = await rotateMitm('rollback', HOSTS);
+  v = await rotateMitm('rollback', HOSTS, { proxyRunning: false });
   assert.equal(v.live.fingerprint256, oldFp);
   assert.equal(v.next.fingerprint256, newFp, 'the rolled-back chain is staged again');
   assert.equal(v.prev, null);
 
-  await rotateMitm('commit', HOSTS);
-  v = await rotateMitm('finish', HOSTS, { servingCa: 'none' });
+  await rotateMitm('commit', HOSTS, { proxyRunning: false });
+  v = await rotateMitm('finish', HOSTS, { proxyRunning: false });
   assert.equal(v.prev, null);
   assert.deepEqual(certsIn(read(MITM_TRUST)), [newFp], 'after finish clients need only the new CA');
   assert.deepEqual(new Set(certsIn(read(CA_BUNDLE))), new Set([newFp, listenerFp]));
@@ -76,18 +76,18 @@ test('stage → commit → rollback → commit → finish, with every CA in play
 test('commit, rollback and finish refuse when there is nothing safe to do', async () => {
   reset();
   await ensureCerts(HOSTS);
-  await assert.rejects(rotateMitm('commit', HOSTS), /nothing to commit/);
-  await assert.rejects(rotateMitm('rollback', HOSTS), /nothing to roll back/);
+  await assert.rejects(rotateMitm('commit', HOSTS, { proxyRunning: false }), /nothing to commit/);
+  await assert.rejects(rotateMitm('rollback', HOSTS, { proxyRunning: false }), /nothing to roll back/);
   // A finish with nothing left still repairs a stale trust file.
   writeFileSync(join(home, MITM_TRUST), read(MITM_TRUST) + generateCertChain(['stale.test']).caCertPem);
   assert.equal(certsIn(read(MITM_TRUST)).length, 2);
-  assert.match((await rotateMitm('finish', HOSTS)).note, /nothing to finish/);
+  assert.match((await rotateMitm('finish', HOSTS, { proxyRunning: false })).note, /nothing to finish/);
   assert.deepEqual(certsIn(read(MITM_TRUST)), [fp(read('teamclaude-ca.pem'))], 'the stale entry is gone');
   // A staged chain whose key is not its leaf's (a crash mid-write) is not committed.
   await rotateMitm('stage', HOSTS);
   writeFileSync(join(home, 'teamclaude-leaf.next.key'), generateCertChain(['y.test']).leafKeyPem);
   const before = fp(read('teamclaude-ca.pem'));
-  await assert.rejects(rotateMitm('commit', HOSTS), /key that is not its leaf/);
+  await assert.rejects(rotateMitm('commit', HOSTS, { proxyRunning: false }), /key that is not its leaf/);
   assert.equal(fp(read('teamclaude-ca.pem')), before, 'the live chain is untouched');
 });
 
@@ -193,14 +193,14 @@ test('a crash part-way through commit or rollback is safe to retry: the recovery
   writeFileSync(join(home, 'teamclaude-leaf.prev.pem'), old.leafCertPem);
   writeFileSync(join(home, 'teamclaude-leaf.prev.key'), old.leafKeyPem);
   writeFileSync(join(home, 'teamclaude-leaf.key'), staged.key);
-  let v = await rotateMitm('commit', HOSTS);
+  let v = await rotateMitm('commit', HOSTS, { proxyRunning: false });
   assert.equal(v.prev.fingerprint256, fp(old.caCertPem), 'the retry kept the real previous chain');
   assert.equal(v.live.fingerprint256, fp(staged.ca));
   // Commit crashed after live was fully written, before .next was cleared.
   writeFileSync(join(home, 'teamclaude-ca.next.pem'), staged.ca);
   writeFileSync(join(home, 'teamclaude-leaf.next.pem'), staged.leaf);
   writeFileSync(join(home, 'teamclaude-leaf.next.key'), staged.key);
-  v = await rotateMitm('commit', HOSTS);
+  v = await rotateMitm('commit', HOSTS, { proxyRunning: false });
   assert.equal(v.prev.fingerprint256, fp(old.caCertPem), 'not overwritten by the (already live) new chain');
   assert.equal(v.next, null);
   // Rollback crashed after restaging, with live half-written back to the old chain.
@@ -208,32 +208,34 @@ test('a crash part-way through commit or rollback is safe to retry: the recovery
   writeFileSync(join(home, 'teamclaude-leaf.next.pem'), staged.leaf);
   writeFileSync(join(home, 'teamclaude-leaf.next.key'), staged.key);
   writeFileSync(join(home, 'teamclaude-leaf.key'), old.leafKeyPem);
-  v = await rotateMitm('rollback', HOSTS);
+  v = await rotateMitm('rollback', HOSTS, { proxyRunning: false });
   assert.equal(v.live.fingerprint256, fp(old.caCertPem));
   assert.equal(v.next.fingerprint256, fp(staged.ca), 'the new chain stays staged, not overwritten by the broken live set');
   // …and it is the whole good chain (the broken set shared its CA, not its key): it commits again.
-  assert.equal((await rotateMitm('commit', HOSTS)).live.fingerprint256, fp(staged.ca));
+  assert.equal((await rotateMitm('commit', HOSTS, { proxyRunning: false })).live.fingerprint256, fp(staged.ca));
 });
 
-test('finish refuses unless the live chain is good, nothing is staged, and the served CA is known to be the live one', async () => {
+test('commit, rollback and finish run only with the proxy stopped; finish needs a good live chain and nothing staged', async () => {
   reset();
-  const old = await ensureCerts(HOSTS);
+  await ensureCerts(HOSTS);
   await rotateMitm('stage', HOSTS);
-  await rotateMitm('commit', HOSTS);
-  await assert.rejects(rotateMitm('finish', HOSTS), /cannot confirm/, 'unknown fails closed (the default)');
-  await assert.rejects(rotateMitm('finish', HOSTS, { servingCa: fp(old.caCertPem) }), /still serves the previous CA/);
+  for (const step of ['commit', 'rollback', 'finish']) {
+    await assert.rejects(rotateMitm(step, HOSTS, { proxyRunning: true }), /stop the proxy first/, step);
+    await assert.rejects(rotateMitm(step, HOSTS, { proxyRunning: null }), /cannot tell whether the proxy is running/, step);
+  }
+  assert.ok((await rotateMitm('stage', HOSTS, { proxyRunning: true })).next, 'staging runs with the proxy up');
+  await rotateMitm('commit', HOSTS, { proxyRunning: false });
   // A broken live chain: finish would delete the only good one.
   const key = read('teamclaude-leaf.key');
   writeFileSync(join(home, 'teamclaude-leaf.key'), generateCertChain(['z.test']).leafKeyPem);
-  await assert.rejects(rotateMitm('finish', HOSTS, { servingCa: 'none' }), /--rollback, not --finish/);
+  await assert.rejects(rotateMitm('finish', HOSTS, { proxyRunning: false }), /--rollback, not --finish/);
   writeFileSync(join(home, 'teamclaude-leaf.key'), key);
   await rotateMitm('stage', HOSTS);
-  await assert.rejects(rotateMitm('finish', HOSTS, { servingCa: 'none' }), /still staged/);
-  await assert.rejects(rotateMitm('commit', HOSTS), /previous rotation is not finished/);
+  await assert.rejects(rotateMitm('finish', HOSTS, { proxyRunning: false }), /still staged/);
+  await assert.rejects(rotateMitm('commit', HOSTS, { proxyRunning: false }), /previous rotation is not finished/);
   rmSync(join(home, 'teamclaude-ca.next.pem')); rmSync(join(home, 'teamclaude-leaf.next.pem')); rmSync(join(home, 'teamclaude-leaf.next.key'));
   const liveFp = fp(read('teamclaude-ca.pem'));
-  const v = await rotateMitm('finish', HOSTS, { servingCa: liveFp });
-  assert.equal(v.prev, null);
+  assert.equal((await rotateMitm('finish', HOSTS, { proxyRunning: false })).prev, null);
   assert.deepEqual(certsIn(read(MITM_TRUST)), [liveFp]);
 });
 
@@ -241,46 +243,54 @@ test('an interrupted finish resumes: the retired CA is never left advertised', a
   reset();
   const old = await ensureCerts(HOSTS);
   await rotateMitm('stage', HOSTS);
-  await rotateMitm('commit', HOSTS);
+  await rotateMitm('commit', HOSTS, { proxyRunning: false });
   // Finish died after removing the previous CA, before the trust refresh and the leaf/key.
   rmSync(join(home, 'teamclaude-ca.prev.pem'));
   assert.ok(certsIn(read(MITM_TRUST)).includes(fp(old.caCertPem)), 'the stale trust file still lists it');
-  const v = await rotateMitm('finish', HOSTS, { servingCa: 'none' });
+  const v = await rotateMitm('finish', HOSTS, { proxyRunning: false });
   assert.equal(v.prev, null);
   assert.ok(!certsIn(read(MITM_TRUST)).includes(fp(old.caCertPem)), 'the retry refreshed the trust files');
   assert.equal(existsSync(join(home, 'teamclaude-leaf.prev.key')), false, 'and removed what was left');
 });
 
-test('the certificate lock: a live owner excludes, a dead one is taken over, start-up waits rather than races', async () => {
+test('one step at a time; a leftover lock is reported, never taken over, and never stops the proxy starting', async () => {
   reset();
   await ensureCerts(HOSTS);
   const lock = join(home, 'teamclaude-certs.lock');
-  writeFileSync(lock, '1:x'); // pid 1 is alive
-  await assert.rejects(rotateMitm('stage', HOSTS), /another certificate step is running/);
-  // A dead owner's lock is taken over.
-  const dead = spawnSync(process.execPath, ['-e', 'console.log(process.pid)'], { encoding: 'utf8' });
-  writeFileSync(lock, `${dead.stdout.trim()}:y`);
-  assert.ok((await rotateMitm('stage', HOSTS)).next, 'staged under a taken-over lock');
-  assert.equal(existsSync(lock), false, 'released by its owner');
-  // A step whose lock was taken over (it was paused past a takeover) must not
-  // release the new owner's lock on its way out.
-  const { certLockForTests } = await import('../src/mitm.js');
-  const mine = await certLockForTests.acquire(0);
-  writeFileSync(lock, '1:someone-else');
-  await certLockForTests.release(mine);
-  assert.equal(read('teamclaude-certs.lock'), '1:someone-else', 'the other owner keeps its lock');
+  writeFileSync(lock, '999999:dead');
+  await assert.rejects(rotateMitm('stage', HOSTS), /delete that file and retry/);
+  assert.equal(read('teamclaude-certs.lock'), '999999:dead', 'not taken over');
+  assert.ok((await ensureCerts(HOSTS)).leafCertPem, 'the proxy still loads its chain with the lock present');
   rmSync(lock);
-  // Start-up waits for a live step to finish instead of reading mid-write.
-  writeFileSync(lock, '1:z');
-  setTimeout(() => rmSync(lock, { force: true }), 300);
-  const t0 = Date.now();
-  await ensureCerts(HOSTS);
-  assert.ok(Date.now() - t0 >= 250, 'it waited for the lock');
+  assert.ok((await rotateMitm('stage', HOSTS)).next);
+  assert.equal(existsSync(lock), false, 'released after the step');
   // Mid-rotation with a broken live chain, start-up refuses rather than mint a CA no client trusts.
   writeFileSync(join(home, 'teamclaude-leaf.key'), generateCertChain(['q.test']).leafKeyPem);
   const liveCa = read('teamclaude-ca.pem');
   await assert.rejects(ensureCerts(HOSTS), /rotation is in progress/);
   assert.equal(read('teamclaude-ca.pem'), liveCa, 'nothing was overwritten');
+});
+
+test('an interrupted commit or rollback clean-up completes on retry', async () => {
+  reset();
+  await ensureCerts(HOSTS);
+  await rotateMitm('stage', HOSTS);
+  const nextLeaf = read('teamclaude-leaf.next.pem'), nextKey = read('teamclaude-leaf.next.key');
+  await rotateMitm('commit', HOSTS, { proxyRunning: false });
+  // Commit died after removing the staged CA but before its leaf and key.
+  writeFileSync(join(home, 'teamclaude-leaf.next.pem'), nextLeaf);
+  writeFileSync(join(home, 'teamclaude-leaf.next.key'), nextKey);
+  let v = await rotateMitm('commit', HOSTS, { proxyRunning: false });
+  assert.match(v.note, /interrupted commit/);
+  assert.equal(existsSync(join(home, 'teamclaude-leaf.next.key')), false);
+  // Rollback died the same way while clearing .prev.
+  const prevLeaf = read('teamclaude-leaf.prev.pem'), prevKey = read('teamclaude-leaf.prev.key');
+  await rotateMitm('rollback', HOSTS, { proxyRunning: false });
+  writeFileSync(join(home, 'teamclaude-leaf.prev.pem'), prevLeaf);
+  writeFileSync(join(home, 'teamclaude-leaf.prev.key'), prevKey);
+  v = await rotateMitm('rollback', HOSTS, { proxyRunning: false });
+  assert.match(v.note, /interrupted rollback/);
+  assert.equal(existsSync(join(home, 'teamclaude-leaf.prev.key')), false);
 });
 
 test('/teamclaude/status reports the MITM CA the process actually serves', async () => {

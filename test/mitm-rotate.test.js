@@ -134,17 +134,27 @@ async function pythonStrict(leafCertPem, leafKeyPem, caPem) {
   } finally { srv.close(); }
 }
 
-/** An old-style chain like the 2026-06 one: no SKI on the CA, no AKI on the leaf (openssl CLI). */
-function oldStyleChain() {
-  const d = mkdtempSync(join(home, 'old-'));
-  const run = (args) => spawnSync('openssl', args, { cwd: d, encoding: 'utf8' });
-  const steps = [
-    ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '30', '-subj', '/CN=TeamClaude Local CA', '-addext', 'subjectKeyIdentifier=none', '-addext', 'authorityKeyIdentifier=none', '-addext', 'basicConstraints=critical,CA:TRUE', '-keyout', 'ca.key', '-out', 'ca.pem'],
-    ['req', '-new', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=api.anthropic.com', '-keyout', 'leaf.key', '-out', 'leaf.csr'],
-  ];
-  for (const a of steps) if (run(a).status !== 0) return null;
-  writeFileSync(join(d, 'ext.cnf'), 'subjectAltName=DNS:api.anthropic.com\nsubjectKeyIdentifier=none\nauthorityKeyIdentifier=none\n');
-  if (run(['x509', '-req', '-in', 'leaf.csr', '-CA', 'ca.pem', '-CAkey', 'ca.key', '-CAcreateserial', '-days', '30', '-extfile', 'ext.cnf', '-out', 'leaf.pem']).status !== 0) return null;
+/**
+ * An old-style chain like the 2026-06 one — strict-valid in every other way
+ * (CA basicConstraints + keyUsage, leaf SAN) — with or without key identifiers,
+ * built with the openssl CLI. null when openssl is absent; a construction
+ * failure throws, so it cannot pass as a skip.
+ */
+function opensslChain({ keyIds }) {
+  if (spawnSync('openssl', ['version']).status !== 0) return null;
+  const d = mkdtempSync(join(home, 'ossl-'));
+  const run = (args) => {
+    const r = spawnSync('openssl', args, { cwd: d, encoding: 'utf8' });
+    if (r.status !== 0) throw new Error(`openssl ${args[0]} failed: ${r.stderr}`);
+  };
+  const ski = keyIds ? 'hash' : 'none';
+  const aki = keyIds ? 'keyid:always' : 'none';
+  run(['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '30', '-subj', '/CN=Strict Control CA',
+    '-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign,cRLSign',
+    '-addext', `subjectKeyIdentifier=${ski}`, '-addext', 'authorityKeyIdentifier=none', '-keyout', 'ca.key', '-out', 'ca.pem']);
+  run(['req', '-new', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=api.anthropic.com', '-keyout', 'leaf.key', '-out', 'leaf.csr']);
+  writeFileSync(join(d, 'ext.cnf'), `subjectAltName=DNS:api.anthropic.com\nbasicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=${ski}\nauthorityKeyIdentifier=${aki}\n`);
+  run(['x509', '-req', '-in', 'leaf.csr', '-CA', 'ca.pem', '-CAkey', 'ca.key', '-CAcreateserial', '-days', '30', '-extfile', 'ext.cnf', '-out', 'leaf.pem']);
   const r = (n) => readFileSync(join(d, n), 'utf8');
   return { caCertPem: r('ca.pem'), leafCertPem: r('leaf.pem'), leafKeyPem: r('leaf.key') };
 }
@@ -152,15 +162,85 @@ function oldStyleChain() {
 test('Python strict X.509 verification rejects an old-style chain and accepts the new one', async (t) => {
   const py = spawnSync('python3', ['-c', 'import ssl,sys; sys.exit(0 if hasattr(ssl, "VERIFY_X509_STRICT") else 3)']);
   if (py.status !== 0) { t.skip('no python3 with ssl.VERIFY_X509_STRICT'); return; }
-  const old = oldStyleChain();
-  if (!old) { t.skip('no openssl to build the old-style control'); return; }
+  const old = opensslChain({ keyIds: false });
+  if (!old) { t.skip('no openssl to build the controls'); return; }
   assert.equal(has(old.caCertPem, SKI_OID) || has(old.leafCertPem, AKI_OID), false, 'the control really lacks key identifiers');
   const control = await pythonStrict(old.leafCertPem, old.leafKeyPem, old.caCertPem);
-  assert.notEqual(control.code, 0, 'positive control: strict mode rejects the old-style chain');
-  assert.match(control.err, /CERTIFICATE_VERIFY_FAILED/);
+  assert.notEqual(control.code, 0, 'positive control: strict mode rejects the chain without key identifiers');
+  assert.match(control.err, /Key Identifier/i, 'rejected for the missing identifier, not something else');
+  // The same construction with identifiers passes: they were the only difference.
+  const fixed = opensslChain({ keyIds: true });
+  const fixedRun = await pythonStrict(fixed.leafCertPem, fixed.leafKeyPem, fixed.caCertPem);
+  assert.equal(fixedRun.code, 0, fixedRun.err);
   reset();
   const c = await ensureCerts(HOSTS);
   const r = await pythonStrict(c.leafCertPem, c.leafKeyPem, c.caCertPem);
   assert.equal(r.code, 0, r.err);
   assert.match(r.out, /ok/);
+});
+
+test('a crash part-way through commit or rollback is safe to retry: the recovery copy survives', async () => {
+  reset();
+  const old = await ensureCerts(HOSTS);
+  await rotateMitm('stage', HOSTS);
+  const staged = { ca: read('teamclaude-ca.next.pem'), leaf: read('teamclaude-leaf.next.pem'), key: read('teamclaude-leaf.next.key') };
+  // Commit crashed after saving .prev and writing the live key only: live is a mismatched set.
+  writeFileSync(join(home, 'teamclaude-ca.prev.pem'), old.caCertPem);
+  writeFileSync(join(home, 'teamclaude-leaf.prev.pem'), old.leafCertPem);
+  writeFileSync(join(home, 'teamclaude-leaf.prev.key'), old.leafKeyPem);
+  writeFileSync(join(home, 'teamclaude-leaf.key'), staged.key);
+  let v = await rotateMitm('commit', HOSTS);
+  assert.equal(v.prev.fingerprint256, fp(old.caCertPem), 'the retry kept the real previous chain');
+  assert.equal(v.live.fingerprint256, fp(staged.ca));
+  // Commit crashed after live was fully written, before .next was cleared.
+  writeFileSync(join(home, 'teamclaude-ca.next.pem'), staged.ca);
+  writeFileSync(join(home, 'teamclaude-leaf.next.pem'), staged.leaf);
+  writeFileSync(join(home, 'teamclaude-leaf.next.key'), staged.key);
+  v = await rotateMitm('commit', HOSTS);
+  assert.equal(v.prev.fingerprint256, fp(old.caCertPem), 'not overwritten by the (already live) new chain');
+  assert.equal(v.next, null);
+  // Rollback crashed after restaging, with live half-written back to the old chain.
+  writeFileSync(join(home, 'teamclaude-ca.next.pem'), staged.ca);
+  writeFileSync(join(home, 'teamclaude-leaf.next.pem'), staged.leaf);
+  writeFileSync(join(home, 'teamclaude-leaf.next.key'), staged.key);
+  writeFileSync(join(home, 'teamclaude-leaf.key'), old.leafKeyPem);
+  v = await rotateMitm('rollback', HOSTS);
+  assert.equal(v.live.fingerprint256, fp(old.caCertPem));
+  assert.equal(v.next.fingerprint256, fp(staged.ca), 'the new chain stays staged, not overwritten by the broken live set');
+  // …and it is the whole good chain (the broken set shared its CA, not its key): it commits again.
+  assert.equal((await rotateMitm('commit', HOSTS)).live.fingerprint256, fp(staged.ca));
+});
+
+test('finish refuses unless the live chain is good, nothing is staged, and the proxy restarted after the commit', async () => {
+  reset();
+  await ensureCerts(HOSTS);
+  await rotateMitm('stage', HOSTS);
+  await rotateMitm('commit', HOSTS);
+  await assert.rejects(rotateMitm('finish', HOSTS, { servingSince: Date.now() - 3_600_000 }), /started before the commit/);
+  // A broken live chain: finish would delete the only good one.
+  const key = read('teamclaude-leaf.key');
+  writeFileSync(join(home, 'teamclaude-leaf.key'), generateCertChain(['z.test']).leafKeyPem);
+  await assert.rejects(rotateMitm('finish', HOSTS), /--rollback, not --finish/);
+  writeFileSync(join(home, 'teamclaude-leaf.key'), key);
+  await rotateMitm('stage', HOSTS);
+  await assert.rejects(rotateMitm('finish', HOSTS), /still staged/);
+  await assert.rejects(rotateMitm('commit', HOSTS), /previous rotation is not finished/);
+  // Restarted after the commit, nothing staged: allowed.
+  rmSync(join(home, 'teamclaude-ca.next.pem')); rmSync(join(home, 'teamclaude-leaf.next.pem')); rmSync(join(home, 'teamclaude-leaf.next.key'));
+  const v = await rotateMitm('finish', HOSTS, { servingSince: Date.now() + 1000 });
+  assert.equal(v.prev, null);
+});
+
+test('a second step waits its turn, and the proxy never mints an untrusted CA mid-rotation', async () => {
+  reset();
+  await ensureCerts(HOSTS);
+  writeFileSync(join(home, 'teamclaude-certs.lock'), '1');
+  await assert.rejects(rotateMitm('stage', HOSTS), /another certificate step is running/);
+  rmSync(join(home, 'teamclaude-certs.lock'));
+  await rotateMitm('stage', HOSTS);
+  // The live chain is broken mid-rotation: start-up refuses rather than regenerate.
+  writeFileSync(join(home, 'teamclaude-leaf.key'), generateCertChain(['q.test']).leafKeyPem);
+  const liveCa = read('teamclaude-ca.pem');
+  await assert.rejects(ensureCerts(HOSTS), /rotation is in progress/);
+  assert.equal(read('teamclaude-ca.pem'), liveCa, 'nothing was overwritten');
 });

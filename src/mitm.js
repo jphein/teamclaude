@@ -12,7 +12,7 @@
 //   api.anthropic.com → terminate + forward,  www.example.org → local test server,
 //   anything else      → blind tunnel (never to this machine — see forward-target.js).
 
-import { readFile, writeFile, mkdir, rename, unlink } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename, unlink, stat } from 'node:fs/promises';
 import { X509Certificate, createPublicKey, randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import net from 'node:net';
@@ -207,6 +207,7 @@ export async function ensureCerts(host, { keep = false } = {}) {
   const named = Array.isArray(host) ? host : [host];
   const hosts = [...new Set(named.filter(Boolean))];
   if (!hosts.includes(TEST_HOST)) hosts.push(TEST_HOST);
+  await waitForCertLock();
   const [caCertPem, leafCertPem, leafKeyPem] = await Promise.all([
     readIf(fpath(CA_CERT)), readIf(fpath(LEAF_CERT)), readIf(fpath(LEAF_KEY)),
   ]);
@@ -221,6 +222,11 @@ export async function ensureCerts(host, { keep = false } = {}) {
     }
   }
 
+  // Mid-rotation, a chain minted here would be one no client trusts and would
+  // overwrite the live slot the rotation is moving: stop and say so instead.
+  if ((await readIf(fpath(SLOT_FILES.next[0]))) || (await readIf(fpath(SLOT_FILES.prev[0])))) {
+    throw new Error('the live MITM chain cannot be served and a CA rotation is in progress — run `teamclaude certs rotate-mitm --status`, then finish the --commit or --rollback');
+  }
   const chain = generateCertChain(hosts, { caCn: mitmCaCn() }); // caKeyPem intentionally discarded
   await mkdir(certDir(), { recursive: true });
   // Key first: a crash after it and before the cert leaves a mismatched pair,
@@ -257,7 +263,37 @@ async function writeSlot(slot, c) {
 }
 /** @param {'next'|'prev'} slot */
 async function clearSlot(slot) {
-  for (const n of SLOT_FILES[slot]) await unlink(fpath(n)).catch(() => {});
+  // Only an already-missing file is fine; any other failure must stop the step
+  // rather than report a half-deleted slot as done (xreview, 2026-10-27).
+  for (const n of SLOT_FILES[slot]) {
+    await unlink(fpath(n)).catch((/** @type {any} */ e) => { if (e?.code !== 'ENOENT') throw e; });
+  }
+}
+
+// One rotation step at a time, and never while the proxy reads its chain at
+// start: three files are not written atomically together, so a reader in the
+// middle could see a mismatched set (xreview, 2026-10-27). A lock older than
+// LOCK_STALE_MS belongs to a step that died and is taken over.
+const CERT_LOCK = 'teamclaude-certs.lock';
+const LOCK_STALE_MS = 120_000;
+/** @template T @param {() => Promise<T>} fn @returns {Promise<T>} */
+async function withCertLock(fn) {
+  const lock = fpath(CERT_LOCK);
+  try { await writeFile(lock, String(process.pid), { flag: 'wx', mode: 0o600 }); } catch (e) {
+    const age = await stat(lock).then((st) => Date.now() - st.mtimeMs, () => 0);
+    if (/** @type {any} */ (e)?.code !== 'EEXIST' || age < LOCK_STALE_MS) throw new Error('another certificate step is running (teamclaude-certs.lock); try again in a moment');
+    await writeFile(lock, String(process.pid), { mode: 0o600 });
+  }
+  try { return await fn(); } finally { await unlink(lock).catch(() => {}); }
+}
+/** Wait (briefly) for a rotation step to finish before reading the chain. */
+async function waitForCertLock(maxMs = 10_000) {
+  const lock = fpath(CERT_LOCK);
+  for (let waited = 0; waited < maxMs; waited += 100) {
+    const age = await stat(lock).then((st) => Date.now() - st.mtimeMs, () => null);
+    if (age === null || age >= LOCK_STALE_MS) return;
+    await new Promise((r) => setTimeout(r, 100));
+  }
 }
 
 /** The CA's subject CN and SHA-256 fingerprint, for the operator. @param {string|null|undefined} caCertPem */
@@ -294,12 +330,15 @@ function rotationHosts(host) {
  *   stage    — mint a new chain (per-generation CA name) into the .next slot.
  *   commit   — live → .prev, .next → live: served from the next start.
  *   rollback — .prev → live, and the chain it replaces back to .next.
- *   finish   — forget .prev: clients then need only the live CA.
+ *   finish   — forget .prev: clients STARTED from then on need only the live
+ *              CA (running ones keep what they loaded). Refused while a proxy
+ *              that started before the commit is still serving.
  * @param {'stage'|'commit'|'rollback'|'finish'|'status'} action
  * @param {string|string[]} host  the hosts the leaf must name (mitmHosts(config))
+ * @param {{ servingSince?: number|null }} [opts]  when the running proxy started (ms), if one is running
  * @returns {Promise<{ live: ReturnType<typeof describeCa>, next: ReturnType<typeof describeCa>, prev: ReturnType<typeof describeCa>, trustPath: string, note?: string }>}
  */
-export async function rotateMitm(action, host) {
+export async function rotateMitm(action, host, { servingSince = null } = {}) {
   const hosts = rotationHosts(host);
   const view = async () => {
     const [live, next, prev] = await Promise.all([readSlot('live'), readSlot('next'), readSlot('prev')]);
@@ -307,35 +346,47 @@ export async function rotateMitm(action, host) {
   };
   if (action === 'status') return view();
   await mkdir(certDir(), { recursive: true });
-  if (action === 'stage') {
-    const staged = await readSlot('next');
-    if (!slotProblem(staged, hosts)) { await refreshCaBundle(); return { ...(await view()), note: 'already staged' }; }
-    const chain = generateCertChain(hosts, { caCn: mitmCaCn() });
-    await writeSlot('next', chain);
-  } else if (action === 'commit') {
-    const next = await readSlot('next');
-    const problem = slotProblem(next, hosts);
-    if (problem) throw new Error(`nothing to commit: the staged chain ${problem} (run --stage first)`);
-    const live = await readSlot('live');
-    if (live) await writeSlot('prev', live);
-    await writeSlot('live', /** @type {any} */ (next));
-    await clearSlot('next');
-  } else if (action === 'rollback') {
-    const prev = await readSlot('prev');
-    const problem = slotProblem(prev, hosts);
-    if (problem) throw new Error(`nothing to roll back to: the previous chain ${problem}`);
-    const live = await readSlot('live');
-    if (live) await writeSlot('next', live);
-    await writeSlot('live', /** @type {any} */ (prev));
-    await clearSlot('prev');
-  } else if (action === 'finish') {
-    if (!(await readSlot('prev'))) throw new Error('nothing to finish: no previous chain is kept');
-    await clearSlot('prev');
-  } else {
-    throw new Error(`unknown rotation step: ${action}`);
-  }
-  await refreshCaBundle();
-  return view();
+  return withCertLock(async () => {
+    const [live, next, prev] = await Promise.all([readSlot('live'), readSlot('next'), readSlot('prev')]);
+    const ok = (/** @type {any} */ c) => !slotProblem(c, hosts);
+    const same = (/** @type {any} */ a, /** @type {any} */ b) => !!a && !!b && a.caCertPem.trim() === b.caCertPem.trim();
+    // Every step below is safe to run again after a crash part-way through:
+    // a recovery slot (.prev on commit, .next on rollback) is only ever written
+    // from a live chain that validates, and never over a valid one.
+    if (action === 'stage') {
+      if (ok(next)) { await refreshCaBundle(); return { ...(await view()), note: 'already staged' }; }
+      await writeSlot('next', generateCertChain(hosts, { caCn: mitmCaCn() }));
+    } else if (action === 'commit') {
+      if (!ok(next)) throw new Error(`nothing to commit: the staged chain ${slotProblem(next, hosts)} (run --stage first)`);
+      if (ok(prev) && ok(live) && !same(live, next)) throw new Error('the previous rotation is not finished: run --finish (or --rollback) before committing another');
+      if (ok(live) && !ok(prev)) await writeSlot('prev', /** @type {any} */ (live));
+      await writeSlot('live', /** @type {any} */ (next));
+      await clearSlot('next');
+    } else if (action === 'rollback') {
+      if (!ok(prev)) throw new Error(`nothing to roll back to: the previous chain ${slotProblem(prev, hosts)}`);
+      if (ok(next) && ok(live) && !same(live, prev) && !same(live, next)) throw new Error('a chain is staged and the live one is neither it nor the previous one: check --status before rolling back');
+      if (!same(live, prev)) {
+        if (ok(live) && !ok(next)) await writeSlot('next', /** @type {any} */ (live));
+        await writeSlot('live', /** @type {any} */ (prev));
+      }
+      await clearSlot('prev');
+    } else if (action === 'finish') {
+      if (!prev) throw new Error('nothing to finish: no previous chain is kept');
+      if (!ok(live)) throw new Error(`the live chain ${slotProblem(live, hosts)}: --rollback, not --finish`);
+      if (next) throw new Error('a chain is still staged: --commit it or remove it before --finish');
+      // A proxy that started before the commit still serves the previous chain;
+      // retiring its CA now would make every newly started client reject it.
+      const committedAt = await stat(fpath(CA_CERT)).then((st) => st.mtimeMs, () => null);
+      if (servingSince != null && committedAt != null && servingSince < committedAt) {
+        throw new Error('the running proxy started before the commit and still serves the previous chain: restart it, then --finish');
+      }
+      await clearSlot('prev');
+    } else {
+      throw new Error(`unknown rotation step: ${action}`);
+    }
+    await refreshCaBundle();
+    return view();
+  });
 }
 
 function upstreamHostOf(config) {

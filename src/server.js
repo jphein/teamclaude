@@ -14,7 +14,7 @@ import { readFile, readdir, stat, unlink } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
-import { ensureCerts, createConnectHandler, mitmHosts, proxyAuthorizationAuth } from './mitm.js';
+import { ensureCerts, createConnectHandler, mitmHosts, proxyAuthorizationAuth, describeCa } from './mitm.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
@@ -576,6 +576,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   const uiTickets = /** @type {any} */ (hooks).uiTickets || createUiTicketStore();
   // Dashboard SSO through the front proxy (sso.js).
   const ssoUser = createSsoGate();
+  // The MITM CA this process actually serves, once it has loaded its chain
+  // (null until the first intercepted CONNECT). `certs rotate-mitm --finish`
+  // reads it from /teamclaude/status before retiring a previous CA.
+  /** @type {ReturnType<typeof describeCa>} */
+  let servedMitmCa = null;
   const loadUiPage = () => {
     if (!uiPagePromise) {
       const p = readFile(/** @type {any} */ (hooks).uiPagePath || join(__dirname, 'web', 'index.html'), 'utf-8')
@@ -869,7 +874,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const fable = familyStatus(config, 'fable', familyStats.fable);
         const mythos = familyStatus(config, 'mythos', familyStats.mythos);
         const failover = failoverState.snapshot(failoverPolicy(config));
-        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient, sso), fable, mythos, failover, tunnels: tunnelStats.snapshot(), upstreamPool: upstreamPoolStatus() }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient, sso), fable, mythos, failover, tunnels: tunnelStats.snapshot(), upstreamPool: upstreamPoolStatus(), mitm: { servedCa: servedMitmCa } }, null, 2));
         return;
       }
 
@@ -1568,6 +1573,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     // path permanently (a cached rejected promise would re-throw on every CONNECT).
     certsPromise ||= ensureCerts(mitmHostList).catch((err) => { certsPromise = null; throw err; });
     const c = await certsPromise;
+    servedMitmCa ||= describeCa(c.caCertPem);
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
   server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks: channelHooks('m'), log: logLine, sx, egress, clientUsage, dimensionUsage, tunnelStats }));

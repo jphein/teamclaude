@@ -2377,18 +2377,24 @@ async function certsCommand() {
   const step = steps.find((s) => args.includes(`--${s}`));
   if (args[1] !== 'rotate-mitm' || !step) { console.error(CERTS_USAGE); process.exit(1); }
   const config = await loadOrCreateConfig();
-  // --finish asks the running proxy when it started: one started before the
-  // commit still serves the previous chain, whose CA --finish would retire.
-  let servingSince = null;
-  if (step === 'finish' && config?.proxy?.port) {
+  // --finish asks the running proxy which MITM CA it serves: retiring that CA
+  // while it is still served would make newly started clients reject it. Only
+  // a positive answer counts; a proxy that cannot be asked is 'unknown'.
+  let servingCa = 'unknown';
+  if (step === 'finish') {
+    const port = config?.proxy?.port || 3456;
     try {
-      const res = await fetch(`http://localhost:${config.proxy.port}/teamclaude/status`, { headers: { 'x-api-key': config.proxy?.apiKey || '' }, signal: AbortSignal.timeout(3000) });
-      const started = res.ok ? Date.parse((await res.json())?.server?.startedAt) : NaN;
-      if (Number.isFinite(started)) servingSince = started;
-    } catch { /* no proxy running: nothing still serves the previous chain */ }
+      const res = await fetch(`http://localhost:${port}/teamclaude/status`, { headers: { 'x-api-key': config.proxy?.apiKey || '' }, signal: AbortSignal.timeout(5000) });
+      const body = res.ok ? await res.json() : null;
+      if (body && body.mitm && 'servedCa' in body.mitm) servingCa = body.mitm.servedCa?.fingerprint256 || 'none';
+    } catch (e) {
+      // Nothing listening: no proxy serves anything.
+      const code = /** @type {any} */ (e)?.cause?.code;
+      if (code === 'ECONNREFUSED') servingCa = 'none';
+    }
   }
   let view;
-  try { view = await rotateMitm(/** @type {any} */ (step), mitmHosts(config), { servingSince }); }
+  try { view = await rotateMitm(/** @type {any} */ (step), mitmHosts(config), { servingCa }); }
   catch (err) { console.error(`teamclaude certs rotate-mitm --${step}: ${/** @type {Error} */ (err).message}`); process.exit(1); }
   const line = (/** @type {string} */ label, /** @type {any} */ ca) => console.log(`  ${label.padEnd(5)} ${ca ? `${ca.cn}  sha256 ${ca.fingerprint256}  (to ${ca.validTo})` : '—'}`);
   console.log(`MITM CA rotation — ${step}${view.note ? ` (${view.note})` : ''}`);

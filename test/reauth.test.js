@@ -365,3 +365,35 @@ test('strict start (client key or SSO) refuses an entry with no identity to chec
   const { mgr: m3 } = makeManager({ accounts: [legacy()], profile: PROFILE_OK });
   assert.ok((await m3.start('seat6')).authUrl);
 });
+
+test('a client key cannot replace, cancel or fail a reauth the operator started; the operator and the owner can', async () => {
+  const { OPERATOR } = await import('../src/reauth.js');
+  const { mgr, sessions } = makeManager({ accounts: [OAUTH_ACCT(), { name: 'b@x.com', type: 'oauth', accountUuid: 'u2' }], profile: PROFILE_OK });
+  await mgr.start('jp@x.com'); // the operator (default owner)
+  const lane = { owner: 'client:familiar' };
+  await assert.rejects(mgr.start('b@x.com', lane), (e) => e.status === 409 && /started by the operator/.test(e.message), 'no superseding');
+  assert.throws(() => mgr.cancel(lane), (e) => e.status === 409, 'no cancelling');
+  await assert.rejects(mgr.submitCode('https://x/cb?code=c&state=WRONG', lane), (e) => e.status === 409, 'no failing it with a wrong-state code');
+  assert.equal(mgr.status().state, 'pending');
+  assert.equal(mgr.status().account, 'jp@x.com');
+  assert.equal(sessions[0].session.closed, false, 'the operator\'s session is untouched');
+  // The owner (here the operator) still can.
+  mgr.cancel({ owner: OPERATOR });
+  assert.equal(mgr.status().state, 'idle');
+  // A client may replace and cancel its OWN session; the operator may replace a client's.
+  await mgr.start('b@x.com', lane);
+  await mgr.start('b@x.com', lane);
+  await mgr.start('jp@x.com');
+  assert.equal(mgr.status().account, 'jp@x.com');
+  // Another client cannot touch the first client's either.
+  mgr.cancel();
+  await mgr.start('b@x.com', lane);
+  await assert.rejects(mgr.start('jp@x.com', { owner: 'client:other' }), (e) => e.status === 409 && /another client/.test(e.message));
+  mgr.cancel(lane);
+  assert.equal(mgr.status().state, 'idle');
+  // A finished session no longer blocks anyone.
+  await mgr.start('jp@x.com');
+  await mgr.submitCode('code-ok');
+  assert.equal(mgr.status().state, 'done');
+  assert.ok((await mgr.start('b@x.com', lane)).authUrl);
+});

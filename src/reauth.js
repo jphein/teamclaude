@@ -17,6 +17,9 @@ function httpError(status, message) {
   return Object.assign(new Error(message), { status });
 }
 
+/** The owner of a session started by the operator (shared key, loopback, SSO). */
+export const OPERATOR = 'operator';
+
 export function createReauthManager({
   accountManager,
   persistTokens,
@@ -28,6 +31,7 @@ export function createReauthManager({
 }) {
   // Current session context, or null when idle. `settled` flips exactly once:
   // the callback and a pasted code can race, and only the first may complete.
+  /** @type {any} the pending (or last) session */
   let current = null;
   // Starts awaiting their session: counted so the Add account flow's exclusion
   // check sees them before `current` is published.
@@ -97,6 +101,17 @@ export function createReauthManager({
     }
   }
 
+  // Who may touch the pending session (2026-10-27): its owner, or the
+  // operator. Every lane on a host holds a client key, so without this any of
+  // them could close, cancel or fail (a wrong-state code fails a session) the
+  // sign-in the operator is in the middle of. The identity check already
+  // stopped a swap; this stops the disruption.
+  /** @param {string} who */
+  function mayTouch(who) {
+    return !current || who === OPERATOR || current.owner === who;
+  }
+  const busy = () => httpError(409, `a reauth for "${current?.name}" started by ${current?.owner === OPERATOR ? 'the operator' : 'another client'} is waiting for a browser approval; it can only be replaced or cancelled by whoever started it, or the operator`);
+
   return {
     status,
 
@@ -104,23 +119,25 @@ export function createReauthManager({
 
     /**
      * @param {string} name
-     * @param {{ strict?: boolean }} [opts]  strict: the caller is not the
-     *   key-holding operator (a client key, or a dashboard SSO sign-in), so an
-     *   account whose identity cannot be checked is refused.
+     * @param {{ strict?: boolean, owner?: string }} [opts]  strict: the caller is
+     *   not the key-holding operator (a client key, or a dashboard SSO sign-in),
+     *   so an account whose identity cannot be checked is refused. owner: who is
+     *   starting it — OPERATOR, or `client:<name>`.
      */
-    async start(name, { strict = false } = {}) {
+    async start(name, { strict = false, owner = OPERATOR } = {}) {
       if (otherSessionPending()) throw httpError(409, 'an add-account sign-in is already waiting for a browser approval — finish or cancel it first');
       const account = accountManager.accounts.find(a => a.name === name);
       if (!account) throw httpError(404, `account "${name}" not found`);
       if (account.type !== 'oauth') throw httpError(400, `account "${name}" is not an OAuth account`);
       if (strict && unverifiable(account)) throw httpError(403, `account "${name}" has no stored identity to check a sign-in against; reauth it with the proxy key (the desktop launcher)`);
 
+      if (current && current.state === 'pending' && !mayTouch(owner)) throw busy();
       if (current) current.session.close(); // supersede any prior session
 
       starting++;
       let session;
       try { session = await createSession(); } finally { starting--; }
-      const ctx = { name, account, session, state: 'pending', email: null, error: null, settled: false };
+      const ctx = { name, account, session, owner, state: 'pending', email: null, error: null, settled: false };
       current = ctx;
 
       // Browser-callback completion path. A session that was superseded or
@@ -139,9 +156,11 @@ export function createReauthManager({
       return { authUrl: session.authUrl };
     },
 
-    async submitCode(text) {
+    /** @param {string} text @param {{ owner?: string }} [opts] */
+    async submitCode(text, { owner = OPERATOR } = {}) {
       const ctx = current;
       if (!ctx || ctx.state !== 'pending') throw httpError(409, 'no reauth session pending');
+      if (!mayTouch(owner)) throw busy();
 
       let code;
       try {
@@ -159,7 +178,9 @@ export function createReauthManager({
       return status();
     },
 
-    cancel() {
+    /** @param {{ owner?: string }} [opts] */
+    cancel({ owner = OPERATOR } = {}) {
+      if (current && current.state === 'pending' && !mayTouch(owner)) throw busy();
       if (current) {
         current.session.close();
         current = null;

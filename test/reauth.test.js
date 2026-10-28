@@ -482,3 +482,30 @@ test('the localhost callback ignores a wrong or missing state: the pending sign-
     assert.equal(await codePromise, 'good');
   } finally { server.close(); }
 });
+
+test('a client can withdraw its own pending start even when the operator\'s finished result is on record', async () => {
+  const { mgr, gates, made, tick } = deferredManager();
+  const op = mgr.start('jp@x.com'); await tick(); gates[0](); await op;
+  await mgr.submitCode('code-ok');
+  assert.equal(mgr.status().state, 'done');
+  const lane = { owner: 'client:familiar' };
+  const clientStart = mgr.start('b@x.com', lane);
+  await tick();
+  mgr.cancel(lane); // withdraws its own reservation, does not throw
+  assert.equal(mgr.status().state, 'done', 'the operator\'s result is kept');
+  gates[1]();
+  await assert.rejects(clientStart, (e) => e.status === 409);
+  assert.equal(made[1].session.closed, true);
+});
+
+test('a cancelled start still creating its session no longer holds add-account off', async () => {
+  const { mgr, gates, tick } = deferredManager();
+  const start = mgr.start('jp@x.com');
+  await tick();
+  assert.equal(mgr.pending(), true, 'a live start holds the flow');
+  mgr.cancel();
+  assert.equal(mgr.pending(), false, 'released at once, before the stale session arrives');
+  gates[0]();
+  await assert.rejects(start, (e) => e.status === 409);
+  assert.equal(mgr.pending(), false);
+});

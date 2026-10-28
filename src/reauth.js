@@ -33,9 +33,6 @@ export function createReauthManager({
   // the callback and a pasted code can race, and only the first may complete.
   /** @type {any} the pending (or last) session */
   let current = null;
-  // Starts awaiting their session: counted so the Add account flow's exclusion
-  // check sees them before `current` is published.
-  let starting = 0;
 
   function status() {
     if (!current) return { state: 'idle', account: null, email: null, error: null };
@@ -111,7 +108,7 @@ export function createReauthManager({
   // generation number), and publishes only if no later start or cancel
   // happened meanwhile — checking only before the await let a client's slower
   // start overwrite the operator's newer session (Oracle + xreview, 2026-10-27).
-  /** @type {{ gen: number, owner: string, name: string } | null} a start awaiting its session */
+  /** @type {{ gen: number, owner: string, name: string } | null} a start awaiting its session (the Add account flow's exclusion sees it via pending()) */
   let reserved = null;
   let generation = 0;
   /** Who holds the flow now: a start in progress, else a pending session. */
@@ -133,7 +130,10 @@ export function createReauthManager({
   return {
     status,
 
-    pending: () => starting > 0 || status().state === 'pending',
+    // A start that was cancelled or superseded no longer holds add-account
+    // off while its session is still being created: only the live reservation
+    // counts (xreview round 2).
+    pending: () => reserved != null || status().state === 'pending',
 
     /**
      * @param {string} name
@@ -153,12 +153,11 @@ export function createReauthManager({
       const gen = ++generation;
       reserved = { gen, owner, name };
 
-      starting++;
       let session;
       try { session = await createSession(); } catch (err) {
         if (reserved?.gen === gen) reserved = null;
         throw err;
-      } finally { starting--; }
+      }
       // A later start or a cancel took over while this one waited: it lost.
       if (gen !== generation) {
         session.close();
@@ -210,10 +209,16 @@ export function createReauthManager({
     /** @param {{ owner?: string }} [opts] */
     cancel({ owner = OPERATOR } = {}) {
       if (!mayTouch(owner)) throw busy();
-      // Not even a finished session's result may be cleared by a stranger.
-      if (current && owner !== OPERATOR && current.owner !== owner) throw httpError(409, 'that reauth was started by someone else; only they or the operator may clear it');
-      generation++; // a start still waiting for its session loses
+      // The caller's own start still creating its session is withdrawn (it is
+      // the caller's, or the caller is the operator — mayTouch said so) …
+      const hadReservation = reserved != null;
+      generation++; // … so it loses when its session arrives
       reserved = null;
+      // … but a finished session that belongs to someone else keeps its result.
+      if (current && owner !== OPERATOR && current.owner !== owner) {
+        if (hadReservation) return;
+        throw httpError(409, 'that reauth was started by someone else; only they or the operator may clear it');
+      }
       if (current) {
         current.session.close();
         current = null;

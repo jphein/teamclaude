@@ -26,9 +26,9 @@ Python ≥ 3.13 verifies in strict X.509 mode. The MITM chain the VM presents fo
 
 ## Stages
 
-### A — code (PR, before Wed 10/28)
+### A — code (PR, before Wed 10/28) — DONE 2026-10-27 (`teamclaude certs rotate-mitm`; clients' file = `teamclaude-mitm-trust.pem`)
 1. The MITM CA gets a per-generation CN, `TeamClaude MITM CA <12hex>`, mirroring `LISTENER_CA_CN`.
-2. A staged rotation, e.g. `teamclaude certs rotate-mitm --stage` (or a script under `scripts/`). It writes the new chain beside the live one (`teamclaude-ca.next.pem`, `teamclaude-leaf.next.{pem,key}`), refreshes `teamclaude-ca-bundle.pem` to hold the **old MITM CA + new MITM CA + listener CA**, and prints the new CA's fingerprint. `--commit` swaps the `.next` files in (keeping `.prev` copies) for the next start. `--rollback` restores `.prev`.
+2. A staged rotation: `teamclaude certs rotate-mitm --stage` (runs with the proxy up; `--commit`, `--rollback` and `--finish` need it stopped, so nothing reads the chain while it changes). It writes the new chain beside the live one (`teamclaude-ca.next.pem`, `teamclaude-leaf.next.{pem,key}`), refreshes `teamclaude-ca-bundle.pem` to hold the **old MITM CA + new MITM CA + listener CA**, and prints the new CA's fingerprint. `--commit` swaps the `.next` files in (keeping `.prev` copies) for the next start. `--rollback` restores `.prev`.
 3. Tests:
    - the new chain carries SKI and AKI;
    - Python strict verification passes against a fixture;
@@ -51,9 +51,10 @@ Every `claude` process must have started **after** stage B, or it will fail its 
 - The proxy keeps serving the old leaf throughout, so nothing breaks during this period.
 
 ### C — cutover (Fri 10/30 07:00–07:30 PDT)
-1. Confirm no `claude` process on familiar, katana or wakizashi predates stage B. If any does, wait or restart it first.
-2. On the VM, at 0 in-flight: `rotate-mitm --commit`, then restart.
+1. Confirm no `claude` process on familiar, katana or wakizashi predates stage B. If any does, wait or restart it first. One operator only, and no other start of the service during the window: the proxy does not take the rotation lock (a dead step must never block it from starting), so the service-manager stop is what keeps it from reading the chain mid-change.
+2. On the VM, at 0 in-flight: `sudo rc-service teamclaude stop`, then `teamclaude certs rotate-mitm --commit` (it refuses while the proxy listens), then `sudo rc-service teamclaude start`. About 10 s down.
 3. Verify:
+   - make one intercepted request first (`mitm.servedCa` is null until the proxy has loaded its chain), e.g. a `claude -p` from a lane; then `/teamclaude/status` → `mitm.servedCa.fingerprint256` must equal the new CA's (from `--status`). Anything else: stop, `--rollback`, start;
    - the leaf served for `api.anthropic.com` has AKI, and its issuer is `TeamClaude MITM CA <hex>`;
    - Python strict passes: `SSL_CERT_FILE=…python-ca-bundle.pem python3 -c 'import urllib.request…'` gives an HTTP status, not an SSL error;
    - a lane round-trip on each host;
@@ -62,11 +63,11 @@ Every `claude` process must have started **after** stage B, or it will fail its 
 4. Then JP or jp-eb may set `ENABLE_STOP_REVIEW=1` again, together with `SSL_CERT_FILE` in familiar's per-host `settings.local.json` (their decision; harness config).
 
 ### D — drop the old CA (≥ Fri 11/06)
-Rewrite the client files to the new MITM CA only (and the listener CA, where present). Stage, verify, done.
+Stop the proxy, `rotate-mitm --finish`, then start it. Rewrite the client files from the refreshed `teamclaude-mitm-trust.pem`: the new MITM CA only.
 
 ## Rollback
 - **During B:** nothing to undo. Clients trust both CAs and the proxy still serves the old leaf.
-- **During or after C:** on the VM, `rotate-mitm --rollback` (restores `.prev`), then restart at 0 in-flight. Clients still trust the old CA (dual trust until D), so they recover without any change. Backup: the stage-B tarball.
+- **During or after C:** on the VM at 0 in-flight, stop the proxy, run `rotate-mitm --rollback` (restores `.prev`), then start it. Clients still trust the old CA (dual trust until D), so they recover without any change. Backup: the stage-B tarball.
 - **After D:** rollback needs the old CA put back into the client files first. Don't start D until C has run clean for a week.
 
 ## Risks

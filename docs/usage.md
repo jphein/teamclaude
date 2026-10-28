@@ -253,6 +253,10 @@ teamclaude warmup reset 15:30 --timezone Europe/Moscow
                              # Schedule warm-up for a daily target reset
 teamclaude warmup rolling 15:30 --timezone Europe/Moscow
                              # Anchor resets at 15:30, then continue every 5h
+teamclaude certs rotate-mitm --stage
+                             # Mint a new MITM CA beside the live one (also --status,
+                             # --commit, --rollback, --finish; served from the next
+                             # proxy start; clients trust teamclaude-mitm-trust.pem)
 teamclaude api <path>        # Call an API endpoint with account credentials
 teamclaude callback login    # Sign in to callback.net: keep OAuth tokens in step across your installs
 teamclaude callback status   # (also: sync, logout) — see docs/accounts.md

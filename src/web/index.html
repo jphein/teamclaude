@@ -1410,6 +1410,8 @@
 
   function handleReauthStatus(st) {
     if (!reauthCtl.account) return;
+    // Another account's sign-in (someone else replaced ours): ours is gone.
+    if (st.account && st.account !== reauthCtl.account) { showErr('That reauth was replaced by another one'); stopReauth(); return; }
     if (st.state === 'done') {
       flashSvcMsg('✓ reauthed ' + (st.email || st.account));
       stopReauth();
@@ -1488,7 +1490,9 @@
   reauthCodeEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitReauthCode(); });
   reauthCancelEl.addEventListener('click', async () => {
     try {
-      await api('/teamclaude/reauth/cancel', { method: 'POST', headers: { 'x-teamclaude-control': '1' } });
+      const res = await api('/teamclaude/reauth/cancel', { method: 'POST', headers: { 'x-teamclaude-control': '1' } });
+      // Refused (someone else's sign-in): say so and leave the panel as it is.
+      if (res.status === 409) { const d = await res.json().catch(() => ({})); showErr(d.error || 'That reauth belongs to someone else.'); return; }
     } catch { /* the server may be gone; reset the UI regardless */ }
     stopReauth();
   });

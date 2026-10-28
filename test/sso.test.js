@@ -176,9 +176,9 @@ test('an SSO sign-in may not change danger settings or add accounts; the key sti
       assert.equal((await post('/teamclaude/add-account', {})).status, 403);
       // Reauth is open to SSO, but strict: the hook is told so.
       assert.equal((await post('/teamclaude/reauth', { name: 'a' })).status, 200);
-      assert.deepEqual(reauthCalls.at(-1), ['a', { strict: true }]);
+      assert.deepEqual(reauthCalls.at(-1), ['a', { strict: true, owner: 'operator' }]);
       assert.equal((await post('/teamclaude/reauth', { name: 'a' }, { 'x-api-key': 'shared-k' })).status, 200);
-      assert.deepEqual(reauthCalls.at(-1), ['a', { strict: false }]);
+      assert.deepEqual(reauthCalls.at(-1), ['a', { strict: false, owner: 'operator' }]);
       // The shared key may do both.
       const keyed = { 'x-api-key': 'shared-k' };
       assert.equal((await post('/teamclaude/settings', { set: { upstream: 'https://api.anthropic.com' } }, keyed)).status, 200);
@@ -332,4 +332,26 @@ test('settings: the hop secret is write-only, at least 32 characters, and proxy.
   applySettingsChanges(next, { set: { 'proxy.sso.secret': MASK, 'proxy.sso.users': ['jp', 'admin'] } });
   assert.equal(next.proxy.sso.secret, SECRET, 'the mask keeps the stored secret');
   assert.deepEqual(next.proxy.sso.users, ['jp', 'admin']);
+});
+
+test('reauth routes pass the caller as owner: a client key, else the operator', async () => {
+  const calls = [];
+  const reauth = {
+    start: async (name, o) => { calls.push(['start', o.owner]); return { authUrl: 'https://claude.ai/x' }; },
+    submitCode: async (code, o) => { calls.push(['code', o.owner]); return {}; },
+    cancel: (o) => { calls.push(['cancel', o.owner]); if (o.owner !== 'operator') throw Object.assign(new Error('busy'), { status: 409 }); },
+    status: () => ({}),
+  };
+  const am = new AccountManager([{ name: 'a', type: 'apikey', apiKey: 'sk-test' }], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'shared-k', clientKeys: [{ name: 'lane', key: 'k-lane' }], trustLoopback: false }, upstream: 'http://127.0.0.1:9' }, { reauth });
+  const port = await listen(proxy);
+  const post = (path, key, body = {}) => fetch(`http://127.0.0.1:${port}${path}`, { method: 'POST', headers: { 'x-api-key': key, 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  try {
+    await post('/teamclaude/reauth', 'shared-k', { name: 'a' });
+    await post('/teamclaude/reauth', 'k-lane', { name: 'a' });
+    await post('/teamclaude/reauth/code', 'k-lane', { code: 'c' });
+    assert.equal((await post('/teamclaude/reauth/cancel', 'k-lane')).status, 409, 'a refusal reaches the caller');
+    assert.equal((await post('/teamclaude/reauth/cancel', 'shared-k')).status, 200);
+    assert.deepEqual(calls, [['start', 'operator'], ['start', 'client:lane'], ['code', 'client:lane'], ['cancel', 'client:lane'], ['cancel', 'operator']]);
+  } finally { proxy.close(); }
 });

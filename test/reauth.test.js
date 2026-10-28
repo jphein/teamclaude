@@ -365,3 +365,147 @@ test('strict start (client key or SSO) refuses an entry with no identity to chec
   const { mgr: m3 } = makeManager({ accounts: [legacy()], profile: PROFILE_OK });
   assert.ok((await m3.start('seat6')).authUrl);
 });
+
+test('a client key cannot replace, cancel or fail a reauth the operator started; the operator and the owner can', async () => {
+  const { OPERATOR } = await import('../src/reauth.js');
+  const { mgr, sessions } = makeManager({ accounts: [OAUTH_ACCT(), { name: 'b@x.com', type: 'oauth', accountUuid: 'u2' }], profile: PROFILE_OK });
+  await mgr.start('jp@x.com'); // the operator (default owner)
+  const lane = { owner: 'client:familiar' };
+  await assert.rejects(mgr.start('b@x.com', lane), (e) => e.status === 409 && /started by the operator/.test(e.message), 'no superseding');
+  assert.throws(() => mgr.cancel(lane), (e) => e.status === 409, 'no cancelling');
+  await assert.rejects(mgr.submitCode('https://x/cb?code=c&state=WRONG', lane), (e) => e.status === 409, 'no failing it with a wrong-state code');
+  assert.equal(mgr.status().state, 'pending');
+  assert.equal(mgr.status().account, 'jp@x.com');
+  assert.equal(sessions[0].session.closed, false, 'the operator\'s session is untouched');
+  // The owner (here the operator) still can.
+  mgr.cancel({ owner: OPERATOR });
+  assert.equal(mgr.status().state, 'idle');
+  // A client may replace and cancel its OWN session; the operator may replace a client's.
+  await mgr.start('b@x.com', lane);
+  await mgr.start('b@x.com', lane);
+  await mgr.start('jp@x.com');
+  assert.equal(mgr.status().account, 'jp@x.com');
+  // Another client cannot touch the first client's either.
+  mgr.cancel();
+  await mgr.start('b@x.com', lane);
+  await assert.rejects(mgr.start('jp@x.com', { owner: 'client:other' }), (e) => e.status === 409 && /another client/.test(e.message));
+  mgr.cancel(lane);
+  assert.equal(mgr.status().state, 'idle');
+  // A finished session no longer blocks anyone.
+  await mgr.start('jp@x.com');
+  await mgr.submitCode('code-ok');
+  assert.equal(mgr.status().state, 'done');
+  assert.ok((await mgr.start('b@x.com', lane)).authUrl);
+});
+
+/** A manager whose createSession waits until the test releases it: deterministic races. */
+function deferredManager() {
+  const gates = [];
+  const made = [];
+  const mgr = createReauthManager({
+    accountManager: { accounts: [OAUTH_ACCT(), { name: 'b@x.com', type: 'oauth', accountUuid: 'u2' }] },
+    createSession: () => new Promise((resolve) => {
+      gates.push(() => { const s = fakeSession(); made.push(s); resolve(s.session); });
+    }),
+    fetchProfileFn: async () => PROFILE_OK,
+    persistTokens: async () => {},
+    reload: async () => {},
+    log: () => {},
+  });
+  const tick = () => new Promise((r) => setImmediate(r));
+  return { mgr, gates, made, tick };
+}
+
+test('race: a client start still creating its session cannot overwrite the operator\'s newer one', async () => {
+  const { mgr, gates, made, tick } = deferredManager();
+  const lane = { owner: 'client:familiar' };
+  // The client starts first and stalls in createSession…
+  const clientStart = mgr.start('b@x.com', lane);
+  await tick();
+  // …the operator starts after it (allowed: the operator may replace anyone)…
+  const opStart = mgr.start('jp@x.com');
+  await tick();
+  gates[1](); // the operator's session is created first
+  await opStart;
+  gates[0](); // then the client's arrives late
+  await assert.rejects(clientStart, (e) => e.status === 409);
+  assert.equal(mgr.status().account, 'jp@x.com', 'the operator\'s session stands');
+  assert.equal(made[1].session.closed, true, 'the late session was closed, not left open');
+});
+
+test('race: while the operator\'s start is creating its session, a client cannot start or cancel', async () => {
+  const { mgr, gates, tick } = deferredManager();
+  const lane = { owner: 'client:familiar' };
+  const opStart = mgr.start('jp@x.com');
+  await tick();
+  await assert.rejects(mgr.start('b@x.com', lane), (e) => e.status === 409 && /the operator/.test(e.message));
+  assert.throws(() => mgr.cancel(lane), (e) => e.status === 409);
+  gates[0]();
+  await opStart;
+  assert.equal(mgr.status().account, 'jp@x.com');
+});
+
+test('race: an operator cancel invalidates a client start that is still creating its session', async () => {
+  const { mgr, gates, made, tick } = deferredManager();
+  const clientStart = mgr.start('b@x.com', { owner: 'client:familiar' });
+  await tick();
+  mgr.cancel(); // the operator
+  gates[0]();
+  await assert.rejects(clientStart, (e) => e.status === 409);
+  assert.equal(mgr.status().state, 'idle', 'nothing was published after the cancel');
+  assert.equal(made[0].session.closed, true);
+});
+
+test('a client cannot clear the result of the operator\'s finished reauth', async () => {
+  const { mgr } = makeManager({ accounts: [OAUTH_ACCT()], profile: PROFILE_OK });
+  await mgr.start('jp@x.com');
+  await mgr.submitCode('code-ok');
+  assert.equal(mgr.status().state, 'done');
+  assert.throws(() => mgr.cancel({ owner: 'client:familiar' }), (e) => e.status === 409);
+  assert.equal(mgr.status().state, 'done', 'the operator still sees the result');
+});
+
+test('the localhost callback ignores a wrong or missing state: the pending sign-in is not failed', async () => {
+  const { startCallbackServer } = await import('../src/oauth.js');
+  const { port, codePromise, server } = await startCallbackServer('the-real-state');
+  try {
+    let settled = false;
+    codePromise.then(() => { settled = true; }, () => { settled = true; });
+    for (const q of ['?state=wrong&code=x', '?code=x', '?state=wrong&error=access_denied']) {
+      const r = await fetch(`http://127.0.0.1:${port}/callback${q}`);
+      assert.equal(r.status, 400, q);
+    }
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(settled, false, 'still waiting for the real approval');
+    const ok = await fetch(`http://127.0.0.1:${port}/callback?state=the-real-state&code=good`, { redirect: 'manual' });
+    assert.equal(ok.status, 302);
+    assert.equal(await codePromise, 'good');
+  } finally { server.close(); }
+});
+
+test('a client can withdraw its own pending start even when the operator\'s finished result is on record', async () => {
+  const { mgr, gates, made, tick } = deferredManager();
+  const op = mgr.start('jp@x.com'); await tick(); gates[0](); await op;
+  await mgr.submitCode('code-ok');
+  assert.equal(mgr.status().state, 'done');
+  const lane = { owner: 'client:familiar' };
+  const clientStart = mgr.start('b@x.com', lane);
+  await tick();
+  mgr.cancel(lane); // withdraws its own reservation, does not throw
+  assert.equal(mgr.status().state, 'done', 'the operator\'s result is kept');
+  gates[1]();
+  await assert.rejects(clientStart, (e) => e.status === 409);
+  assert.equal(made[1].session.closed, true);
+});
+
+test('a cancelled start still creating its session no longer holds add-account off', async () => {
+  const { mgr, gates, tick } = deferredManager();
+  const start = mgr.start('jp@x.com');
+  await tick();
+  assert.equal(mgr.pending(), true, 'a live start holds the flow');
+  mgr.cancel();
+  assert.equal(mgr.pending(), false, 'released at once, before the stale session arrives');
+  gates[0]();
+  await assert.rejects(start, (e) => e.status === 409);
+  assert.equal(mgr.pending(), false);
+});

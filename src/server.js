@@ -498,6 +498,11 @@ const SSO_REFUSED_PATHS = new Map([
   ['/teamclaude/ui-ticket', 'a dashboard ticket carries a key; an SSO sign-in has none'],
 ]);
 
+/** Who a reauth session belongs to: a client key by name, else the operator (shared key, loopback, SSO). @param {any} req */
+function reauthOwner(req) {
+  return req?.tcClient ? `client:${req.tcClient}` : 'operator';
+}
+
 /** How a control-plane log line names its caller. @param {any} req */
 function viaWhom(req) {
   return req?.tcSso ? `via SSO as "${req.tcSso}"` : 'via UI';
@@ -989,7 +994,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           if (!name) { json(res, 400, { error: 'Missing "name"' }); return; }
           // Strict for anyone but the key-holding operator: an entry with no
           // stored identity would accept any sign-in (security review, 2026-10-26).
-          const { authUrl } = await hooks.reauth.start(name, { strict: !!(req.tcClient || req.tcSso) });
+          const { authUrl } = await hooks.reauth.start(name, { strict: !!(req.tcClient || req.tcSso), owner: reauthOwner(req) });
           console.log(`[TeamClaude] Reauth started for "${name}" ${viaWhom(req)}`);
           emitActivity({ type: 'reauth', name });
           json(res, 200, { ok: true, authUrl });
@@ -1000,13 +1005,13 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         if (!hooks.reauth) { json(res, 501, { error: 'reauth not supported' }); return; }
         try {
           const { code } = JSON.parse((await readControlBody(req)) || '{}');
-          json(res, 200, await hooks.reauth.submitCode(code));
+          json(res, 200, await hooks.reauth.submitCode(code, { owner: reauthOwner(req) }));
         } catch (err) { json(res, err.status || 500, { error: err.message }); }
         return;
       }
       if (req.method === 'POST' && req.url === '/teamclaude/reauth/cancel') {
         if (!hooks.reauth) { json(res, 501, { error: 'reauth not supported' }); return; }
-        hooks.reauth.cancel();
+        try { hooks.reauth.cancel({ owner: reauthOwner(req) }); } catch (err) { const e = /** @type {any} */ (err); json(res, e.status || 500, { error: e.message }); return; }
         json(res, 200, hooks.reauth.status());
         return;
       }

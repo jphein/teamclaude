@@ -184,7 +184,13 @@ export function proxyFetch(url, opts = {}) {
   // them through the DNS-cached pooled agent too; the cache now covers the
   // forwarding path only, which is where the lookup volume behind the
   // 2026-07/08 ENOTFOUND storms came from. These calls are a few per hour.
-  if (!proxyForHost(new URL(url).hostname)) return fetch(url, rest);
+  // Not followed unless a caller explicitly asks: these calls carry refresh
+  // tokens, codes and bearer tokens, and fetch resends a POST body to a
+  // 307/308's Location. A redirect comes back as the 3xx it is (status and
+  // Location readable: Node's 'manual' is not the browser's opaque redirect),
+  // a non-ok response every caller already checks. (The pooled path below uses
+  // http.request, which never follows one.)
+  if (!proxyForHost(new URL(url).hostname)) return fetch(url, { ...rest, redirect: rest.redirect ?? 'manual' });
   return pooledFetch(url, rest, resolveHeadersTimeout(headersTimeoutMs));
 }
 

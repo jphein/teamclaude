@@ -603,6 +603,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // Activity feed: a ring buffer of recent lifecycle/control events plus the set
   // of SSE subscribers. Lives here (not in the TUI) so the browser dashboard
   // shows live traffic even when the process is a TTY-less daemon.
+  // Accounts an unlink is removing (POST /teamclaude/account {remove}): while
+  // its file write runs, no other change to the account is taken, so a
+  // concurrent enable cannot put it back in rotation (xreview round 2).
+  /** @type {Set<string>} */
+  const unlinking = new Set();
   const activityBuf = [];
   const activityClients = new Set();
   const reqStartTimes = new Map();
@@ -990,6 +995,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         if (asked[0] === 'remove' && /** @type {any} */ (req).tcSso) { json(res, 403, { error: 'unlinking an account needs the proxy key (use the desktop launcher)' }); return; }
         const idx = accountManager.accounts.findIndex(a => a.name === name);
         if (typeof name !== 'string' || idx < 0) { json(res, 404, { error: `account "${name}" not found` }); return; }
+        if (unlinking.has(name)) { json(res, 409, { error: `"${name}" is being unlinked` }); return; }
 
         if (asked[0] === 'threshold') {
           const t = body.threshold;
@@ -1040,6 +1046,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           // holds when it leaves the fleet.
           const wasDisabled = acct.disabled;
           acct.disabled = true;
+          unlinking.add(name);
           let found = false;
           try {
             await atomicConfigUpdate((/** @type {Record<string, any>} */ disk) => {
@@ -1048,11 +1055,19 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
               found = disk.accounts.length < before;
             });
           } catch (err) {
-            acct.disabled = wasDisabled;
+            unlinking.delete(name);
+            // Only our own pause is undone: a reload that changed the flag meanwhile wins.
+            if (acct.disabled === true) acct.disabled = wasDisabled;
             console.error(`[TeamClaude] Saving the removal of "${name}" failed:`, /** @type {Error} */ (err).message);
             json(res, 500, { error: `${name}: the config file could not be saved, so nothing was removed; see the proxy log` });
             return;
           }
+          unlinking.delete(name);
+          // A reload during the write reads the row still on disk and may have
+          // re-enabled it; it leaves the fleet now either way.
+          acct.disabled = true;
+          const stillLive = Math.max(acct.inFlight || 0, acct.activityOpen || 0);
+          if (stillLive > 0) console.warn(`[TeamClaude] Unlinking "${name}" with ${stillLive} request(s) admitted during the save`);
           // Re-found by identity: another request may have reordered the list
           // while the write was pending.
           const now = accountManager.accounts.indexOf(acct);

@@ -215,15 +215,19 @@ test('while an unlink is saving, the account takes no other change (an enable ca
     const gate = new Promise(r => { release = r; });
     const holder = atomicConfigUpdate(async () => { await gate; });
     const unlink = post(port, { name: 'a', remove: true, confirm: 'a' });
-    // Let the unlink reach the lock.
-    for (let i = 0; i < 50 && !am.accounts[0].disabled; i++) await new Promise(r => setImmediate(r));
-    assert.equal(am.accounts[0].disabled, true, 'paused while the write is pending');
-    const enable = await post(port, { name: 'a', disabled: false });
-    assert.equal(enable.status, 409);
-    assert.equal((await post(port, { name: 'a', threshold: { bucket: 'unified5h', percent: 80 } })).status, 409);
-    assert.equal(am.accounts[0].disabled, true, 'the enable did not land');
-    release();
-    await holder;
+    try {
+      // Let the unlink reach the lock.
+      for (let i = 0; i < 50 && !am.accounts[0].disabled; i++) await new Promise(r => setImmediate(r));
+      assert.equal(am.accounts[0].disabled, true, 'paused while the write is pending');
+      const enable = await post(port, { name: 'a', disabled: false });
+      assert.equal(enable.status, 409);
+      assert.equal((await post(port, { name: 'a', threshold: { bucket: 'unified5h', percent: 80 } })).status, 409);
+      assert.equal(am.accounts[0].disabled, true, 'the enable did not land');
+    } finally {
+      // Released on a failure too, or the held lock would hang the run.
+      release();
+      await holder;
+    }
     assert.equal((await unlink).status, 200);
     assert.deepEqual(am.accounts.map(x => x.name), ['b']);
     assert.deepEqual((await disk()).accounts.map(x => x.name), ['b']);

@@ -103,16 +103,43 @@ test('a percentage given as a string is accepted, as the CLI accepts one', async
   });
 });
 
-test('one number replaces a per-bucket table and names what it dropped', async () => {
+test('the default percentage keeps the per-bucket table (two sliders must not wipe each other)', async () => {
   await withServer(async ({ port, path }) => {
     const res = await post(port, JSON.stringify({ percent: 90 }));
     assert.equal(res.status, 200);
     assert.equal(res.body.switchThreshold, 0.9);
-    // The operator who set those buckets should hear they are gone rather than
-    // find the number quietly governing everything.
-    assert.deepEqual(res.body.dropped, ['unified7d']);
-    assert.equal(await readStored(path), 0.9);
+    assert.deepEqual(res.body.switchThresholds, { default: 0.9, unified7d: 0.8 });
+    assert.deepEqual(res.body.dropped, []);
+    assert.deepEqual(await readStored(path), { default: 0.9, unified7d: 0.8 });
   }, { configExtra: { switchThreshold: { default: 0.98, unified7d: 0.8 } } });
+});
+
+test('a bucket save writes only that bucket; the other slider\'s bucket stays', async () => {
+  await withServer(async ({ port, path, reloads }) => {
+    let res = await post(port, JSON.stringify({ bucket: 'unified5h', percent: 85 }));
+    assert.equal(res.status, 200);
+    assert.equal(res.body.bucket, 'unified5h');
+    assert.deepEqual(await readStored(path), { default: 0.95, unified5h: 0.85 });
+    res = await post(port, JSON.stringify({ bucket: 'unified7d', percent: 75 }));
+    assert.deepEqual(await readStored(path), { default: 0.95, unified5h: 0.85, unified7d: 0.75 });
+    assert.equal(res.body.switchThreshold, 0.95, 'switchThreshold stays the default as a number');
+    assert.equal(reloads.count, 2);
+    // Null drops the bucket's override; the last one gone, the bare number is back.
+    await post(port, JSON.stringify({ bucket: 'unified5h', percent: null }));
+    await post(port, JSON.stringify({ bucket: 'unified7d', percent: null }));
+    assert.equal(await readStored(path), 0.95);
+  }, { configExtra: { switchThreshold: 0.95 } });
+});
+
+test('an unknown bucket, and a null default, are refused before the write', async () => {
+  for (const body of [{ bucket: 'unified1h', percent: 80 }, { bucket: 'default', percent: null }, { percent: null }, { bucket: 5, percent: 80 }]) {
+    await withServer(async ({ port, path, reloads }) => {
+      const res = await post(port, JSON.stringify(body));
+      assert.equal(res.status, 400, JSON.stringify(body));
+      assert.equal(await readStored(path), 0.95);
+      assert.equal(reloads.count, 0);
+    }, { configExtra: { switchThreshold: 0.95 } });
+  }
 });
 
 test('a percentage out of range is refused and nothing is written', async () => {

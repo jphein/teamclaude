@@ -7,6 +7,7 @@ import {
   resolveConfiguredAccount,
   setAccountDisabled,
   setAccountPriority,
+  setAccountThreshold,
   removeRoute,
   renameAccount,
   setBlockedModels,
@@ -311,4 +312,38 @@ test('renameAccount refuses a name that would reach another account, and changes
   refused(() => renameAccount(config, 'solo@x.com', 'S\n1'), /control characters/);
   refused(() => renameAccount(config, 'nobody@x.com', 'S1'), /no account matches/);
   assert.deepEqual(config, before);
+});
+
+test('an account\'s own limit is set one bucket at a time, in the shape the readers take', () => {
+  const config = { accounts: [{ name: 'a' }, { name: 'b' }] };
+  assert.deepEqual(setAccountThreshold(config, 'a', { bucket: 'unified5h', percent: 85 }),
+    { name: 'a', switchThreshold: { unified5h: 0.85 }, governedBy: 'account' });
+  setAccountThreshold(config, 'a', { bucket: 'unified7d', percent: 70 });
+  assert.deepEqual(config.accounts[0].switchThreshold, { unified5h: 0.85, unified7d: 0.7 });
+  assert.equal(config.accounts[1].switchThreshold, undefined);
+  // Null follows the fleet again, for that bucket only.
+  assert.equal(setAccountThreshold(config, 'a', { bucket: 'unified5h', percent: null }).governedBy, 'fleet');
+  assert.deepEqual(config.accounts[0].switchThreshold, { unified7d: 0.7 });
+  setAccountThreshold(config, 'a', { bucket: 'unified7d', percent: null });
+  assert.equal('switchThreshold' in config.accounts[0], false, 'an empty table is no field at all');
+});
+
+test('an account\'s own default survives a bucket edit and still governs a dropped bucket', () => {
+  const config = { accounts: [{ name: 'a', switchThreshold: 0.9 }] };
+  setAccountThreshold(config, 'a', { bucket: 'unified7d', percent: 80 });
+  assert.deepEqual(config.accounts[0].switchThreshold, { default: 0.9, unified7d: 0.8 });
+  // The account default outranks the fleet, so the bucket is not the fleet's.
+  assert.equal(setAccountThreshold(config, 'a', { bucket: 'unified7d', percent: null }).governedBy, 'account-default');
+  assert.equal(config.accounts[0].switchThreshold, 0.9, 'only the default left: back to a bare number');
+  setAccountThreshold(config, 'a', { bucket: 'default', percent: null });
+  assert.equal('switchThreshold' in config.accounts[0], false);
+});
+
+test('an account limit refuses an unknown bucket, a bad percentage and an unknown account', () => {
+  const config = { accounts: [{ name: 'a' }] };
+  refused(() => setAccountThreshold(config, 'a', { bucket: 'unified1h', percent: 80 }), /Unknown quota bucket/);
+  refused(() => setAccountThreshold(config, 'a', { bucket: 'unified5h', percent: 0 }), /1 to 100/);
+  refused(() => setAccountThreshold(config, 'a', { bucket: 'unified5h', percent: true }), /1 to 100/);
+  refused(() => setAccountThreshold(config, 'ghost', { bucket: 'unified5h', percent: 80 }), /no account matches/);
+  assert.equal(config.accounts[0].switchThreshold, undefined);
 });

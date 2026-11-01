@@ -121,3 +121,19 @@ test('GET /teamclaude/activity is an SSE stream that replays terminal events', a
     assert.match(chunk, /"account":"b"/);
   });
 });
+
+test('GET /ui carries a 5h and a 7d fleet slider, per-card limits and an in-card unlink confirm', async () => {
+  await withProxy({}, async (port) => {
+    const html = await (await fetch(`http://127.0.0.1:${port}/ui`)).text();
+    assert.match(html, /id="thr5h" data-bucket="unified5h"/);
+    assert.match(html, /id="thr7d" data-bucket="unified7d"/);
+    assert.doesNotMatch(html, /id="thr"[ >]/, 'the single slider is gone');
+    // Each slider saves only its own bucket.
+    assert.match(html, /JSON\.stringify\(\{ bucket, percent: Number\(input\.value\) \}\)/);
+    assert.match(html, /limits-toggle/);
+    assert.match(html, /threshold: \{ bucket: t\.getAttribute\('data-bucket'\), percent: Number\(t\.value\) \}/);
+    // Unlink is confirmed by typing the name inside the card, never window.confirm.
+    assert.match(html, /remove: true, confirm: unlinkCtl\.typed/);
+    assert.doesNotMatch(html, /window\.confirm|[^.\w]confirm\(/);
+  });
+});

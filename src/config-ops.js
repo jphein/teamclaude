@@ -437,3 +437,44 @@ export function renameAccount(config, query, newName, spec = {}) {
   }
   return { from, name, routes };
 }
+
+/**
+ * One bucket of an account's own switch threshold (the dashboard's per-card
+ * 5h/7d sliders). A null percentage drops that bucket, so the account follows
+ * the fleet for it again. `accounts[].switchThreshold` stays in the shape the
+ * readers already take: a table while more than a default is left, a bare
+ * number when only the default is, and no field at all when nothing is.
+ *
+ * An account's own default governs every bucket its table does not name and
+ * outranks the fleet's per-bucket table (resolveSwitchThreshold), so dropping a
+ * bucket while an own default stands does not hand that bucket to the fleet:
+ * `governedBy` says which value now governs it.
+ *
+ * @param {any} config
+ * @param {string} query
+ * @param {{ bucket?: unknown, percent?: unknown, orgFilter?: string }} spec
+ * @returns {{ name: string, switchThreshold: number|Record<string, number>|null, governedBy: 'account'|'account-default'|'fleet' }}
+ */
+export function setAccountThreshold(config, query, spec = {}) {
+  const { bucket, percent } = spec;
+  if (typeof bucket !== 'string' || (bucket !== 'default' && !QUOTA_BUCKETS.includes(bucket))) {
+    throw new ConfigOpError(`Unknown quota bucket "${bucket}" — expected one of: default, ${QUOTA_BUCKETS.join(', ')}`);
+  }
+  let ratio = null;
+  if (percent !== null) {
+    ratio = thresholdRatio(percent);
+    if (ratio === null) throw new ConfigOpError(BAD_PERCENT);
+  }
+  const account = resolveConfiguredAccount(config, query, spec.orgFilter);
+  const current = account.switchThreshold;
+  /** @type {Record<string, number>} */
+  const table = typeof current === 'number' && Number.isFinite(current) ? { default: current }
+    : current && typeof current === 'object' && !Array.isArray(current) ? { ...current } : {};
+  if (ratio === null) delete table[bucket];
+  else table[bucket] = ratio;
+  const keys = Object.keys(table);
+  if (!keys.length) delete account.switchThreshold;
+  else account.switchThreshold = keys.length === 1 && keys[0] === 'default' ? table.default : table;
+  const governedBy = table[bucket] != null ? 'account' : table.default != null ? 'account-default' : 'fleet';
+  return { name: account.name, switchThreshold: account.switchThreshold ?? null, governedBy };
+}

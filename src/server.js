@@ -40,7 +40,8 @@ import { resolveLogSource, resolveRestartMethod, startRestartCommand, tailFile, 
 import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
-import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
+import { configIndexFor, markAccountRemoved } from './account-pairing.js';
+import { ConfigOpError, QUOTA_BUCKETS, setAccountThreshold, setBucketThresholds, thresholdRatio, thresholdTable } from './config-ops.js';
 import { envVar, legacyControlUrl } from './brand.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
@@ -968,19 +969,89 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // ── Web dashboard controls (the /ui page itself is served above the
       //    gate; everything it calls is below it) ─────────────────────────
 
-      // POST /teamclaude/account — enable/disable an account (live + persisted,
-      // so a restart doesn't undo it; re-enable also clears a stuck error state).
+      // POST /teamclaude/account — one change to one account, named by `name`:
+      //   {disabled}  enable/disable (live + persisted, so a restart doesn't
+      //               undo it; re-enable also clears a stuck error state);
+      //   {threshold: {bucket, percent|null}}  the account's own switch
+      //               threshold for one bucket, null = follow the fleet again
+      //               (config file under its lock, then a reload applies it);
+      //   {remove: true, confirm: <name>}  unlink: the path the MCP
+      //               remove_account tool takes (live drop, tombstone, entry and
+      //               credentials gone from the config file). `confirm` repeats
+      //               the name, so a stray or replayed body cannot remove one.
       if (req.method === 'POST' && req.url === '/teamclaude/account') {
+        /** @type {any} */ let body;
+        try { body = JSON.parse((await readControlBody(req)) || '{}') ?? {}; } catch { json(res, 400, { error: 'body must be JSON' }); return; }
+        const { name } = body;
+        const asked = ['disabled', 'threshold', 'remove'].filter(k => body[k] !== undefined);
+        if (asked.length !== 1) { json(res, 400, { error: 'give exactly one of disabled, threshold or remove' }); return; }
+        // A dashboard SSO sign-in may not add a seat (SSO_REFUSED_PATHS), so it
+        // may not take one away either: what it removed it could not restore.
+        if (asked[0] === 'remove' && /** @type {any} */ (req).tcSso) { json(res, 403, { error: 'unlinking an account needs the proxy key (use the desktop launcher)' }); return; }
+        const idx = accountManager.accounts.findIndex(a => a.name === name);
+        if (typeof name !== 'string' || idx < 0) { json(res, 404, { error: `account "${name}" not found` }); return; }
+
+        if (asked[0] === 'threshold') {
+          const t = body.threshold;
+          if (!t || typeof t !== 'object' || Array.isArray(t)) { json(res, 400, { error: 'threshold is {bucket, percent}; percent null follows the fleet' }); return; }
+          if (!hooks.reload) { json(res, 501, { error: 'threshold change not supported' }); return; }
+          let result;
+          try {
+            await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => { result = setAccountThreshold(c, name, { bucket: t.bucket, percent: t.percent === undefined ? NaN : t.percent }); });
+          } catch (err) {
+            const bad = err instanceof ConfigOpError;
+            console.error(`[TeamClaude] Threshold change for "${name}" failed:`, /** @type {Error} */ (err).message);
+            json(res, bad ? 400 : 500, { error: bad ? /** @type {Error} */ (err).message : 'threshold change failed; see the proxy log' });
+            return;
+          }
+          try { await hooks.reload(); } catch (err) {
+            console.error('[TeamClaude] Reload after an account threshold change failed:', /** @type {Error} */ (err).message);
+            json(res, 500, { error: 'saved to the config file, but the reload failed; see the proxy log' });
+            return;
+          }
+          const r = /** @type {any} */ (result);
+          console.log(`[TeamClaude] Account "${name}" ${t.bucket} threshold ${t.percent === null ? 'follows the fleet' : `set to ${t.percent}%`} ${viaWhom(req)}`);
+          emitActivity({ type: 'account-threshold', name, bucket: t.bucket, percent: t.percent, switchThreshold: r.switchThreshold });
+          json(res, 200, { name, ...r });
+          return;
+        }
+
+        if (asked[0] === 'remove') {
+          if (body.remove !== true || body.confirm !== name) { json(res, 400, { error: 'unlinking needs remove: true and confirm set to the account name' }); return; }
+          if (!hooks.persistAccounts) { json(res, 501, { error: 'this server cannot save account changes' }); return; }
+          const acct = accountManager.accounts[idx];
+          // Requests still running on it would lose their account mid-stream;
+          // the operator retries once they finish (the card shows "N live").
+          const live = Math.max(acct.inFlight || 0, acct.activityOpen || 0);
+          if (live > 0) { json(res, 409, { error: `"${name}" has ${live} request${live === 1 ? '' : 's'} in flight; try again when they finish` }); return; }
+          const entryIndex = configIndexFor(config.accounts || [], accountManager.accounts, idx);
+          const entry = entryIndex >= 0 ? config.accounts[entryIndex] : null;
+          accountManager.removeAccount(idx);
+          if (entry) {
+            // The save adopts rows on disk that are not in memory, so the entry
+            // has to be marked before it goes or the save would read it back in.
+            markAccountRemoved(config, entry.id);
+            config.accounts.splice(entryIndex, 1);
+          }
+          try { await hooks.persistAccounts(); } catch (err) {
+            console.error(`[TeamClaude] Saving the removal of "${name}" failed:`, /** @type {Error} */ (err).message);
+            json(res, 500, { error: `${name}: removed from the running server, but the config file could not be saved; see the proxy log` });
+            return;
+          }
+          console.log(`[TeamClaude] Account "${name}" unlinked ${viaWhom(req)}`);
+          emitActivity({ type: 'account-removed', name });
+          json(res, 200, { name, removed: true, persisted: !!entry });
+          return;
+        }
+
+        const { disabled } = body;
         try {
-          const { name, disabled } = JSON.parse((await readControlBody(req)) || '{}');
-          const idx = accountManager.accounts.findIndex(a => a.name === name);
-          if (idx < 0) { json(res, 404, { error: `account "${name}" not found` }); return; }
           accountManager.setDisabled(idx, !!disabled);
           await hooks.persistAccountDisabled?.(name, !!disabled);
           console.log(`[TeamClaude] Account "${name}" ${disabled ? 'disabled' : 'enabled'} ${viaWhom(req)}`);
           emitActivity({ type: 'account', name, disabled: !!disabled });
           json(res, 200, { name, disabled: !!disabled });
-        } catch (err) { json(res, 400, { error: err.message }); }
+        } catch (err) { json(res, 400, { error: /** @type {Error} */ (err).message }); }
         return;
       }
 
@@ -1407,10 +1478,16 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // same-origin, so it passes while another site's no-cors POST does not —
       // and the client-key refusal, since this is a setting and not a nudge.
       if (req.method === 'POST' && req.url === '/teamclaude/threshold') {
-        let percent;
+        // Body: {"percent"} sets the default bucket; {"bucket", "percent"} sets
+        // one bucket (the dashboard's 5h and 7d sliders), where a null percent
+        // drops that bucket's override. Neither form touches another bucket:
+        // with two sliders, a save from one must not wipe what the other set
+        // (dashboard limits, 2026-11-01; the endpoint used to go through
+        // setThreshold, which replaces the whole table).
+        let body;
         try {
           const raw = await readControlBody(req);
-          percent = JSON.parse(raw || '{}')?.percent;
+          body = JSON.parse(raw || '{}') ?? {};
         } catch (err) {
           const message = /** @type {Error} */ (err).message;
           const tooLarge = message === 'body too large';
@@ -1418,10 +1495,18 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
           return;
         }
+        const bucket = body.bucket === undefined ? 'default' : body.bucket;
+        const percent = body.percent;
+        if (bucket !== 'default' && !QUOTA_BUCKETS.includes(bucket)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `bucket must be one of: default, ${QUOTA_BUCKETS.join(', ')}` }));
+          return;
+        }
         // What counts as a percentage is the shared rule's to say (1–100, kept
         // to tenths); restating the range here would let the two drift. Checked
-        // before the write so a bad number never takes the config lock.
-        if (thresholdRatio(percent) === null) {
+        // before the write so a bad number never takes the config lock. Null
+        // drops a bucket's override; the default has nothing to fall back to.
+        if (!(percent === null && bucket !== 'default') && thresholdRatio(percent) === null) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'percent must be a number from 1 to 100' }));
           return;
@@ -1435,10 +1520,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           res.end(JSON.stringify({ ok: false, error: 'threshold change not supported' }));
           return;
         }
-        /** @type {string[]} */ let dropped = [];
         let saved;
         try {
-          const disk = await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => { ({ dropped } = setThreshold(c, percent)); });
+          const disk = await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => { setBucketThresholds(c, [[bucket, percent]]); });
           saved = disk.switchThreshold;
         } catch (err) {
           const message = /** @type {Error} */ (err).message;
@@ -1466,10 +1550,14 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // The same trace a manual switch leaves, and for the same reason: on the
         // background-service deployment this endpoint exists for, a threshold
         // that quietly retires an account would otherwise change nothing visible.
-        console.log(`[TeamClaude] Switch threshold set to ${Math.round(saved * 1000) / 10}% (dashboard)`
-          + (dropped.length ? ` — dropped the per-bucket thresholds (${dropped.join(', ')})` : ''));
+        const table = thresholdTable(saved);
+        const said = percent === null ? 'follows the default again' : `set to ${Math.round(table[bucket] * 1000) / 10}%`;
+        console.log(`[TeamClaude] Switch threshold${bucket === 'default' ? '' : ` (${bucket})`} ${said} ${viaWhom(req)}`);
+        emitActivity({ type: 'threshold', bucket, value: percent === null ? null : table[bucket], switchThreshold: table.default, switchThresholds: typeof saved === 'object' ? saved : null });
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, switchThreshold: saved, dropped }));
+        // `switchThreshold` stays the default as a number (what the endpoint
+        // has always answered); the table rides beside it, as in /status.
+        res.end(JSON.stringify({ ok: true, bucket, switchThreshold: table.default, switchThresholds: typeof saved === 'object' ? saved : null, dropped: [] }));
         return;
       }
 

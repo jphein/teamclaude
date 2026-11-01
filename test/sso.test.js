@@ -115,6 +115,9 @@ test('over plain HTTP with requireTls off: SSO is the operator on the dashboard 
     // An operator-only control passes every gate (404: no such account).
     const acct = await call('/teamclaude/account', { method: 'POST', headers: { ...HOP, 'sec-fetch-site': 'same-origin' }, body: JSON.stringify({ name: 'zz', disabled: true }) });
     assert.equal(acct.status, 404);
+    // Unlink stays with the key: an SSO sign-in cannot add a seat back.
+    const unlink = await call('/teamclaude/account', { method: 'POST', headers: { ...HOP, 'sec-fetch-site': 'same-origin' }, body: JSON.stringify({ name: 'zz', remove: true, confirm: 'zz' }) });
+    assert.equal(unlink.status, 403);
     // The model API stays key-only: refused before anything is forwarded.
     const v1 = await call('/v1/messages', { method: 'POST', headers: { ...HOP, 'content-type': 'application/json' }, body: '{}' });
     assert.equal(v1.status, 401);

@@ -347,3 +347,11 @@ test('an account limit refuses an unknown bucket, a bad percentage and an unknow
   refused(() => setAccountThreshold(config, 'ghost', { bucket: 'unified5h', percent: 80 }), /no account matches/);
   assert.equal(config.accounts[0].switchThreshold, undefined);
 });
+
+test('an account limit given an id writes that entry, whatever its name now is', () => {
+  const config = { accounts: [{ id: 'x', name: 'b' }, { id: 'y', name: 'a' }] };
+  assert.equal(setAccountThreshold(config, 'a', { id: 'x', bucket: 'unified7d', percent: 90 }).name, 'b');
+  assert.deepEqual(config.accounts[0].switchThreshold, { unified7d: 0.9 });
+  assert.equal(config.accounts[1].switchThreshold, undefined);
+  refused(() => setAccountThreshold(config, 'a', { id: 'gone', bucket: 'unified7d', percent: 90 }), /no account with id/);
+});

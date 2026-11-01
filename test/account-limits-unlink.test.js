@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, chmod } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AccountManager } from '../src/account-manager.js';
@@ -45,7 +46,7 @@ async function withServer(fn, { accounts = ACCTS(), proxy = { apiKey: 'tc-test' 
   const port = await listen(server);
   const disk = async () => JSON.parse(await readFile(path, 'utf-8'));
   try {
-    await fn({ port, am, reloads, disk, config });
+    await fn({ port, am, reloads, disk, config, path });
   } finally {
     server.close();
     if (previous === undefined) delete process.env.TEAMCLAUDE_CONFIG;
@@ -166,11 +167,45 @@ test('unlink is refused while the account has requests in flight', async () => {
   });
 });
 
-test('unlink without a save hook is refused up front', async () => {
-  await withServer(async ({ port, am }) => {
-    assert.equal((await post(port, { name: 'a', remove: true, confirm: 'a' })).status, 501);
+test('a failed write removes nothing: the account stays in the fleet and in rotation', async () => {
+  await withServer(async ({ port, am, path, disk }) => {
+    am.accounts[0].disabled = false;
+    await chmod(dirname(path), 0o500);
+    let res;
+    try { res = await post(port, { name: 'a', remove: true, confirm: 'a' }); } finally { await chmod(dirname(path), 0o700); }
+    assert.equal(res.status, 500);
+    assert.match(res.body.error, /nothing was removed/);
+    assert.deepEqual(am.accounts.map(x => x.name), ['a', 'b'], 'still live');
+    assert.equal(am.accounts[0].disabled, false, 'and back in rotation');
+    assert.equal((await disk()).accounts.length, 2);
+    // A retry once the file is writable again goes through (no 404 for a half-removed account).
+    assert.equal((await post(port, { name: 'a', remove: true, confirm: 'a' })).status, 200);
+    assert.deepEqual((await disk()).accounts.map(x => x.name), ['b']);
+  });
+});
+
+test('an account not paired with a config entry is refused before anything changes', async () => {
+  await withServer(async ({ port, am, disk }) => {
+    am.accounts[0].id = 'not-on-disk';
+    const res = await post(port, { name: 'a', remove: true, confirm: 'a' });
+    assert.equal(res.status, 409);
     assert.equal(am.accounts.length, 2);
-  }, { hooks: { persistAccounts: undefined } });
+    assert.equal((await disk()).accounts.length, 2);
+  });
+});
+
+test('an account limit follows the entry id, not a name reassigned on disk meanwhile', async () => {
+  await withServer(async ({ port, disk, path }) => {
+    // Another writer swaps the two names on disk after the server loaded them.
+    const d = await disk();
+    d.accounts[0].name = 'b'; d.accounts[1].name = 'a';
+    await writeFile(path, JSON.stringify(d));
+    const res = await post(port, { name: 'a', threshold: { bucket: 'unified5h', percent: 80 } });
+    assert.equal(res.status, 200);
+    const after = await disk();
+    assert.deepEqual(after.accounts.find(x => x.id === 'id-a').switchThreshold, { unified5h: 0.8 }, 'the card\'s account (id-a)');
+    assert.equal(after.accounts.find(x => x.id === 'id-b').switchThreshold, undefined);
+  });
 });
 
 test('the old {name, disabled} body still works', async () => {

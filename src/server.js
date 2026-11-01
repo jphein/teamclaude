@@ -995,9 +995,14 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           const t = body.threshold;
           if (!t || typeof t !== 'object' || Array.isArray(t)) { json(res, 400, { error: 'threshold is {bucket, percent}; percent null follows the fleet' }); return; }
           if (!hooks.reload) { json(res, 501, { error: 'threshold change not supported' }); return; }
+          // Bound to the entry this card shows by its id, not resolved again by
+          // name: a rename on disk meanwhile must not move the write onto
+          // another account (xreview, 2026-11-01).
+          const id = accountManager.accounts[idx].id;
+          if (!id) { json(res, 409, { error: `"${name}" has no entry id in the config file; reload and try again` }); return; }
           let result;
           try {
-            await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => { result = setAccountThreshold(c, name, { bucket: t.bucket, percent: t.percent === undefined ? NaN : t.percent }); });
+            await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => { result = setAccountThreshold(c, name, { id, bucket: t.bucket, percent: t.percent === undefined ? NaN : t.percent }); });
           } catch (err) {
             const bad = err instanceof ConfigOpError;
             console.error(`[TeamClaude] Threshold change for "${name}" failed:`, /** @type {Error} */ (err).message);
@@ -1018,29 +1023,49 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
 
         if (asked[0] === 'remove') {
           if (body.remove !== true || body.confirm !== name) { json(res, 400, { error: 'unlinking needs remove: true and confirm set to the account name' }); return; }
-          if (!hooks.persistAccounts) { json(res, 501, { error: 'this server cannot save account changes' }); return; }
           const acct = accountManager.accounts[idx];
           // Requests still running on it would lose their account mid-stream;
           // the operator retries once they finish (the card shows "N live").
           const live = Math.max(acct.inFlight || 0, acct.activityOpen || 0);
           if (live > 0) { json(res, 409, { error: `"${name}" has ${live} request${live === 1 ? '' : 's'} in flight; try again when they finish` }); return; }
+          // Only an account paired with its config entry is removed: without
+          // the entry's id the file's row could not be found, and a removal
+          // that left it there would come back on the next restart.
           const entryIndex = configIndexFor(config.accounts || [], accountManager.accounts, idx);
-          const entry = entryIndex >= 0 ? config.accounts[entryIndex] : null;
-          accountManager.removeAccount(idx);
-          if (entry) {
-            // The save adopts rows on disk that are not in memory, so the entry
-            // has to be marked before it goes or the save would read it back in.
-            markAccountRemoved(config, entry.id);
-            config.accounts.splice(entryIndex, 1);
-          }
-          try { await hooks.persistAccounts(); } catch (err) {
+          if (entryIndex < 0) { json(res, 409, { error: `"${name}" is not paired with an entry in the config file; reload and try again` }); return; }
+          const entryId = config.accounts[entryIndex].id;
+          // The file first, the running fleet after (xreview, 2026-11-01): a
+          // failed write then changes nothing. While the write is pending the
+          // account takes no new requests, so the in-flight check above still
+          // holds when it leaves the fleet.
+          const wasDisabled = acct.disabled;
+          acct.disabled = true;
+          let found = false;
+          try {
+            await atomicConfigUpdate((/** @type {Record<string, any>} */ disk) => {
+              const before = Array.isArray(disk.accounts) ? disk.accounts.length : 0;
+              disk.accounts = (disk.accounts || []).filter((/** @type {any} */ a) => a?.id !== entryId);
+              found = disk.accounts.length < before;
+            });
+          } catch (err) {
+            acct.disabled = wasDisabled;
             console.error(`[TeamClaude] Saving the removal of "${name}" failed:`, /** @type {Error} */ (err).message);
-            json(res, 500, { error: `${name}: removed from the running server, but the config file could not be saved; see the proxy log` });
+            json(res, 500, { error: `${name}: the config file could not be saved, so nothing was removed; see the proxy log` });
             return;
+          }
+          // Re-found by identity: another request may have reordered the list
+          // while the write was pending.
+          const now = accountManager.accounts.indexOf(acct);
+          if (now >= 0) accountManager.removeAccount(now);
+          const cfgNow = (config.accounts || []).findIndex((/** @type {any} */ a) => a?.id === entryId);
+          if (cfgNow >= 0) {
+            // Marked as well, so a later merge-save cannot adopt a stale row.
+            markAccountRemoved(config, entryId);
+            config.accounts.splice(cfgNow, 1);
           }
           console.log(`[TeamClaude] Account "${name}" unlinked ${viaWhom(req)}`);
           emitActivity({ type: 'account-removed', name });
-          json(res, 200, { name, removed: true, persisted: !!entry });
+          json(res, 200, { name, removed: true, persisted: found });
           return;
         }
 

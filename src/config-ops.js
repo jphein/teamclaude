@@ -452,7 +452,7 @@ export function renameAccount(config, query, newName, spec = {}) {
  *
  * @param {any} config
  * @param {string} query
- * @param {{ bucket?: unknown, percent?: unknown, orgFilter?: string }} spec
+ * @param {{ id?: string, bucket?: unknown, percent?: unknown, orgFilter?: string }} spec
  * @returns {{ name: string, switchThreshold: number|Record<string, number>|null, governedBy: 'account'|'account-default'|'fleet' }}
  */
 export function setAccountThreshold(config, query, spec = {}) {
@@ -465,7 +465,15 @@ export function setAccountThreshold(config, query, spec = {}) {
     ratio = thresholdRatio(percent);
     if (ratio === null) throw new ConfigOpError(BAD_PERCENT);
   }
-  const account = resolveConfiguredAccount(config, query, spec.orgFilter);
+  // By id when the caller holds one (the dashboard's card): a name can be
+  // reassigned on disk between the caller's lookup and this write.
+  let account;
+  if (spec.id != null) {
+    account = (config.accounts || []).find((/** @type {any} */ a) => a?.id === spec.id);
+    if (!account) throw new ConfigOpError(`no account with id "${spec.id}" in the config file`);
+  } else {
+    account = resolveConfiguredAccount(config, query, spec.orgFilter);
+  }
   const current = account.switchThreshold;
   /** @type {Record<string, number>} */
   const table = typeof current === 'number' && Number.isFinite(current) ? { default: current }

@@ -93,9 +93,17 @@
     gap: 0.625rem;
     font-size: 0.875rem;
   }
-  .threshold-row label { color: var(--text-dim); }
+  .threshold-rows {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.35rem 1rem;
+    font-size: 0.875rem;
+  }
+  .threshold-rows .thr-title { color: var(--text-dim); }
+  .threshold-row label { color: var(--text-dim); min-width: 1.4rem; }
   .threshold-row input[type=range] {
-    width: 180px;
+    width: clamp(120px, 14vw, 180px);
     accent-color: var(--accent);
   }
   .threshold-row .val {
@@ -231,6 +239,59 @@
     .card-actions { grid-row: auto; grid-column: 1; justify-content: flex-start; }
   }
   .card-actions .btn-ghost { padding: 0.3rem 0.6rem; font-size: 0.8rem; }
+
+  /* ── Per-card panels: own limits, and the unlink confirm ── */
+  .card-panel {
+    grid-column: 1 / -1;
+    display: grid;
+    gap: 0.45rem;
+    padding-top: 0.6rem;
+    border-top: 1px dashed var(--panel-border);
+    font-size: 0.8rem;
+    min-width: 0;
+  }
+  .card-panel .panel-msg { color: var(--text-dim); }
+  .limit-row {
+    display: grid;
+    grid-template-columns: 1.6rem minmax(0, 1fr) 3rem auto;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .limit-row .lbl { color: var(--text-dim); }
+  .limit-row input[type=range] { width: 100%; min-width: 0; accent-color: var(--accent); }
+  .limit-row.fleet input[type=range] { opacity: 0.5; }
+  .limit-row .val { font-variant-numeric: tabular-nums; font-weight: 600; text-align: right; color: var(--accent); }
+  .limit-row.fleet .val { color: var(--text-dim); font-weight: 400; }
+  .limit-row .state { grid-column: 2 / -1; color: var(--text-dim); margin-top: -0.3rem; }
+  .card-panel .btn-ghost { padding: 0.3rem 0.6rem; font-size: 0.8rem; }
+  .btn-ghost.limits-toggle.on { color: var(--accent); border-color: var(--accent); }
+  .unlink-panel { border-top-color: var(--bad); }
+  .card-panel .warnt { color: var(--warn); }
+  .card-panel .badt { color: var(--bad); }
+  .unlink-panel .unlink-row { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
+  .unlink-panel input {
+    flex: 1;
+    min-width: 9rem;
+    padding: 0.3rem 0.5rem;
+    font: inherit;
+    font-size: 0.8rem;
+    color: var(--text);
+    background: var(--log-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 5px;
+  }
+  .unlink-panel input:focus { outline: none; border-color: var(--bad); }
+  .btn-unlink { color: var(--bad); }
+  .btn-unlink:hover:not(:disabled) { color: var(--bad); border-color: var(--bad); }
+  .btn-danger {
+    background: transparent;
+    color: var(--bad);
+    border: 1px solid var(--bad);
+    padding: 0.3rem 0.6rem;
+    font-size: 0.8rem;
+  }
+  .btn-danger:hover:not(:disabled) { background: var(--bad); color: #fff; }
+  .btn-danger:disabled { opacity: 0.4; cursor: default; }
 
   /* ── Reauth panel (shown inside a card while a reauth session is pending) ── */
   .reauth-panel {
@@ -525,7 +586,7 @@
   #problems .warn { color: var(--warn); border-color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); }
 
   /* ── Per-account block reason ── */
-  .card .blocked { font-size: 0.8rem; color: var(--warn); margin: 0.1rem 0 0.35rem; }
+  .card .blocked { font-size: 0.8rem; color: var(--warn); margin: 0.1rem 0 0.35rem; grid-column: 1 / -1; }
 
   /* ── Status tables (routing, clients, dimensions, sessions) ── */
 
@@ -628,10 +689,18 @@
   <header>
     <h1>TeamClaude<span class="sub">multi-account proxy</span></h1>
     <div class="header-right">
-      <div class="threshold-row">
-        <label for="thr">Rotate at</label>
-        <input type="range" id="thr" min="50" max="100" step="1" value="98">
-        <span class="val" id="thrVal">98%</span>
+      <div class="threshold-rows" role="group" aria-label="Rotate away from an account at">
+        <span class="thr-title">Rotate at</span>
+        <div class="threshold-row">
+          <label for="thr5h" title="5-hour window: rotation leaves an account once this much of its 5h quota is used">5h</label>
+          <input type="range" id="thr5h" data-bucket="unified5h" min="50" max="100" step="1" value="98">
+          <span class="val" id="thr5hVal">98%</span>
+        </div>
+        <div class="threshold-row">
+          <label for="thr7d" title="Weekly window: rotation leaves an account once this much of its 7d quota is used">7d</label>
+          <input type="range" id="thr7d" data-bucket="unified7d" min="50" max="100" step="1" value="98">
+          <span class="val" id="thr7dVal">98%</span>
+        </div>
       </div>
     </div>
   </header>
@@ -738,8 +807,9 @@
   const cardsEl     = document.getElementById('cards');
   const errEl       = document.getElementById('errBox');
   const metaEl      = document.getElementById('meta');
-  const thr         = document.getElementById('thr');
-  const thrVal      = document.getElementById('thrVal');
+  // The fleet's two rotate-at sliders, one per quota window. Each saves only
+  // its own bucket (POST /teamclaude/threshold {bucket, percent}).
+  const thrInputs   = [document.getElementById('thr5h'), document.getElementById('thr7d')];
   const restartBtn  = document.getElementById('restartBtn');
   const restartStatusEl = document.getElementById('restartStatus');
   const svcStatsEl  = document.getElementById('svcStats');
@@ -754,8 +824,19 @@
   const actSepEl    = document.getElementById('actSep');
   const logBoxEl    = document.getElementById('logBox');
 
-  let lastThreshold = null;
-  let saveTimer = null;
+  const lastThreshold = {};
+  // Per-card panel state, kept here because the cards are rebuilt on every
+  // poll: which cards have their limits open, which card is asking to confirm
+  // an unlink (and what has been typed so far), and which control was focused.
+  const openLimits = new Set();
+  const unlinkCtl = { name: null, typed: '', error: '' };
+  // True between a card slider's first input and its change: a rebuild then
+  // would yank the thumb out from under the pointer.
+  let cardDrag = false;
+  // What this caller may change, from /status `caller` (the gate's own lists).
+  let canEditThreshold = true;
+  let canEditAccounts = true;
+  let canUnlink = true;
   let restartPending = false;
   let wasDisconnected = false;
 
@@ -1003,7 +1084,7 @@
       { key: 'unified7dSonnet', family: 'sonnet', label: '7d sonnet' },
     ]
       .filter(f => q[f.key] != null)
-      .map(f => ({ family: f.family, label: f.label, util: q[f.key], reset: q[f.key + 'Reset'] ?? null }));
+      .map(f => ({ bucket: f.key, family: f.family, label: f.label, util: q[f.key], reset: q[f.key + 'Reset'] ?? null }));
     // Families learned from the usage payload's `limits` array (scopedWeekly):
     // upstream can meter a third family before this page knows its name.
     const scoped = q.scopedWeekly || {};
@@ -1030,7 +1111,95 @@
     ];
   }
 
-  function renderAccount(acct, isActive, threshold, mixedProviders, rank) {
+  // The threshold in force for one account and bucket, as the manager resolves
+  // it (resolveSwitchThreshold in model.js): the account's own bare number, its
+  // table's bucket or default, else the fleet's bucket or default.
+  function fleetThresholdFor(fleet, bucket) {
+    const t = fleet.switchThresholds;
+    if (t && typeof t === 'object') {
+      const v = t[bucket] != null ? t[bucket] : t.default;
+      if (typeof v === 'number' && isFinite(v)) return v;
+    }
+    return typeof fleet.switchThreshold === 'number' ? fleet.switchThreshold : 0.98;
+  }
+  function ownThresholdFor(acct, bucket) {
+    const t = acct.switchThreshold;
+    if (typeof t === 'number' && isFinite(t)) return { value: t, from: 'account-default' };
+    if (t && typeof t === 'object') {
+      if (typeof t[bucket] === 'number') return { value: t[bucket], from: 'account' };
+      if (typeof t.default === 'number') return { value: t.default, from: 'account-default' };
+    }
+    return null;
+  }
+  function thresholdIn(acct, bucket, fleet) {
+    const own = ownThresholdFor(acct, bucket);
+    return own ? own.value : fleetThresholdFor(fleet, bucket);
+  }
+  const pctOf = v => Math.round(v * 1000) / 10;
+
+  // The "own limits" panel: a 5h and a 7d slider per account, each either the
+  // account's own number or following the fleet's.
+  function limitsPanel(acct, fleet) {
+    const rows = [];
+    const ownDefault = typeof acct.switchThreshold === 'number' ? acct.switchThreshold
+      : acct.switchThreshold && typeof acct.switchThreshold.default === 'number' ? acct.switchThreshold.default : null;
+    for (const [bucket, label] of [['unified5h', '5h'], ['unified7d', '7d']]) {
+      const own = ownThresholdFor(acct, bucket);
+      const value = own ? own.value : fleetThresholdFor(fleet, bucket);
+      const key = 'lim:' + acct.name + ':' + bucket;
+      const valEl = el('span', { class: 'val', text: pctOf(value) + '%' });
+      rows.push(el('div', { class: 'limit-row' + (own ? '' : ' fleet') }, [
+        el('label', { class: 'lbl', for: key, text: label }),
+        el('input', { type: 'range', id: key, min: '50', max: '100', step: '1', value: String(Math.round(value * 100)),
+          class: 'acct-limit', 'data-name': acct.name, 'data-bucket': bucket, 'data-key': key,
+          'aria-label': acct.name + ' ' + label + ' rotate-at', disabled: !canEditAccounts }),
+        valEl,
+        own && own.from === 'account'
+          ? el('button', { class: 'btn-ghost limit-follow', 'data-name': acct.name, 'data-bucket': bucket, 'data-key': key + ':follow', disabled: !canEditAccounts,
+              title: 'Drop this account\'s own ' + label + ' limit and use the fleet slider again', text: 'Follow fleet' })
+          : el('span'),
+        el('span', { class: 'state', text: own
+          ? (own.from === 'account' ? 'own ' + label + ' limit' : 'set by this account\'s own limit for every window (below)')
+          : 'follows the fleet ' + label + ' slider — move this one to give the account its own' }),
+      ]));
+    }
+    if (ownDefault != null) {
+      rows.push(el('div', { class: 'limit-row' }, [
+        el('span', { class: 'lbl', text: 'all' }),
+        el('span', { class: 'panel-msg', text: 'An own limit for every window (from the config file); it outranks the fleet sliders.' }),
+        el('span', { class: 'val', text: pctOf(ownDefault) + '%' }),
+        el('button', { class: 'btn-ghost limit-follow', 'data-name': acct.name, 'data-bucket': 'default', 'data-key': 'lim:' + acct.name + ':default:follow', disabled: !canEditAccounts,
+          title: 'Drop the account-wide limit; buckets without their own follow the fleet', text: 'Clear' }),
+      ]));
+    }
+    return el('div', { class: 'card-panel limits-panel' }, [
+      el('div', { class: 'panel-msg', text: 'Rotation leaves ' + acct.name + ' at these levels. Saved to the config file and applied at once.' }),
+      ...rows,
+    ]);
+  }
+
+  // Unlink: confirmed inside the card by typing the account's name.
+  function unlinkPanel(acct) {
+    const live = Math.max(acct.inFlight || 0, 0);
+    const input = el('input', { type: 'text', class: 'unlink-name', 'data-name': acct.name, 'data-key': 'unlink:' + acct.name,
+      placeholder: 'type ' + acct.name + ' to confirm', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Type the account name to confirm' });
+    input.value = unlinkCtl.typed;
+    return el('div', { class: 'card-panel unlink-panel' }, [
+      el('div', { class: 'panel-msg', text: 'Unlink ' + acct.name + '? It leaves the fleet and its sign-in leaves the config file. '
+        + 'It comes back with ＋ Add account (or teamclaude login). To pause it instead, use Disable.' }),
+      live > 0 ? el('div', { class: 'warnt', text: live + ' request' + (live === 1 ? '' : 's') + ' in flight: unlinking waits until ' + (live === 1 ? 'it finishes' : 'they finish') + '.' }) : null,
+      unlinkCtl.error ? el('div', { class: 'badt', text: unlinkCtl.error }) : null,
+      el('div', { class: 'unlink-row' }, [
+        input,
+        el('button', { class: 'btn-danger unlink-go', 'data-name': acct.name, 'data-key': 'unlink:' + acct.name + ':go',
+          disabled: unlinkCtl.typed !== acct.name || live > 0, text: 'Unlink' }),
+        el('button', { class: 'btn-ghost unlink-cancel', 'data-key': 'unlink:' + acct.name + ':cancel', text: 'Cancel' }),
+      ]),
+    ]);
+  }
+
+  function renderAccount(acct, isActive, fleet, mixedProviders, rank) {
+    const threshold = fleet.switchThreshold;
     const q = acct.quota;
     const u5h = q.unified5h != null ? q.unified5h
       : (q.tokensLimit ? 1 - q.tokensRemaining / q.tokensLimit : null);
@@ -1058,6 +1227,9 @@
         text: f.label.replace('7d ', '') + ' spent',
       })),
       el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', text: acct.type }),
+      // Its own limits, where they differ from the fleet's (shared helper).
+      (t => t ? el('span', { class: 'badge', style: 'background:transparent;color:var(--accent);border:1px dashed var(--accent);', title: 'this account rotates at its own limit', text: t }) : null)(
+        thresholdBadgeText(acct.switchThreshold, fleet.switchThreshold, fleet.switchThresholds)),
       mixedProviders ? el('span', { class: 'badge', style: 'background:transparent;color:var(--text-dim);', text: providerLabel(acct.provider) }) : null,
       rank && rank.mode === 'expiry'
         ? el('span', { class: 'badge', style: 'background:transparent;color:var(--accent);border:1px solid var(--accent);', title: 'expiry pressure: weekly allowance left per hour until it resets (higher = more to lose, used first)', text: rank.pressurePerHour == null ? 'pressure ?' : 'pressure ' + (rank.pressurePerHour * 100).toFixed(2) + '%/h' })
@@ -1081,18 +1253,31 @@
         title: 'Re-run the browser OAuth login for this account (fixes a revoked refresh token). Log into claude.ai as this account before approving.',
         text: 'Reauth',
       }) : null,
+      el('button', {
+        class: 'btn-ghost limits-toggle' + (openLimits.has(acct.name) ? ' on' : ''), 'data-name': acct.name, 'data-key': 'limits:' + acct.name,
+        'aria-expanded': openLimits.has(acct.name) ? 'true' : 'false',
+        title: 'This account\'s own 5h and 7d rotate-at limits', text: 'Limits',
+      }),
+      canUnlink ? el('button', {
+        class: 'btn-ghost btn-unlink unlink-open', 'data-name': acct.name, 'data-key': 'unlink-open:' + acct.name,
+        title: 'Remove this account from the fleet (asks you to type its name first)', text: 'Unlink',
+      }) : null,
     ]);
     const families = familyBuckets(q);
     const bars = el('div', { class: 'bars' }, [
-      ...makeBar('5h', u5h, threshold, q.unified5hReset ?? q.resetsAt),
-      ...makeBar('7d', u7d, threshold, q.unified7dReset),
-      ...families.flatMap(f => makeBar(f.label, f.util, threshold, f.reset)),
+      ...makeBar('5h', u5h, thresholdIn(acct, 'unified5h', fleet), q.unified5hReset ?? q.resetsAt),
+      ...makeBar('7d', u7d, thresholdIn(acct, 'unified7d', fleet), q.unified7dReset),
+      ...families.flatMap(f => makeBar(f.label, f.util, thresholdIn(acct, f.bucket || 'default', fleet), f.reset)),
     ]);
     const metaText = fmtNum(acct.usage.totalRequests) + ' requests · '
       + fmtNum(totalTok) + ' tokens · last used ' + fmtAgo(acct.usage.lastUsed)
       + (acct.rateLimitedUntil ? ' · throttled until ' + new Date(acct.rateLimitedUntil).toLocaleTimeString() : '');
     const meta = el('div', { class: 'meta', text: metaText });
-    return el('div', { class: 'card' + (isActive ? ' active' : '') + (acct.disabled ? ' off' : ''), 'data-name': acct.name }, [nameRow, actions, blocked, bars, meta]);
+    return el('div', { class: 'card' + (isActive ? ' active' : '') + (acct.disabled ? ' off' : ''), 'data-name': acct.name }, [
+      nameRow, actions, blocked, bars, meta,
+      openLimits.has(acct.name) ? limitsPanel(acct, fleet) : null,
+      unlinkCtl.name === acct.name ? unlinkPanel(acct) : null,
+    ]);
   }
 
   // ── Error display ────────────────────────────────────────────
@@ -1293,16 +1478,33 @@
       wasDisconnected = false;
       showErr('');
 
-      const serverPct = Math.round(data.switchThreshold * 100);
-      if (lastThreshold !== serverPct && document.activeElement !== thr) {
-        thr.value = serverPct;
-        thrVal.textContent = serverPct + '%';
-        lastThreshold = serverPct;
+      const caller = data.caller || {};
+      const refused = Array.isArray(caller.refused) ? caller.refused : [];
+      canEditThreshold = !refused.includes('/teamclaude/threshold');
+      canEditAccounts = !refused.includes('/teamclaude/account');
+      // A dashboard SSO sign-in cannot add a seat, so it is not offered the
+      // removal it could not undo (the server refuses it as well).
+      canUnlink = canEditAccounts && !(typeof caller.sso === 'string' && caller.sso);
+      const fleet = { switchThreshold: data.switchThreshold, switchThresholds: data.switchThresholds || null };
+      for (const input of thrInputs) {
+        const b = input.dataset.bucket;
+        const serverPct = Math.round(fleetThresholdFor(fleet, b) * 100);
+        input.disabled = !canEditThreshold;
+        if (lastThreshold[b] !== serverPct && document.activeElement !== input) {
+          input.value = serverPct;
+          document.getElementById(input.id + 'Val').textContent = serverPct + '%';
+          lastThreshold[b] = serverPct;
+        }
       }
 
       // Cards are rebuilt every poll; the reauth panel is a singleton element
       // re-attached afterwards so a half-typed code (and focus) survives.
       const reauthHadFocus = document.activeElement === reauthCodeEl;
+      // A control inside a card panel is found again by its data-key after the
+      // rebuild, so a half-typed confirm or a focused slider survives the poll.
+      const focusKey = cardsEl.contains(document.activeElement) ? document.activeElement.getAttribute('data-key') : null;
+      if (unlinkCtl.name && !data.accounts.some(a => a.name === unlinkCtl.name)) Object.assign(unlinkCtl, { name: null, typed: '', error: '' });
+      if (!cardDrag) {
       cardsEl.textContent = '';
       // Cards follow the order traffic follows (shared rotationView): live
       // expiry pressure when expiry routing is on, else priority then list
@@ -1315,7 +1517,12 @@
       const isCurrent = a => currents ? currents[a.provider] === a.name : a.name === data.currentAccount;
       const mixed = new Set(data.accounts.map(a => a.provider || 'anthropic')).size > 1;
       for (const acct of ordered) {
-        cardsEl.appendChild(renderAccount(acct, isCurrent(acct), data.switchThreshold, mixed, rankOf.get(acct.name)));
+        cardsEl.appendChild(renderAccount(acct, isCurrent(acct), fleet, mixed, rankOf.get(acct.name)));
+      }
+      if (focusKey) {
+        const again = [...cardsEl.querySelectorAll('[data-key]')].find(n => n.getAttribute('data-key') === focusKey);
+        if (again) { again.focus(); if (again.classList.contains('unlink-name')) again.setSelectionRange(again.value.length, again.value.length); }
+      }
       }
       attachReauthPanel(reauthHadFocus);
       lastStatus = data;
@@ -1667,29 +1874,118 @@
     svcAction(reloadBtn, '/teamclaude/reload', d => d.added ? '✓ +' + d.added + ' account' + (d.added === 1 ? '' : 's') : '✓ config re-synced'));
 
   // ── Threshold slider ─────────────────────────────────────────
-  thr.addEventListener('input', () => { thrVal.textContent = thr.value + '%'; });
-  thr.addEventListener('change', () => {
-    clearTimeout(saveTimer);
-    const value = Number(thr.value) / 100;
-    saveTimer = setTimeout(async () => {
-      try {
-        const res = await api('/teamclaude/threshold', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', 'x-teamclaude-control': '1' },
-          // Upstream's threshold endpoint (since the 2026-10-21 sync) takes a
-          // percentage, 1–100, kept to tenths; it saves under the config lock
-          // and reloads, so the change survives a restart.
-          body: JSON.stringify({ percent: Number(thr.value) }),
-        });
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          throw new Error(err.error || 'HTTP ' + res.status);
+  for (const input of thrInputs) {
+    const valEl = document.getElementById(input.id + 'Val');
+    const bucket = input.dataset.bucket;
+    let timer = null;
+    input.addEventListener('input', () => { valEl.textContent = input.value + '%'; });
+    input.addEventListener('change', () => {
+      clearTimeout(timer);
+      timer = setTimeout(async () => {
+        try {
+          // {bucket, percent}: only this window's threshold changes; the other
+          // slider's bucket and any other override stay as they are. Saved
+          // under the config lock and reloaded, so it survives a restart.
+          const res = await api('/teamclaude/threshold', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-teamclaude-control': '1' },
+            body: JSON.stringify({ bucket, percent: Number(input.value) }),
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.error || 'HTTP ' + res.status);
+          }
+          lastThreshold[bucket] = Number(input.value);
+          await refresh();
+        } catch (err) {
+          showErr('Threshold update failed: ' + err.message);
         }
-        lastThreshold = Math.round(value * 100);
-      } catch (err) {
-        showErr('Threshold update failed: ' + err.message);
+      }, 100);
+    });
+  }
+
+  // ── Per-card panels: own limits and unlink ───────────────────
+  async function accountChange(body) {
+    const res = await api('/teamclaude/account', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-teamclaude-control': '1' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
+    return data;
+  }
+  cardsEl.addEventListener('click', async (e) => {
+    const btn = e.target.closest('button.limits-toggle, button.limit-follow, button.unlink-open, button.unlink-cancel, button.unlink-go');
+    if (!btn || btn.disabled) return;
+    const name = btn.getAttribute('data-name');
+    if (btn.classList.contains('limits-toggle')) {
+      if (openLimits.has(name)) openLimits.delete(name); else openLimits.add(name);
+      await refresh();
+      return;
+    }
+    if (btn.classList.contains('unlink-open')) {
+      Object.assign(unlinkCtl, unlinkCtl.name === name ? { name: null, typed: '', error: '' } : { name, typed: '', error: '' });
+      await refresh();
+      const input = cardsEl.querySelector('input.unlink-name');
+      if (input) input.focus();
+      return;
+    }
+    if (btn.classList.contains('unlink-cancel')) {
+      Object.assign(unlinkCtl, { name: null, typed: '', error: '' });
+      await refresh();
+      return;
+    }
+    btn.disabled = true;
+    try {
+      if (btn.classList.contains('limit-follow')) {
+        await accountChange({ name, threshold: { bucket: btn.getAttribute('data-bucket'), percent: null } });
+      } else {
+        await accountChange({ name, remove: true, confirm: unlinkCtl.typed });
+        Object.assign(unlinkCtl, { name: null, typed: '', error: '' });
+        openLimits.delete(name);
       }
-    }, 100);
+      await refresh();
+    } catch (err) {
+      if (btn.classList.contains('unlink-go')) { unlinkCtl.error = 'Unlink failed: ' + err.message; await refresh(); }
+      else showErr('Limit change failed: ' + err.message);
+      btn.disabled = false;
+    }
+  });
+  cardsEl.addEventListener('input', (e) => {
+    const t = e.target;
+    if (t.classList.contains('unlink-name')) {
+      unlinkCtl.typed = t.value;
+      unlinkCtl.error = '';
+      const go = t.parentNode.querySelector('button.unlink-go');
+      const card = t.closest('.card');
+      const live = card && card.querySelector('.unlink-panel .warnt');
+      if (go) go.disabled = t.value !== t.getAttribute('data-name') || !!live;
+    } else if (t.classList.contains('acct-limit')) {
+      cardDrag = true;
+      const val = t.parentNode.querySelector('.val');
+      if (val) val.textContent = t.value + '%';
+    }
+  });
+  cardsEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && e.target.classList.contains('unlink-name')) {
+      Object.assign(unlinkCtl, { name: null, typed: '', error: '' });
+      refresh();
+    } else if (e.key === 'Enter' && e.target.classList.contains('unlink-name')) {
+      const go = e.target.parentNode.querySelector('button.unlink-go');
+      if (go && !go.disabled) go.click();
+    }
+  });
+  cardsEl.addEventListener('change', async (e) => {
+    const t = e.target;
+    if (!t.classList.contains('acct-limit')) return;
+    cardDrag = false;
+    try {
+      await accountChange({ name: t.getAttribute('data-name'), threshold: { bucket: t.getAttribute('data-bucket'), percent: Number(t.value) } });
+    } catch (err) {
+      showErr('Limit change failed: ' + err.message);
+    }
+    await refresh();
   });
 
   // ── Settings view ────────────────────────────────────────────
@@ -2077,9 +2373,23 @@
       ]);
     }
     if (evt.type === 'threshold') {
+      const lbl = evt.bucket && evt.bucket !== 'default' ? (THRESHOLD_BUCKET_LABELS[evt.bucket] || evt.bucket) + ' ' : '';
+      const v = evt.value != null ? evt.value : evt.switchThreshold;
       return el('div', { class: 'activity-item activity-sys' }, [
         el('span', { class: 'act-dot act-dot-sys', text: '⚙' }),
-        el('span', { text: 'Threshold → ' + Math.round(evt.value * 100) + '%' }),
+        el('span', { text: 'Rotate at ' + lbl + '→ ' + (v == null ? 'default' : pctOf(v) + '%') }),
+      ]);
+    }
+    if (evt.type === 'account-threshold') {
+      return el('div', { class: 'activity-item activity-sys' }, [
+        el('span', { class: 'act-dot act-dot-sys', text: '⚙' }),
+        el('span', { text: evt.name + ' ' + (THRESHOLD_BUCKET_LABELS[evt.bucket] || evt.bucket) + ' limit ' + (evt.percent == null ? 'follows the fleet' : '→ ' + evt.percent + '%') }),
+      ]);
+    }
+    if (evt.type === 'account-removed') {
+      return el('div', { class: 'activity-item activity-sys' }, [
+        el('span', { class: 'act-dot act-dot-sys', text: '✕' }),
+        el('span', { text: 'Unlinked ' + evt.name }),
       ]);
     }
     if (evt.type === 'reauth') {

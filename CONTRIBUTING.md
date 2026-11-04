@@ -26,7 +26,7 @@ If you are unsure which side an idea falls on, open an issue describing the use 
 ## What a pull request needs
 
 - **Open an issue first for anything sizeable.** Agreeing on the shape beforehand saves a rewrite.
-- **Checks.** CI runs `npm test`, `npm run lint`, `npm run typecheck` and the strict typecheck ratchet (`npm run typecheck:strict -- --base <master sha>`): the count of strict-mode diagnostics per file may not grow. A fork's CI run waits for a maintainer to approve it.
+- **Checks.** CI runs `npm test`, `npm run lint`, `npm run typecheck` and the strict typecheck ratchet (`npm run typecheck:strict -- --base <master sha>`): the count of strict-mode diagnostics per file may not grow. A fork's CI run waits for a maintainer to approve it. `npm run gate` (`scripts/gate.sh`) runs all four locally against `origin/master` and stops at the first failure.
 - **Tests.** Follow [test/README.md](test/README.md). In short: assert the mechanism rather than the clock (no sleeps, no short deadlines — a test that fails on a loaded machine is testing the scheduler), spawn the real server only through `test-helpers/spawn-server.js`, and clean up in `finally`.
 - **No runtime dependencies.** The proxy uses Node built-ins only, on Node 20 and later.
 - **Say what you verified.** If a change rests on a provider's wire behaviour, say what you observed and against what, and say plainly what you could not check live. Never include tokens, account ids or anything else that identifies an account in an issue, a test or a log excerpt.

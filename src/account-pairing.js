@@ -88,7 +88,11 @@ export function markAccountRemoved(config, id) {
   config[REMOVED].add(id);
 }
 
-/** Take back a removal that did not happen (its save failed), so the entry is adopted again. */
+/**
+ * Take back a removal that did not happen (its save failed), so the entry is adopted again.
+ * @param {any} config
+ * @param {string} id
+ */
 export function unmarkAccountRemoved(config, id) {
   config?.[REMOVED]?.delete(id);
 }

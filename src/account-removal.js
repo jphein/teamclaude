@@ -19,6 +19,13 @@ export class RemovalError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 
+// Removals run one at a time, whole: a save writes the shared config, so one
+// removal's save would otherwise write another's pending omission, and that
+// one's later failure could not take it back; nor could two rollbacks put
+// their entries back in the right order (xreview, 2026-11-04).
+/** @type {Promise<unknown>} */
+let queue = Promise.resolve();
+
 /**
  * @param {{
  *   accountManager: any,
@@ -29,15 +36,10 @@ export class RemovalError extends Error {
  * }} args  `persist` writes the removal to the config file. The entry is
  *   already out of `config.accounts` and recorded as removed when it runs, so a
  *   merge-save omits it; a caller may also filter the file by `id` directly.
+ *   `restore` runs after a failed save has been rolled back: it puts the entry
+ *   back in the file if another writer saved the omission meanwhile.
  * @returns {Promise<{ name: string, id: string, account: any }>}
  */
-// Removals run one at a time, whole: a save writes the shared config, so one
-// removal's save would otherwise write another's pending omission, and that
-// one's later failure could not take it back; nor could two rollbacks put
-// their entries back in the right order (xreview, 2026-11-04).
-/** @type {Promise<unknown>} */
-let queue = Promise.resolve();
-
 export function removeAccountGuarded({ accountManager, config, index, persist, restore }) {
   // The account by identity, now: a removal queued behind another would find
   // the list renumbered, and an index would name a neighbour.

@@ -261,7 +261,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // An account a removal is saving (account-removal.js) is that removal's to
     // drop, after its file write lands; dropped here, a failed save could not
     // put it back.
-    if (claimed.has(i) || pendingAdds.has(gone.id) || gone._removing) continue;
+    if (claimed.has(i) || pendingAdds.has(gone.id) || /** @type {any} */ (gone)._removing) continue;
     const cfgIdx = configIndexFor(memConfig.accounts, accountManager.accounts, i);
     console.log(`[TeamClaude] Removed account "${safeLine(gone.name, 64)}": its config entry is gone from disk`);
     accountManager.removeAccount(i);

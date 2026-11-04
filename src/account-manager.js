@@ -4919,7 +4919,8 @@ export class AccountManager {
     // it is gone: a reload reading its row before the save lands, or an enable
     // from any surface, must not let a request in.
     // A disable asked for meanwhile is kept for the removal's rollback.
-    if (account._removing) { if (disabled) account._disableAsked = true; return; }
+    const pending = /** @type {any} */ (account);
+    if (pending._removing) { if (disabled) pending._disableAsked = true; return; }
     account.disabled = disabled;
     if (!disabled && account.status === 'error') {
       account.status = 'active';

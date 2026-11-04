@@ -16,7 +16,8 @@
     "test": "node scripts/run-tests.mjs",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json",
-    "typecheck:strict": "node scripts/typecheck-strict.mjs"
+    "typecheck:strict": "node scripts/typecheck-strict.mjs",
+    "gate": "bash scripts/gate.sh"
   },
   "keywords": [
     "claude",

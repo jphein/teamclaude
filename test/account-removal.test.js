@@ -114,3 +114,64 @@ test('a reload during a save that then fails leaves the account live and in rota
   const { added, removed } = await syncAccountsFromDisk({ accounts: disk.map(e => ({ ...e })) }, config, am);
   assert.deepEqual({ added, removed }, { added: 0, removed: 0 });
 });
+
+function three() {
+  const disk = [entry('a', 'a@example.com'), entry('b', 'b@example.com'), entry('c', 'c@example.com')];
+  const config = { accounts: disk.map(e => ({ ...e })) };
+  const am = new AccountManager(disk.map(e => ({ ...e })), 0.98);
+  return { config, am };
+}
+
+test('removals run one at a time: one save never writes another removal\'s omission', async () => {
+  const { config, am } = three();
+  let disk = config.accounts.map(a => a.id);
+  // A merge-save: whatever the in-memory config lists is what the file gets.
+  const mergeSave = () => { disk = config.accounts.map(a => a.id); };
+  let releaseA;
+  const heldA = new Promise(r => { releaseA = r; });
+  const order = [];
+  const a = removeAccountGuarded({ accountManager: am, config, index: 0, persist: async () => { order.push('A'); await heldA; mergeSave(); } });
+  const b = removeAccountGuarded({ accountManager: am, config, index: 1, persist: async () => { order.push('B'); throw new Error('disk full'); } });
+  await new Promise(r => setImmediate(r));
+  assert.deepEqual(order, ['A'], 'B waits for A to finish');
+  assert.equal(am.accounts[1]._removing, undefined, 'B has not started');
+  releaseA();
+  await a;
+  await assert.rejects(b, err => err.status === 500);
+  assert.deepEqual(disk, ['b', 'c'], 'A\'s save did not drop B');
+  assert.deepEqual(config.accounts.map(x => x.id), ['b', 'c']);
+  assert.deepEqual(am.accounts.map(x => x.name), ['b@example.com', 'c@example.com']);
+});
+
+test('two removals that both fail leave the config in its original order', async () => {
+  const { config, am } = three();
+  const fail = async () => { throw new Error('disk full'); };
+  const results = await Promise.allSettled([
+    removeAccountGuarded({ accountManager: am, config, index: 0, persist: fail }),
+    removeAccountGuarded({ accountManager: am, config, index: 1, persist: fail }),
+  ]);
+  assert.deepEqual(results.map(r => r.status), ['rejected', 'rejected']);
+  assert.deepEqual(config.accounts.map(x => x.id), ['a', 'b', 'c']);
+});
+
+test('a disable asked for during the save survives a failed removal', async () => {
+  const { config, am } = three();
+  let fail;
+  const held = new Promise((_, reject) => { fail = reject; });
+  const removal = removeAccountGuarded({ accountManager: am, config, index: 0, persist: () => held });
+  await new Promise(r => setImmediate(r));
+  am.setDisabled(0, true); // the operator disables it meanwhile
+  fail(new Error('disk full'));
+  await assert.rejects(removal, err => err.status === 500);
+  assert.equal(am.accounts[0].disabled, true, 'the disable stands');
+  assert.equal('_disableAsked' in am.accounts[0], false);
+});
+
+test('a second removal of the same account, queued behind the first, is a 404 not a neighbour', async () => {
+  const { config, am } = three();
+  const first = removeAccountGuarded({ accountManager: am, config, index: 0, persist: async () => {} });
+  const second = removeAccountGuarded({ accountManager: am, config, index: 0, persist: async () => {} });
+  await first;
+  await assert.rejects(second, err => err.status === 404);
+  assert.deepEqual(am.accounts.map(x => x.name), ['b@example.com', 'c@example.com']);
+});

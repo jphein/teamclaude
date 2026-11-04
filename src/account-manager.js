@@ -4918,7 +4918,8 @@ export class AccountManager {
     // An account being removed (account-removal.js) stays out of rotation until
     // it is gone: a reload reading its row before the save lands, or an enable
     // from any surface, must not let a request in.
-    if (account._removing && !disabled) return;
+    // A disable asked for meanwhile is kept for the removal's rollback.
+    if (account._removing) { if (disabled) account._disableAsked = true; return; }
     account.disabled = disabled;
     if (!disabled && account.status === 'error') {
       account.status = 'active';

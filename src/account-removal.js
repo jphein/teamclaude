@@ -73,17 +73,19 @@ async function removeOne({ accountManager, config, account, persist, restore }) 
   } catch (err) {
     accounts.splice(Math.min(entryIndex, accounts.length), 0, entry);
     unmarkAccountRemoved(config, id);
+    // Another writer (a token refresh, a TUI edit) may have saved the staged
+    // omission before this save failed (xreview round 2). Put the row back if
+    // the file lacks it; a writer just succeeded, so the file is writable.
+    // The account stays `_removing`, out of rotation, until this is done, so a
+    // reload reading the file meanwhile cannot drop it (round 3).
+    if (restore) {
+      try { await restore(entry, entryIndex); }
+      catch (again) { console.error(`[TeamClaude] Removal of "${name}" failed, and its config entry may be missing from the file: do NOT reload (that would drop it); save any setting once the file is writable, which writes it back:`, /** @type {Error} */ (again).message); }
+    }
     account._removing = false;
     // A disable asked for while the save ran (setDisabled) stands.
     account.disabled = wasDisabled || account._disableAsked;
     delete account._disableAsked;
-    // Another writer (a token refresh, a TUI edit) may have saved the staged
-    // omission before this save failed (xreview round 2). Put the row back if
-    // the file lacks it; a writer just succeeded, so the file is writable.
-    if (restore) {
-      try { await restore(entry, entryIndex); }
-      catch (again) { console.error(`[TeamClaude] Removal of "${name}" failed and its config entry could not be re-checked; save or reload once the file is writable:`, /** @type {Error} */ (again).message); }
-    }
     const e = new RemovalError(500, `${name}: the config file could not be saved, so nothing was removed`);
     /** @type {any} */ (e).cause = err;
     throw e;

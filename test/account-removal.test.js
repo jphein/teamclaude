@@ -191,3 +191,24 @@ test('another writer saving the omission before the removal\'s own save fails: t
   assert.deepEqual(disk, ['a', 'b', 'c'], 'and the restore put it back');
   assert.deepEqual(am.accounts.map(x => x.name), ['a@example.com', 'b@example.com', 'c@example.com']);
 });
+
+test('a reload while the restore runs does not drop the account', async () => {
+  const { config, am } = three();
+  let releaseRestore;
+  const restoreHeld = new Promise(r => { releaseRestore = r; });
+  let restoring;
+  const reached = new Promise(r => { restoring = r; });
+  const removal = removeAccountGuarded({
+    accountManager: am, config, index: 1,
+    persist: async () => { throw new Error('disk full'); },
+    restore: async () => { restoring(); await restoreHeld; },
+  });
+  await reached;
+  // The file another writer left behind: the row is missing.
+  await syncAccountsFromDisk({ accounts: [entry('a', 'a@example.com'), entry('c', 'c@example.com')] }, config, am);
+  assert.deepEqual(am.accounts.map(x => x.name), ['a@example.com', 'b@example.com', 'c@example.com'], 'not dropped');
+  assert.equal(am.accounts[1].disabled, true, 'still out of rotation while the restore runs');
+  releaseRestore();
+  await assert.rejects(removal, err => err.status === 500);
+  assert.equal(am.accounts[1].disabled, false);
+});

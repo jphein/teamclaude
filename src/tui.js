@@ -8,7 +8,8 @@ import {
   canUpsertOAuthAccount,
   oauthIdentityFields,
 } from './identity.js';
-import { configIndexFor, managerAccountFor, markAccountRemoved, markAccountAdded } from './account-pairing.js';
+import { configIndexFor, managerAccountFor, markAccountAdded } from './account-pairing.js';
+import { removeAccountGuarded, RemovalError } from './account-removal.js';
 import { PROVIDERS, providerOf, isSubscriptionAccount, upstreamFor } from './provider.js';
 import { mintAccountId } from './account-id.js';
 import { formatPercent, heldResetCredits, showSessionRow, showWeeklyRow } from './status-renderer.js';
@@ -2309,23 +2310,19 @@ export class TUI {
   async _doRemove(idx) {
     if (idx < 0 || idx >= this.am.accounts.length) return;
     const name = this.am.accounts[idx].name;
-    // Resolved before removeAccount, which splices this list and renumbers it.
-    // The selected row is a manager index; applying it to the config list
-    // deleted whichever entry sat at that position instead — the credential-less
-    // one resolveAccounts dropped, or a neighbour, either of which leaves the
-    // fleet running an account whose entry is gone.
-    const cfgIdx = configIndexFor(this.config.accounts, this.am.accounts, idx);
-    this.am.removeAccount(idx);
-    if (cfgIdx >= 0) {
-      // Record the id before the row goes: the save adopts rows that are on disk
-      // and not in memory (an account added by another process since the last
-      // reload), and removal is itself a save — so without this the entry being
-      // deleted would be read back off disk and written straight out again.
-      markAccountRemoved(this.config, this.config.accounts[cfgIdx]?.id);
-      this.config.accounts.splice(cfgIdx, 1);
+    // The shared removal (account-removal.js): the config row is found by id
+    // (a manager index is not a config index), recorded as removed before the
+    // save so the save cannot adopt it back off disk, and the file is written
+    // before the account leaves the fleet. Refused while requests still run on
+    // it; a save that fails leaves it where it was.
+    try {
+      await removeAccountGuarded({ accountManager: this.am, config: this.config, index: idx, persist: () => this.saveConfig(this.config) });
+    } catch (err) {
+      if (!(err instanceof RemovalError)) throw err;
+      this._addLog(`Not removed: ${err.message}`);
+      return;
     }
     if (this.selIdx >= this.am.accounts.length) this.selIdx = Math.max(0, this.am.accounts.length - 1);
-    await this.saveConfig(this.config);
     this._addLog(`Removed account "${name}"`);
   }
 

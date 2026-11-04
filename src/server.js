@@ -40,7 +40,7 @@ import { resolveLogSource, resolveRestartMethod, startRestartCommand, tailFile, 
 import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
-import { configIndexFor, markAccountRemoved } from './account-pairing.js';
+import { removeAccountGuarded, RemovalError } from './account-removal.js';
 import { ConfigOpError, QUOTA_BUCKETS, setAccountThreshold, setBucketThresholds, thresholdRatio, thresholdTable } from './config-ops.js';
 import { envVar, legacyControlUrl } from './brand.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
@@ -603,12 +603,6 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // Activity feed: a ring buffer of recent lifecycle/control events plus the set
   // of SSE subscribers. Lives here (not in the TUI) so the browser dashboard
   // shows live traffic even when the process is a TTY-less daemon.
-  // Accounts an unlink is removing (POST /teamclaude/account {remove}), by
-  // object so a rename meanwhile cannot slip past it: while
-  // its file write runs, no other change to the account is taken, so a
-  // concurrent enable cannot put it back in rotation (xreview round 2).
-  /** @type {WeakSet<object>} */
-  const unlinking = new WeakSet();
   const activityBuf = [];
   const activityClients = new Set();
   const reqStartTimes = new Map();
@@ -996,7 +990,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         if (asked[0] === 'remove' && /** @type {any} */ (req).tcSso) { json(res, 403, { error: 'unlinking an account needs the proxy key (use the desktop launcher)' }); return; }
         const idx = accountManager.accounts.findIndex(a => a.name === name);
         if (typeof name !== 'string' || idx < 0) { json(res, 404, { error: `account "${name}" not found` }); return; }
-        if (unlinking.has(accountManager.accounts[idx])) { json(res, 409, { error: `"${name}" is being unlinked` }); return; }
+        if (accountManager.accounts[idx]._removing) { json(res, 409, { error: `"${name}" is being unlinked` }); return; }
 
         if (asked[0] === 'threshold') {
           const t = body.threshold;
@@ -1030,54 +1024,24 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
 
         if (asked[0] === 'remove') {
           if (body.remove !== true || body.confirm !== name) { json(res, 400, { error: 'unlinking needs remove: true and confirm set to the account name' }); return; }
-          const acct = accountManager.accounts[idx];
-          // Requests still running on it would lose their account mid-stream;
-          // the operator retries once they finish (the card shows "N live").
-          const live = Math.max(acct.inFlight || 0, acct.activityOpen || 0);
-          if (live > 0) { json(res, 409, { error: `"${name}" has ${live} request${live === 1 ? '' : 's'} in flight; try again when they finish` }); return; }
-          // Only an account paired with its config entry is removed: without
-          // the entry's id the file's row could not be found, and a removal
-          // that left it there would come back on the next restart.
-          const entryIndex = configIndexFor(config.accounts || [], accountManager.accounts, idx);
-          if (entryIndex < 0) { json(res, 409, { error: `"${name}" is not paired with an entry in the config file; reload and try again` }); return; }
-          const entryId = config.accounts[entryIndex].id;
-          // The file first, the running fleet after (xreview, 2026-11-01): a
-          // failed write then changes nothing. While the write is pending the
-          // account takes no new requests, so the in-flight check above still
-          // holds when it leaves the fleet.
-          const wasDisabled = acct.disabled;
-          acct.disabled = true;
-          unlinking.add(acct);
+          // The shared removal (account-removal.js): refused while requests run
+          // or the entry is unpaired; the file first, the live fleet after.
           let found = false;
           try {
-            await atomicConfigUpdate((/** @type {Record<string, any>} */ disk) => {
-              const before = Array.isArray(disk.accounts) ? disk.accounts.length : 0;
-              disk.accounts = (disk.accounts || []).filter((/** @type {any} */ a) => a?.id !== entryId);
-              found = disk.accounts.length < before;
+            await removeAccountGuarded({
+              accountManager, config, index: idx,
+              persist: (entryId) => atomicConfigUpdate((/** @type {Record<string, any>} */ disk) => {
+                const before = Array.isArray(disk.accounts) ? disk.accounts.length : 0;
+                disk.accounts = (disk.accounts || []).filter((/** @type {any} */ a) => a?.id !== entryId);
+                found = disk.accounts.length < before;
+              }),
             });
           } catch (err) {
-            unlinking.delete(acct);
-            // Only our own pause is undone: a reload that changed the flag meanwhile wins.
-            if (acct.disabled === true) acct.disabled = wasDisabled;
-            console.error(`[TeamClaude] Saving the removal of "${name}" failed:`, /** @type {Error} */ (err).message);
-            json(res, 500, { error: `${name}: the config file could not be saved, so nothing was removed; see the proxy log` });
+            const e = /** @type {any} */ (err);
+            if (!(err instanceof RemovalError)) throw err;
+            if (e.status === 500) console.error(`[TeamClaude] Saving the removal of "${name}" failed:`, e.cause?.message);
+            json(res, e.status, { error: e.status === 500 ? e.message + '; see the proxy log' : e.message });
             return;
-          }
-          unlinking.delete(acct);
-          // A reload during the write reads the row still on disk and may have
-          // re-enabled it; it leaves the fleet now either way.
-          acct.disabled = true;
-          const stillLive = Math.max(acct.inFlight || 0, acct.activityOpen || 0);
-          if (stillLive > 0) console.warn(`[TeamClaude] Unlinking "${name}" with ${stillLive} request(s) admitted during the save`);
-          // Re-found by identity: another request may have reordered the list
-          // while the write was pending.
-          const now = accountManager.accounts.indexOf(acct);
-          if (now >= 0) accountManager.removeAccount(now);
-          const cfgNow = (config.accounts || []).findIndex((/** @type {any} */ a) => a?.id === entryId);
-          if (cfgNow >= 0) {
-            // Marked as well, so a later merge-save cannot adopt a stale row.
-            markAccountRemoved(config, entryId);
-            config.accounts.splice(cfgNow, 1);
           }
           console.log(`[TeamClaude] Account "${name}" unlinked ${viaWhom(req)}`);
           emitActivity({ type: 'account-removed', name });

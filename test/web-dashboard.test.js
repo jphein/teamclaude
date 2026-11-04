@@ -137,3 +137,12 @@ test('GET /ui carries a 5h and a 7d fleet slider, per-card limits and an in-card
     assert.doesNotMatch(html, /window\.confirm|[^.\w]confirm\(/);
   });
 });
+
+test('GET /ui dims the threshold sliders for a caller that may not change them, and says why', async () => {
+  await withProxy({}, async (port) => {
+    const html = await (await fetch(`http://127.0.0.1:${port}/ui`)).text();
+    assert.match(html, /\.threshold-row input\[type=range\]:disabled,\s*\.limit-row input\[type=range\]:disabled \{ opacity: 0\.4;/);
+    assert.match(html, /thrGroup\.classList\.toggle\('readonly', !canEditThreshold\)/);
+    assert.match(html, /needs the proxy key; this key can only view it/);
+  });
+});

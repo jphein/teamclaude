@@ -101,6 +101,11 @@
     font-size: 0.875rem;
   }
   .threshold-rows .thr-title { color: var(--text-dim); }
+  /* A caller the server would refuse (a client key) sees the numbers, not live
+     controls: dimmed, and the group's title says why. */
+  .threshold-row input[type=range]:disabled,
+  .limit-row input[type=range]:disabled { opacity: 0.4; cursor: not-allowed; filter: grayscale(1); }
+  .threshold-rows.readonly .val { color: var(--text-dim); font-weight: 400; }
   .threshold-row label { color: var(--text-dim); min-width: 1.4rem; }
   .threshold-row input[type=range] {
     width: clamp(120px, 14vw, 180px);
@@ -1172,7 +1177,7 @@
           title: 'Drop the account-wide limit; buckets without their own follow the fleet', text: 'Clear' }),
       ]));
     }
-    return el('div', { class: 'card-panel limits-panel' }, [
+    return el('div', { class: 'card-panel limits-panel', title: canEditAccounts ? null : 'Changing an account\'s limits needs the proxy key; this key can only view them' }, [
       el('div', { class: 'panel-msg', text: 'Rotation leaves ' + acct.name + ' at these levels. Saved to the config file and applied at once.' }),
       ...rows,
     ]);
@@ -1486,6 +1491,10 @@
       // removal it could not undo (the server refuses it as well).
       canUnlink = canEditAccounts && !(typeof caller.sso === 'string' && caller.sso);
       const fleet = { switchThreshold: data.switchThreshold, switchThresholds: data.switchThresholds || null };
+      const thrGroup = thrInputs[0].closest('.threshold-rows');
+      thrGroup.classList.toggle('readonly', !canEditThreshold);
+      if (canEditThreshold) thrGroup.removeAttribute('title');
+      else thrGroup.setAttribute('title', 'Changing the fleet threshold needs the proxy key; this key can only view it');
       for (const input of thrInputs) {
         const b = input.dataset.bucket;
         const serverPct = Math.round(fleetThresholdFor(fleet, b) * 100);

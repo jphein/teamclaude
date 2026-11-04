@@ -2316,7 +2316,7 @@ export class TUI {
     // before the account leaves the fleet. Refused while requests still run on
     // it; a save that fails leaves it where it was.
     try {
-      await removeAccountGuarded({ accountManager: this.am, config: this.config, index: idx, persist: () => this.saveConfig(this.config) });
+      await removeAccountGuarded({ accountManager: this.am, config: this.config, index: idx, persist: () => this.saveConfig(this.config), restore: () => this.saveConfig(this.config) });
     } catch (err) {
       if (!(err instanceof RemovalError)) throw err;
       this._addLog(`Not removed: ${err.message}`);

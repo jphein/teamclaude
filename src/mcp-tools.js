@@ -362,6 +362,8 @@ const WRITE_TOOLS = [
         const { name } = await removeAccountGuarded({
           accountManager: ctx.accountManager, config: ctx.config, index,
           persist: () => ctx.hooks.persistAccounts(),
+          // The entry is back in the config by then, so a merge-save writes it back.
+          restore: () => ctx.hooks.persistAccounts(),
         });
         return { account: name, removed: true, persisted: true };
       } catch (err) {

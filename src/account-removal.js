@@ -25,6 +25,7 @@ export class RemovalError extends Error {
  *   config: { accounts?: any[] },
  *   index: number,
  *   persist: (id: string) => Promise<unknown>,
+ *   restore?: (entry: any, at: number) => Promise<unknown>,
  * }} args  `persist` writes the removal to the config file. The entry is
  *   already out of `config.accounts` and recorded as removed when it runs, so a
  *   merge-save omits it; a caller may also filter the file by `id` directly.
@@ -37,18 +38,18 @@ export class RemovalError extends Error {
 /** @type {Promise<unknown>} */
 let queue = Promise.resolve();
 
-export function removeAccountGuarded({ accountManager, config, index, persist }) {
+export function removeAccountGuarded({ accountManager, config, index, persist, restore }) {
   // The account by identity, now: a removal queued behind another would find
   // the list renumbered, and an index would name a neighbour.
   const account = accountManager.accounts[index];
   if (!account) return Promise.reject(new RemovalError(404, 'no such account'));
-  const run = queue.then(() => removeOne({ accountManager, config, account, persist }));
+  const run = queue.then(() => removeOne({ accountManager, config, account, persist, restore }));
   queue = run.catch(() => {});
   return run;
 }
 
-/** @param {{ accountManager: any, config: { accounts?: any[] }, account: any, persist: (id: string) => Promise<unknown> }} args */
-async function removeOne({ accountManager, config, account, persist }) {
+/** @param {{ accountManager: any, config: { accounts?: any[] }, account: any, persist: (id: string) => Promise<unknown>, restore?: (entry: any, at: number) => Promise<unknown> }} args */
+async function removeOne({ accountManager, config, account, persist, restore }) {
   const name = account.name;
   const index = accountManager.accounts.indexOf(account);
   if (index < 0) throw new RemovalError(404, `"${name}" is no longer in the fleet`);
@@ -76,6 +77,13 @@ async function removeOne({ accountManager, config, account, persist }) {
     // A disable asked for while the save ran (setDisabled) stands.
     account.disabled = wasDisabled || account._disableAsked;
     delete account._disableAsked;
+    // Another writer (a token refresh, a TUI edit) may have saved the staged
+    // omission before this save failed (xreview round 2). Put the row back if
+    // the file lacks it; a writer just succeeded, so the file is writable.
+    if (restore) {
+      try { await restore(entry, entryIndex); }
+      catch (again) { console.error(`[TeamClaude] Removal of "${name}" failed and its config entry could not be re-checked; save or reload once the file is writable:`, /** @type {Error} */ (again).message); }
+    }
     const e = new RemovalError(500, `${name}: the config file could not be saved, so nothing was removed`);
     /** @type {any} */ (e).cause = err;
     throw e;

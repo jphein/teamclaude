@@ -1035,6 +1035,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
                 disk.accounts = (disk.accounts || []).filter((/** @type {any} */ a) => a?.id !== entryId);
                 found = disk.accounts.length < before;
               }),
+              restore: (entry, at) => atomicConfigUpdate((/** @type {Record<string, any>} */ disk) => {
+                disk.accounts = Array.isArray(disk.accounts) ? disk.accounts : [];
+                if (!disk.accounts.some((/** @type {any} */ a) => a?.id === entry.id)) disk.accounts.splice(Math.min(at, disk.accounts.length), 0, entry);
+              }),
             });
           } catch (err) {
             const e = /** @type {any} */ (err);

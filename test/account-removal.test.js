@@ -175,3 +175,19 @@ test('a second removal of the same account, queued behind the first, is a 404 no
   await assert.rejects(second, err => err.status === 404);
   assert.deepEqual(am.accounts.map(x => x.name), ['b@example.com', 'c@example.com']);
 });
+
+test('another writer saving the omission before the removal\'s own save fails: the restore puts the row back', async () => {
+  const { config, am } = three();
+  let disk = config.accounts.map(a => a.id);
+  const mergeSave = async () => { disk = config.accounts.map(a => a.id); };
+  let fail;
+  const held = new Promise((_, reject) => { fail = reject; });
+  const removal = removeAccountGuarded({ accountManager: am, config, index: 1, persist: () => held, restore: mergeSave });
+  await new Promise(r => setImmediate(r));
+  await mergeSave(); // a token refresh lands while the removal's save is pending
+  assert.deepEqual(disk, ['a', 'c'], 'the omission reached the file');
+  fail(new Error('disk full'));
+  await assert.rejects(removal, err => err.status === 500);
+  assert.deepEqual(disk, ['a', 'b', 'c'], 'and the restore put it back');
+  assert.deepEqual(am.accounts.map(x => x.name), ['a@example.com', 'b@example.com', 'c@example.com']);
+});

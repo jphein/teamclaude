@@ -263,11 +263,29 @@ test('an account change that could not be saved says so, and says the fleet alre
   // The running fleet is changed first and the file second; when the second
   // half fails the caller must hear both halves, or a restart will surprise them.
   const { tools, am } = await fixture({ hooks: { persistAccounts: async () => { throw new Error('config lock busy at /home/op/.config'); } } });
-  const text = await refused(tools, 'remove_account', { account: 'bob@example.com', org: 'Acme' });
+  const text = await refused(tools, 'set_account_enabled', { account: 'alice@example.com', enabled: false });
   assert.match(text, /changed in the running server/);
   assert.match(text, /could not be saved/);
   assert.doesNotMatch(text, /home\/op/);
-  assert.deepEqual(am.accounts.map(a => a.name), ['alice@example.com', 'bob@example.com (Globex)']);
+  assert.equal(am.accounts[0].disabled, true);
+});
+
+test('a removal that could not be saved removes nothing (the file goes first)', async () => {
+  const { tools, am, config } = await fixture({ hooks: { persistAccounts: async () => { throw new Error('config lock busy at /home/op/.config'); } } });
+  const text = await refused(tools, 'remove_account', { account: 'bob@example.com', org: 'Acme' });
+  assert.match(text, /nothing was removed/);
+  assert.doesNotMatch(text, /home\/op/);
+  assert.equal(am.accounts.length, 3, 'still in the fleet');
+  assert.equal(config.accounts.length, 3, 'and in the config');
+  assert.equal(am.accounts[1].disabled, false, 'and back in rotation');
+});
+
+test('remove_account refuses an account with requests in flight', async () => {
+  const { tools, am, calls } = await fixture();
+  am.accounts[0].inFlight = 1;
+  assert.match(await refused(tools, 'remove_account', { account: 'alice@example.com' }), /in flight/);
+  assert.equal(am.accounts.length, 3);
+  assert.deepEqual(calls, []);
 });
 
 test('set_threshold writes the file and reloads; a bad value writes nothing', async () => {

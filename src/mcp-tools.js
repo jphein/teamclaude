@@ -1,5 +1,6 @@
 import { distributionMode } from './account-manager.js';
-import { configIndexFor, markAccountRemoved } from './account-pairing.js';
+import { configIndexFor } from './account-pairing.js';
+import { removeAccountGuarded, RemovalError } from './account-removal.js';
 import { atomicConfigUpdate } from './config.js';
 import {
   ConfigOpError,
@@ -349,15 +350,28 @@ const WRITE_TOOLS = [
     properties: ACCOUNT_ARGS,
     required: ['account'],
     write: true,
-    run: (args, ctx) => changeAccount(ctx, args, (index, entry, entryIndex) => {
-      ctx.accountManager.removeAccount(index);
-      if (entry) {
-        // The save adopts rows on disk that are not in memory, so the entry has
-        // to be marked before it goes or the save would read it back in.
-        markAccountRemoved(ctx.config, entry.id);
-        ctx.config.accounts.splice(entryIndex, 1);
+    // The shared removal (account-removal.js): refused while requests run or
+    // the entry is unpaired; the file first, the running fleet after, so a
+    // failed save leaves the account where it was.
+    run: async (args, ctx) => {
+      if (!ctx.hooks.persistAccounts) {
+        throw new ToolFailure('this server cannot save account changes; edit the config file and reload_config instead');
       }
-    }).then(outcome => ({ ...outcome, removed: true })),
+      const index = accountIndexFor(ctx, args);
+      try {
+        const { name } = await removeAccountGuarded({
+          accountManager: ctx.accountManager, config: ctx.config, index,
+          persist: () => ctx.hooks.persistAccounts(),
+          // The entry is back in the config by then, so a merge-save writes it back.
+          restore: () => ctx.hooks.persistAccounts(),
+        });
+        return { account: name, removed: true, persisted: true };
+      } catch (err) {
+        if (!(err instanceof RemovalError)) throw err;
+        if (err.status === 500) console.error('[TeamClaude] MCP: saving an account removal failed:', /** @type {any} */ (err).cause?.message);
+        throw new ToolFailure(err.message);
+      }
+    },
   },
   {
     name: 'set_threshold',

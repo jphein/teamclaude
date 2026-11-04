@@ -4915,6 +4915,12 @@ export class AccountManager {
   setDisabled(accountIndex, disabled) {
     const account = this.accounts[accountIndex];
     if (!account) return;
+    // An account being removed (account-removal.js) stays out of rotation until
+    // it is gone: a reload reading its row before the save lands, or an enable
+    // from any surface, must not let a request in.
+    // A disable asked for meanwhile is kept for the removal's rollback.
+    const pending = /** @type {any} */ (account);
+    if (pending._removing) { if (disabled) pending._disableAsked = true; return; }
     account.disabled = disabled;
     if (!disabled && account.status === 'error') {
       account.status = 'active';

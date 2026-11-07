@@ -5849,6 +5849,25 @@ export class AccountManager {
     return { live_seats: live, next_reset: Number.isFinite(next) ? new Date(next).toISOString() : null };
   }
 
+  /**
+   * Whether `account`'s week is spent as far as rotation is concerned: the
+   * weekly window that governs a default request is at the switch threshold, or
+   * an operator cap other than the 5h one (weekly, family or money) is reached.
+   * Keep-warm asks this so it never warms a seat rotation will not use: a warm-up
+   * on a spent week only collects a 429 and a one-hour hold (2026-11-07 11:00,
+   * three of them on jp, claude4 and claude6).
+   * @param {Record<string, any>} account
+   */
+  weekBarred(account) {
+    if (!account) return false;
+    this._clearExpiredQuotas(account);
+    const cap = this.capExceeded(account, null);
+    if (cap && cap !== 'unified5h') return true;
+    const weekly = this._governingWindow(account, null);
+    return weekly.utilization != null
+      && weekly.utilization >= this.thresholdFor(this._weeklyBucketFor(null), account);
+  }
+
   /** Return per-account quota and fleet aggregates for status clients. */
   getQuotaSummary() {
     this.refreshExpiredQuotas();

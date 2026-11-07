@@ -195,6 +195,7 @@ export class Warmer {
       if (account.disabled) why = 'disabled';
       else if (account.status === 'throttled') why = 'throttled';
       else if (account.status === 'error' || account.status === 'exhausted') why = account.status;
+      else if (/** @type {any} */ (this.am).weekBarred?.(account)) why = 'weekly limit reached';
       else {
         const reset = Number(account.quota?.unified5hReset);
         why = Number.isFinite(reset) && reset > now ? `window running until ${new Date(reset).toLocaleTimeString()}` : 'not eligible';
@@ -300,6 +301,9 @@ export class Warmer {
     if (!warmApplicable(account) || !account.credential) return false;
     if (account.disabled) return false;
     if (account.status === 'error' || account.status === 'exhausted' || account.status === 'throttled') return false;
+    // A seat whose week is spent (threshold or cap) is one rotation will not
+    // send to, so warming it only buys a 429 and an hour's hold.
+    if (/** @type {any} */ (this.am).weekBarred?.(account)) return false;
     return true;
   }
 

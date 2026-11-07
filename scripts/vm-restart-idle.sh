@@ -25,7 +25,7 @@ idle() {
 const fs = require('fs');
 const key = JSON.parse(fs.readFileSync(process.env.HOME + '/.config/teamclaude.json', 'utf8')).proxy.apiKey;
 const port = Number(process.env.TC_STATUS_PORT || 3456);
-fetch(`http://127.0.0.1:${port}/teamclaude/status`, { headers: { 'x-api-key': key }, signal: AbortSignal.timeout(5000) })
+fetch(`http://127.0.0.1:${port}/teamclaude/status`, { headers: { 'x-api-key': key }, redirect: 'error', signal: AbortSignal.timeout(5000) })
   .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
   .then(d => {
     const accounts = d && d.accounts;
@@ -40,18 +40,18 @@ fetch(`http://127.0.0.1:${port}/teamclaude/status`, { headers: { 'x-api-key': ke
   .catch(() => process.exit(2));
 JS
 }
-i=0
-while [ "$i" -lt "$WAIT" ]; do
+# A wall-clock deadline, not a loop count: one check can take up to 5 s.
+deadline=$(( $(date +%s) + WAIT ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
   # Two zero readings a second apart, restart right after the second. This
   # narrows the check-then-act window; it cannot close it, because shutdown
   # closes connections rather than draining them (follow-up issue: drain on
   # SIGTERM). A request that lands in that gap is cut, as on any restart.
-  if idle && sleep 1 && idle; then
+  if idle && sleep 1 && idle && [ "$(date +%s)" -lt "$deadline" ]; then
     sudo rc-service teamclaude restart >/dev/null 2>&1
-    echo "restarted at 0 in-flight after ${i}s"
+    echo "restarted at 0 in-flight"
     exit 0
   fi
-  i=$((i + 1))
   sleep 1
 done
 echo "never at 0 in-flight within ${WAIT}s; not restarted" >&2

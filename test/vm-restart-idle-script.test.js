@@ -70,3 +70,34 @@ test('idle check: anything malformed or failed is not idle', async () => {
     assert.equal((await idleExit(/** @type {number} */ (status), /** @type {string} */ (body))).code, 2, why);
   }
 });
+
+test('idle check: a redirect is refused and the key never follows it', async () => {
+  let elsewhere = 0;
+  const other = createServer((req, res) => { elsewhere++; res.writeHead(200); res.end(JSON.stringify({ accounts: [{ inFlight: 0 }] })); });
+  await new Promise(r => other.listen(0, '127.0.0.1', r));
+  const to = `http://127.0.0.1:${/** @type {any} */ (other.address()).port}/teamclaude/status`;
+  try {
+    const home = mkdtempSync(join(tmpdir(), 'tc-idle-'));
+    mkdirSync(join(home, '.config'));
+    writeFileSync(join(home, '.config', 'teamclaude.json'), JSON.stringify({ proxy: { apiKey: 'tc-fake' } }));
+    const redirector = createServer((req, res) => { res.writeHead(302, { location: to }); res.end(); });
+    await new Promise(r => redirector.listen(0, '127.0.0.1', r));
+    const port = /** @type {any} */ (redirector.address()).port;
+    const code = await new Promise(resolve => {
+      const child = spawn(process.execPath, ['-'], { env: { HOME: home, TC_STATUS_PORT: String(port), PATH: process.env.PATH ?? '' }, stdio: ['pipe', 'ignore', 'ignore'] });
+      child.on('exit', resolve);
+      child.stdin.end(snippet);
+    });
+    redirector.close();
+    rmSync(home, { recursive: true, force: true });
+    assert.equal(code, 2);
+    assert.equal(elsewhere, 0, 'the redirect target was never asked');
+  } finally {
+    other.close();
+  }
+});
+
+test('the wait is a wall-clock deadline, re-checked before the restart', () => {
+  assert.match(code, /deadline=\$\(\( \$\(date \+%s\) \+ WAIT \)\)/);
+  assert.match(code, /idle && sleep 1 && idle && \[ "\$\(date \+%s\)" -lt "\$deadline" \]/);
+});

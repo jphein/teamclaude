@@ -5820,10 +5820,10 @@ export class AccountManager {
     if (account.status === 'throttled' && account.rateLimitedUntil > now) ends.push(account.rateLimitedUntil);
     /** @param {string} bucket @param {number|null|undefined} used @param {number|null|undefined} reset */
     const bar = (bucket, used, reset) => {
-      if (used == null || !(reset > now)) return;
+      if (used == null || reset == null || reset <= now) return;
       const cap = this.capFor(bucket, account);
       const limit = Math.min(this.thresholdFor(bucket, account), cap ?? Infinity);
-      if (used >= limit) ends.push(/** @type {number} */ (reset));
+      if (used >= limit) ends.push(reset);
     };
     bar('unified5h', q.unified5h, q.unified5hReset);
     const weekly = this._governingWindow(account, null);

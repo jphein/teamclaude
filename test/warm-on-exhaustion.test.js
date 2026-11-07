@@ -252,3 +252,39 @@ test('an event sweep with nobody to warm is silent; a manual one says so', async
   assert.match(logs.at(-1), /Keep-warm \(manual\): warming nobody; leaving "a" \(window running until .*\), "b" \(window running until/);
   warmer.stop();
 });
+
+test('a sweep skips seats whose week is spent: at the weekly threshold or past an operator cap', async () => {
+  const later = Date.now() + 50 * 3600_000;
+  const am = new AccountManager([
+    oauth('hot'), oauth('cold'), oauth('spent'),
+    oauth('capped', { maxUsage: { unified5h: 0.6, unified7d: 0.5 } }),
+  ], { default: 0.93, unified5h: 0.95, unified7d: 0.9 });
+  Object.assign(am.accounts[1].quota, { unified7d: 0.4, unified7dReset: later });
+  Object.assign(am.accounts[2].quota, { unified7d: 1, unified7dReset: later });
+  Object.assign(am.accounts[3].quota, { unified7d: 0.55, unified7dReset: later });
+  const spawn = fakeSpawner();
+  const lines = [];
+  const warmer = new Warmer(am, { intervalMs: 0, onExhaustion: true, transport: 'claude', port: 3456, apiKey: 'k', spawnFn: spawn, log: (l) => lines.push(l) });
+  warmer.start();
+
+  am.updateQuota(0, headers5h(1, Date.now() + 3600_000));
+  await tick(); await tick();
+
+  const pinned = spawn.calls.map(c => c.env.ANTHROPIC_BASE_URL.split('/tc-acct/')[1]).sort();
+  assert.deepEqual(pinned, ['cold'], 'neither the spent week nor the capped seat is warmed');
+  assert.match(lines.join('\n'), /"spent" \(weekly limit reached\)/);
+  assert.match(lines.join('\n'), /"capped" \(weekly limit reached\)/);
+  warmer.stop();
+});
+
+test('a week that has since reset is warmed again', async () => {
+  const am = new AccountManager([oauth('hot'), oauth('renewed')], 0.93);
+  Object.assign(am.accounts[1].quota, { unified7d: 1, unified7dReset: Date.now() - 1000 });
+  const spawn = fakeSpawner();
+  const warmer = new Warmer(am, { intervalMs: 0, onExhaustion: true, transport: 'claude', port: 3456, apiKey: 'k', spawnFn: spawn, log: () => {} });
+  warmer.start();
+  am.updateQuota(0, headers5h(1, Date.now() + 3600_000));
+  await tick(); await tick();
+  assert.deepEqual(spawn.calls.map(c => c.env.ANTHROPIC_BASE_URL.split('/tc-acct/')[1]), ['renewed']);
+  warmer.stop();
+});

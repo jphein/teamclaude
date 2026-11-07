@@ -22,7 +22,7 @@ test('the restart script reads the key inside node, never through argv or env', 
 });
 
 test('the node snippet is fed on stdin, not with -e', () => {
-  assert.match(code, /\/opt\/node\/bin\/node - <<'JS'/);
+  assert.match(code, /\/opt\/node\/bin\/node - 2>\/dev\/null <<'JS'/);
   assert.doesNotMatch(code, /node -e/);
 });
 
@@ -100,4 +100,24 @@ test('idle check: a redirect is refused and the key never follows it', async () 
 test('the wait is a wall-clock deadline, re-checked before the restart', () => {
   assert.match(code, /deadline=\$\(\( \$\(date \+%s\) \+ WAIT \)\)/);
   assert.match(code, /idle && sleep 1 && idle && \[ "\$\(date \+%s\)" -lt "\$deadline" \]/);
+});
+
+test('idle check: a malformed config exits 2 and prints nothing', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'tc-idle-'));
+  mkdirSync(join(home, '.config'));
+  writeFileSync(join(home, '.config', 'teamclaude.json'), '{"proxy": {"apiKey": tc-unquoted-secret}}');
+  try {
+    const { code, err } = await new Promise(resolve => {
+      const child = spawn(process.execPath, ['-'], { env: { HOME: home, TC_STATUS_PORT: '9', PATH: process.env.PATH ?? '' }, stdio: ['pipe', 'pipe', 'pipe'] });
+      let out = '';
+      child.stdout.on('data', d => { out += d; });
+      child.stderr.on('data', d => { out += d; });
+      child.on('exit', c => resolve({ code: c, err: out }));
+      child.stdin.end(snippet);
+    });
+    assert.equal(code, 2);
+    assert.equal(err, '', 'nothing printed, so nothing of the key');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });

@@ -17,27 +17,33 @@ if [ "${#WAIT}" -gt 4 ] || [ "$WAIT" -gt 3600 ]; then echo "max-wait is at most 
 ssh -o ConnectTimeout=5 "$HOST" "WAIT=$WAIT sh -s" <<'REMOTE'
 set -eu
 idle() {
-  /opt/node/bin/node - <<'JS'
+  /opt/node/bin/node - 2>/dev/null <<'JS'
 // Exit 0 only on a proven idle proxy: an ok HTTP status, a non-empty account
 // list and a non-negative whole inFlight on every account. Anything else
 // (error status, bad JSON, missing or negative counters, timeout) exits 2,
 // which the loop treats as "not idle" (xreview 2026-11-07).
-const fs = require('fs');
-const key = JSON.parse(fs.readFileSync(process.env.HOME + '/.config/teamclaude.json', 'utf8')).proxy.apiKey;
-const port = Number(process.env.TC_STATUS_PORT || 3456);
-fetch(`http://127.0.0.1:${port}/teamclaude/status`, { headers: { 'x-api-key': key }, redirect: 'error', signal: AbortSignal.timeout(5000) })
-  .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
-  .then(d => {
-    const accounts = d && d.accounts;
-    if (!Array.isArray(accounts) || accounts.length === 0) throw new Error('no accounts');
-    let n = 0;
-    for (const a of accounts) {
-      if (!a || !Number.isInteger(a.inFlight) || a.inFlight < 0) throw new Error('bad inFlight');
-      n += a.inFlight;
-    }
-    process.exit(n === 0 ? 0 : 1);
-  })
-  .catch(() => process.exit(2));
+// Everything inside one try: a bad config must exit 2 without printing (a JSON
+// parse error can quote the file, key included).
+try {
+  const fs = require('fs');
+  const key = JSON.parse(fs.readFileSync(process.env.HOME + '/.config/teamclaude.json', 'utf8')).proxy.apiKey;
+  const port = Number(process.env.TC_STATUS_PORT || 3456);
+  fetch(`http://127.0.0.1:${port}/teamclaude/status`, { headers: { 'x-api-key': key }, redirect: 'error', signal: AbortSignal.timeout(5000) })
+    .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+    .then(d => {
+      const accounts = d && d.accounts;
+      if (!Array.isArray(accounts) || accounts.length === 0) throw new Error('no accounts');
+      let n = 0;
+      for (const a of accounts) {
+        if (!a || !Number.isInteger(a.inFlight) || a.inFlight < 0) throw new Error('bad inFlight');
+        n += a.inFlight;
+      }
+      process.exit(n === 0 ? 0 : 1);
+    })
+    .catch(() => process.exit(2));
+} catch {
+  process.exit(2);
+}
 JS
 }
 # A wall-clock deadline, not a loop count: one check can take up to 5 s.

@@ -5800,9 +5800,58 @@ export class AccountManager {
     };
   }
 
+  /**
+   * When a seat that cannot serve now comes back on its own clock, or null when
+   * nothing it is waiting for has a known end (disabled, a broken login, a
+   * route, an upstream rejection with no spent window to name). A seat can be
+   * barred by several things at once (a 429 hold AND a spent weekly window), so
+   * it is back only when the LAST of them ends. Each bar is read from the same
+   * threshold and cap the selector uses, so this cannot promise a seat the
+   * rotation would still skip.
+   * @param {Record<string, any>} account
+   * @param {number} now
+   * @returns {number|null}
+   */
+  _backAt(account, now) {
+    if (account.disabled || account.status === 'error' || account.status === 'exhausted') return null;
+    const q = account.quota;
+    /** @type {number[]} */
+    const ends = [];
+    if (account.status === 'throttled' && account.rateLimitedUntil > now) ends.push(account.rateLimitedUntil);
+    /** @param {string} bucket @param {number|null|undefined} used @param {number|null|undefined} reset */
+    const bar = (bucket, used, reset) => {
+      if (used == null || reset == null || reset <= now) return;
+      const cap = this.capFor(bucket, account);
+      const limit = Math.min(this.thresholdFor(bucket, account), cap ?? Infinity);
+      if (used >= limit) ends.push(reset);
+    };
+    bar('unified5h', q.unified5h, q.unified5hReset);
+    const weekly = this._governingWindow(account, null);
+    bar(this._weeklyBucketFor(null), weekly.utilization, weekly.resetAt);
+    return ends.length ? Math.max(...ends) : null;
+  }
+
+  /**
+   * The two numbers a fleet sweep needs: how many seats can serve a request
+   * right now, and when the next barred seat comes back. Snake case because the
+   * lead's sweep reads exactly these names (2026-11-07).
+   * @returns {{live_seats: number, next_reset: string|null}}
+   */
+  liveSeats() {
+    const now = Date.now();
+    let live = 0;
+    let next = Infinity;
+    for (const account of this.accounts) {
+      if (this.unavailableReason(account) == null) { live++; continue; }
+      const back = this._backAt(account, now);
+      if (back != null && back < next) next = back;
+    }
+    return { live_seats: live, next_reset: Number.isFinite(next) ? new Date(next).toISOString() : null };
+  }
+
   /** Return per-account quota and fleet aggregates for status clients. */
   getQuotaSummary() {
     this.refreshExpiredQuotas();
-    return buildQuotaSummary(this.accounts);
+    return { ...this.liveSeats(), ...buildQuotaSummary(this.accounts) };
   }
 }

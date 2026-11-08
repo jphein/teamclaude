@@ -14,6 +14,10 @@ set -u
 cd "$(dirname "$0")/.." || exit 2
 base=${1:-origin/master}
 unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy NO_PROXY no_proxy
+# tsc and eslint call module.enableCompileCache(), which writes to os.tmpdir()
+# when this is unset: 3.6 MB per gate run into familiar's 512 MB RAM-backed
+# /tmp (2026-11-07). Keep it on disk unless the caller already chose a place.
+export NODE_COMPILE_CACHE=${NODE_COMPILE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/node-compile-cache}
 
 if [ "$base" = origin/master ]; then
   git fetch -q origin master || { echo "gate: cannot fetch origin/master" >&2; exit 2; }

@@ -75,6 +75,7 @@ function harness(accounts, { now = at('01:00'), thresholds = { default: 0.93, un
   const warmer = {
     _isWarmCandidate: (/** @type {any} */ a) => !a.disabled && a.status !== 'error' && a.status !== 'throttled' && a.status !== 'exhausted' && !am.weekBarred(a),
     gate: /** @type {Promise<void>|null} */ (null),
+    accountStatus: new Map(),
     blind: false, // true: skip the warmer's own cold check, so the stagger's is the one tested
     async _warmTargets(/** @type {any[]} */ targets, /** @type {any} */ opts = {}) {
       if (this.gate) await this.gate;
@@ -83,6 +84,7 @@ function harness(accounts, { now = at('01:00'), thresholds = { default: 0.93, un
         const reset = Number(a.quota.unified5hReset);
         if (!this.blind && Number.isFinite(reset) && reset > clock) continue; // the warmer's own re-check
         touched.push({ name: a.name, at: clock });
+        this.accountStatus.set(a.name, { status: 'ok', startedAt: clock });
         a.quota.unified5h = 0.01;
         a.quota.unified5hReset = clock + 5 * H;
       }
@@ -241,4 +243,26 @@ test('a suspend of days steps over the missed slots instead of walking them', as
   assert.equal(fired, 1, 'the one overdue timer fires, and is not followed by a chain of past slots');
   assert.equal(h.touched.length, before);
   assert.equal(h.st.status().seats[0].nextTouchAt, new Date(at('12:00', 3)).toISOString());
+});
+
+test('the reserve is asked again at send time, and a cancelled touch is reported as one', async () => {
+  const h = harness(['a']);
+  /** @type {() => void} */
+  let release = () => {};
+  h.warmer.gate = new Promise(r => { release = () => r(); });
+  h.st.configure(cfg);
+  await h.advance(at('02:01'));
+  // While the touch waits, the week drops under the 10% reserve.
+  Object.assign(h.am.accounts[0].quota, { unified7d: 0.95, unified7dReset: at('00:00', 3) });
+  release();
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+  assert.deepEqual(h.touched, []);
+  assert.match(h.st.status().seats[0].last, /^cancelled .* before sending$/);
+});
+
+test('a completed touch is reported with the reset it produced', async () => {
+  const h = harness(['a']);
+  h.st.configure(cfg);
+  await h.advance(at('02:05'));
+  assert.match(h.st.status().seats[0].last, /^touched .*, resets 2026-11-10T15:00:00\.000Z$/);
 });

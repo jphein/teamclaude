@@ -859,3 +859,13 @@ test('a caller\'s shouldContinue is asked right before each send', async () => {
   await w._warmTargets([am.accounts[0]], { shouldContinue: () => true });
   assert.equal(spawn.calls.length, 1);
 });
+
+test('a sweep already running stops sending once the stagger takes over', async () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  let w;
+  const spawn = fakeSpawner();
+  const spawnFn = async (spec) => { await spawn(spec); w.suspendSweeps = true; return 0; };
+  w = makeWarmer(am, spawnFn);
+  await w.warmAll('interval');
+  assert.equal(spawn.calls.length, 1, 'the first send went; the second did not');
+});

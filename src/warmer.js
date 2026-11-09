@@ -343,7 +343,7 @@ export class Warmer {
 
     const fromEvent = trigger.startsWith('exhaustion:') || trigger.startsWith('window-start:');
     if (targets.length || !fromEvent) this.log(this._describeSweep(trigger, targets, now));
-    await this._warmTargets(targets, { generation });
+    await this._warmTargets(targets, { generation, allowWhileSuspended: trigger === 'manual' });
     for (const item of deferred) {
       this._deferWarmAccount(item.account, item.runAt, generation);
     }
@@ -354,6 +354,9 @@ export class Warmer {
     waitForRunning = false,
     deadline = null,
     shouldContinue = () => true,
+    // Manual sweeps and the stagger's own touches; every other caller stops
+    // sending the moment the stagger takes over, even mid-sweep.
+    allowWhileSuspended = false,
   } = {}) {
     while (this._running) {
       if (!waitForRunning) return false;
@@ -374,6 +377,7 @@ export class Warmer {
         const canContinue = () => generation === this._scheduleGeneration
           && !this._stopped
           && (deadline === null || this.nowFn() < deadline)
+          && (allowWhileSuspended || !this.suspendSweeps)
           && shouldContinue();
         if (abort.signal.aborted || !canContinue()) break;
         const isStillEligible = () => this._isWarmTarget(account);

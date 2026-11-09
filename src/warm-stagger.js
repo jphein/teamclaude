@@ -253,15 +253,26 @@ export class StaggerAnchors {
     this.log(`[TeamClaude] Keep-warm stagger: touching "${account.name}" for its ${slot} slot at ${new Date(this.nowFn()).toISOString()}`);
     // The warmer re-checks that the seat is still cold right before it sends,
     // so a request that started the window meanwhile is not doubled.
+    const before = this.warmer.accountStatus?.get(account.name)?.startedAt;
     await this.warmer._warmTargets([account], {
       waitForRunning: true,
+      allowWhileSuspended: true,
       deadline: at + GRACE_MS + DEFER_WITHIN_MS,
       // Checked by the warmer right before it sends, after any wait behind a
-      // running sweep: a stop or re-configure meanwhile cancels the touch.
-      shouldContinue: () => generation === this.generation && this.seats.get(account.name) === seat,
+      // running sweep or a token refresh: a stop or re-configure meanwhile, or
+      // the seat falling under a skip rule (the weekly reserve), cancels it.
+      shouldContinue: () => generation === this.generation
+        && this.seats.get(account.name) === seat
+        && this.skipReason(account) == null,
     });
+    // Report what the warmer did, not what was asked of it.
+    const rec = this.warmer.accountStatus?.get(account.name);
+    const sent = rec && rec.startedAt !== before && rec.status !== 'running';
     const reset = Number(account.quota?.unified5hReset);
-    seat.last = `touched ${new Date(this.nowFn()).toISOString()}${Number.isFinite(reset) && reset > this.nowFn() ? `, resets ${new Date(reset).toISOString()}` : ''}`;
+    const resets = Number.isFinite(reset) && reset > this.nowFn() ? `, resets ${new Date(reset).toISOString()}` : '';
+    if (!sent) seat.last = `cancelled ${new Date(this.nowFn()).toISOString()} before sending`;
+    else if (rec.status === 'ok') seat.last = `touched ${new Date(this.nowFn()).toISOString()}${resets}`;
+    else seat.last = `touch failed ${new Date(this.nowFn()).toISOString()}: ${rec.error || rec.status}`;
   }
 
   /** For /teamclaude/quota and /status. */

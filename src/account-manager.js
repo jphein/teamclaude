@@ -1747,6 +1747,15 @@ export class AccountManager {
       // request's first attempt only: on a retry the band's best may be the
       // account that just failed, and moving the fleet's cursor to whatever is
       // left would be undone by the very next request.
+      if (this._firstAttempt && this._manualHold !== current.index && this._refreshPreempts(current, model, advisorModel, exclude)) {
+        const next = this._selectNext(exclude, model, advisorModel);
+        if (next && next.index !== current.index) {
+          if (this._selectionDecision) (this._selectionDecision.rolledOff ??= new Set()).add(current.index);
+          const at = (/** @type {any} */ a) => (Number.isFinite(this._refreshKey(a, Date.now())) ? new Date(a.quota.unified5hReset).toISOString() : 'no window');
+          console.log(`[TeamClaude] Refresh routing: "${current.name}" → "${next.name}" (5h resets ${at(next)}, before ${at(current)})`);
+          return next;
+        }
+      }
       if (this._firstAttempt && this._manualHold !== current.index && this._bandPreempts(current, model, advisorModel)) {
         const next = this._selectNext(exclude, model, advisorModel);
         if (next && next.index !== current.index) {
@@ -2135,6 +2144,7 @@ export class AccountManager {
     let best = null;
     let bestPriority = Infinity;
     let bestSpent = Infinity;
+    let bestRefresh = Infinity;
     let bestRequests = Infinity;
     let bestSessions = Infinity;
     let bestInFlight = Infinity;
@@ -2143,16 +2153,21 @@ export class AccountManager {
     candidates.forEach((account, i) => {
       const priority = account.priority || 0;
       const heldOff = spent[i];
+      // Ahead of load when refresh routing is on: spreading sessions evenly
+      // would spend every window at once, which is what it exists to avoid.
+      const refresh = this._refreshKey(account, now);
       const requests = byRequests ? this.sessionTracker.recentRequestsFor(account.index, now) : 0;
       const sessions = this.sessionTracker.activeCountFor(account.index, now);
       const inFlight = account.inFlight || 0;
       const pressure = pressures[i];
       const reset = this._rankedReset(account, model);
       const samePriority = priority === bestPriority;
-      const sameSpend = samePriority && heldOff === bestSpent;
+      const sameHeld = samePriority && heldOff === bestSpent;
+      const sameSpend = sameHeld && refresh === bestRefresh;
       const sameLoad = sameSpend && requests === bestRequests;
       if (priority < bestPriority
         || (samePriority && heldOff < bestSpent)
+        || (sameHeld && refresh < bestRefresh)
         || (sameSpend && requests < bestRequests)
         || (sameLoad && sessions < bestSessions)
         || (sameLoad && sessions === bestSessions && inFlight < bestInFlight)
@@ -2161,6 +2176,7 @@ export class AccountManager {
         best = account;
         bestPriority = priority;
         bestSpent = heldOff;
+        bestRefresh = refresh;
         bestRequests = requests;
         bestSessions = sessions;
         bestInFlight = inFlight;
@@ -3139,6 +3155,11 @@ export class AccountManager {
       // reset, the default) or 'soonest' (the soonest weekly reset with any
       // headroom left; fork, JP 2026-10-28). Anything else is the default.
       rank: c.rank === 'soonest' ? 'soonest' : 'pressure',
+      // Within the band, spend the seat whose 5h window resets soonest first
+      // and keep fresher windows in reserve, so a pool run dry is minutes from
+      // its next refresh rather than hours ('nearest'; fork, JP 2026-11-09).
+      // A seat with no running window sorts last. Anything else is off.
+      refresh: c.refresh === 'nearest' ? 'nearest' : 'off',
     };
     // Nothing survives the knob being off: every observation is dropped when
     // preemption stops and none is written while it is off, so no mechanism
@@ -3305,6 +3326,34 @@ export class AccountManager {
    * @param {string|null} [model]
    * @param {string|null} [advisorModel]
    */
+  /**
+   * Refresh routing's sort key: the reset of the seat's running 5h window, or
+   * Infinity when none is running (a cold seat starts a new window, the thing
+   * this rule saves for last). 0 for every seat when the rule is off, so the
+   * key is inert rather than a branch.
+   * @param {Record<string, any>} account @param {number} now
+   */
+  _refreshKey(account, now) {
+    if (!this.expiryRouting?.enabled || this.expiryRouting.refresh !== 'nearest') return 0;
+    const reset = account.quota?.unified5hReset;
+    return reset != null && reset > now ? reset : Infinity;
+  }
+
+  /**
+   * Refresh routing moves the cursor when a seat whose window resets sooner can
+   * serve. Asked on a request's first attempt only, like band preemption. The
+   * key is fixed for a window's life, so this does not flap: once on the
+   * nearest seat the cursor stays until that seat is spent or resets.
+   * @param {Record<string, any>} current @param {string|null} [model] @param {string|null} [advisorModel] @param {Set<number>|null} [exclude]
+   */
+  _refreshPreempts(current, model = null, advisorModel = null, exclude = null) {
+    if (!this.expiryRouting?.enabled || this.expiryRouting.refresh !== 'nearest') return false;
+    const now = Date.now();
+    const mine = this._refreshKey(current, now);
+    return this._bandedCandidates(exclude, model, advisorModel)
+      .some(a => a.index !== current.index && (a.priority || 0) <= (current.priority || 0) && this._refreshKey(a, now) < mine);
+  }
+
   _bandPreempts(account, model = null, advisorModel = null) {
     const er = this.expiryRouting;
     if (!account || !er?.enabled || !er.preempt || !er.rebalance) return false;
@@ -4161,7 +4210,9 @@ export class AccountManager {
     // the switch runs the same `_isAvailable(acc)` the knob-off path runs; a
     // model-scoped filter there is a live routing change on the path that
     // promises none.
-    if (sessionReset.length) {
+    // Refresh routing ranks a seat that just reset last (its next window is the
+    // freshest), so jumping to it here would undo the rule on the next request.
+    if (sessionReset.length && this.expiryRouting.refresh !== 'nearest') {
       this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null, scope, adv);
     }
     return changed;
@@ -4310,6 +4361,7 @@ export class AccountManager {
   _pickBestAvailable(exclude = null, model = null, advisorModel = null) {
     let best = null;
     let bestPriority = Infinity;
+    let bestRefresh = Infinity;
     let bestPressure = Infinity;
     let bestReset = Infinity;
 
@@ -4319,6 +4371,7 @@ export class AccountManager {
     const pressures = this._rankedPressures(candidates, model, now);
     candidates.forEach((account, i) => {
       const priority = account.priority || 0;
+      const refresh = this._refreshKey(account, now);
       const pressure = pressures[i];
       // Rank by the reset of the weekly window that governs THIS model (Fable and
       // Sonnet have their own, and a family can be metered by a learned scoped
@@ -4326,10 +4379,13 @@ export class AccountManager {
       // refreshes soonest while preserving accounts that reset later for
       // Opus/Sonnet. Unknown reset sorts first so we probe and fill it in.
       const weeklyReset = this._rankedReset(account, model);
+      const sameRefresh = priority === bestPriority && refresh === bestRefresh;
       if (priority < bestPriority
-          || (priority === bestPriority && pressure < bestPressure)
-          || (priority === bestPriority && pressure === bestPressure && weeklyReset < bestReset)) {
+          || (priority === bestPriority && refresh < bestRefresh)
+          || (sameRefresh && pressure < bestPressure)
+          || (sameRefresh && pressure === bestPressure && weeklyReset < bestReset)) {
         bestPriority = priority;
+        bestRefresh = refresh;
         bestPressure = pressure;
         bestReset = weeklyReset;
         best = account;
@@ -5182,7 +5238,7 @@ export class AccountManager {
       if (!fresh) return;
     }
     if (!this._on5hWindowStarted.length) return;
-    console.log(`[TeamClaude] Account "${account.name}" started a 5h window (resets ${new Date(reset).toLocaleTimeString()})`);
+    console.log(`[TeamClaude] Account "${account.name}" started a 5h window (resets ${new Date(reset).toLocaleTimeString()}; at ${new Date().toISOString()}, reset ${new Date(reset).toISOString()})`);
     for (const fn of this._on5hWindowStarted) {
       try { fn({ account, reset }); }
       catch (err) { console.error(`[TeamClaude] 5h-window-started listener failed: ${/** @type {any} */ (err)?.message || err}`); }
@@ -5868,9 +5924,30 @@ export class AccountManager {
       && weekly.utilization >= this.thresholdFor(this._weeklyBucketFor(null), account);
   }
 
+  /**
+   * The pool's next 5h refresh: the soonest reset among running windows on
+   * seats whose week still has room (a spent week refreshes nothing usable).
+   * For the lead's sweep and the plan's seats tile ("next refresh 09:12").
+   */
+  nextRefresh() {
+    const now = Date.now();
+    let best = null;
+    for (const account of this.accounts) {
+      if (account.disabled || account.status === 'error') continue;
+      const reset = account.quota?.unified5hReset;
+      if (reset == null || reset <= now || this.weekBarred(account)) continue;
+      if (!best || reset < best.reset) best = { reset, seat: account.name };
+    }
+    return {
+      next_refresh: best
+        ? { at: new Date(best.reset).toISOString(), seat: best.seat, in_minutes: Math.ceil((best.reset - now) / 60000) }
+        : null,
+    };
+  }
+
   /** Return per-account quota and fleet aggregates for status clients. */
   getQuotaSummary() {
     this.refreshExpiredQuotas();
-    return { ...this.liveSeats(), ...buildQuotaSummary(this.accounts) };
+    return { ...this.liveSeats(), ...this.nextRefresh(), ...buildQuotaSummary(this.accounts) };
   }
 }

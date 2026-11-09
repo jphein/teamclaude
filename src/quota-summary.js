@@ -78,6 +78,12 @@ function accountBuckets(quota) {
       quota.unified7dFable != null ? 'unified7dFable' : 'unified7d',
     ),
   };
+  // Anthropic reports only a 5h window's reset; it began five hours before it
+  // (fork, for the seats tile and the stagger measurement). An inference, so
+  // it rides beside resetAt rather than replacing anything reported.
+  if (buckets.fiveHour?.source === 'unified5h' && Number.isFinite(Number(buckets.fiveHour.resetAt))) {
+    buckets.fiveHour = { ...buckets.fiveHour, windowStart: Number(buckets.fiveHour.resetAt) - 5 * 60 * 60 * 1000 };
+  }
   // A monthly window exists only on third-party backends; like tokens and
   // requests, the key appears only when there is a reading.
   const monthly = backendWindow(backend?.monthly, 'backendMonthly', backendAt);

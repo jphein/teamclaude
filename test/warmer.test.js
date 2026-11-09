@@ -907,3 +907,15 @@ test('the stagger taking over drops pending automatic deferrals', () => {
   w.setSuspendSweeps(true);
   assert.equal(w._deferredWarmups.size, 0);
 });
+
+test('while suspended, an automatic deferral is not queued; a manual one is', () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  const w = makeWarmer(am, fakeSpawner());
+  w.schedule = { mode: 'rolling' };
+  w.setTimeoutFn = () => ({ unref() {} });
+  w.nowFn = () => 1000;
+  w.setSuspendSweeps(true);
+  w._deferWarmAccount(am.accounts[0], 5000, w._scheduleGeneration, false);
+  w._deferWarmAccount(am.accounts[1], 5000, w._scheduleGeneration, true);
+  assert.deepEqual([...w._deferredWarmups.keys()].map(a => a.name), ['b']);
+});

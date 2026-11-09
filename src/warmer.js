@@ -415,6 +415,8 @@ export class Warmer {
   /** @param {any} account @param {number} runAt @param {number} generation @param {boolean} [manual] */
   _deferWarmAccount(account, runAt, generation, manual = false) {
     if (generation !== this._scheduleGeneration || this._stopped || this.schedule?.mode !== 'rolling') return;
+    // A sweep that was mid-send when the stagger took over must not queue.
+    if (this.suspendSweeps && !manual) return;
     if (this._deferredWarmups.has(account)) return;
     const delay = Math.max(0, runAt - this.nowFn());
     const timer = this.setTimeoutFn(async () => {

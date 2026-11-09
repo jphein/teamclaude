@@ -75,12 +75,13 @@ function harness(accounts, { now = at('01:00'), thresholds = { default: 0.93, un
   const warmer = {
     _isWarmCandidate: (/** @type {any} */ a) => !a.disabled && a.status !== 'error' && a.status !== 'throttled' && a.status !== 'exhausted' && !am.weekBarred(a),
     gate: /** @type {Promise<void>|null} */ (null),
+    blind: false, // true: skip the warmer's own cold check, so the stagger's is the one tested
     async _warmTargets(/** @type {any[]} */ targets, /** @type {any} */ opts = {}) {
       if (this.gate) await this.gate;
       if (opts.shouldContinue && !opts.shouldContinue()) return false;
       for (const a of targets) {
         const reset = Number(a.quota.unified5hReset);
-        if (Number.isFinite(reset) && reset > clock) continue; // the warmer's own re-check
+        if (!this.blind && Number.isFinite(reset) && reset > clock) continue; // the warmer's own re-check
         touched.push({ name: a.name, at: clock });
         a.quota.unified5h = 0.01;
         a.quota.unified5hReset = clock + 5 * H;
@@ -224,6 +225,7 @@ test('a window started by traffic during the deferral is not doubled', async () 
   Object.assign(h.am.accounts[0].quota, { unified5h: 0.4, unified5hReset: at('02:10') });
   h.st.configure(cfg);
   await h.advance(at('02:05'));
+  h.warmer.blind = true;
   // Traffic lands right after the reset, before the deferred touch.
   h.am.accounts[0].quota.unified5hReset = at('02:10') + 5 * H;
   await h.advance(at('02:20'));

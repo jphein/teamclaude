@@ -849,3 +849,13 @@ test('while the stagger owns window starts, interval/schedule/align sweeps send 
   await w.warmAll('manual');
   assert.equal(spawn.calls.length, 1);
 });
+
+test('a caller\'s shouldContinue is asked right before each send', async () => {
+  const am = new AccountManager([oauth('idle')], 0.98);
+  const spawn = fakeSpawner();
+  const w = makeWarmer(am, spawn);
+  await w._warmTargets([am.accounts[0]], { shouldContinue: () => false });
+  assert.equal(spawn.calls.length, 0);
+  await w._warmTargets([am.accounts[0]], { shouldContinue: () => true });
+  assert.equal(spawn.calls.length, 1);
+});

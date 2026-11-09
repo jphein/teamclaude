@@ -75,7 +75,6 @@ function harness(accounts, { now = at('01:00'), thresholds = { default: 0.93, un
   const warmer = {
     _isWarmCandidate: (/** @type {any} */ a) => !a.disabled && a.status !== 'error' && a.status !== 'throttled' && a.status !== 'exhausted' && !am.weekBarred(a),
     gate: /** @type {Promise<void>|null} */ (null),
-    accountStatus: new Map(),
     blind: false, // true: skip the warmer's own cold check, so the stagger's is the one tested
     async _warmTargets(/** @type {any[]} */ targets, /** @type {any} */ opts = {}) {
       if (this.gate) await this.gate;
@@ -84,7 +83,7 @@ function harness(accounts, { now = at('01:00'), thresholds = { default: 0.93, un
         const reset = Number(a.quota.unified5hReset);
         if (!this.blind && Number.isFinite(reset) && reset > clock) continue; // the warmer's own re-check
         touched.push({ name: a.name, at: clock });
-        this.accountStatus.set(a.name, { status: 'ok', startedAt: clock });
+        opts.outcomes?.push({ account: a, outcome: 'ok' });
         a.quota.unified5h = 0.01;
         a.quota.unified5hReset = clock + 5 * H;
       }
@@ -265,4 +264,18 @@ test('a completed touch is reported with the reset it produced', async () => {
   h.st.configure(cfg);
   await h.advance(at('02:05'));
   assert.match(h.st.status().seats[0].last, /^touched .*, resets 2026-11-10T15:00:00\.000Z$/);
+});
+
+test('a seat warmed by someone else while the touch waited is not reported as touched', async () => {
+  const h = harness(['a']);
+  /** @type {() => void} */
+  let release = () => {};
+  h.warmer.gate = new Promise(r => { release = () => r(); });
+  h.st.configure(cfg);
+  await h.advance(at('02:01'));
+  h.am.accounts[0].quota.unified5hReset = at('02:01') + 5 * H; // another sweep's warm-up
+  release();
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+  assert.deepEqual(h.touched, []);
+  assert.match(h.st.status().seats[0].last, /^cancelled /);
 });

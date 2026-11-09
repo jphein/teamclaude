@@ -869,3 +869,29 @@ test('a sweep already running stops sending once the stagger takes over', async 
   await w.warmAll('interval');
   assert.equal(spawn.calls.length, 1, 'the first send went; the second did not');
 });
+
+test('_warmTargets reports what each send it made came to', async () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  am.accounts[1].quota.unified5hReset = Date.now() + 3600_000; // running: not sent
+  const outcomes = [];
+  await makeWarmer(am, fakeSpawner())._warmTargets(am.accounts, { outcomes });
+  assert.deepEqual(outcomes.map(o => [o.account.name, o.outcome]), [['a', 'ok']]);
+  const failed = [];
+  await makeWarmer(am, fakeSpawner(3))._warmTargets([am.accounts[0]], { outcomes: failed });
+  assert.deepEqual(failed.map(o => o.outcome), ['error: claude exited 3']);
+});
+
+test('a manual sweep under the stagger keeps its exemption for rolling deferrals', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const w = makeWarmer(am, fakeSpawner());
+  /** @type {any[]} */
+  const calls = [];
+  w._warmTargets = async (_t, opts) => { calls.push(opts); return true; };
+  w.schedule = { mode: 'rolling' };
+  /** @type {Function[]} */
+  const due = [];
+  w.setTimeoutFn = (fn) => { due.push(fn); return { unref() {} }; };
+  w.nowFn = () => 1000;
+  w._deferWarmAccount(am.accounts[0], 1000, w._scheduleGeneration, true);
+  return Promise.resolve(due[0]()).then(() => assert.equal(calls[0]?.allowWhileSuspended, true));
+});

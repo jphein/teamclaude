@@ -253,8 +253,10 @@ export class StaggerAnchors {
     this.log(`[TeamClaude] Keep-warm stagger: touching "${account.name}" for its ${slot} slot at ${new Date(this.nowFn()).toISOString()}`);
     // The warmer re-checks that the seat is still cold right before it sends,
     // so a request that started the window meanwhile is not doubled.
-    const before = this.warmer.accountStatus?.get(account.name)?.startedAt;
+    /** @type {{account: any, outcome: string}[]} */
+    const outcomes = [];
     await this.warmer._warmTargets([account], {
+      outcomes,
       waitForRunning: true,
       allowWhileSuspended: true,
       deadline: at + GRACE_MS + DEFER_WITHIN_MS,
@@ -265,14 +267,14 @@ export class StaggerAnchors {
         && this.seats.get(account.name) === seat
         && this.skipReason(account) == null,
     });
-    // Report what the warmer did, not what was asked of it.
-    const rec = this.warmer.accountStatus?.get(account.name);
-    const sent = rec && rec.startedAt !== before && rec.status !== 'running';
+    // Report what this call did, not what was asked of it or what another
+    // sweep did to the same seat meanwhile.
+    const outcome = outcomes.find(o => o.account === account)?.outcome ?? 'skipped';
     const reset = Number(account.quota?.unified5hReset);
     const resets = Number.isFinite(reset) && reset > this.nowFn() ? `, resets ${new Date(reset).toISOString()}` : '';
-    if (!sent) seat.last = `cancelled ${new Date(this.nowFn()).toISOString()} before sending`;
-    else if (rec.status === 'ok') seat.last = `touched ${new Date(this.nowFn()).toISOString()}${resets}`;
-    else seat.last = `touch failed ${new Date(this.nowFn()).toISOString()}: ${rec.error || rec.status}`;
+    if (outcome === 'skipped') seat.last = `cancelled ${new Date(this.nowFn()).toISOString()} before sending`;
+    else if (outcome === 'ok') seat.last = `touched ${new Date(this.nowFn()).toISOString()}${resets}`;
+    else seat.last = `touch failed ${new Date(this.nowFn()).toISOString()}: ${outcome.replace(/^error: /, '')}`;
   }
 
   /** For /teamclaude/quota and /status. */

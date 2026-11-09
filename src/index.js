@@ -38,6 +38,7 @@ import { Prober, probeApplicable } from './prober.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
 import { Warmer, warmApplicable } from './warmer.js';
+import { StaggerAnchors } from './warm-stagger.js';
 import { formatWarmupScheduleConfirmation, resolveWarmupConfig } from './warmup-schedule.js';
 import { TUI, ACCOUNT_SORTS } from './tui.js';
 import { SessionTitles } from './session-titles.js';
@@ -525,6 +526,8 @@ async function serverCommand() {
   let prober = null;
   // Opt-in keep-warm scheduler (interval or persisted reset-target schedule).
   let warmer = null;
+  /** @type {StaggerAnchors|null} */
+  let stagger = null;
   const serverStartedAt = Date.now();
   // Read once here, not per request: `teamclaude update` swaps package.json on
   // disk while this process keeps running the old code, and status must report
@@ -686,8 +689,18 @@ async function serverCommand() {
         delete config.warmupSchedule;
         config.warmupSeconds = diskConfig.warmupSeconds || 0;
       }
+      // Validated before anything is published, like the schedule above: a bad
+      // hand edit fails the reload and keeps the running stagger.
+      if (stagger) {
+        stagger.configure(diskConfig.warmupStagger || null);
+        if (diskConfig.warmupStagger) config.warmupStagger = diskConfig.warmupStagger;
+        else delete config.warmupStagger;
+        warmer.setSuspendSweeps(stagger.enabled);
+      }
       config.warmOnExhaustion = !!diskConfig.warmOnExhaustion;
-      warmer.setOnExhaustion(config.warmOnExhaustion);
+      // Align puts every seat on one clock; the stagger spreads them. The
+      // stagger wins while it is configured, and align's setting is kept.
+      warmer.setOnExhaustion(config.warmOnExhaustion && !config.warmupStagger);
     }
     return { added, removed };
   };
@@ -938,7 +951,7 @@ async function serverCommand() {
       })),
     },
   });
-  hooks.getQuotaExtra = () => ({ warmup: resolveWarmupConfig(config) });
+  hooks.getQuotaExtra = () => ({ warmup: resolveWarmupConfig(config), stagger: stagger?.status() || { enabled: false } });
 
   // Web-dashboard control hooks — consumed by the /teamclaude/* endpoints in
   // server.js. They work with or without the TUI, so the browser dashboard can
@@ -1143,12 +1156,16 @@ async function serverCommand() {
   warmer = new Warmer(accountManager, {
     intervalMs: (config.warmupSeconds || 0) * 1000,
     schedule: config.warmupSchedule || null,
-    onExhaustion: !!config.warmOnExhaustion,
+    onExhaustion: !!config.warmOnExhaustion && !config.warmupStagger,
     transport: config.warmTransport || 'direct',
     port,
     apiKey: config.proxy?.apiKey,
   });
   warmer.start();
+  stagger = new StaggerAnchors(accountManager, warmer);
+  try { stagger.configure(config.warmupStagger || null); }
+  catch (err) { console.error(`[TeamClaude] warmupStagger ignored: ${/** @type {any} */ (err)?.message || err}`); }
+  warmer.setSuspendSweeps(stagger.enabled);
 
   // The first credential-sync pass, and the daily one after it. Not awaited:
   // the store is reached over the network and the proxy serves meanwhile.
@@ -1176,6 +1193,7 @@ async function serverCommand() {
     stopTitle();
     if (!tui) console.log('\n[TeamClaude] Shutting down...');
     prober?.stop();
+    stagger?.stop();
     warmer?.stop();
     credentialSync.stop();
     eventLoopMonitor.stop();

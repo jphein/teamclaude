@@ -114,6 +114,8 @@ export class Warmer {
     this.intervalMs = intervalMs;
     this.schedule = schedule;
     this.onExhaustion = onExhaustion;
+    // Set while the stagger owns window starts; see warmAll.
+    this.suspendSweeps = false;
     this.transport = transport === 'claude' ? 'claude' : 'direct';
     this.port = port;
     this.apiKey = apiKey;
@@ -156,6 +158,14 @@ export class Warmer {
         : () => {};
       this._unsubscribe = () => { offExhausted(); offStarted(); };
     }
+  }
+
+  /** Hand window starts to the stagger (or back). Taking over drops every
+   *  pending rolling deferral: those were queued by automatic sweeps, and a
+   *  later manual sweep must be able to queue its own. @param {boolean} on */
+  setSuspendSweeps(on) {
+    this.suspendSweeps = !!on;
+    if (this.suspendSweeps) this._clearDeferredWarmups();
   }
 
   /** Turn the on-exhaustion trigger on/off at runtime. */
@@ -317,6 +327,9 @@ export class Warmer {
    *  on purpose: one subprocess at a time keeps load and the quota burst gentle. */
   async warmAll(trigger = 'manual') {
     if (this._running) return;
+    // The stagger (src/warm-stagger.js) decides when each seat's window starts;
+    // an interval, schedule or align sweep would start them on its own clock.
+    if (this.suspendSweeps && trigger !== 'manual') return;
     this.lastTrigger = trigger;
     const now = this.nowFn();
     const generation = this._scheduleGeneration;
@@ -338,9 +351,9 @@ export class Warmer {
 
     const fromEvent = trigger.startsWith('exhaustion:') || trigger.startsWith('window-start:');
     if (targets.length || !fromEvent) this.log(this._describeSweep(trigger, targets, now));
-    await this._warmTargets(targets, { generation });
+    await this._warmTargets(targets, { generation, allowWhileSuspended: trigger === 'manual' });
     for (const item of deferred) {
-      this._deferWarmAccount(item.account, item.runAt, generation);
+      this._deferWarmAccount(item.account, item.runAt, generation, trigger === 'manual');
     }
   }
 
@@ -348,6 +361,14 @@ export class Warmer {
     generation = this._scheduleGeneration,
     waitForRunning = false,
     deadline = null,
+    shouldContinue = () => true,
+    // Manual sweeps and the stagger's own touches; every other caller stops
+    // sending the moment the stagger takes over, even mid-sweep.
+    allowWhileSuspended = false,
+    // Optional: each account this call sent for, with what came of it, so a
+    // caller learns what ITS call did rather than reading shared state.
+    /** @type {{account: any, outcome: string}[]|null} */
+    outcomes = null,
   } = {}) {
     while (this._running) {
       if (!waitForRunning) return false;
@@ -367,16 +388,19 @@ export class Warmer {
       for (const account of targets) {
         const canContinue = () => generation === this._scheduleGeneration
           && !this._stopped
-          && (deadline === null || this.nowFn() < deadline);
+          && (deadline === null || this.nowFn() < deadline)
+          && (allowWhileSuspended || !this.suspendSweeps)
+          && shouldContinue();
         if (abort.signal.aborted || !canContinue()) break;
         const isStillEligible = () => this._isWarmTarget(account);
         if (!isStillEligible()) continue;
-        await this.warmAccount(
+        const outcome = await this.warmAccount(
           account,
           abort.signal,
           canContinue,
           isStillEligible,
         );
+        outcomes?.push({ account, outcome });
       }
       return true;
     } finally {
@@ -388,8 +412,11 @@ export class Warmer {
     }
   }
 
-  _deferWarmAccount(account, runAt, generation) {
+  /** @param {any} account @param {number} runAt @param {number} generation @param {boolean} [manual] */
+  _deferWarmAccount(account, runAt, generation, manual = false) {
     if (generation !== this._scheduleGeneration || this._stopped || this.schedule?.mode !== 'rolling') return;
+    // A sweep that was mid-send when the stagger took over must not queue.
+    if (this.suspendSweeps && !manual) return;
     if (this._deferredWarmups.has(account)) return;
     const delay = Math.max(0, runAt - this.nowFn());
     const timer = this.setTimeoutFn(async () => {
@@ -397,7 +424,7 @@ export class Warmer {
       if (generation !== this._scheduleGeneration || this._stopped || this.schedule?.mode !== 'rolling') return;
       const remaining = runAt - this.nowFn();
       if (remaining > 0) {
-        this._deferWarmAccount(account, runAt, generation);
+        this._deferWarmAccount(account, runAt, generation, manual);
         return;
       }
       const deadline = runAt + SCHEDULE_TIMER_GRACE_MS;
@@ -406,6 +433,7 @@ export class Warmer {
       await this._warmTargets([account], {
         generation,
         waitForRunning: true,
+        allowWhileSuspended: manual,
         deadline,
       });
     }, delay);
@@ -428,7 +456,7 @@ export class Warmer {
       if (signal?.aborted || !shouldContinue()) {
         if (previousStatus) this.accountStatus.set(account.name, previousStatus);
         else this.accountStatus.delete(account.name);
-        return;
+        return 'skipped';
       }
       if (account.status === 'error') {
         const finishedAt = Date.now();
@@ -437,12 +465,12 @@ export class Warmer {
           error: 'token refresh rejected; re-login required',
           startedAt, finishedAt, durationMs: finishedAt - startedAt,
         });
-        return;
+        return 'error';
       }
       if (!isStillEligible()) {
         if (previousStatus) this.accountStatus.set(account.name, previousStatus);
         else this.accountStatus.delete(account.name);
-        return;
+        return 'skipped';
       }
       let error = null;
       if (this.transport === 'direct') {
@@ -458,6 +486,7 @@ export class Warmer {
         error,
         startedAt, finishedAt, durationMs: finishedAt - startedAt,
       });
+      return error ? `error: ${error}` : 'ok';
     } catch (err) {
       const finishedAt = Date.now();
       this._record(account, {
@@ -465,6 +494,7 @@ export class Warmer {
         error: err?.message || String(err),
         startedAt, finishedAt, durationMs: finishedAt - startedAt,
       });
+      return `error: ${err?.message || String(err)}`;
     }
   }
 

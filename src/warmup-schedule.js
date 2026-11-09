@@ -23,7 +23,7 @@ function formatter(timezone) {
   return value;
 }
 
-function localParts(epochMs, timezone) {
+export function localParts(epochMs, timezone) {
   const values = {};
   for (const part of formatter(timezone).formatToParts(epochMs)) {
     if (part.type !== 'literal') values[part.type] = Number(part.value);
@@ -46,7 +46,7 @@ function sameLocalMinute(epochMs, wanted, timezone) {
     && actual.minute === wanted.minute;
 }
 
-function localInstant(wanted, timezone) {
+export function localInstant(wanted, timezone) {
   const naiveUtc = Date.UTC(wanted.year, wanted.month - 1, wanted.day, wanted.hour, wanted.minute);
   const offsets = new Set();
   for (let hours = -36; hours <= 36; hours += 3) {
@@ -59,7 +59,7 @@ function localInstant(wanted, timezone) {
   return matches[0] ?? null;
 }
 
-function addCalendarDays(date, days) {
+export function addCalendarDays(date, days) {
   const value = new Date(Date.UTC(date.year, date.month - 1, date.day + days));
   return {
     year: value.getUTCFullYear(),

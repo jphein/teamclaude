@@ -836,3 +836,86 @@ test('a schedule replaced during warm-up cannot create an orphan timer', async (
   assert.equal(timers.length, 2, 'only the replacement schedule owns a timer');
   assert.equal(warmer.getStatus().resetTime, '16:30');
 });
+
+test('while the stagger owns window starts, interval/schedule/align sweeps send nothing; manual still does', async () => {
+  const am = new AccountManager([oauth('idle')], 0.98);
+  const spawn = fakeSpawner();
+  const w = makeWarmer(am, spawn);
+  w.suspendSweeps = true;
+  await w.warmAll('interval');
+  await w.warmAll('schedule');
+  await w.warmAll('window-start:other');
+  assert.equal(spawn.calls.length, 0);
+  await w.warmAll('manual');
+  assert.equal(spawn.calls.length, 1);
+});
+
+test('a caller\'s shouldContinue is asked right before each send', async () => {
+  const am = new AccountManager([oauth('idle')], 0.98);
+  const spawn = fakeSpawner();
+  const w = makeWarmer(am, spawn);
+  await w._warmTargets([am.accounts[0]], { shouldContinue: () => false });
+  assert.equal(spawn.calls.length, 0);
+  await w._warmTargets([am.accounts[0]], { shouldContinue: () => true });
+  assert.equal(spawn.calls.length, 1);
+});
+
+test('a sweep already running stops sending once the stagger takes over', async () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  let w;
+  const spawn = fakeSpawner();
+  const spawnFn = async (spec) => { await spawn(spec); w.suspendSweeps = true; return 0; };
+  w = makeWarmer(am, spawnFn);
+  await w.warmAll('interval');
+  assert.equal(spawn.calls.length, 1, 'the first send went; the second did not');
+});
+
+test('_warmTargets reports what each send it made came to', async () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  am.accounts[1].quota.unified5hReset = Date.now() + 3600_000; // running: not sent
+  const outcomes = [];
+  await makeWarmer(am, fakeSpawner())._warmTargets(am.accounts, { outcomes });
+  assert.deepEqual(outcomes.map(o => [o.account.name, o.outcome]), [['a', 'ok']]);
+  const failed = [];
+  await makeWarmer(am, fakeSpawner(3))._warmTargets([am.accounts[0]], { outcomes: failed });
+  assert.deepEqual(failed.map(o => o.outcome), ['error: claude exited 3']);
+});
+
+test('a manual sweep under the stagger keeps its exemption for rolling deferrals', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const w = makeWarmer(am, fakeSpawner());
+  /** @type {any[]} */
+  const calls = [];
+  w._warmTargets = async (_t, opts) => { calls.push(opts); return true; };
+  w.schedule = { mode: 'rolling' };
+  /** @type {Function[]} */
+  const due = [];
+  w.setTimeoutFn = (fn) => { due.push(fn); return { unref() {} }; };
+  w.nowFn = () => 1000;
+  w._deferWarmAccount(am.accounts[0], 1000, w._scheduleGeneration, true);
+  return Promise.resolve(due[0]()).then(() => assert.equal(calls[0]?.allowWhileSuspended, true));
+});
+
+test('the stagger taking over drops pending automatic deferrals', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const w = makeWarmer(am, fakeSpawner());
+  w.schedule = { mode: 'rolling' };
+  w.setTimeoutFn = () => ({ unref() {} });
+  w.nowFn = () => 1000;
+  w._deferWarmAccount(am.accounts[0], 5000, w._scheduleGeneration, false);
+  assert.equal(w._deferredWarmups.size, 1);
+  w.setSuspendSweeps(true);
+  assert.equal(w._deferredWarmups.size, 0);
+});
+
+test('while suspended, an automatic deferral is not queued; a manual one is', () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  const w = makeWarmer(am, fakeSpawner());
+  w.schedule = { mode: 'rolling' };
+  w.setTimeoutFn = () => ({ unref() {} });
+  w.nowFn = () => 1000;
+  w.setSuspendSweeps(true);
+  w._deferWarmAccount(am.accounts[0], 5000, w._scheduleGeneration, false);
+  w._deferWarmAccount(am.accounts[1], 5000, w._scheduleGeneration, true);
+  assert.deepEqual([...w._deferredWarmups.keys()].map(a => a.name), ['b']);
+});

@@ -68,7 +68,7 @@ test('quota summary returns per-account buckets and tier-weighted fleet totals',
 
   const summary = am.getQuotaSummary();
   assert.deepEqual(summary.accounts[0].buckets, {
-    fiveHour: { utilization: 0.2, remaining: 0.8, resetAt: resetPro, source: 'unified5h' },
+    fiveHour: { utilization: 0.2, remaining: 0.8, resetAt: resetPro, source: 'unified5h', windowStart: resetPro - 5 * 3_600_000 },
     weeklyShared: { utilization: 0.4, remaining: 0.6, resetAt: resetPro, source: 'unified7d' },
     weeklySonnet: { utilization: 0.6, remaining: 0.4, resetAt: resetMax, source: 'unified7dSonnet' },
     weeklyFable: { utilization: 0.4, remaining: 0.6, resetAt: resetPro, source: 'unified7d' },
@@ -225,7 +225,7 @@ test('a unified reading outranks a backend window', () => {
   const summary = am.getQuotaSummary();
 
   assert.deepEqual(summary.accounts[0].buckets.fiveHour, {
-    utilization: 0.9, remaining: 0.1, resetAt: unifiedReset, source: 'unified5h',
+    utilization: 0.9, remaining: 0.1, resetAt: unifiedReset, source: 'unified5h', windowStart: unifiedReset - 5 * 3_600_000,
   });
 });
 

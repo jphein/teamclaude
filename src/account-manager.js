@@ -3317,16 +3317,6 @@ export class AccountManager {
   }
 
   /**
-   * True when expiry routing would not choose `account` now: it is outside the
-   * top pressure band of the fleet it serves. Drawn over that fleet (the provider
-   * partition) and never over one request's tried set, as in
-   * _switchOnSessionReset. An account whose pressure is unknown is never moved
-   * off: the band passes it through rather than ranking a guess.
-   * @param {Record<string, any>} account
-   * @param {string|null} [model]
-   * @param {string|null} [advisorModel]
-   */
-  /**
    * Refresh routing's sort key: the reset of the seat's running 5h window, or
    * Infinity when none is running (a cold seat starts a new window, the thing
    * this rule saves for last). 0 for every seat when the rule is off, so the
@@ -3354,6 +3344,16 @@ export class AccountManager {
       .some(a => a.index !== current.index && (a.priority || 0) <= (current.priority || 0) && this._refreshKey(a, now) < mine);
   }
 
+  /**
+   * True when expiry routing would not choose `account` now: it is outside the
+   * top pressure band of the fleet it serves. Drawn over that fleet (the provider
+   * partition) and never over one request's tried set, as in
+   * _switchOnSessionReset. An account whose pressure is unknown is never moved
+   * off: the band passes it through rather than ranking a guess.
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   */
   _bandPreempts(account, model = null, advisorModel = null) {
     const er = this.expiryRouting;
     if (!account || !er?.enabled || !er.preempt || !er.rebalance) return false;
@@ -4212,7 +4212,7 @@ export class AccountManager {
     // promises none.
     // Refresh routing ranks a seat that just reset last (its next window is the
     // freshest), so jumping to it here would undo the rule on the next request.
-    if (sessionReset.length && this.expiryRouting.refresh !== 'nearest') {
+    if (sessionReset.length && this.expiryRouting?.refresh !== 'nearest') {
       this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null, scope, adv);
     }
     return changed;

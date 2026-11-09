@@ -20,6 +20,7 @@ import { atomicConfigUpdate, getConfigPath } from './config.js';
 import { resolveTlsConfig } from './tls-listener.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
 import { resolveWarmupSchedule } from './warmup-schedule.js';
+import { normalizeStagger } from './warm-stagger.js';
 import { parseProxyUrl } from './upstream-proxy.js';
 import { resolveLogSource, resolveRestartMethod } from './service-control.js';
 import { SHARED_KEY_ENTRY, fallbackAllowed } from './family-policy.js';
@@ -164,6 +165,9 @@ export const FIELDS = [
   { key: 'warmupSchedule', group: 'Keep-warm', label: 'Warm-up schedule', type: 'json', apply: 'hot', def: null,
     help: 'Time warm-ups for a daily reset, e.g. { "resetTime": "15:30", "timezone": "America/Los_Angeles" }. Empty = none.',
     check: (v) => { if (v == null) return null; try { resolveWarmupSchedule(v); return null; } catch (e) { return /** @type {Error} */ (e).message; } } },
+  { key: 'warmupStagger', group: 'Keep-warm', label: 'Stagger 5h windows', type: 'json', apply: 'hot', def: null,
+    help: 'Spread the seats\' 5h windows across the five hours before you wake, so a refresh is never far away, e.g. { "wake": "07:00", "timezone": "America/Los_Angeles" }. Suspends align while set. Empty = off.',
+    check: (v) => { if (v == null) return null; try { normalizeStagger(v); return null; } catch (e) { return /** @type {Error} */ (e).message; } } },
   { key: 'warmTransport', group: 'Keep-warm', label: 'Warm-up transport', type: 'enum', apply: 'restart', def: 'direct', options: ['direct', 'claude'],
     help: 'How a warm-up is sent: direct (the proxy calls itself, reliable) or claude (spawns the CLI).' },
 
@@ -522,7 +526,7 @@ export const SSO_EDITABLE = new Set([
   'failover.enabled', 'failover.afterSeconds', 'failover.maxConcurrent', 'failover.contextTokens',
   'failover.maxPromptTokens', 'failover.templateTokens', 'failover.timeoutSeconds',
   'fable.allow', 'fable.model', 'fable.fallbackOnCapacity', 'mythos.allow', 'mythos.model', 'mythos.fallbackOnCapacity',
-  'warmOnExhaustion', 'warmupSeconds', 'warmupSchedule',
+  'warmOnExhaustion', 'warmupSeconds', 'warmupSchedule', 'warmupStagger',
   'quotaBarPercent', 'accountSort',
 ]);
 // Left to the key on purpose (Oracle round 4): failover.excludeClients (who

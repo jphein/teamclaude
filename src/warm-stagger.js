@@ -57,9 +57,12 @@ export function normalizeStagger(cfg) {
   };
 }
 
+/** @typedef {NonNullable<ReturnType<typeof normalizeStagger>>} StaggerSettings */
+
 /** Seat i of n: its slot as minutes after local midnight. The first slot is
  *  one window before wake (its window ends at wake), the rest spread evenly
- *  across the span after it. */
+ *  across the span after it.
+ *  @param {number} i @param {number} n @param {StaggerSettings} s */
 export function slotMinutes(i, n, s) {
   const first = s.wakeMinutes - 300;
   const offset = n > 0 ? Math.round(i * s.spanMinutes / n) : 0;
@@ -73,7 +76,9 @@ export function formatSlot(minutes) {
 
 /** The first touch time strictly after `after` for a seat whose slot is
  *  `minutes` past local midnight: the slot on some local day, or 5, 10 or 15
- *  hours after it. Elapsed hours, not wall-clock ones, since a window is. */
+ *  hours after it. Elapsed hours, not wall-clock ones, since a window is.
+ *  @param {number} minutes @param {StaggerSettings} s @param {number} after
+ *  @returns {number|null} */
 export function nextTouchAt(minutes, s, after) {
   const today = localParts(after, s.timezone);
   let best = null;
@@ -115,7 +120,8 @@ export class StaggerAnchors {
 
   /** Apply a config value (null/absent turns it off). Throws on a bad value
    *  and leaves the running schedule as it was. Re-applying recomputes the
-   *  slots, so a seat added or removed on reload is placed. */
+   *  slots, so a seat added or removed on reload is placed.
+   *  @param {any} cfg */
   configure(cfg) {
     const settings = normalizeStagger(cfg);
     const previous = this.seats;
@@ -123,7 +129,7 @@ export class StaggerAnchors {
     this.settings = settings;
     if (!settings) return;
     const roster = this._roster();
-    roster.forEach((account, i) => {
+    roster.forEach((/** @type {any} */ account, /** @type {number} */ i) => {
       const minutes = slotMinutes(i, roster.length, settings);
       const old = previous.get(account.name);
       const keep = old && old.minutes === minutes;
@@ -135,7 +141,7 @@ export class StaggerAnchors {
     });
     const now = this.nowFn();
     for (const account of roster) this._arm(account, now - GRACE_MS);
-    this.log(`[TeamClaude] Keep-warm stagger: ${roster.map(a => `"${a.name}" ${formatSlot(/** @type {any} */ (this.seats.get(a.name)).minutes)}`).join(', ')} (${settings.timezone}; wake ${settings.wake})`);
+    this.log(`[TeamClaude] Keep-warm stagger: ${roster.map((/** @type {any} */ a) => `"${a.name}" ${formatSlot(/** @type {any} */ (this.seats.get(a.name)).minutes)}`).join(', ')} (${settings.timezone}; wake ${settings.wake})`);
   }
 
   stop() {

@@ -895,3 +895,15 @@ test('a manual sweep under the stagger keeps its exemption for rolling deferrals
   w._deferWarmAccount(am.accounts[0], 1000, w._scheduleGeneration, true);
   return Promise.resolve(due[0]()).then(() => assert.equal(calls[0]?.allowWhileSuspended, true));
 });
+
+test('the stagger taking over drops pending automatic deferrals', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const w = makeWarmer(am, fakeSpawner());
+  w.schedule = { mode: 'rolling' };
+  w.setTimeoutFn = () => ({ unref() {} });
+  w.nowFn = () => 1000;
+  w._deferWarmAccount(am.accounts[0], 5000, w._scheduleGeneration, false);
+  assert.equal(w._deferredWarmups.size, 1);
+  w.setSuspendSweeps(true);
+  assert.equal(w._deferredWarmups.size, 0);
+});

@@ -160,6 +160,14 @@ export class Warmer {
     }
   }
 
+  /** Hand window starts to the stagger (or back). Taking over drops every
+   *  pending rolling deferral: those were queued by automatic sweeps, and a
+   *  later manual sweep must be able to queue its own. @param {boolean} on */
+  setSuspendSweeps(on) {
+    this.suspendSweeps = !!on;
+    if (this.suspendSweeps) this._clearDeferredWarmups();
+  }
+
   /** Turn the on-exhaustion trigger on/off at runtime. */
   setOnExhaustion(on) {
     on = !!on;

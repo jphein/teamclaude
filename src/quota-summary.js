@@ -81,7 +81,7 @@ function accountBuckets(quota) {
   // Anthropic reports only a 5h window's reset; it began five hours before it
   // (fork, for the seats tile and the stagger measurement). An inference, so
   // it rides beside resetAt rather than replacing anything reported.
-  if (buckets.fiveHour?.source === 'unified5h' && Number.isFinite(Number(buckets.fiveHour.resetAt))) {
+  if (buckets.fiveHour?.source === 'unified5h' && buckets.fiveHour.resetAt != null && Number.isFinite(Number(buckets.fiveHour.resetAt))) {
     buckets.fiveHour = { ...buckets.fiveHour, windowStart: Number(buckets.fiveHour.resetAt) - 5 * 60 * 60 * 1000 };
   }
   // A monthly window exists only on third-party backends; like tokens and

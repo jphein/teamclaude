@@ -87,3 +87,11 @@ test('quota summary: next_refresh names the soonest usable reset; fiveHour carri
   const fh = s.accounts.find((/** @type {any} */ x) => x.name === 'a').buckets.fiveHour;
   assert.equal(fh.windowStart, fh.resetAt - 5 * H);
 });
+
+test('a seat with no running window has no windowStart', () => {
+  const am = mgr('nearest', ['cold']);
+  am.accounts[0].quota.unified5h = 0;
+  const fh = am.getQuotaSummary().accounts[0].buckets.fiveHour;
+  assert.equal(fh.resetAt, null);
+  assert.equal('windowStart' in fh, false);
+});

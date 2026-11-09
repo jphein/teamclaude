@@ -114,6 +114,8 @@ export class Warmer {
     this.intervalMs = intervalMs;
     this.schedule = schedule;
     this.onExhaustion = onExhaustion;
+    // Set while the stagger owns window starts; see warmAll.
+    this.suspendSweeps = false;
     this.transport = transport === 'claude' ? 'claude' : 'direct';
     this.port = port;
     this.apiKey = apiKey;
@@ -317,6 +319,9 @@ export class Warmer {
    *  on purpose: one subprocess at a time keeps load and the quota burst gentle. */
   async warmAll(trigger = 'manual') {
     if (this._running) return;
+    // The stagger (src/warm-stagger.js) decides when each seat's window starts;
+    // an interval, schedule or align sweep would start them on its own clock.
+    if (this.suspendSweeps && trigger !== 'manual') return;
     this.lastTrigger = trigger;
     const now = this.nowFn();
     const generation = this._scheduleGeneration;
@@ -348,6 +353,7 @@ export class Warmer {
     generation = this._scheduleGeneration,
     waitForRunning = false,
     deadline = null,
+    shouldContinue = () => true,
   } = {}) {
     while (this._running) {
       if (!waitForRunning) return false;
@@ -367,7 +373,8 @@ export class Warmer {
       for (const account of targets) {
         const canContinue = () => generation === this._scheduleGeneration
           && !this._stopped
-          && (deadline === null || this.nowFn() < deadline);
+          && (deadline === null || this.nowFn() < deadline)
+          && shouldContinue();
         if (abort.signal.aborted || !canContinue()) break;
         const isStillEligible = () => this._isWarmTarget(account);
         if (!isStillEligible()) continue;

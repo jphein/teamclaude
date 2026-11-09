@@ -836,3 +836,16 @@ test('a schedule replaced during warm-up cannot create an orphan timer', async (
   assert.equal(timers.length, 2, 'only the replacement schedule owns a timer');
   assert.equal(warmer.getStatus().resetTime, '16:30');
 });
+
+test('while the stagger owns window starts, interval/schedule/align sweeps send nothing; manual still does', async () => {
+  const am = new AccountManager([oauth('idle')], 0.98);
+  const spawn = fakeSpawner();
+  const w = makeWarmer(am, spawn);
+  w.suspendSweeps = true;
+  await w.warmAll('interval');
+  await w.warmAll('schedule');
+  await w.warmAll('window-start:other');
+  assert.equal(spawn.calls.length, 0);
+  await w.warmAll('manual');
+  assert.equal(spawn.calls.length, 1);
+});

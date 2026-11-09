@@ -695,6 +695,7 @@ async function serverCommand() {
         stagger.configure(diskConfig.warmupStagger || null);
         if (diskConfig.warmupStagger) config.warmupStagger = diskConfig.warmupStagger;
         else delete config.warmupStagger;
+        warmer.suspendSweeps = stagger.enabled;
       }
       config.warmOnExhaustion = !!diskConfig.warmOnExhaustion;
       // Align puts every seat on one clock; the stagger spreads them. The
@@ -1164,6 +1165,7 @@ async function serverCommand() {
   stagger = new StaggerAnchors(accountManager, warmer);
   try { stagger.configure(config.warmupStagger || null); }
   catch (err) { console.error(`[TeamClaude] warmupStagger ignored: ${/** @type {any} */ (err)?.message || err}`); }
+  warmer.suspendSweeps = stagger.enabled;
 
   // The first credential-sync pass, and the daily one after it. Not awaited:
   // the store is reached over the network and the proxy serves meanwhile.

@@ -114,6 +114,12 @@ export class StaggerAnchors {
     this.settings = null;
     /** @type {Map<string, {minutes: number, nextAt: number|null, timer: any, lastAt: number|null, last: string|null}>} */
     this.seats = new Map();
+    // The last touch time served per seat and slot, kept across stop() and
+    // re-configure, so turning the stagger off and on never replays a slot.
+    /** @type {Map<string, number>} */
+    this.served = new Map();
+    // Bumped by configure/stop; a touch from an older generation never sends.
+    this.generation = 0;
   }
 
   get enabled() { return !!this.settings; }
@@ -132,11 +138,10 @@ export class StaggerAnchors {
     roster.forEach((/** @type {any} */ account, /** @type {number} */ i) => {
       const minutes = slotMinutes(i, roster.length, settings);
       const old = previous.get(account.name);
-      const keep = old && old.minutes === minutes;
       this.seats.set(account.name, {
         minutes, nextAt: null, timer: null,
-        lastAt: keep ? old.lastAt : null,
-        last: keep ? old.last : null,
+        lastAt: this.served.get(`${account.name}@${minutes}`) ?? null,
+        last: old && old.minutes === minutes ? old.last : null,
       });
     });
     const now = this.nowFn();
@@ -145,6 +150,7 @@ export class StaggerAnchors {
   }
 
   stop() {
+    this.generation += 1;
     for (const seat of this.seats.values()) if (seat.timer) this.clearTimeoutFn(seat.timer);
     this.seats = new Map();
     this.settings = null;
@@ -161,8 +167,10 @@ export class StaggerAnchors {
   _arm(account, after) {
     const seat = this.seats.get(account.name);
     if (!seat || !this.settings) return;
-    // A touch time already handled is never replayed by a re-arm.
-    const from = seat.lastAt != null ? Math.max(after, seat.lastAt) : after;
+    // A touch time already handled is never replayed by a re-arm, and one
+    // further back than the grace (a long suspend) is stepped over at once
+    // rather than walked one zero-delay timer at a time.
+    const from = Math.max(after, seat.lastAt ?? -Infinity, this.nowFn() - GRACE_MS);
     const at = nextTouchAt(seat.minutes, this.settings, from);
     seat.nextAt = at;
     if (at == null) return;
@@ -197,6 +205,7 @@ export class StaggerAnchors {
     const seat = this.seats.get(account.name);
     if (!seat) return;
     seat.lastAt = at;
+    this.served.set(`${account.name}@${seat.minutes}`, at);
     const now = this.nowFn();
     const slot = formatSlot(seat.minutes);
     if (now - at > GRACE_MS) {
@@ -234,10 +243,23 @@ export class StaggerAnchors {
     if (!seat) return;
     const why = this.skipReason(account);
     if (why) { seat.last = `left at ${new Date(at).toISOString()} (${why})`; return; }
+    // Re-read after any deferral: traffic may have started a window meanwhile.
+    const running = Number(account.quota?.unified5hReset);
+    if (Number.isFinite(running) && running > this.nowFn()) {
+      seat.last = `left at ${new Date(at).toISOString()} (window started meanwhile, until ${new Date(running).toISOString()})`;
+      return;
+    }
+    const generation = this.generation;
     this.log(`[TeamClaude] Keep-warm stagger: touching "${account.name}" for its ${slot} slot at ${new Date(this.nowFn()).toISOString()}`);
     // The warmer re-checks that the seat is still cold right before it sends,
     // so a request that started the window meanwhile is not doubled.
-    await this.warmer._warmTargets([account], { waitForRunning: true, deadline: at + GRACE_MS + DEFER_WITHIN_MS });
+    await this.warmer._warmTargets([account], {
+      waitForRunning: true,
+      deadline: at + GRACE_MS + DEFER_WITHIN_MS,
+      // Checked by the warmer right before it sends, after any wait behind a
+      // running sweep: a stop or re-configure meanwhile cancels the touch.
+      shouldContinue: () => generation === this.generation && this.seats.get(account.name) === seat,
+    });
     const reset = Number(account.quota?.unified5hReset);
     seat.last = `touched ${new Date(this.nowFn()).toISOString()}${Number.isFinite(reset) && reset > this.nowFn() ? `, resets ${new Date(reset).toISOString()}` : ''}`;
   }

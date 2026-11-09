@@ -74,7 +74,10 @@ function harness(accounts, { now = at('01:00'), thresholds = { default: 0.93, un
   const touched = [];
   const warmer = {
     _isWarmCandidate: (/** @type {any} */ a) => !a.disabled && a.status !== 'error' && a.status !== 'throttled' && a.status !== 'exhausted' && !am.weekBarred(a),
-    async _warmTargets(/** @type {any[]} */ targets) {
+    gate: /** @type {Promise<void>|null} */ (null),
+    async _warmTargets(/** @type {any[]} */ targets, /** @type {any} */ opts = {}) {
+      if (this.gate) await this.gate;
+      if (opts.shouldContinue && !opts.shouldContinue()) return false;
       for (const a of targets) {
         const reset = Number(a.quota.unified5hReset);
         if (Number.isFinite(reset) && reset > clock) continue; // the warmer's own re-check
@@ -99,7 +102,22 @@ function harness(accounts, { now = at('01:00'), thresholds = { default: 0.93, un
     }
     clock = to;
   }
-  return { am, st, touched, lines, advance, get clock() { return clock; } };
+  /** The process was suspended: the clock leaps, then the overdue timers fire late. */
+  async function jump(/** @type {number} */ to) {
+    clock = to;
+    let fired = 0;
+    for (;;) {
+      timers.sort((a, b) => a.at - b.at || a.id - b.id);
+      const t = timers[0];
+      if (!t || t.at > to) break;
+      timers.shift();
+      fired++;
+      t.fn();
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    }
+    return fired;
+  }
+  return { am, st, warmer, jump, touched, lines, advance, get clock() { return clock; } };
 }
 
 test('a cold seat is touched at its slot, and its windows then roll on the 5 h grid', async () => {
@@ -174,4 +192,51 @@ test('status names each seat, its slot and its next touch', () => {
   assert.equal(s.seats[0].nextTouchAt, new Date(at('02:00')).toISOString());
   h.st.configure(null);
   assert.deepEqual(h.st.status(), { enabled: false });
+});
+
+test('a touch queued behind a running sweep is cancelled by turning the stagger off', async () => {
+  const h = harness(['a']);
+  /** @type {() => void} */
+  let release = () => {};
+  h.warmer.gate = new Promise(r => { release = () => r(); });
+  h.st.configure(cfg);
+  await h.advance(at('02:01'));
+  h.st.configure(null);
+  release();
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+  assert.deepEqual(h.touched, []);
+});
+
+test('off and on again within the grace does not replay the slot it served', async () => {
+  const h = harness(['a']);
+  h.st.configure(cfg);
+  await h.advance(at('02:05'));
+  assert.equal(h.touched.length, 1);
+  h.am.accounts[0].quota.unified5hReset = null;
+  h.st.configure(null);
+  h.st.configure(cfg);
+  await h.advance(at('02:15'));
+  assert.equal(h.touched.length, 1);
+});
+
+test('a window started by traffic during the deferral is not doubled', async () => {
+  const h = harness(['a']);
+  Object.assign(h.am.accounts[0].quota, { unified5h: 0.4, unified5hReset: at('02:10') });
+  h.st.configure(cfg);
+  await h.advance(at('02:05'));
+  // Traffic lands right after the reset, before the deferred touch.
+  h.am.accounts[0].quota.unified5hReset = at('02:10') + 5 * H;
+  await h.advance(at('02:20'));
+  assert.deepEqual(h.touched, []);
+});
+
+test('a suspend of days steps over the missed slots instead of walking them', async () => {
+  const h = harness(['a']);
+  h.st.configure(cfg);
+  await h.advance(at('02:05'));
+  const before = h.touched.length;
+  const fired = await h.jump(at('09:00', 3));
+  assert.equal(fired, 1, 'the one overdue timer fires, and is not followed by a chain of past slots');
+  assert.equal(h.touched.length, before);
+  assert.equal(h.st.status().seats[0].nextTouchAt, new Date(at('12:00', 3)).toISOString());
 });

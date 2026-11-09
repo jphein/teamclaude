@@ -4212,7 +4212,7 @@ export class AccountManager {
     // promises none.
     // Refresh routing ranks a seat that just reset last (its next window is the
     // freshest), so jumping to it here would undo the rule on the next request.
-    if (sessionReset.length && this.expiryRouting?.refresh !== 'nearest') {
+    if (sessionReset.length && !(this.expiryRouting?.enabled && this.expiryRouting.refresh === 'nearest')) {
       this._switchOnSessionReset(sessionReset, this.expiryRouting.enabled ? model : null, scope, adv);
     }
     return changed;

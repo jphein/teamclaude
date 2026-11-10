@@ -17,6 +17,7 @@
 // keep-warm sweep applies (disabled, re-auth, throttled, week spent), plus a
 // floor on the weekly quota left.
 
+import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { localParts, localInstant, addCalendarDays } from './warmup-schedule.js';
 import { warmApplicable } from './warmer.js';
 
@@ -24,6 +25,16 @@ export const WINDOW_MS = 5 * 60 * 60 * 1000;
 export const DEFER_WITHIN_MS = 15 * 60 * 1000;
 export const GRACE_MS = 20 * 60 * 1000;
 export const POST_RESET_BUFFER_MS = 10 * 1000;
+// Anthropic starts a 5h window at the 10-minute mark at or before the first
+// request (measured 2026-11-10: 02:43 → resets 07:40, 04:51 → 09:50). Slots sit
+// on those marks and a touch goes this long after one, so the window it starts
+// runs exactly slot → slot + 5h and the previous one has surely ended.
+export const TOUCH_OFFSET_MS = 10 * 1000;
+// Each day's slots are handed out this long before the first one, over the
+// seats that can be touched that morning (2026-11-10: four spent seats held
+// empty slots and the refresh gaps doubled).
+export const PLAN_LEAD_MINUTES = 10;
+const SERVED_KEEP_MS = 3 * 24 * 60 * 60 * 1000;
 const STEPS_PER_DAY = 4; // slot, +5h, +10h, +15h; the window from +15h ends at +20h
 
 /** @param {any} cfg */
@@ -65,8 +76,33 @@ export function normalizeStagger(cfg) {
  *  @param {number} i @param {number} n @param {StaggerSettings} s */
 export function slotMinutes(i, n, s) {
   const first = s.wakeMinutes - 300;
-  const offset = n > 0 ? Math.round(i * s.spanMinutes / n) : 0;
-  return (((first + offset) % 1440) + 1440) % 1440;
+  const offset = n > 0 ? i * s.spanMinutes / n : 0;
+  const onMark = Math.round((first + offset) / 10) * 10;
+  return ((onMark % 1440) + 1440) % 1440;
+}
+
+/** The local instants at `minutes` past midnight around `around`, ascending.
+ *  @param {number} minutes @param {StaggerSettings} s @param {number} around */
+function dailyInstants(minutes, s, around) {
+  const today = localParts(around, s.timezone);
+  const out = [];
+  for (let d = -2; d <= 2; d++) {
+    const t = localInstant({ ...addCalendarDays(today, d), hour: Math.floor(minutes / 60), minute: minutes % 60 }, s.timezone);
+    if (t != null) out.push(t);
+  }
+  return out.sort((a, b) => a - b);
+}
+
+/** The latest plan instant at or before `now`, and the next one after it.
+ *  A plan is made PLAN_LEAD_MINUTES (elapsed) before the day's first slot as
+ *  resolved, rounding included, so a plan time that a DST change skips still
+ *  plans a slot that exists; a day whose first slot does not exist has none.
+ *  @param {StaggerSettings} s @param {number} now */
+export function planWindow(s, now) {
+  const all = dailyInstants(slotMinutes(0, 1, s), s, now).map(t => t - PLAN_LEAD_MINUTES * 60_000);
+  const last = all.filter(t => t <= now).pop() ?? null;
+  const next = all.find(t => t > now) ?? null;
+  return { last, next };
 }
 
 /** @param {number} minutes */
@@ -103,8 +139,17 @@ export class StaggerAnchors {
    * @param {Function} [opts.setTimeoutFn]
    * @param {Function} [opts.clearTimeoutFn]
    * @param {(line: string) => void} [opts.log]
+   * @param {string|null} [opts.statePath] where the day's plan and the served
+   *   slots are kept across restarts (null: memory only)
    */
-  constructor(am, warmer, { nowFn = Date.now, setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout, log = console.log } = {}) {
+  constructor(am, warmer, { nowFn = Date.now, setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout, log = console.log, statePath = null } = {}) {
+    this.statePath = statePath;
+    /** @type {any} */
+    this.planTimer = null;
+    /** @type {number|null} */
+    this.planAt = null;
+    /** @type {number|null} */
+    this.nextPlanAt = null;
     this.am = am;
     this.warmer = warmer;
     this.nowFn = nowFn;
@@ -112,7 +157,7 @@ export class StaggerAnchors {
     this.clearTimeoutFn = clearTimeoutFn;
     this.log = log;
     this.settings = null;
-    /** @type {Map<string, {minutes: number, nextAt: number|null, timer: any, lastAt: number|null, last: string|null}>} */
+    /** @type {Map<string, {minutes: number|null, nextAt: number|null, timer: any, lastAt: number|null, last: string|null}>} */
     this.seats = new Map();
     // The last touch time served per seat and slot, kept across stop() and
     // re-configure, so turning the stagger off and on never replays a slot.
@@ -125,40 +170,156 @@ export class StaggerAnchors {
   get enabled() { return !!this.settings; }
 
   /** Apply a config value (null/absent turns it off). Throws on a bad value
-   *  and leaves the running schedule as it was. Re-applying recomputes the
-   *  slots, so a seat added or removed on reload is placed.
+   *  and leaves the running schedule as it was. The day's plan is reused when
+   *  one was made since the last plan time (a restart or reload mid-day keeps
+   *  the morning's slots); otherwise it is made now.
    *  @param {any} cfg */
   configure(cfg) {
     const settings = normalizeStagger(cfg);
-    const previous = this.seats;
     this.stop();
     this.settings = settings;
     if (!settings) return;
-    const roster = this._roster();
-    roster.forEach((/** @type {any} */ account, /** @type {number} */ i) => {
-      const minutes = slotMinutes(i, roster.length, settings);
-      const old = previous.get(account.name);
-      this.seats.set(account.name, {
-        minutes, nextAt: null, timer: null,
-        lastAt: this.served.get(`${account.name}@${minutes}`) ?? null,
-        last: old && old.minutes === minutes ? old.last : null,
-      });
-    });
+    try { this._configure(); } catch (err) { this.stop(); throw err; }
+  }
+
+  _configure() {
+    const settings = /** @type {StaggerSettings} */ (this.settings);
+    const saved = this._load();
+    for (const [k, v] of Object.entries(saved?.served || {})) {
+      if (typeof v === 'number' && !((this.served.get(k) ?? -Infinity) >= v)) this.served.set(k, v);
+    }
     const now = this.nowFn();
-    for (const account of roster) this._arm(account, now - GRACE_MS);
-    this.log(`[TeamClaude] Keep-warm stagger: ${roster.map((/** @type {any} */ a) => `"${a.name}" ${formatSlot(/** @type {any} */ (this.seats.get(a.name)).minutes)}`).join(', ')} (${settings.timezone}; wake ${settings.wake})`);
+    const { last } = planWindow(settings, now);
+    const sig = this._signature();
+    const reuse = saved && saved.signature === sig && last != null && saved.planAt === last && saved.slots
+      ? saved.slots : null;
+    this._applyPlan(reuse, last ?? now, reuse ? 'kept' : 'made');
+    this._armPlan();
+  }
+
+  /** What a saved plan must match to be reused. */
+  _signature() {
+    const s = /** @type {StaggerSettings} */ (this.settings);
+    return `${s.wake}|${s.timezone}|${s.spanMinutes}|${s.minWeeklyRemaining}`;
+  }
+
+  /** Hand out slots (or take `slots` as given), then arm every slotted seat.
+   *  @param {Record<string, number|null>|null} slots @param {number} planAt @param {string} how */
+  _applyPlan(slots, planAt, how) {
+    const settings = /** @type {StaggerSettings} */ (this.settings);
+    for (const seat of this.seats.values()) if (seat.timer) this.clearTimeoutFn(seat.timer);
+    const previous = this.seats;
+    this.seats = new Map();
+    this.generation += 1;
+    const roster = this._roster();
+    /** @type {Record<string, number|null>} */
+    const plan = {};
+    /** @type {Record<string, string>} */
+    const why = {};
+    if (slots) {
+      for (const a of roster) plan[a.name] = typeof slots[a.name] === 'number' ? slots[a.name] : null;
+    } else {
+      const eligible = [];
+      for (const a of roster) {
+        const r = this.skipReason(a);
+        if (r) { plan[a.name] = null; why[a.name] = r; } else eligible.push(a);
+      }
+      eligible.forEach((a, i) => { plan[a.name] = slotMinutes(i, eligible.length, settings); });
+    }
+    for (const a of roster) {
+      const minutes = plan[a.name];
+      const old = previous.get(a.name);
+      this.seats.set(a.name, {
+        minutes, nextAt: null, timer: null,
+        lastAt: minutes == null ? null : this.served.get(`${a.name}@${minutes}`) ?? null,
+        last: minutes == null
+          ? `no slot today${why[a.name] ? ` (${why[a.name]})` : ''}`
+          : (old && old.minutes === minutes ? old.last : null),
+      });
+    }
+    this.planAt = planAt;
+    const now = this.nowFn();
+    for (const a of roster) if (plan[a.name] != null) this._arm(a, now - GRACE_MS);
+    this._save(plan);
+    const slotted = roster.filter(a => plan[a.name] != null).map(a => `"${a.name}" ${formatSlot(/** @type {number} */ (plan[a.name]))}`);
+    const none = roster.filter(a => plan[a.name] == null).map(a => `"${a.name}"${why[a.name] ? ` (${why[a.name]})` : ''}`);
+    this.log(`[TeamClaude] Keep-warm stagger: plan ${how} for ${new Date(planAt).toISOString()}: ${slotted.join(', ') || 'no seat can be touched'}${none.length ? `; no slot: ${none.join(', ')}` : ''} (${settings.timezone}; wake ${settings.wake})`);
+  }
+
+  /** Re-plan every day PLAN_LEAD_MINUTES before the first slot. */
+  _armPlan() {
+    if (!this.settings) return;
+    const settings = this.settings;
+    const { next } = planWindow(settings, this.nowFn());
+    this.nextPlanAt = next;
+    if (next == null) return;
+    const t = this.setTimeoutFn(() => {
+      if (this.settings !== settings) return;
+      this.planTimer = null;
+      // The plan time this run serves; after a long suspend that is the latest
+      // one passed, not the one the timer was set for.
+      this._applyPlan(null, planWindow(settings, this.nowFn()).last ?? next, 'made');
+      this._armPlan();
+    }, Math.max(0, next - this.nowFn()));
+    t?.unref?.();
+    this.planTimer = t;
+  }
+
+  /** The saved state, validated as a whole; anything malformed is ignored
+   *  entirely (and logged) rather than trusted in part. */
+  _load() {
+    if (!this.statePath) return null;
+    let raw;
+    try { raw = JSON.parse(readFileSync(this.statePath, 'utf8')); } catch { return null; }
+    const now = this.nowFn();
+    const okTime = (/** @type {any} */ v) => typeof v === 'number' && Number.isFinite(v)
+      && v > now - SERVED_KEEP_MS - 86_400_000 && v < now + 2 * 86_400_000;
+    const okSlot = (/** @type {any} */ v) => v === null || (Number.isInteger(v) && v >= 0 && v < 1440);
+    const valid = raw && typeof raw === 'object'
+      && typeof raw.signature === 'string'
+      && (raw.planAt === null || okTime(raw.planAt))
+      && raw.slots && typeof raw.slots === 'object' && Object.values(raw.slots).every(okSlot)
+      && raw.served && typeof raw.served === 'object' && Object.values(raw.served).every(okTime);
+    if (!valid) {
+      this.log(`[TeamClaude] Keep-warm stagger: ignoring a malformed state file ${this.statePath}`);
+      return null;
+    }
+    return raw;
+  }
+
+  /** Write the state; false when it could not be written (memory-only is
+   *  true). @param {Record<string, number|null>} [plan] @returns {boolean} */
+  _save(plan) {
+    if (!this.statePath || !this.settings) return true;
+    const now = this.nowFn();
+    /** @type {Record<string, number>} */
+    const served = {};
+    for (const [k, v] of this.served) if (now - v < SERVED_KEEP_MS) served[k] = v;
+    const slots = plan ?? Object.fromEntries([...this.seats].map(([n, s]) => [n, s.minutes]));
+    try {
+      const tmp = `${this.statePath}.tmp`;
+      writeFileSync(tmp, JSON.stringify({ signature: this._signature(), planAt: this.planAt, slots, served }) + '\n', { mode: 0o600 });
+      renameSync(tmp, this.statePath);
+      return true;
+    } catch (err) {
+      this.log(`[TeamClaude] Keep-warm stagger: could not save its state: ${/** @type {any} */ (err)?.message || err}`);
+      return false;
+    }
   }
 
   stop() {
     this.generation += 1;
+    if (this.planTimer) { this.clearTimeoutFn(this.planTimer); this.planTimer = null; }
     for (const seat of this.seats.values()) if (seat.timer) this.clearTimeoutFn(seat.timer);
     this.seats = new Map();
     this.settings = null;
   }
 
-  /** Seats that hold a slot: every warmable seat that is not disabled, in
-   *  config order. A seat whose week is spent keeps its slot and is skipped at
-   *  it, so the others do not shift every time a week runs out. */
+  /** Seats a plan considers: every warmable seat that is not disabled, in
+   *  config order. Each day's plan gives slots only to those that can be
+   *  touched then, so a spent week leaves no hole; within the day the slots
+   *  stay put, and a seat whose week resets mid-day joins the next plan. */
+  /** @returns {any[]} */
   _roster() {
     return this.am.accounts.filter((/** @type {any} */ a) => warmApplicable(a) && !a.disabled);
   }
@@ -166,7 +327,7 @@ export class StaggerAnchors {
   /** @param {any} account @param {number} after */
   _arm(account, after) {
     const seat = this.seats.get(account.name);
-    if (!seat || !this.settings) return;
+    if (!seat || !this.settings || seat.minutes == null) return;
     // A touch time already handled is never replayed by a re-arm, and one
     // further back than the grace (a long suspend) is stepped over at once
     // rather than walked one zero-delay timer at a time.
@@ -181,7 +342,7 @@ export class StaggerAnchors {
       this._fire(account, at).catch(() => {}).finally(() => {
         if (this.settings === settings && this.seats.get(account.name) === seat) this._arm(account, at);
       });
-    }, Math.max(0, at - this.nowFn()));
+    }, Math.max(0, at + TOUCH_OFFSET_MS - this.nowFn()));
     timer?.unref?.();
     seat.timer = timer;
   }
@@ -204,10 +365,17 @@ export class StaggerAnchors {
   async _fire(account, at) {
     const seat = this.seats.get(account.name);
     if (!seat) return;
+    if (seat.minutes == null) return;
     seat.lastAt = at;
     this.served.set(`${account.name}@${seat.minutes}`, at);
     const now = this.nowFn();
     const slot = formatSlot(seat.minutes);
+    // A slot is served only once it is on disk: a touch whose record could
+    // not be written could be replayed by a restart, so it is not sent.
+    if (!this._save()) {
+      seat.last = `not sent at ${new Date(at).toISOString()} (could not record the slot)`;
+      return;
+    }
     if (now - at > GRACE_MS) {
       seat.last = `missed ${new Date(at).toISOString()} (woke ${Math.round((now - at) / 60000)}m late)`;
       return;
@@ -286,9 +454,11 @@ export class StaggerAnchors {
       timezone: this.settings.timezone,
       spanMinutes: this.settings.spanMinutes,
       minWeeklyRemaining: this.settings.minWeeklyRemaining,
+      planAt: this.planAt != null ? new Date(this.planAt).toISOString() : null,
+      nextPlanAt: this.nextPlanAt != null ? new Date(this.nextPlanAt).toISOString() : null,
       seats: [...this.seats.entries()].map(([name, s]) => ({
         name,
-        slot: formatSlot(s.minutes),
+        slot: s.minutes == null ? null : formatSlot(s.minutes),
         nextTouchAt: s.nextAt != null ? new Date(s.nextAt).toISOString() : null,
         last: s.last,
       })),

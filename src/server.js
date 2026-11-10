@@ -506,7 +506,9 @@ function reauthOwner(req) {
 
 /** How a control-plane log line names its caller. @param {any} req */
 function viaWhom(req) {
-  return req?.tcSso ? `via SSO as "${req.tcSso}"` : 'via UI';
+  if (req?.tcSso) return `via SSO as "${req.tcSso}"`;
+  if (req?.tcClient) return `via client key "${req.tcClient}"`;
+  return 'via UI';
 }
 
 /**

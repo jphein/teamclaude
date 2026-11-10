@@ -20,6 +20,7 @@ test('keeps routing decisions, labelled by kind; drops everything else', () => {
     '[TeamClaude] Switch threshold (unified7d) set to 93% via SSO as "jp"',
     '[TeamClaude] Account "a" disabled via UI',
     '[TeamClaude] Reauth started for "a" via UI',
+    '[TeamClaude] Reauthed "a" via dashboard',
     '[TeamClaude] Quota rejection (429) on "a" — throttling 60s and switching account',
     '[TeamClaude] TLS listener: handshake from ? failed: ECONNRESET',
     '[TeamClaude] [familiar] WebSocket /api/frame/sync connected',
@@ -27,12 +28,13 @@ test('keeps routing decisions, labelled by kind; drops everything else', () => {
   ];
   for (const l of lines) ev.note(l);
   assert.deepEqual(ev.list().map(e => e.kind),
-    ['switch', 'rebalance', 'refresh-routing', 'window-start', 'window-spent', 'stagger', 'threshold', 'account', 'reauth', 'quota-429']);
+    ['switch', 'rebalance', 'refresh-routing', 'window-start', 'window-spent', 'stagger', 'threshold', 'account', 'reauth', 'reauth', 'quota-429']);
   assert.equal(ev.list()[0].text, 'Switched to account "claude5@x"');
   assert.equal(ev.list()[0].ts, '2026-11-10T15:00:00.000Z');
   assert.deepEqual(ev.list({ kind: 'stagger' }).length, 1);
-  assert.deepEqual(ev.list({ since: '2026-11-10T15:00:00.004Z' }).map(e => e.kind), ['stagger', 'threshold', 'account', 'reauth', 'quota-429']);
+  assert.deepEqual(ev.list({ since: '2026-11-10T15:00:00.004Z' }).map(e => e.kind), ['stagger', 'threshold', 'account', 'reauth', 'reauth', 'quota-429']);
   assert.deepEqual(ev.list({ limit: 2 }).map(e => e.kind), ['reauth', 'quota-429']);
+  assert.match(ev.list({ kind: 'reauth' })[1].text, /^Reauthed /);
 });
 
 test('the buffer is bounded and the tap never breaks logging', () => {
@@ -56,7 +58,7 @@ test('GET /teamclaude/events answers like /teamclaude/status does, with filters'
   ev.note('[TeamClaude] Switched to account "a"');
   ev.note('[TeamClaude] Keep-warm stagger: touching "a" for its 02:00 slot at 2026-11-10T10:00:00.000Z');
   const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.98);
-  const server = createProxyServer(am, { proxy: { apiKey: 'tc-test', clientKeys: { lane: 'tc-lane' } }, upstream: 'https://api.anthropic.com', accounts: [] }, { routingEvents: ev });
+  const server = createProxyServer(am, { proxy: { apiKey: 'tc-test', clientKeys: [{ name: 'lane', key: 'tc-lane' }] }, upstream: 'https://api.anthropic.com', accounts: [] }, { routingEvents: ev });
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   const port = /** @type {any} */ (server.address()).port;
   try {
@@ -74,4 +76,22 @@ test('GET /teamclaude/events answers like /teamclaude/status does, with filters'
     // status": the route sits behind the same gate.
     assert.equal(refused.status, status.status, 'events is gated exactly like status');
   } finally { server.close(); }
+});
+
+test('a reauth started with a client key names that client in the log', async () => {
+  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.98);
+  const reauth = { start: async () => ({ authUrl: 'https://example.invalid/auth' }), status: () => ({ state: 'idle' }) };
+  const server = createProxyServer(am, { proxy: { apiKey: 'tc-test', clientKeys: [{ name: 'lane', key: 'tc-lane' }] }, upstream: 'https://api.anthropic.com', accounts: [] }, { reauth });
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  const port = /** @type {any} */ (server.address()).port;
+  const lines = /** @type {string[]} */ ([]);
+  const orig = console.log;
+  console.log = (...a) => { lines.push(a.join(' ')); };
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/reauth`, {
+      method: 'POST', headers: { 'x-api-key': 'tc-lane', 'content-type': 'application/json' }, body: JSON.stringify({ name: 'a' }),
+    });
+    assert.equal(res.status, 200);
+  } finally { console.log = orig; server.close(); }
+  assert.ok(lines.some(l => l === '[TeamClaude] Reauth started for "a" via client key "lane"'), lines.join('\n'));
 });

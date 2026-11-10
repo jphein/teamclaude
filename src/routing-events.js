@@ -23,7 +23,7 @@ const KINDS = /** @type {[string, RegExp][]} */ ([
   ['keep-warm', /^Keep-warm \(/],
   ['threshold', /^(Switch threshold |Account "[^"]+" \S+ threshold )/],
   ['account', /^(Account "[^"]+" (disabled|enabled|unlinked) |Add account started)/],
-  ['reauth', /^Reauth /],
+  ['reauth', /^Reauth(ed)? /],
   ['quota-429', /^(Quota rejection \(429\)|Rate-limit 429 on|Fable weekly exhausted on)/],
   ['exhausted', /^(All accounts exhausted|No account can serve|FAILOVER: )/],
 ]);

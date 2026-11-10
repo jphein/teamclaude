@@ -48,6 +48,7 @@ test('the buffer is bounded and the tap never breaks logging', () => {
   assert.equal(console.log, quiet, 'undo restores the previous logger');
   console.log = orig;
   assert.deepEqual(ev.list().map(e => e.text), ['Switched to account "s2"', 'Switched to account "s3"', 'Switched to account "s4"']);
+  assert.equal(ev.events.length, 3, 'the buffer itself is bounded, not just the answer');
 });
 
 test('GET /teamclaude/events answers like /teamclaude/status does, with filters', async () => {

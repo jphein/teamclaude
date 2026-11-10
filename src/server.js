@@ -879,6 +879,20 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // Recent routing decisions as JSON (fork, src/routing-events.js): seat
+      // switches, rebalances, 5h window starts and ends, the stagger's touches.
+      // Same auth as status, which already shows every seat by name; read-only.
+      // ?since=<ISO>&kind=<kind>&limit=<n>
+      if (req.method === 'GET' && (req.url === '/teamclaude/events' || req.url?.startsWith('/teamclaude/events?'))) {
+        const ev = /** @type {any} */ (hooks).routingEvents;
+        if (!ev) { json(res, 501, { error: 'routing events not available' }); return; }
+        const q = new URL(req.url, 'http://x').searchParams;
+        const limit = q.has('limit') ? Number(q.get('limit')) : undefined;
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ events: ev.list({ since: q.get('since'), kind: q.get('kind'), limit }), max: ev.max }, null, 2));
+        return;
+      }
+
       // The local-failover signal alone, for whoever shares the local model's
       // slot (HA warms Ember's prompt cache there and must skip while teamclaude
       // is serving from it). Same auth as status; carries no account details.

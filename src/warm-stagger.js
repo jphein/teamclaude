@@ -93,16 +93,13 @@ function dailyInstants(minutes, s, around) {
   return out.sort((a, b) => a - b);
 }
 
-/** When the day's plan is made: PLAN_LEAD_MINUTES before the first slot.
- *  @param {StaggerSettings} s */
-export function planMinutes(s) {
-  return ((((s.wakeMinutes - 300 - PLAN_LEAD_MINUTES) % 1440) + 1440) % 1440);
-}
-
 /** The latest plan instant at or before `now`, and the next one after it.
+ *  A plan is made PLAN_LEAD_MINUTES (elapsed) before the day's first slot as
+ *  resolved, rounding included, so a plan time that a DST change skips still
+ *  plans a slot that exists; a day whose first slot does not exist has none.
  *  @param {StaggerSettings} s @param {number} now */
 export function planWindow(s, now) {
-  const all = dailyInstants(planMinutes(s), s, now);
+  const all = dailyInstants(slotMinutes(0, 1, s), s, now).map(t => t - PLAN_LEAD_MINUTES * 60_000);
   const last = all.filter(t => t <= now).pop() ?? null;
   const next = all.find(t => t > now) ?? null;
   return { last, next };
@@ -182,6 +179,11 @@ export class StaggerAnchors {
     this.stop();
     this.settings = settings;
     if (!settings) return;
+    try { this._configure(); } catch (err) { this.stop(); throw err; }
+  }
+
+  _configure() {
+    const settings = /** @type {StaggerSettings} */ (this.settings);
     const saved = this._load();
     for (const [k, v] of Object.entries(saved?.served || {})) {
       if (typeof v === 'number' && !((this.served.get(k) ?? -Infinity) >= v)) this.served.set(k, v);
@@ -263,14 +265,32 @@ export class StaggerAnchors {
     this.planTimer = t;
   }
 
+  /** The saved state, validated as a whole; anything malformed is ignored
+   *  entirely (and logged) rather than trusted in part. */
   _load() {
     if (!this.statePath) return null;
-    try { return JSON.parse(readFileSync(this.statePath, 'utf8')); } catch { return null; }
+    let raw;
+    try { raw = JSON.parse(readFileSync(this.statePath, 'utf8')); } catch { return null; }
+    const now = this.nowFn();
+    const okTime = (/** @type {any} */ v) => typeof v === 'number' && Number.isFinite(v)
+      && v > now - SERVED_KEEP_MS - 86_400_000 && v < now + 2 * 86_400_000;
+    const okSlot = (/** @type {any} */ v) => v === null || (Number.isInteger(v) && v >= 0 && v < 1440);
+    const valid = raw && typeof raw === 'object'
+      && typeof raw.signature === 'string'
+      && (raw.planAt === null || okTime(raw.planAt))
+      && raw.slots && typeof raw.slots === 'object' && Object.values(raw.slots).every(okSlot)
+      && raw.served && typeof raw.served === 'object' && Object.values(raw.served).every(okTime);
+    if (!valid) {
+      this.log(`[TeamClaude] Keep-warm stagger: ignoring a malformed state file ${this.statePath}`);
+      return null;
+    }
+    return raw;
   }
 
-  /** @param {Record<string, number|null>} [plan] */
+  /** Write the state; false when it could not be written (memory-only is
+   *  true). @param {Record<string, number|null>} [plan] @returns {boolean} */
   _save(plan) {
-    if (!this.statePath || !this.settings) return;
+    if (!this.statePath || !this.settings) return true;
     const now = this.nowFn();
     /** @type {Record<string, number>} */
     const served = {};
@@ -280,8 +300,10 @@ export class StaggerAnchors {
       const tmp = `${this.statePath}.tmp`;
       writeFileSync(tmp, JSON.stringify({ signature: this._signature(), planAt: this.planAt, slots, served }) + '\n', { mode: 0o600 });
       renameSync(tmp, this.statePath);
+      return true;
     } catch (err) {
       this.log(`[TeamClaude] Keep-warm stagger: could not save its state: ${/** @type {any} */ (err)?.message || err}`);
+      return false;
     }
   }
 
@@ -346,9 +368,14 @@ export class StaggerAnchors {
     if (seat.minutes == null) return;
     seat.lastAt = at;
     this.served.set(`${account.name}@${seat.minutes}`, at);
-    this._save();
     const now = this.nowFn();
     const slot = formatSlot(seat.minutes);
+    // A slot is served only once it is on disk: a touch whose record could
+    // not be written could be replayed by a restart, so it is not sent.
+    if (!this._save()) {
+      seat.last = `not sent at ${new Date(at).toISOString()} (could not record the slot)`;
+      return;
+    }
     if (now - at > GRACE_MS) {
       seat.last = `missed ${new Date(at).toISOString()} (woke ${Math.round((now - at) / 60000)}m late)`;
       return;

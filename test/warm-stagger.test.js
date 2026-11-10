@@ -2,10 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   normalizeStagger, slotMinutes, formatSlot, nextTouchAt, StaggerAnchors,
-  GRACE_MS, POST_RESET_BUFFER_MS, TOUCH_OFFSET_MS,
+  GRACE_MS, POST_RESET_BUFFER_MS, TOUCH_OFFSET_MS, planWindow,
 } from '../src/warm-stagger.js';
 import { AccountManager } from '../src/account-manager.js';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -341,4 +341,36 @@ test('a plan from an earlier day is not reused', () => {
   const h2 = harness(['a', 'b'], { statePath, now: at('03:00', 1) });
   h2.st.configure(cfg);
   assert.ok(h2.lines.some(l => /plan made/.test(l)));
+});
+
+test('a slot whose record cannot be written is not sent', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tc-stagger-'));
+  const h = harness(['a'], { statePath: join(dir, 'missing-dir', 'stagger.json') });
+  h.st.configure(cfg);
+  await h.advance(at('02:05'));
+  assert.deepEqual(h.touched, []);
+  assert.match(h.st.status().seats[0].last, /not sent .*could not record the slot/);
+});
+
+test('a malformed state file is ignored as a whole', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tc-stagger-'));
+  const statePath = join(dir, 'stagger.json');
+  writeFileSync(statePath, '{"signature":"x","planAt":null,"slots":{"a":120},"served":{"a@120":1e400}}');
+  const h = harness(['a'], { statePath });
+  h.st.configure(cfg);
+  assert.ok(h.lines.some(l => /ignoring a malformed state file/.test(l)));
+  assert.equal(h.st.status().seats[0].nextTouchAt, new Date(at('02:00')).toISOString());
+});
+
+test('the plan is made 10 minutes before the rounded first slot, and on a spring-forward day too', () => {
+  const s1 = /** @type {any} */ (normalizeStagger({ wake: '07:06', timezone: LA }));
+  assert.equal(formatSlot(slotMinutes(0, 3, s1)), '02:10');
+  const { next } = planWindow(s1, at('01:00'));
+  assert.equal(next, at('02:00'));
+  // New York, wake 08:00: first slot 03:00, plan 02:50 — which does not exist
+  // on 2027-03-14. The plan still comes ten elapsed minutes before 03:00 EDT.
+  const ny = /** @type {any} */ (normalizeStagger({ wake: '08:00', timezone: 'America/New_York' }));
+  const slot = Date.parse('2027-03-14T07:00:00Z'); // 03:00 EDT
+  const w = planWindow(ny, Date.parse('2027-03-14T06:00:00Z'));
+  assert.equal(w.next, slot - 10 * M);
 });

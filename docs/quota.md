@@ -20,6 +20,12 @@ Remote callers authenticate exactly like the other control endpoints:
 curl -H "x-api-key: $TEAMCLAUDE_API_KEY" https://proxy.example.com/teamclaude/quota
 ```
 
+Fork additions:
+- The top level carries `live_seats`, `next_reset` (when the next barred seat returns), `next_refresh` (`{at, seat, in_minutes}`: the soonest 5h reset on a seat whose week has room) and `stagger` (slots, next touch and last outcome per seat; see `warmupStagger` in [configuration](configuration.md)).
+- Each `fiveHour` bucket gains `windowStart` (reset − 5 h).
+
+`GET /teamclaude/events` (fork) lists the last 300 routing decisions as JSON, newest last: `{ts, kind, text}`. Kinds are `switch`, `rebalance`, `refresh-routing`, `window-start`, `window-spent`, `session-reset`, `near-limit`, `stagger`, `keep-warm`, `threshold`, `account`, `reauth`, `quota-429` and `exhausted`. Filter with `?since=<ISO>&kind=<kind>&limit=<n>`. It takes the same key as `/teamclaude/status` and is kept in memory, so a restart empties it.
+
 The optional quota probe also fills missing tier metadata on its first successful refresh. Tier metadata is persisted with observed quota in `teamclaude.state.json`, so it survives subsequent restarts.
 
 ## Quota probe

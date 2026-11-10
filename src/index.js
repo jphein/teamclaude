@@ -1168,7 +1168,10 @@ async function serverCommand() {
     apiKey: config.proxy?.apiKey,
   });
   warmer.start();
-  stagger = new StaggerAnchors(accountManager, warmer);
+  // The day's plan and the served slots survive a restart (beside the config).
+  stagger = new StaggerAnchors(accountManager, warmer, {
+    statePath: getConfigPath().replace(/\.json$/, '') + '-stagger.json',
+  });
   try { stagger.configure(config.warmupStagger || null); }
   catch (err) { console.error(`[TeamClaude] warmupStagger ignored: ${/** @type {any} */ (err)?.message || err}`); }
   warmer.setSuspendSweeps(stagger.enabled);

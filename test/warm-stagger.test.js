@@ -2,9 +2,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   normalizeStagger, slotMinutes, formatSlot, nextTouchAt, StaggerAnchors,
-  GRACE_MS, POST_RESET_BUFFER_MS,
+  GRACE_MS, POST_RESET_BUFFER_MS, TOUCH_OFFSET_MS,
 } from '../src/warm-stagger.js';
 import { AccountManager } from '../src/account-manager.js';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // JP 2026-11-09 08:4x: "touch all active accounts several hours before I get
 // up, that way if I use all the tokens then I only have to wait minutes for the
@@ -36,10 +39,10 @@ const at = (/** @type {string} */ hhmm, day = 0) => {
   return MIDNIGHT + day * 24 * H + h * H + m * M;
 };
 
-test('seven seats spread one window before wake: a refresh every ~43 minutes', () => {
+test('seven seats spread one window before wake, on 10-minute marks: a refresh every 40-50 minutes', () => {
   const s = /** @type {any} */ (normalizeStagger(cfg));
   const slots = Array.from({ length: 7 }, (_, i) => formatSlot(slotMinutes(i, 7, s)));
-  assert.deepEqual(slots, ['02:00', '02:43', '03:26', '04:09', '04:51', '05:34', '06:17']);
+  assert.deepEqual(slots, ['02:00', '02:40', '03:30', '04:10', '04:50', '05:30', '06:20']);
   const three = Array.from({ length: 3 }, (_, i) => formatSlot(slotMinutes(i, 3, s)));
   assert.deepEqual(three, ['02:00', '03:40', '05:20']);
 });
@@ -70,7 +73,7 @@ test('bad settings are refused with a reason; absent or disabled is off', () => 
 });
 
 /** A fake clock and timer queue, driven by `advance`. */
-function harness(accounts, { now = at('01:00'), thresholds = { default: 0.93, unified5h: 0.95, unified7d: 0.9 } } = {}) {
+function harness(accounts, { now = at('01:00'), thresholds = { default: 0.93, unified5h: 0.95, unified7d: 0.9 }, statePath = null } = {}) {
   let clock = now;
   /** @type {{at: number, fn: Function, id: number}[]} */
   let timers = [];
@@ -106,7 +109,7 @@ function harness(accounts, { now = at('01:00'), thresholds = { default: 0.93, un
     },
   };
   const lines = /** @type {string[]} */ ([]);
-  const st = new StaggerAnchors(am, warmer, { nowFn: () => clock, setTimeoutFn, clearTimeoutFn, log: l => lines.push(l) });
+  const st = new StaggerAnchors(am, warmer, { nowFn: () => clock, setTimeoutFn, clearTimeoutFn, log: l => lines.push(l), statePath });
   async function advance(/** @type {number} */ to) {
     for (;;) {
       timers.sort((a, b) => a.at - b.at || a.id - b.id);
@@ -141,10 +144,11 @@ test('a cold seat is touched at its slot, and its windows then roll on the 5 h g
   const h = harness(['a', 'b', 'c']);
   h.st.configure(cfg);
   await h.advance(at('12:30'));
+  const T = TOUCH_OFFSET_MS;
   const a = h.touched.filter(t => t.name === 'a').map(t => t.at);
-  assert.deepEqual(a, [at('02:00'), at('07:00'), at('12:00')]);
+  assert.deepEqual(a, [at('02:00') + T, at('07:00') + T, at('12:00') + T]);
   const firsts = ['a', 'b', 'c'].map(n => h.touched.find(t => t.name === n)?.at);
-  assert.deepEqual(firsts, [at('02:00'), at('03:40'), at('05:20')]);
+  assert.deepEqual(firsts, [at('02:00') + T, at('03:40') + T, at('05:20') + T]);
   assert.ok(h.lines.some(l => /touching "b" for its 03:40 slot/.test(l)));
 });
 
@@ -254,7 +258,7 @@ test('a suspend of days steps over the missed slots instead of walking them', as
   await h.advance(at('02:05'));
   const before = h.touched.length;
   const fired = await h.jump(at('09:00', 3));
-  assert.equal(fired, 1, 'the one overdue timer fires, and is not followed by a chain of past slots');
+  assert.ok(fired <= 2, `the seat's overdue timer and the plan's fire once each, with no chain of past slots (fired ${fired})`);
   assert.equal(h.touched.length, before);
   assert.equal(h.st.status().seats[0].nextTouchAt, new Date(at('12:00', 3)).toISOString());
 });
@@ -278,7 +282,7 @@ test('a completed touch is reported with the reset it produced', async () => {
   const h = harness(['a']);
   h.st.configure(cfg);
   await h.advance(at('02:05'));
-  const want = new Date(at('07:00')).toISOString().replace(/\./g, '\\.');
+  const want = new Date(at('07:00') + TOUCH_OFFSET_MS).toISOString().replace(/\./g, '\\.');
   assert.match(h.st.status().seats[0].last, new RegExp(`^touched .*, resets ${want}$`));
 });
 
@@ -294,4 +298,47 @@ test('a seat warmed by someone else while the touch waited is not reported as to
   for (let i = 0; i < 20; i++) await Promise.resolve();
   assert.deepEqual(h.touched, []);
   assert.match(h.st.status().seats[0].last, /^cancelled /);
+});
+
+test('each morning the slots go only to seats that can be touched: no holes for spent weeks', async () => {
+  const names = ['s1', 's2', 's3', 's4', 's5', 's6', 's7'];
+  const h = harness(names, { now: at('01:00') });
+  for (const n of ['s2', 's3', 's5', 's7']) {
+    Object.assign(h.am.accounts[names.indexOf(n)].quota, { unified7d: 1, unified7dReset: at('00:00', 4) });
+  }
+  h.st.configure(cfg);
+  await h.advance(at('01:55')); // the day's plan is made at 01:50
+  const slots = Object.fromEntries(h.st.status().seats.map((/** @type {any} */ x) => [x.name, x.slot]));
+  assert.deepEqual(slots, { s1: '02:00', s2: null, s3: null, s4: '03:40', s5: null, s6: '05:20', s7: null });
+  assert.match(h.st.status().seats[1].last, /no slot today \(weekly limit reached\)/);
+  await h.advance(at('06:00'));
+  assert.deepEqual(h.touched.map(t => [t.name, formatSlot(Math.round((t.at - MIDNIGHT) / M))]), [['s1', '02:00'], ['s4', '03:40'], ['s6', '05:20']]);
+});
+
+test('a restart keeps the morning plan and never replays a served slot', async () => {
+  const statePath = join(mkdtempSync(join(tmpdir(), 'tc-stagger-')), 'stagger.json');
+  const h = harness(['a', 'b'], { statePath });
+  h.st.configure(cfg);
+  await h.advance(at('02:05'));
+  assert.deepEqual(h.touched.map(t => t.name), ['a']);
+  const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+  assert.deepEqual(saved.slots, { a: 2 * 60, b: 4 * 60 + 30 });
+  // The restart: a new instance on the same file, the window reading lost, and
+  // seat b now spent. The morning plan stands; a is not touched again.
+  const h2 = harness(['a', 'b'], { now: at('02:06'), statePath });
+  Object.assign(h2.am.accounts[1].quota, { unified7d: 1, unified7dReset: at('00:00', 4) });
+  h2.st.configure(cfg);
+  assert.deepEqual(h2.st.status().seats.map((/** @type {any} */ x) => x.slot), ['02:00', '04:30']);
+  assert.ok(h2.lines.some(l => /plan kept/.test(l)));
+  await h2.advance(at('02:20'));
+  assert.deepEqual(h2.touched, []);
+});
+
+test('a plan from an earlier day is not reused', () => {
+  const statePath = join(mkdtempSync(join(tmpdir(), 'tc-stagger-')), 'stagger.json');
+  const h = harness(['a', 'b'], { statePath, now: at('01:00') });
+  h.st.configure(cfg);
+  const h2 = harness(['a', 'b'], { statePath, now: at('03:00', 1) });
+  h2.st.configure(cfg);
+  assert.ok(h2.lines.some(l => /plan made/.test(l)));
 });

@@ -5234,7 +5234,7 @@ export class AccountManager {
       // first request), but a window well underway was running before we
       // looked, so it is a baseline, not an event.
       const util = account.quota.unified5h;
-      const fresh = util != null && util < this.switchThreshold && reset - Date.now() > 5 * 3600_000 - 10 * 60_000;
+      const fresh = util != null && util < this.thresholdFor('unified5h', account) && reset - Date.now() > 5 * 3600_000 - 10 * 60_000;
       if (!fresh) return;
     }
     if (!this._on5hWindowStarted.length) return;
@@ -5247,7 +5247,11 @@ export class AccountManager {
 
   _note5hExhausted(account) {
     const q = account.quota;
-    if (q.unified5h == null || q.unified5h < this.switchThreshold) return;
+    // The 5h bucket's own threshold. `switchThreshold` may be the per-bucket
+    // object ({default, unified5h, unified7d}); compared with a number it is
+    // NaN, the guard never returned, and every 5h reading logged "used up"
+    // (seen 2026-11-10 after each stagger touch at 0% use).
+    if (q.unified5h == null || q.unified5h < this.thresholdFor('unified5h', account)) return;
     // One event per window. The window is identified by its reset timestamp;
     // sources round it differently (seconds vs ms), so treat resets within a
     // minute of each other as the same window.

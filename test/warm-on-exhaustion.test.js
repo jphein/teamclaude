@@ -288,3 +288,17 @@ test('a week that has since reset is warmed again', async () => {
   assert.deepEqual(spawn.calls.map(c => c.env.ANTHROPIC_BASE_URL.split('/tc-acct/')[1]), ['renewed']);
   warmer.stop();
 });
+
+// 2026-11-10: with the per-bucket threshold object (the fleet sliders), every
+// 5h reading at 0% logged "used up its 5h window" — number < object is false.
+test('with per-bucket sliders, a fresh 5h reading is not "used up"; crossing the 5h slider is', () => {
+  const am = new AccountManager([oauth('a')], { default: 0.93, unified5h: 0.95, unified7d: 0.9 });
+  let fired = 0;
+  am.on5hExhausted(() => fired++);
+  const reset = Date.now() + 4 * 3600_000;
+  am.updateQuota(0, headers5h(0, reset));
+  am.updateQuota(0, headers5h(0.94, reset));
+  assert.equal(fired, 0, 'under the 95% 5h slider is not used up');
+  am.updateQuota(0, headers5h(0.95, reset));
+  assert.equal(fired, 1);
+});

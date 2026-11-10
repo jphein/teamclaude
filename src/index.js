@@ -39,6 +39,7 @@ import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
 import { Warmer, warmApplicable } from './warmer.js';
 import { StaggerAnchors } from './warm-stagger.js';
+import { RoutingEvents } from './routing-events.js';
 import { formatWarmupScheduleConfirmation, resolveWarmupConfig } from './warmup-schedule.js';
 import { TUI, ACCOUNT_SORTS } from './tui.js';
 import { SessionTitles } from './session-titles.js';
@@ -860,6 +861,11 @@ async function serverCommand() {
     console.error = (...a) => { const m = a.join(' '); origErr(m); writeActivity(m); };
     process.on('exit', () => aStream.end());
   }
+
+  // Routing decisions, for GET /teamclaude/events (plan's seats tab).
+  const routingEvents = new RoutingEvents();
+  routingEvents.tapConsole();
+  hooks.routingEvents = routingEvents;
 
   // Expose reload to the proxy's control endpoint (works with or without TUI).
   hooks.reload = reloadAccounts;

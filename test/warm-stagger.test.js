@@ -14,8 +14,23 @@ const H = 3_600_000;
 const M = 60_000;
 const LA = 'America/Los_Angeles';
 const cfg = { wake: '07:00', timezone: LA };
-// Tue 2026-11-10 00:00 PST = 08:00Z.
-const MIDNIGHT = Date.parse('2026-11-10T08:00:00Z');
+// A Los Angeles midnight at least two days ahead of the real clock. It must be
+// in the future: the AccountManager clears windows against the real clock, so a
+// fixed date became a time bomb the morning it passed (2026-11-10). The day and
+// the four after it have no DST change, so local hours are fixed offsets.
+const MIDNIGHT = (() => {
+  const offset = (/** @type {number} */ t) => {
+    const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: LA, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+      .formatToParts(t).filter(x => x.type !== 'literal').map(x => [x.type, Number(x.value)]));
+    return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute) - Math.floor(t / 60_000) * 60_000;
+  };
+  let day = Math.floor(Date.now() / 86_400_000) * 86_400_000 + 2 * 86_400_000;
+  for (;;) {
+    const mid = day + 8 * H; // 00:00 PST
+    if (offset(mid) === -8 * H && offset(mid + 5 * 24 * H) === -8 * H) return mid;
+    day += 86_400_000;
+  }
+})();
 const at = (/** @type {string} */ hhmm, day = 0) => {
   const [h, m] = hhmm.split(':').map(Number);
   return MIDNIGHT + day * 24 * H + h * H + m * M;
@@ -263,7 +278,8 @@ test('a completed touch is reported with the reset it produced', async () => {
   const h = harness(['a']);
   h.st.configure(cfg);
   await h.advance(at('02:05'));
-  assert.match(h.st.status().seats[0].last, /^touched .*, resets 2026-11-10T15:00:00\.000Z$/);
+  const want = new Date(at('07:00')).toISOString().replace(/\./g, '\\.');
+  assert.match(h.st.status().seats[0].last, new RegExp(`^touched .*, resets ${want}$`));
 });
 
 test('a seat warmed by someone else while the touch waited is not reported as touched', async () => {

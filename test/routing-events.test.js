@@ -95,3 +95,11 @@ test('a reauth started with a client key names that client in the log', async ()
   } finally { console.log = orig; server.close(); }
   assert.ok(lines.some(l => l === '[TeamClaude] Reauth started for "a" via client key "lane"'), lines.join('\n'));
 });
+
+test('near-limit lines from both quota paths are kept, labelled near-limit', () => {
+  const ev = new RoutingEvents();
+  ev.note('[TeamClaude] Account "a" 5h at 100.0% usage — will switch on next request');
+  ev.note('[TeamClaude] Account "b" 7-day (unified7d_fable) at 96.0% usage — will switch on next request');
+  ev.note('[TeamClaude] "c" near quota: 7-day at 95%');
+  assert.deepEqual(ev.list().map(e => e.kind), ['near-limit', 'near-limit', 'near-limit']);
+});

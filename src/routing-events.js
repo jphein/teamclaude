@@ -18,7 +18,9 @@ const KINDS = /** @type {[string, RegExp][]} */ ([
   ['window-start', /^Account "[^"]+" started a 5h window/],
   ['window-spent', /^Account "[^"]+" used up its 5h window/],
   ['session-reset', /^Account "[^"]+" session quota reset/],
-  ['near-limit', /^Account "[^"]+" at [\d.]+% usage/],
+  // "Account "x" 5h at 100.0% usage — will switch …" and the response path's
+  // ""x" near quota: 7-day at 95%"; both name the bucket that tripped.
+  ['near-limit', /^(Account "[^"]+" .*\bat [\d.]+% usage|"[^"]+" near quota: )/],
   ['stagger', /^Keep-warm stagger: /],
   ['keep-warm', /^Keep-warm \(/],
   ['threshold', /^(Switch threshold |Account "[^"]+" \S+ threshold )/],

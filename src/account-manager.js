@@ -4311,11 +4311,24 @@ export class AccountManager {
   }
 
   _isNearQuota(account, model = null) {
+    return this._nearQuotaTrip(account, model) != null;
+  }
+
+  /**
+   * Which bucket put `account` over its threshold for `model`, and how full it
+   * is: `{ bucket, used }` (used is 0–1), or null when none has. The log lines
+   * print this so they name the bucket that actually tripped; they used to
+   * print the 7-day figure for a 5h trip ("at 56% usage" on a spent 5h window).
+   * @param {any} account
+   * @param {string|null} [model]
+   * @returns {{ bucket: string, used: number } | null}
+   */
+  _nearQuotaTrip(account, model = null) {
     const q = account.quota;
     this._clearExpiredQuotas(account);
 
     // Shared 5-hour bucket gates every request regardless of model.
-    if (q.unified5h != null && q.unified5h >= this.thresholdFor('unified5h', account)) return true;
+    if (q.unified5h != null && q.unified5h >= this.thresholdFor('unified5h', account)) return { bucket: '5h', used: q.unified5h };
 
     // The HIGHER of the weekly bucket that GOVERNS this model and the shared
     // weekly one. Fable and Sonnet meter their own quota, so a spent Fable
@@ -4325,20 +4338,23 @@ export class AccountManager {
     // ratcheting further past that cap. When the family bucket isn't reported
     // (e.g. the plan doesn't expose it) the shared one answers alone.
     const weeklyVal = this._governingWeekly(account, model);
-    if (weeklyVal != null && weeklyVal >= this.thresholdFor(this._weeklyBucketFor(model), account)) return true;
+    const weeklyBucket = this._weeklyBucketFor(model);
+    if (weeklyVal != null && weeklyVal >= this.thresholdFor(weeklyBucket, account)) {
+      return { bucket: weeklyBucket === 'unified7d' ? '7-day' : `7-day (${weeklyBucket})`, used: weeklyVal };
+    }
 
     // Standard quotas (API key accounts)
     if (q.tokensLimit != null && q.tokensRemaining != null) {
       const used = 1 - (q.tokensRemaining / q.tokensLimit);
-      if (used >= this.thresholdFor('tokens', account)) return true;
+      if (used >= this.thresholdFor('tokens', account)) return { bucket: 'tokens', used };
     }
 
     if (q.requestsLimit != null && q.requestsRemaining != null) {
       const used = 1 - (q.requestsRemaining / q.requestsLimit);
-      if (used >= this.thresholdFor('requests', account)) return true;
+      if (used >= this.thresholdFor('requests', account)) return { bucket: 'requests', used };
     }
 
-    return false;
+    return null;
   }
 
   /**
@@ -4589,9 +4605,9 @@ export class AccountManager {
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
 
-    if (this._isNearQuota(account)) {
-      const pct = account.quota.unified7d != null ? Math.round(account.quota.unified7d * 100) : null;
-      console.log(`[TeamClaude] "${safeLine(account.name, 64)}" near weekly quota${pct == null ? '' : ` (${pct}%)`}`);
+    const trip = this._nearQuotaTrip(account);
+    if (trip) {
+      console.log(`[TeamClaude] "${safeLine(account.name, 64)}" near quota: ${trip.bucket} at ${Math.round(trip.used * 100)}%`);
     }
   }
 
@@ -4722,13 +4738,9 @@ export class AccountManager {
     account.usage.lastUsed = new Date().toISOString();
 
     // Log when approaching quota
-    if (this._isNearQuota(account)) {
-      const pct = account.quota.unified7d != null
-        ? (account.quota.unified7d * 100).toFixed(1)
-        : account.quota.tokensLimit
-          ? ((1 - account.quota.tokensRemaining / account.quota.tokensLimit) * 100).toFixed(1)
-          : '?';
-      console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" at ${pct}% usage — will switch on next request`);
+    const trip = this._nearQuotaTrip(account);
+    if (trip) {
+      console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" ${trip.bucket} at ${(trip.used * 100).toFixed(1)}% usage — will switch on next request`);
     }
   }
 

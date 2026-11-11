@@ -302,3 +302,25 @@ test('with per-bucket sliders, a fresh 5h reading is not "used up"; crossing the
   am.updateQuota(0, headers5h(0.95, reset));
   assert.equal(fired, 1);
 });
+
+// 2026-11-11: a spent 5h window logged "at 56.0% usage — will switch", the
+// seat's 7-day figure, so the line read as a false trip. It names the bucket now.
+test('the near-limit line names the bucket that tripped, with that bucket\'s figure', () => {
+  const am = new AccountManager([oauth('a')], { default: 0.93, unified5h: 1, unified7d: 1 });
+  const lines = [];
+  const orig = console.log;
+  console.log = (...a) => lines.push(a.join(' '));
+  try {
+    const reset = Date.now() + 4 * 3600_000;
+    am.updateQuota(0, {
+      ...headers5h(1, reset),
+      'anthropic-ratelimit-unified-7d-utilization': '0.56',
+      'anthropic-ratelimit-unified-7d-reset': String(Math.floor((Date.now() + 3 * 86400_000) / 1000)),
+    });
+  } finally { console.log = orig; }
+  const near = lines.filter(l => /will switch on next request/.test(l));
+  assert.equal(near.length, 1, lines.join('\n'));
+  assert.match(near[0], /Account "a" 5h at 100\.0% usage/);
+  assert.doesNotMatch(near[0], /56/);
+  assert.deepEqual(am._nearQuotaTrip(am.accounts[0]), { bucket: '5h', used: 1 });
+});

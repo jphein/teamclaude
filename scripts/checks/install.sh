@@ -52,15 +52,24 @@ quiesced=1
 $SYSTEMCTL --user stop "${timers[@]}" 2>/dev/null || true
 # a stop that failed leaves a timer armed: refuse unless every timer reads inactive (or is not
 # installed yet, which also reads inactive)
+# only a recognized answer counts: an empty one (the user manager unreachable) is not "stopped"
 for t in "${timers[@]}"; do
-  case $($SYSTEMCTL --user is-active "$t" 2>/dev/null) in
+  st=$($SYSTEMCTL --user is-active "$t" 2>/dev/null) || true   # 3 = inactive, 4 = no such unit
+  case $st in
+    inactive|failed|unknown) ;;
     active|activating|reloading) echo "install.sh: $t did not stop; nothing installed" >&2; exit 6 ;;
+    *) echo "install.sh: cannot read the state of $t (${st:-no answer}); nothing installed" >&2; exit 6 ;;
   esac
 done
 for _ in $(seq 1 60); do
   busy=0
   for svc in "${services[@]}"; do
-    case $($SYSTEMCTL --user is-active "$svc" 2>/dev/null) in active|activating|deactivating) busy=1 ;; esac
+    st=$($SYSTEMCTL --user is-active "$svc" 2>/dev/null) || true
+    case $st in
+      inactive|failed|unknown) ;;
+      active|activating|deactivating|reloading) busy=1 ;;
+      *) echo "install.sh: cannot read the state of $svc (${st:-no answer}); nothing installed" >&2; exit 6 ;;
+    esac
   done
   [ "$busy" = 0 ] && break; sleep "${CHECK_INSTALL_WAIT_STEP:-5}"
 done

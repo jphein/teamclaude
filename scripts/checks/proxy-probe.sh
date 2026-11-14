@@ -109,4 +109,32 @@ elif [ -f "$HOME/.config/claude-code/env.sh" ]; then
 else
   state=none
 fi
-echo "proxy=$code wrapper=$state"
+# What the running claude CLIs actually do: through the pool every HTTPS call is a CONNECT to the
+# forwarder (127.0.0.1:3456) or the VM on the LAN, so a claude process holding an established
+# connection to a PUBLIC address on port 443 is going around the pool, whatever PATH, wrapper or
+# settings launched it. (/proc/<pid>/environ is not enough: ~/.claude/settings.json sets the proxy
+# inside claude after start.) Processes are found by executable path, never by name.
+private() { # host -> 0 when loopback, LAN or link-local
+  local h=${1#[}; h=${h%]}; h=${h#::ffff:}
+  case $h in
+    127.*|10.*|192.168.*|::1|fe80:*|fc*|fd*|localhost) return 0 ;;
+    172.*) local o=${h#172.}; o=${o%%.*}; [[ "$o" =~ ^[0-9]+$ ]] && (( o >= 16 && o <= 31 )) && return 0 ;;
+  esac
+  return 1
+}
+procroot=${CHECK_PROC:-/proc}
+declare -A cl=()
+for d in "$procroot"/[0-9]*; do
+  e=$(readlink "$d/exe" 2>/dev/null) || continue
+  case $e in */claude/versions/*) cl[${d##*/}]=1 ;; esac
+done
+declare -A around=()
+while read -r peer procs; do
+  port=${peer##*:}; host=${peer%:*}
+  [ "$port" = 443 ] || continue
+  private "$host" && continue
+  for pid in $(grep -oE 'pid=[0-9]+' <<<"$procs" | cut -d= -f2); do
+    [ -n "${cl[$pid]:-}" ] && around[$pid]=1
+  done
+done < <(${CHECK_SS:-ss} -tnpH state established 2>/dev/null | awk '{print $4, $5}')
+echo "proxy=$code wrapper=$state claude=${#cl[@]} direct=${#around[@]}"

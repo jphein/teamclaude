@@ -4,7 +4,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync, execFile, spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, chmodSync, mkdirSync, rmSync, utimesSync, copyFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, chmodSync, mkdirSync, rmSync, utimesSync, copyFileSync, existsSync, symlinkSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join, dirname } from 'node:path';
 import { tmpdir, hostname } from 'node:os';
@@ -105,26 +105,26 @@ function pw(results) { // host -> probe line ('' = unreachable)
   chmodSync(p, 0o755);
   return run('proxy-wrapper.sh', { CHECK_HOSTS: Object.keys(results).join(' '), CHECK_PROBE: p });
 }
-const OK = 'proxy=200 wrapper=refuses';
+const OK = 'proxy=200 wrapper=refuses claude=0 direct=0';
 
 test('proxy-wrapper: all forwarders up and every claude fails closed is ok', () => {
-  const r = pw({ [SELF]: OK, waki: OK, kat: 'proxy=200 wrapper=envsh-pool' });
+  const r = pw({ [SELF]: OK, waki: OK, kat: 'proxy=200 wrapper=envsh-pool claude=0 direct=0' });
   assert.equal(r.status, 0);
-  assert.match(r.line, new RegExp(`^CHECK proxy-wrapper ok · ${SELF} :3456 200, wrapper refuses; waki :3456 200, wrapper refuses; kat :3456 200, wrapper envsh-pool, at `));
+  assert.match(r.line, new RegExp(`^CHECK proxy-wrapper ok · ${SELF} :3456 200, wrapper refuses, 0 claude running; waki :3456 200, wrapper refuses, 0 claude running; kat :3456 200, wrapper envsh-pool, 0 claude running, at `));
 });
 
 test('proxy-wrapper: another host down or unreachable warns; this host down fails', () => {
-  let r = pw({ [SELF]: OK, waki: 'proxy=000 wrapper=refuses' });
+  let r = pw({ [SELF]: OK, waki: 'proxy=000 wrapper=refuses claude=0 direct=0' });
   assert.equal(r.status, 0); assert.match(r.line, /^CHECK proxy-wrapper warn · waki forwarder 000 — /);
   r = pw({ [SELF]: OK, waki: '' });
   assert.match(r.line, /^CHECK proxy-wrapper warn · waki unreachable — /);
-  r = pw({ [SELF]: 'proxy=502 wrapper=refuses', waki: OK });
+  r = pw({ [SELF]: 'proxy=502 wrapper=refuses claude=0 direct=0', waki: OK });
   assert.equal(r.status, 1); assert.match(r.line, new RegExp(`^CHECK proxy-wrapper fail · ${SELF} forwarder 502 — `));
 });
 
 test('proxy-wrapper: a claude that would run outside the pool warns', () => {
   for (const state of ['envsh-off', 'none']) {
-    const r = pw({ [SELF]: OK, waki: `proxy=200 wrapper=${state}` });
+    const r = pw({ [SELF]: OK, waki: `proxy=200 wrapper=${state} claude=0 direct=0` });
     assert.equal(r.status, 0);
     assert.match(r.line, new RegExp(`^CHECK proxy-wrapper warn · waki claude can run outside the pool \\(${state}\\) — `), state);
   }
@@ -138,17 +138,17 @@ test('proxy-wrapper: a probe that exits non-zero is unreachable even if its line
 });
 
 test('proxy-wrapper: an env.sh whose NO_PROXY skips the pool warns', () => {
-  const r = pw({ [SELF]: OK, kat: 'proxy=200 wrapper=envsh-bypass' });
+  const r = pw({ [SELF]: OK, kat: 'proxy=200 wrapper=envsh-bypass claude=0 direct=0' });
   assert.match(r.line, /^CHECK proxy-wrapper warn · kat env\.sh NO_PROXY lets claude skip the pool — /);
 });
 
 test('proxy-wrapper: an env.sh that cannot be read without running it warns', () => {
-  const r = pw({ [SELF]: OK, kat: 'proxy=200 wrapper=envsh-unverifiable' });
+  const r = pw({ [SELF]: OK, kat: 'proxy=200 wrapper=envsh-unverifiable claude=0 direct=0' });
   assert.match(r.line, /^CHECK proxy-wrapper warn · kat env\.sh cannot be read without running it — /);
 });
 
 test('proxy-wrapper: a wrapper that is not the reviewed one warns', () => {
-  const r = pw({ [SELF]: OK, waki: 'proxy=200 wrapper=wrapper-1b2c3d4e' });
+  const r = pw({ [SELF]: OK, waki: 'proxy=200 wrapper=wrapper-1b2c3d4e claude=0 direct=0' });
   assert.match(r.line, /^CHECK proxy-wrapper warn · waki ~\/\.cargo\/bin\/claude is not the reviewed wrapper \(wrapper-1b2c3d4e\) — /);
 });
 
@@ -180,8 +180,9 @@ function home(wrapperSrc, envsh) {
 }
 // async: a spawnSync would block this process's event loop, and the test server could never answer
 const sha = (text) => createHash('sha256').update(text).digest('hex');
+const EMPTY_PROC = (() => { const d = join(dir, 'empty-proc'); mkdirSync(d, { recursive: true }); return d; })();
 const probe = (h, port, extra = {}, opts = {}) => new Promise((resolve, reject) => {
-  execFile('bash', [join(C, 'proxy-probe.sh'), sha(NEW_WRAPPER)], { ...opts, env: { PATH: process.env.PATH, HOME: h, CHECK_PROXY_PORT: String(port), ...extra }, encoding: 'utf8', timeout: 60_000 },
+  execFile('bash', [join(C, 'proxy-probe.sh'), sha(NEW_WRAPPER)], { ...opts, env: { PATH: process.env.PATH, HOME: h, CHECK_PROXY_PORT: String(port), CHECK_PROC: EMPTY_PROC, CHECK_SS: '/bin/true', ...extra }, encoding: 'utf8', timeout: 60_000 },
     (err, stdout) => (err && err.code !== 0 ? reject(err) : resolve(stdout.trim())));
 });
 const NEW_WRAPPER = readFileSync(join(ROOT, 'scripts', 'claude-wrapper.sh'), 'utf8');
@@ -190,14 +191,14 @@ const OLD_WRAPPER = '#!/bin/sh\nREAL=$(readlink -f "$HOME/.local/bin/claude")\ni
 
 test('proxy-probe: the reviewed wrapper reads refuses; any other wrapper is named by hash and never run', async () => {
   await withServer(200, async (port) => {
-    assert.equal(await probe(home(NEW_WRAPPER), port), 'proxy=200 wrapper=refuses');
-    assert.equal(await probe(home(OLD_WRAPPER), port), `proxy=200 wrapper=wrapper-${sha(OLD_WRAPPER).slice(0, 8)}`);
+    assert.equal(await probe(home(NEW_WRAPPER), port), 'proxy=200 wrapper=refuses claude=0 direct=0');
+    assert.equal(await probe(home(OLD_WRAPPER), port), `proxy=200 wrapper=wrapper-${sha(OLD_WRAPPER).slice(0, 8)} claude=0 direct=0`);
     const rogue = '#!/bin/sh\ntouch "$HOME/probe-ran-me"\nexit 69\n';
     const h = home(rogue);
-    assert.equal(await probe(h, port), `proxy=200 wrapper=wrapper-${sha(rogue).slice(0, 8)}`);
+    assert.equal(await probe(h, port), `proxy=200 wrapper=wrapper-${sha(rogue).slice(0, 8)} claude=0 direct=0`);
     assert.equal(existsSync(join(h, 'probe-ran-me')), false, 'the probe executed the wrapper');
     const nx = home(NEW_WRAPPER); chmodSync(join(nx, '.cargo', 'bin', 'claude'), 0o644);
-    assert.equal(await probe(nx, port), 'proxy=200 wrapper=wrapper-notexec', 'a non-executable reviewed wrapper is skipped by PATH');
+    assert.equal(await probe(nx, port), 'proxy=200 wrapper=wrapper-notexec claude=0 direct=0', 'a non-executable reviewed wrapper is skipped by PATH');
   });
 });
 
@@ -205,14 +206,14 @@ test('proxy-probe: the reviewed wrapper reads refuses; any other wrapper is name
 const envs = (body) => home(null, 'unset HTTPS_PROXY https_proxy NO_PROXY no_proxy\n' + body);
 test('proxy-probe: katana-style env.sh is judged by where HTTPS_PROXY points', async () => {
   await withServer(200, async (port) => {
-    assert.equal(await probe(envs('export HTTPS_PROXY=https://key:key@10.0.6.145:3443\n'), port), 'proxy=200 wrapper=envsh-pool');
-    assert.equal(await probe(envs('export HTTPS_PROXY=http://127.0.0.1:3456\n'), port), 'proxy=200 wrapper=envsh-pool');
-    assert.equal(await probe(envs('# cc direct\nunset HTTPS_PROXY\n'), port), 'proxy=200 wrapper=envsh-off');
-    assert.equal(await probe(envs('# export HTTPS_PROXY=http://127.0.0.1:3456\n'), port), 'proxy=200 wrapper=envsh-off');
-    assert.equal(await probe(envs('export HTTPS_PROXY=http://127.0.0.1:34560\n'), port), 'proxy=200 wrapper=envsh-off', 'another port');
-    assert.equal(await probe(envs('export HTTPS_PROXY=http://127.0.0.1:3456#x\n'), port), 'proxy=200 wrapper=envsh-off', 'a # touching the value is part of it, as in bash');
+    assert.equal(await probe(envs('export HTTPS_PROXY=https://key:key@10.0.6.145:3443\n'), port), 'proxy=200 wrapper=envsh-pool claude=0 direct=0');
+    assert.equal(await probe(envs('export HTTPS_PROXY=http://127.0.0.1:3456\n'), port), 'proxy=200 wrapper=envsh-pool claude=0 direct=0');
+    assert.equal(await probe(envs('# cc direct\nunset HTTPS_PROXY\n'), port), 'proxy=200 wrapper=envsh-off claude=0 direct=0');
+    assert.equal(await probe(envs('# export HTTPS_PROXY=http://127.0.0.1:3456\n'), port), 'proxy=200 wrapper=envsh-off claude=0 direct=0');
+    assert.equal(await probe(envs('export HTTPS_PROXY=http://127.0.0.1:34560\n'), port), 'proxy=200 wrapper=envsh-off claude=0 direct=0', 'another port');
+    assert.equal(await probe(envs('export HTTPS_PROXY=http://127.0.0.1:3456#x\n'), port), 'proxy=200 wrapper=envsh-off claude=0 direct=0', 'a # touching the value is part of it, as in bash');
     for (const loc of ['C', 'C.UTF-8'])
-      assert.equal(await probe(envs('export HTTPS_PROXY=http://127.0.0.1:3456\u2003\n'), port, { LC_ALL: loc }), 'proxy=200 wrapper=envsh-off', `an EM SPACE stays in the value (${loc})`);
+      assert.equal(await probe(envs('export HTTPS_PROXY=http://127.0.0.1:3456\u2003\n'), port, { LC_ALL: loc }), 'proxy=200 wrapper=envsh-off claude=0 direct=0', `an EM SPACE stays in the value (${loc})`);
     const P = 'export HTTPS_PROXY=http://127.0.0.1:3456\n';
     for (const [body, want, why] of [
       [P + "export NO_PROXY='*'\n", 'envsh-bypass', 'NO_PROXY=*'],
@@ -240,37 +241,37 @@ test('proxy-probe: katana-style env.sh is judged by where HTTPS_PROXY points', a
       [P + 'export https_proxy=http://elsewhere:8080\n', 'envsh-off', 'lowercase https_proxy wins in Node and points elsewhere'],
       ['export https_proxy=http://127.0.0.1:3456\n', 'envsh-pool', 'lowercase alone at the pool'],
       ['export HTTPS_PROXY=https://k@x@10.0.6.145:3443\n', 'envsh-off', 'userinfo is token characters only'],
-    ]) assert.equal(await probe(envs(body), port), `proxy=200 wrapper=${want}`, why);
+    ]) assert.equal(await probe(envs(body), port), `proxy=200 wrapper=${want} claude=0 direct=0`, why);
     for (const ws of ['\v', '\f'])
-      assert.equal(await probe(envs(`export HTTPS_PROXY=http://127.0.0.1:3456${ws}\n`), port), 'proxy=200 wrapper=envsh-off', `a trailing ${JSON.stringify(ws)} stays in the value, as in bash`);
-    assert.equal(await probe(envs('export HTTPS_PROXY=http://127.0.0.1:3456\nunset HTTPS_PROXY\n'), port), 'proxy=200 wrapper=envsh-off', 'a later unset wins');
-    assert.equal(await probe(envs('export HTTPS_PROXY=http://127.0.0.1:3456\nexport HTTPS_PROXY=http://elsewhere:1\n'), port), 'proxy=200 wrapper=envsh-off', 'a later export wins');
-    assert.equal(await probe(envs('export HTTPS_PROXY=https://k@10.0.6.145:3443.evil\n'), port), 'proxy=200 wrapper=envsh-off', 'anchored host');
-    assert.equal(await probe(envs('unset HTTPS_PROXY; exit 0\n'), port), 'proxy=200 wrapper=envsh-unverifiable', 'a compound line is not read');
+      assert.equal(await probe(envs(`export HTTPS_PROXY=http://127.0.0.1:3456${ws}\n`), port), 'proxy=200 wrapper=envsh-off claude=0 direct=0', `a trailing ${JSON.stringify(ws)} stays in the value, as in bash`);
+    assert.equal(await probe(envs('export HTTPS_PROXY=http://127.0.0.1:3456\nunset HTTPS_PROXY\n'), port), 'proxy=200 wrapper=envsh-off claude=0 direct=0', 'a later unset wins');
+    assert.equal(await probe(envs('export HTTPS_PROXY=http://127.0.0.1:3456\nexport HTTPS_PROXY=http://elsewhere:1\n'), port), 'proxy=200 wrapper=envsh-off claude=0 direct=0', 'a later export wins');
+    assert.equal(await probe(envs('export HTTPS_PROXY=https://k@10.0.6.145:3443.evil\n'), port), 'proxy=200 wrapper=envsh-off claude=0 direct=0', 'anchored host');
+    assert.equal(await probe(envs('unset HTTPS_PROXY; exit 0\n'), port), 'proxy=200 wrapper=envsh-unverifiable claude=0 direct=0', 'a compound line is not read');
     const mut = envs('touch "$HOME/probe-ran-envsh"\nexport HTTPS_PROXY=http://127.0.0.1:3456\n');
-    assert.equal(await probe(mut, port), 'proxy=200 wrapper=envsh-unverifiable');
+    assert.equal(await probe(mut, port), 'proxy=200 wrapper=envsh-unverifiable claude=0 direct=0');
     assert.equal(existsSync(join(mut, 'probe-ran-envsh')), false, 'the probe executed env.sh');
     for (const v of ["'http://127.0.0.1:3456'", '"http://127.0.0.1:3456"', 'https://k:k@10.0.6.145:3443 # a comment'])
-      assert.equal(await probe(envs(`export HTTPS_PROXY=${v}\n`), port), 'proxy=200 wrapper=envsh-pool', v);
+      assert.equal(await probe(envs(`export HTTPS_PROXY=${v}\n`), port), 'proxy=200 wrapper=envsh-pool claude=0 direct=0', v);
     for (const body of ["export HTTPS_PROXY='http://127.0.0.1:3456'#$(printf suffix)\n", "export HTTPS_PROXY='http://127.0.0.1:3456'\r\n",
       'export HTTPS_PROXY=$POOL\n', 'export HTTPS_PROXY=http://127.0.0.1:3456\nexport NO_PROXY={example.org,anthropic.com}\n', 'export NO_PROXY=~/x\n', 'export NO_PROXY=*\n', 'if true; then export HTTPS_PROXY=http://127.0.0.1:3456; fi\n', '. ./other.sh\n', 'export HTTPS_PROXY=`cat x`\n'])
-      assert.equal(await probe(envs(body), port), 'proxy=200 wrapper=envsh-unverifiable', body);
+      assert.equal(await probe(envs(body), port), 'proxy=200 wrapper=envsh-unverifiable claude=0 direct=0', body);
     const katana = '# Claude Code active backend: teamclaude\nunset CLAUDE_CODE_USE_BEDROCK ANTHROPIC_BASE_URL\nunset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy NODE_EXTRA_CA_CERTS\nexport TITLE=1  # Let shell set title\nexport HTTPS_PROXY=https://k:k@10.0.6.145:3443\nexport NO_PROXY=localhost,127.0.0.1\nexport no_proxy=localhost,127.0.0.1\nexport NODE_EXTRA_CA_CERTS=/home/u/.config/ca.pem\nunset ANTHROPIC_BASE_URL\n';
-    assert.equal(await probe(home(null, katana), port), 'proxy=200 wrapper=envsh-pool', 'katana-shaped file');
-    assert.equal(await probe(home(null, null), port), 'proxy=200 wrapper=none');
+    assert.equal(await probe(home(null, katana), port), 'proxy=200 wrapper=envsh-pool claude=0 direct=0', 'katana-shaped file');
+    assert.equal(await probe(home(null, null), port), 'proxy=200 wrapper=none claude=0 direct=0');
     // the file alone must decide: a variable it neither exports nor unsets comes from the caller
-    assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:3456\n'), port), 'proxy=200 wrapper=envsh-unverifiable', 'https_proxy/NO_PROXY left to the caller');
-    assert.equal(await probe(home(null, 'unset HTTPS_PROXY https_proxy NO_PROXY\nexport HTTPS_PROXY=http://127.0.0.1:3456\n'), port), 'proxy=200 wrapper=envsh-unverifiable', 'no_proxy left to the caller');
+    assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:3456\n'), port), 'proxy=200 wrapper=envsh-unverifiable claude=0 direct=0', 'https_proxy/NO_PROXY left to the caller');
+    assert.equal(await probe(home(null, 'unset HTTPS_PROXY https_proxy NO_PROXY\nexport HTTPS_PROXY=http://127.0.0.1:3456\n'), port), 'proxy=200 wrapper=envsh-unverifiable claude=0 direct=0', 'no_proxy left to the caller');
     // a * entry must not be expanded as a file name in the probe's working directory
     const cwd = fresh(); writeFileSync(join(cwd, 'ordinary'), '');
-    assert.equal(await probe(envs("export HTTPS_PROXY=http://127.0.0.1:3456\nexport NO_PROXY='*'\n"), port, {}, { cwd }), 'proxy=200 wrapper=envsh-bypass', 'glob in cwd');
+    assert.equal(await probe(envs("export HTTPS_PROXY=http://127.0.0.1:3456\nexport NO_PROXY='*'\n"), port, {}, { cwd }), 'proxy=200 wrapper=envsh-bypass claude=0 direct=0', 'glob in cwd');
   });
 });
 
 test('proxy-probe: a forwarder that errors or is down reports its code', async () => {
-  await withServer(502, async (port) => assert.equal(await probe(home(NEW_WRAPPER), port), 'proxy=502 wrapper=refuses'));
+  await withServer(502, async (port) => assert.equal(await probe(home(NEW_WRAPPER), port), 'proxy=502 wrapper=refuses claude=0 direct=0'));
   const srv = createServer(); await new Promise((r) => srv.listen(0, '127.0.0.1', r)); const { port } = srv.address(); await new Promise((r) => srv.close(r));
-  assert.equal(await probe(home(NEW_WRAPPER), port), 'proxy=000 wrapper=refuses');
+  assert.equal(await probe(home(NEW_WRAPPER), port), 'proxy=000 wrapper=refuses claude=0 direct=0');
 });
 
 // ---------- forge-keys (canned psql output)
@@ -390,7 +391,7 @@ const payload = (omit = []) => {
   return files;
 };
 function install(repo, h) {
-  const fake = join(fresh(), 'systemctl'); writeFileSync(fake, `#!/bin/sh\necho "$@" >> '${join(h, 'systemctl.log')}'\n`); chmodSync(fake, 0o755);
+  const fake = join(fresh(), 'systemctl'); writeFileSync(fake, `#!/bin/sh\necho "$@" >> '${join(h, 'systemctl.log')}'\n[ "$2" = is-active ] && { echo inactive; exit 3; }\nexit 0\n`); chmodSync(fake, 0o755);
   return spawnSync('bash', [join(repo.dir, 'scripts', 'checks', 'install.sh'), repo.head], { cwd: repo.dir, env: { PATH: process.env.PATH, HOME: h, CHECK_SYSTEMCTL: fake }, encoding: 'utf8' });
 }
 
@@ -458,7 +459,7 @@ test('install: a move that fails mid-publish restores every file already moved',
   const changed = payload();
   changed['scripts/checks/pool-quota.sh'] = before + '\n# changed\n';
   changed['scripts/checks/systemd/teamclaude-check-pool-quota.timer'] = unitBefore + '\n# changed\n';
-  const fake = join(fresh(), 'systemctl'); writeFileSync(fake, '#!/bin/sh\n'); chmodSync(fake, 0o755);
+  const fake = join(fresh(), 'systemctl'); writeFileSync(fake, '#!/bin/sh\n[ "$2" = is-active ] && { echo inactive; exit 3; }\nexit 0\n'); chmodSync(fake, 0o755);
   const repo = repoAt(changed);
   const r = spawnSync('bash', [join(repo.dir, 'scripts', 'checks', 'install.sh'), repo.head], { cwd: repo.dir, env: { PATH: process.env.PATH, HOME: h, CHECK_SYSTEMCTL: fake, CHECK_INSTALL_FAIL_AT: 'teamclaude-check-proxy-wrapper.timer' }, encoding: 'utf8' });
   assert.equal(r.status, 5, r.stderr);
@@ -502,21 +503,21 @@ test('install: timers are stopped before publishing and started again after', ()
 
 function installWith(repo, h, systemctlBody, extraEnv = {}) {
   const fake = join(fresh(), 'systemctl');
-  writeFileSync(fake, `#!/bin/sh\necho "$@" >> '${join(h, 'systemctl.log')}'\n${systemctlBody}\n`); chmodSync(fake, 0o755);
+  writeFileSync(fake, `#!/bin/sh\necho "$@" >> '${join(h, 'systemctl.log')}'\n${systemctlBody}\n[ "$2" = is-active ] && { echo inactive; exit 3; }\nexit 0\n`); chmodSync(fake, 0o755);
   return spawnSync('bash', [join(repo.dir, 'scripts', 'checks', 'install.sh'), repo.head], { cwd: repo.dir, env: { PATH: process.env.PATH, HOME: h, CHECK_SYSTEMCTL: fake, CHECK_INSTALL_WAIT_STEP: '0', ...extraEnv }, encoding: 'utf8' });
 }
 
 test('install: waits for a running check to finish before publishing', () => {
   const h = fresh(); const n = join(h, 'n');
   // the first is-active answers "active", every later one "inactive"
-  const r = installWith(repoAt(payload()), h, `case "$2:$3" in is-active:*.service) if [ ! -e '${n}' ]; then : > '${n}'; echo active; else echo inactive; fi ;; is-active:*) echo inactive ;; esac`);
+  const r = installWith(repoAt(payload()), h, `case "$2:$3" in is-active:*.service) if [ ! -e '${n}' ]; then : > '${n}'; echo active; exit 0; fi ;; esac`);
   assert.equal(r.status, 0, r.stderr);
   assert.ok(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')));
 });
 
 test('install: a check still running after the wait publishes nothing and restarts the timers', () => {
   const h = fresh();
-  const r = installWith(repoAt(payload()), h, 'case "$2:$3" in is-active:*.service) echo active ;; is-active:*) echo inactive ;; esac');
+  const r = installWith(repoAt(payload()), h, 'case "$2:$3" in is-active:*.service) echo active; exit 0 ;; esac');
   assert.equal(r.status, 6);
   assert.match(r.stderr, /still running/);
   assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false);
@@ -543,7 +544,7 @@ test('forge-keys: an empty models list is unrestricted, never "outside its allow
 
 test('install: a timer that did not stop refuses the install and is started again', () => {
   const h = fresh();
-  const r = installWith(repoAt(payload()), h, 'case "$2" in stop) exit 1 ;; is-active) case "$3" in *.timer) echo active ;; *) echo inactive ;; esac ;; esac');
+  const r = installWith(repoAt(payload()), h, 'case "$2:$3" in stop:*) exit 1 ;; is-active:*.timer) echo active; exit 0 ;; esac');
   assert.equal(r.status, 6);
   assert.match(r.stderr, /did not stop; nothing installed/);
   assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false);
@@ -570,4 +571,39 @@ test('install: a second install while one holds the lock is refused', async () =
     assert.match(r.stderr, /another install is running/);
     assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false);
   } finally { holder.kill(); }
+});
+
+test('proxy-probe: counts running claude CLIs and those connected to a public :443 around the pool', async () => {
+  const proc = fresh();
+  const mk = (pid, exe) => { mkdirSync(join(proc, String(pid))); symlinkSync(exe, join(proc, String(pid), 'exe')); };
+  mk(101, '/home/u/.local/share/claude/versions/2.1.325');
+  mk(102, '/home/u/.local/share/claude/versions/2.1.325');
+  mk(103, '/home/u/.local/share/claude/versions/2.1.325');
+  mk(200, '/usr/bin/curl');
+  const ssOut = [
+    '0 0 127.0.0.1:50000 127.0.0.1:3456 users:(("claude",pid=101,fd=5))',
+    '0 0 10.0.6.107:50001 160.79.104.10:443 users:(("claude",pid=102,fd=6))',
+    '0 0 10.0.6.107:50002 10.0.6.145:3443 users:(("claude",pid=103,fd=7))',
+    '0 0 10.0.6.107:50003 172.20.1.1:443 users:(("claude",pid=103,fd=8))',
+    '0 0 10.0.6.107:50004 [2606:4700::1]:443 users:(("claude",pid=103,fd=9))',
+    '0 0 10.0.6.107:50005 160.79.104.10:8443 users:(("claude",pid=101,fd=9))',
+    '0 0 10.0.6.107:50006 93.184.216.34:443 users:(("curl",pid=200,fd=3))',
+  ].join('\n');
+  const ss = join(fresh(), 'ss'); writeFileSync(ss, `#!/bin/sh\ncat <<'EOF'\n${ssOut}\nEOF\n`); chmodSync(ss, 0o755);
+  await withServer(200, async (port) => {
+    assert.equal(await probe(home(NEW_WRAPPER), port, { CHECK_PROC: proc, CHECK_SS: ss }), 'proxy=200 wrapper=refuses claude=3 direct=2');
+  });
+});
+
+test('proxy-wrapper: claude processes connected around the pool warn', () => {
+  const r = pw({ [SELF]: 'proxy=200 wrapper=refuses claude=5 direct=2' });
+  assert.match(r.line, new RegExp(`^CHECK proxy-wrapper warn · ${SELF} 2 claude processes connected around the pool — ${SELF} :3456 200, wrapper refuses, 5 claude running`));
+});
+
+test('install: a systemd state that cannot be read is not "stopped"', () => {
+  const h = fresh();
+  const r = installWith(repoAt(payload()), h, 'case "$2" in is-active) exit 1 ;; esac');
+  assert.equal(r.status, 6);
+  assert.match(r.stderr, /cannot read the state of teamclaude-check-pool-quota\.timer \(no answer\)/);
+  assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false);
 });

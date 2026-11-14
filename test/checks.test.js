@@ -209,8 +209,12 @@ test('proxy-probe: katana-style env.sh is judged by where HTTPS_PROXY points', a
     for (const [body, want, why] of [
       [P + "export NO_PROXY='*'\n", 'envsh-bypass', 'NO_PROXY=*'],
       [P + 'export no_proxy=localhost,.anthropic.com\n', 'envsh-bypass', 'no_proxy names anthropic'],
-      [P + 'export NO_PROXY=api.claude.ai\n', 'envsh-bypass', 'NO_PROXY names claude'],
+      [P + 'export NO_PROXY=claude.ai\n', 'envsh-bypass', 'NO_PROXY names claude.ai'],
+      [P + 'export NO_PROXY=api.claude.ai\n', 'envsh-pool', 'a subdomain entry does not cover its parent claude.ai'],
       [P + 'export NO_PROXY=API.ANTHROPIC.COM\n', 'envsh-bypass', 'host matching is case-insensitive'],
+      [P + 'export NO_PROXY=anthropic.com\n', 'envsh-bypass', 'a parent domain'],
+      [P + 'export NO_PROXY=*.anthropic.com:443\n', 'envsh-bypass', 'a *. entry with a port'],
+      [P + 'export NO_PROXY=claude.invalid,anthropic.example.org,notanthropic.com\n', 'envsh-pool', 'look-alike names are not the hosts'],
       [P + 'export NO_PROXY=" localhost , *"\n', 'envsh-bypass', 'a spaced * entry'],
       [P + "export NO_PROXY='*'\nunset NO_PROXY\n", 'envsh-pool', 'a later unset clears the bypass'],
       [P + 'export NO_PROXY=localhost,127.0.0.1,10.0.0.0/8,.jphe.in\n', 'envsh-pool', 'a LAN-only NO_PROXY'],

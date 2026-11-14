@@ -11,8 +11,8 @@
 #   envsh-pool     no cargo wrapper; the cc switcher's env.sh, READ (never run), leaves HTTPS_PROXY
 #                  exactly at the pool (http://127.0.0.1:3456 or https://…@10.0.6.145:3443)
 #   envsh-off      no cargo wrapper; env.sh leaves HTTPS_PROXY anywhere else (a run uses the own login)
-#   envsh-bypass   env.sh points at the pool but NO_PROXY/no_proxy holds * or an anthropic/claude
-#                  entry, so claude's API calls skip it
+#   envsh-bypass   env.sh points at the pool but NO_PROXY/no_proxy holds * or an entry matching a
+#                  host claude calls (api.anthropic.com, claude.ai, …), so those calls skip it
 #   envsh-unverifiable  env.sh has a line that is not a comment, `unset NAMES` or a literal
 #                  `export NAME=value`, or it leaves one of HTTPS_PROXY, https_proxy, NO_PROXY,
 #                  no_proxy to the caller's environment, so its effect cannot be read from the file
@@ -57,11 +57,19 @@ envsh_state() { # read env.sh line by line, as the shell would apply it, without
   { [ -z "$hp" ] || [[ "$hp" =~ $re_pool ]]; } && { [ -z "$hpl" ] || [[ "$hpl" =~ $re_pool ]]; } && [ -n "$hp$hpl" ] \
     || { echo envsh-off; return; }
   # a no-proxy entry of * or naming anthropic/claude sends claude's API calls around the pool
-  # split into an array (no word splitting, no filename expansion of a *), compare lowercased
+  # NO_PROXY host rules, against the hosts claude calls: an entry matches a host it equals or a parent
+  # domain of it; a leading "." or "*." and a ":port" are dropped; "*" matches everything. The list is
+  # split into an array (no word splitting, no filename expansion of a *), entries lowercased.
+  local hosts=(api.anthropic.com console.anthropic.com statsig.anthropic.com mcp-proxy.anthropic.com claude.ai) host
   IFS=, read -r -a list <<<"$np,$npl"
   for e in "${list[@]}"; do
     e=${e,,}; e=${e//[ $'\t']/}
-    case $e in '*'|*anthropic*|*claude*) echo envsh-bypass; return ;; esac
+    [ "$e" = '*' ] && { echo envsh-bypass; return; }
+    e=${e#\*}; e=${e#.}; e=${e%%:*}
+    [ -n "$e" ] || continue
+    for host in "${hosts[@]}"; do
+      [[ "$host" == "$e" || "$host" == *".$e" ]] && { echo envsh-bypass; return; }
+    done
   done
   echo envsh-pool
 }

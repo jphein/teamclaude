@@ -725,3 +725,29 @@ test('install: after a failed enable --now, timers are stopped and checks waited
   const reload = after.indexOf('--user daemon-reload');
   assert.ok(waited > 0 && reload > waited, after.join(' | '));
 });
+
+test('proxy-probe: a byte-identical wrapper under a path with a backslash still reads refuses', async () => {
+  const h = join(fresh(), 'odd\\home'); mkdirSync(join(h, '.cargo', 'bin'), { recursive: true });
+  writeFileSync(join(h, '.cargo', 'bin', 'claude'), NEW_WRAPPER); chmodSync(join(h, '.cargo', 'bin', 'claude'), 0o755);
+  await withServer(200, async (port) => assert.equal(await probe(h, port), 'proxy=200 wrapper=refuses claude=0 direct=0'));
+});
+
+test('install: a check that never goes idle during rollback: no file is replaced under it, backups kept, timers stay stopped', () => {
+  const h = fresh();
+  assert.equal(install(repoAt(payload()), h).status, 0);
+  rmSync(join(h, 'systemctl.log'));
+  const lib = join(h, '.local/libexec/teamclaude-checks/pool-quota.sh');
+  const before = readFileSync(lib, 'utf8');
+  const changed = payload(); changed['scripts/checks/pool-quota.sh'] = before + '\n# changed\n';
+  const marker = join(h, 'enabled');
+  const body = RUNNING(h) + `\ncase "$2:$3" in enable:*) : > '${marker}'; exit 1 ;; is-active:*.service) if [ -e '${marker}' ]; then echo active; exit 0; fi ;; esac`;
+  const r = installWith(repoAt(changed), h, body);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /ROLLBACK INCOMPLETE/);
+  assert.equal(readFileSync(lib, 'utf8'), before + '\n# changed\n', 'a file was replaced under a running check');
+  const keep = r.stderr.match(/previous files in (\S+)/)[1];
+  const manifest = readFileSync(join(keep, 'MANIFEST'), 'utf8');
+  const idx = manifest.split('\n').find((l) => l.endsWith('/pool-quota.sh')).split('\t')[0];
+  assert.equal(readFileSync(join(keep, idx), 'utf8'), before, 'the backup of the previous file is kept');
+  assert.doesNotMatch(readFileSync(join(h, 'systemctl.log'), 'utf8').split('--user enable')[1], /^--user start /m);
+});

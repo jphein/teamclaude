@@ -16,7 +16,7 @@ self=$(hostname -s 2>/dev/null || echo localhost)
 # ~/.cargo/bin/claude must be byte-identical to it
 ref=${CHECK_WRAPPER_REF:-$here/claude-wrapper.sh}
 [ -f "$ref" ] || ref="$here/../claude-wrapper.sh"   # running from the repo: scripts/claude-wrapper.sh
-want=$(sha256sum "$ref" 2>/dev/null | cut -d' ' -f1)
+want=$(sha256sum < "$ref" 2>/dev/null | cut -d' ' -f1)
 [ -n "$want" ] || check_emit "$NAME" fail "reference wrapper $ref missing; reinstall the checks, at $(check_now)" "$NEXT"
 probe() {
   if [ -n "${CHECK_PROBE:-}" ]; then $CHECK_PROBE "$1" "$want"; return; fi

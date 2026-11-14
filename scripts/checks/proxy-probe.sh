@@ -98,7 +98,7 @@ code=$(env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy -u ALL_PROX
 [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
 w="$HOME/.cargo/bin/claude"
 if [ -e "$w" ]; then
-  have=$(sha256sum "$w" 2>/dev/null | cut -d' ' -f1)
+  have=$(sha256sum < "$w" 2>/dev/null | cut -d' ' -f1)   # stdin: a path never escapes the digest
   if [ -n "$want" ] && [ "$have" = "$want" ]; then state=refuses; else state="wrapper-${have:0:8}"; fi
   [ -n "$have" ] || state=wrapper-unreadable
   # bash skips a wrapper it cannot execute and runs the next claude on PATH (the own login)

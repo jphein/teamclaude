@@ -53,12 +53,21 @@ cleanup() {
     # check that started finish, so nothing runs while files are put back
     $SYSTEMCTL --user stop "${timers[@]}" 2>/dev/null || true
     if [ "$moved" -gt 0 ]; then
-      services_idle || echo "install.sh: a check may still be running during the restore" >&2
-      # a failure after publishing (daemon-reload, enable): the old files go back and the manager
-      # reloads them before any timer runs again, so new scripts never run under old units
-      restore_published
-      $SYSTEMCTL --user daemon-reload 2>/dev/null || true
-      echo "install.sh: failed after publishing; the previous install is restored" >&2
+      if services_idle; then
+        # a failure after publishing (daemon-reload, enable): the old files go back and the manager
+        # reloads them before any timer runs again, so new scripts never run under old units
+        restore_published
+        $SYSTEMCTL --user daemon-reload 2>/dev/null || true
+        echo "install.sh: failed after publishing; the previous install is restored" >&2
+      else
+        # a check is still running (or cannot be read): never replace files under it. Keep the
+        # backups where they survive this script, leave every timer stopped, and say so.
+        keep="$lib/.rollback-$(date +%Y%m%dT%H%M%S)"
+        mkdir -p "$keep" && cp -p "$stage"/old/* "$keep"/ 2>/dev/null || true
+        for ((i = 0; i < moved; i++)); do printf '%s\t%s\n' "$i" "${dsts[$i]}"; done > "$keep/MANIFEST"
+        echo "install.sh: ROLLBACK INCOMPLETE: a check is still running; new files left in place, timers stopped, previous files in $keep (MANIFEST maps each to its path)" >&2
+        was_running=()
+      fi
     fi
     # then start only the timers that were running before this install
     [ ${#was_running[@]} -eq 0 ] || $SYSTEMCTL --user start "${was_running[@]}" 2>/dev/null || true

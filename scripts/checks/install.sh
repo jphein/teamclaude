@@ -76,6 +76,7 @@ incomplete() { # why
   echo "install.sh: ROLLBACK INCOMPLETE: $1; timers left stopped; previous files in $kept (MANIFEST maps each to its path)" >&2
 }
 cleanup() {
+  trap '' TERM INT HUP   # a second signal must not cut the rollback short
   set +e   # an EXIT trap under set -e would stop at the first failing command: every step is checked here
   if [ "$quiesced" = 1 ] && [ "$finished" = 0 ]; then
     # quiet first: stop all three timers (a failed `enable --now` may have started some) and let a

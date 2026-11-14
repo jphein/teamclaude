@@ -851,3 +851,23 @@ test('install: a SIGTERM right after the first move still rolls that file back',
   assert.notEqual(r.status, 0);
   assert.equal(readFileSync(first, 'utf8'), before, 'the file moved before the signal was left new');
 });
+
+test('install: a second signal during the rollback does not cut it short', () => {
+  const h = fresh();
+  assert.equal(install(repoAt(payload()), h).status, 0);
+  const libdir = join(h, '.local/libexec/teamclaude-checks');
+  const a = join(libdir, 'claude-wrapper.sh'), b = join(libdir, 'forge-keys.sh');   // the first two published
+  const beforeA = readFileSync(a, 'utf8'), beforeB = readFileSync(b, 'utf8');
+  const changed = payload();
+  changed['scripts/claude-wrapper.sh'] = NEW_WRAPPER + '\n# changed\n';
+  changed['scripts/checks/forge-keys.sh'] = beforeB + '\n# changed\n';
+  const bin = fresh(); const n = join(bin, 'moves'); const once = join(bin, 'cp-once');
+  writeFileSync(join(bin, 'mv'), `#!/bin/sh\n/bin/mv "$@" || exit $?\ncase "$*" in *-fT*) echo x >> '${n}'; [ "$(wc -l < '${n}')" = 2 ] && kill -TERM $PPID ;; esac\n`);
+  writeFileSync(join(bin, 'cp'), `#!/bin/sh\n/bin/cp "$@" || exit $?\nif [ "$1" = -p ]; then case "$2" in */old/*) if [ ! -e '${once}' ]; then : > '${once}'; kill -TERM $PPID; fi ;; esac; fi\n`);
+  chmodSync(join(bin, 'mv'), 0o755); chmodSync(join(bin, 'cp'), 0o755);
+  const r = installWith(repoAt(changed), h, RUNNING(h), { PATH: `${bin}:${process.env.PATH}` });
+  assert.notEqual(r.status, 0);
+  assert.ok(existsSync(once), 'the second signal was never sent');
+  assert.equal(readFileSync(a, 'utf8'), beforeA);
+  assert.equal(readFileSync(b, 'utf8'), beforeB, 'the rollback stopped after the second signal');
+});

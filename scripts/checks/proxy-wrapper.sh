@@ -27,13 +27,14 @@ status=ok; parts=(); bad=()
 for h in ${CHECK_HOSTS:-familiar wakizashi katana}; do
   # the probe must exit 0 AND print exactly one well-formed line
   out=$(probe "$h" 2>/dev/null); prc=$?
-  if [ "$prc" != 0 ] || [[ ! "$out" =~ ^proxy=([0-9]{3})\ wrapper=([a-z0-9-]+)\ claude=([0-9]+)\ direct=([0-9]+)$ ]]; then
+  if [ "$prc" != 0 ] || [[ ! "$out" =~ ^proxy=([0-9]{3})\ wrapper=([a-z0-9-]+)\ claude=([0-9]+)\ direct=([0-9]+|unknown)$ ]]; then
     parts+=("$h unreachable"); bad+=("$h unreachable"); [ "$h" = "$self" ] && status=fail || { [ "$status" = fail ] || status=warn; }
     continue
   fi
   code=${BASH_REMATCH[1]} state=${BASH_REMATCH[2]} ncl=${BASH_REMATCH[3]} direct=${BASH_REMATCH[4]}
   p="$h :3456 $code, wrapper $state, $ncl claude running"; parts+=("$p")
-  if [ "$direct" != 0 ]; then bad+=("$h $direct claude processes connected around the pool"); [ "$status" = fail ] || status=warn; fi
+  if [ "$direct" = unknown ]; then bad+=("$h claude connections could not be read"); [ "$status" = fail ] || status=warn
+  elif [ "$direct" != 0 ]; then bad+=("$h $direct claude processes connected around the pool"); [ "$status" = fail ] || status=warn; fi
   if [ "$code" != 200 ]; then
     bad+=("$h forwarder $code")
     if [ "$h" = "$self" ]; then status=fail; else [ "$status" = fail ] || status=warn; fi

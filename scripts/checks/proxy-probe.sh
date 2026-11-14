@@ -129,6 +129,8 @@ for d in "$procroot"/[0-9]*; do
   case $e in */claude/versions/*) cl[${d##*/}]=1 ;; esac
 done
 declare -A around=()
+# the listing itself must succeed: a failed ss (missing, no permission) is "cannot tell", never 0
+if conns=$(${CHECK_SS:-ss} -tnpH state established 2>/dev/null); then direct_ok=1; else direct_ok=0; conns=; fi
 while read -r peer procs; do
   port=${peer##*:}; host=${peer%:*}
   [ "$port" = 443 ] || continue
@@ -136,5 +138,6 @@ while read -r peer procs; do
   for pid in $(grep -oE 'pid=[0-9]+' <<<"$procs" | cut -d= -f2); do
     [ -n "${cl[$pid]:-}" ] && around[$pid]=1
   done
-done < <(${CHECK_SS:-ss} -tnpH state established 2>/dev/null | awk '{print $4, $5}')
-echo "proxy=$code wrapper=$state claude=${#cl[@]} direct=${#around[@]}"
+done < <(awk '{print $4, $5}' <<<"$conns")
+if [ "$direct_ok" = 1 ]; then direct=${#around[@]}; else direct=unknown; fi
+echo "proxy=$code wrapper=$state claude=${#cl[@]} direct=$direct"

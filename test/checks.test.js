@@ -501,6 +501,8 @@ test('install: timers are stopped before publishing and started again after', ()
   assert.ok(stop >= 0 && reload > stop, log.join(' | '));
 });
 
+// timers report active until this install stops them (as on a host where the checks run)
+const RUNNING = (h) => `case "$2:$3" in stop:*) : > '${join(h, 'stopped')}' ;; is-active:*.timer) if [ -e '${join(h, 'stopped')}' ]; then echo inactive; exit 3; else echo active; exit 0; fi ;; esac`;
 function installWith(repo, h, systemctlBody, extraEnv = {}) {
   const fake = join(fresh(), 'systemctl');
   writeFileSync(fake, `#!/bin/sh\necho "$@" >> '${join(h, 'systemctl.log')}'\n${systemctlBody}\n[ "$2" = is-active ] && { echo inactive; exit 3; }\nexit 0\n`); chmodSync(fake, 0o755);
@@ -517,7 +519,7 @@ test('install: waits for a running check to finish before publishing', () => {
 
 test('install: a check still running after the wait publishes nothing and restarts the timers', () => {
   const h = fresh();
-  const r = installWith(repoAt(payload()), h, 'case "$2:$3" in is-active:*.service) echo active; exit 0 ;; esac');
+  const r = installWith(repoAt(payload()), h, RUNNING(h) + '\ncase "$2:$3" in is-active:*.service) echo active; exit 0 ;; esac');
   assert.equal(r.status, 6);
   assert.match(r.stderr, /still running/);
   assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false);
@@ -528,7 +530,7 @@ test('install: a failed publish restarts the stopped timers', () => {
   const h = fresh();
   assert.equal(install(repoAt(payload()), h).status, 0);
   rmSync(join(h, 'systemctl.log'));
-  const r = installWith(repoAt(payload()), h, '', { CHECK_INSTALL_FAIL_AT: 'teamclaude-check-proxy-wrapper.timer' });
+  const r = installWith(repoAt(payload()), h, RUNNING(h), { CHECK_INSTALL_FAIL_AT: 'teamclaude-check-proxy-wrapper.timer' });
   assert.equal(r.status, 5, r.stderr);
   const log = readFileSync(join(h, 'systemctl.log'), 'utf8');
   assert.match(log, /^--user stop /m); assert.match(log, /^--user start teamclaude-check-pool-quota\.timer /m);
@@ -553,7 +555,7 @@ test('install: a timer that did not stop refuses the install and is started agai
 
 test('install: an unexpected failure after the stop (daemon-reload) still starts the timers again', () => {
   const h = fresh();
-  const r = installWith(repoAt(payload()), h, 'case "$2" in daemon-reload) exit 1 ;; esac');
+  const r = installWith(repoAt(payload()), h, RUNNING(h) + '\ncase "$2" in daemon-reload) exit 1 ;; esac');
   assert.notEqual(r.status, 0);
   const log = readFileSync(join(h, 'systemctl.log'), 'utf8').trim().split('\n');
   assert.equal(log[log.length - 1], '--user start teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer', log.join(' | '));
@@ -609,4 +611,27 @@ test('install: a systemd state that cannot be read is not "stopped"', () => {
   assert.equal(r.status, 6);
   assert.match(r.stderr, /cannot read the state of teamclaude-check-pool-quota\.timer \(no answer\)/);
   assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false);
+});
+
+test('install: a refused install does not start timers that were not running before it', () => {
+  const h = fresh();
+  const r = installWith(repoAt(payload()), h, 'case "$2:$3" in is-active:*.service) echo active; exit 0 ;; esac');
+  assert.equal(r.status, 6);
+  assert.doesNotMatch(readFileSync(join(h, 'systemctl.log'), 'utf8'), /^--user start /m);
+});
+
+test('install: an unreadable timer state before stopping refuses without stopping anything', () => {
+  const h = fresh();
+  const r = installWith(repoAt(payload()), h, 'case "$2" in is-active) exit 1 ;; esac');
+  assert.equal(r.status, 6);
+  assert.doesNotMatch(readFileSync(join(h, 'systemctl.log'), 'utf8'), /^--user stop /m);
+});
+
+test('proxy-probe: a failed connection listing reads "unknown", never 0; the check warns', async () => {
+  const proc = fresh(); mkdirSync(join(proc, '101')); symlinkSync('/x/claude/versions/2', join(proc, '101', 'exe'));
+  await withServer(200, async (port) => {
+    assert.equal(await probe(home(NEW_WRAPPER), port, { CHECK_PROC: proc, CHECK_SS: '/bin/false' }), 'proxy=200 wrapper=refuses claude=1 direct=unknown');
+  });
+  const r = pw({ [SELF]: 'proxy=200 wrapper=refuses claude=1 direct=unknown' });
+  assert.match(r.line, new RegExp(`^CHECK proxy-wrapper warn · ${SELF} claude connections could not be read — `));
 });

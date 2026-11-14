@@ -19,10 +19,11 @@ exec 8>"$lib/.install.lock"
 flock -n 8 || { echo "install.sh: another install is running; nothing installed" >&2; exit 7; }
 # On ANY exit after the timers were stopped (a refusal, a failed move, or an unexpected set -e
 # failure such as a daemon-reload error) the timers are started again, unless the install finished.
-quiesced=0 finished=0 timers=()
+quiesced=0 finished=0 timers=() was_running=()
 cleanup() {
-  if [ "$quiesced" = 1 ] && [ "$finished" = 0 ] && [ ${#timers[@]} -gt 0 ]; then
-    $SYSTEMCTL --user start "${timers[@]}" 2>/dev/null || true
+  # start again only the timers that were running before this install stopped them
+  if [ "$quiesced" = 1 ] && [ "$finished" = 0 ] && [ ${#was_running[@]} -gt 0 ]; then
+    $SYSTEMCTL --user start "${was_running[@]}" 2>/dev/null || true
   fi
   rm -rf -- "${stage:?}"
 }
@@ -48,6 +49,15 @@ for f in "$stage"/lib/*.sh; do bash -n "$f" || { echo "install.sh: $(basename "$
 # quiesce: stop the timers and wait for a running check to finish, so no check runs while its files
 # are half replaced (a check started mid-publish could load a new lib.sh with an old script)
 services=(); for n in "${checks[@]}"; do services+=("teamclaude-check-$n.service"); done
+# remember which timers run now (an unreadable state refuses before anything is stopped)
+for t in "${timers[@]}"; do
+  st=$($SYSTEMCTL --user is-active "$t" 2>/dev/null) || true
+  case $st in
+    active|activating|reloading) was_running+=("$t") ;;
+    inactive|failed|unknown) ;;
+    *) echo "install.sh: cannot read the state of $t (${st:-no answer}); nothing installed" >&2; exit 6 ;;
+  esac
+done
 quiesced=1
 $SYSTEMCTL --user stop "${timers[@]}" 2>/dev/null || true
 # a stop that failed leaves a timer armed: refuse unless every timer reads inactive (or is not

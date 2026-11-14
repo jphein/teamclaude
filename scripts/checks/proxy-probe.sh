@@ -117,7 +117,7 @@ fi
 private() { # host -> 0 when loopback, LAN or link-local
   local h=${1#[}; h=${h%]}; h=${h#::ffff:}
   case $h in
-    127.*|10.*|192.168.*|::1|fe80:*|fc*|fd*|localhost) return 0 ;;
+    127.*|10.*|192.168.*|169.254.*|::1|fe80:*|fc*|fd*|localhost) return 0 ;;
     172.*) local o=${h#172.}; o=${o%%.*}; [[ "$o" =~ ^[0-9]+$ ]] && (( o >= 16 && o <= 31 )) && return 0 ;;
   esac
   return 1

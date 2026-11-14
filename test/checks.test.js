@@ -590,6 +590,7 @@ test('proxy-probe: counts running claude CLIs and those connected to a public :4
     '0 0 10.0.6.107:50007 192.168.1.9:443 users:(("claude",pid=101,fd=10))',
     '0 0 10.0.6.107:50008 10.0.6.11:443 users:(("claude",pid=101,fd=11))',
     '0 0 10.0.6.107:50009 [::ffff:10.0.6.11]:443 users:(("claude",pid=101,fd=12))',
+    '0 0 10.0.6.107:50010 169.254.1.1:443 users:(("claude",pid=101,fd=13))',
     '0 0 10.0.6.107:50004 [2606:4700::1]:443 users:(("claude",pid=103,fd=9))',
     '0 0 10.0.6.107:50005 160.79.104.10:8443 users:(("claude",pid=101,fd=9))',
     '0 0 10.0.6.107:50006 93.184.216.34:443 users:(("curl",pid=200,fd=3))',
@@ -750,4 +751,39 @@ test('install: a check that never goes idle during rollback: no file is replaced
   const idx = manifest.split('\n').find((l) => l.endsWith('/pool-quota.sh')).split('\t')[0];
   assert.equal(readFileSync(join(keep, idx), 'utf8'), before, 'the backup of the previous file is kept');
   assert.doesNotMatch(readFileSync(join(h, 'systemctl.log'), 'utf8').split('--user enable')[1], /^--user start /m);
+});
+
+test('install: a timer that does not stop during rollback: no file is replaced, backups kept', () => {
+  const h = fresh();
+  assert.equal(install(repoAt(payload()), h).status, 0);
+  const lib = join(h, '.local/libexec/teamclaude-checks/pool-quota.sh');
+  const before = readFileSync(lib, 'utf8');
+  const changed = payload(); changed['scripts/checks/pool-quota.sh'] = before + '\n# changed\n';
+  const marker = join(h, 'enabled');
+  // enable starts a timer and fails; after that, stop has no effect and the timer reads active
+  const body = `case "$2:$3" in enable:*) : > '${marker}'; exit 1 ;; is-active:*.timer) if [ -e '${marker}' ]; then echo active; exit 0; fi ;; esac`;
+  const r = installWith(repoAt(changed), h, body);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /ROLLBACK INCOMPLETE/);
+  assert.equal(readFileSync(lib, 'utf8'), before + '\n# changed\n');
+});
+
+test('install: if the backups cannot be moved aside, the staging copy is kept and named', () => {
+  const h = fresh();
+  assert.equal(install(repoAt(payload()), h).status, 0);
+  const libdir = join(h, '.local/libexec/teamclaude-checks');
+  const before = readFileSync(join(libdir, 'pool-quota.sh'), 'utf8');
+  const changed = payload(); changed['scripts/checks/pool-quota.sh'] = before + '\n# changed\n';
+  const marker = join(h, 'enabled');
+  // services stay busy after enable fails; a fake mv refuses to move the rollback directory
+  const bin = fresh(); const mv = join(bin, 'mv');
+  writeFileSync(mv, `#!/bin/sh\ncase "$*" in *.rollback-*) exit 1 ;; esac\nexec /bin/mv "$@"\n`); chmodSync(mv, 0o755);
+  const body = RUNNING(h) + `\ncase "$2:$3" in enable:*) : > '${marker}'; exit 1 ;; is-active:*.service) if [ -e '${marker}' ]; then echo active; exit 0; fi ;; esac`;
+  const r = installWith(repoAt(changed), h, body, { PATH: `${bin}:${process.env.PATH}` });
+  assert.notEqual(r.status, 0);
+  const m = r.stderr.match(/previous files remain in (\S+)/);
+  assert.ok(m, r.stderr);
+  const manifest = readFileSync(join(m[1], 'MANIFEST'), 'utf8');
+  const idx = manifest.split('\n').find((l) => l.endsWith('/pool-quota.sh')).split('\t')[0];
+  assert.equal(readFileSync(join(m[1], idx), 'utf8'), before);
 });

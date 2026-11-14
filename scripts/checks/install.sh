@@ -20,7 +20,16 @@ flock -n 8 || { echo "install.sh: another install is running; nothing installed"
 # On ANY exit after the timers were stopped (a refusal, a failed move, or an unexpected set -e
 # failure such as a daemon-reload error) the timers are started again, unless the install finished.
 quiesced=0 finished=0 timers=() services=() was_running=()
-srcs=() dsts=() moved=0   # staged file i goes to dsts[i]; its previous copy is $stage/old/i
+srcs=() dsts=() moved=0 keep_stage=0   # staged file i goes to dsts[i]; its previous copy is $stage/old/i
+# 0 when every timer reads inactive (or not installed); 1 when one is still armed or unreadable
+timers_stopped() {
+  local t st
+  for t in "${timers[@]}"; do
+    st=$($SYSTEMCTL --user is-active "$t" 2>/dev/null) || true
+    case $st in inactive|failed|unknown) ;; *) return 1 ;; esac
+  done
+  return 0
+}
 # put back every file this install moved into place (from the copies kept in $stage/old)
 restore_published() {
   local i
@@ -53,26 +62,30 @@ cleanup() {
     # check that started finish, so nothing runs while files are put back
     $SYSTEMCTL --user stop "${timers[@]}" 2>/dev/null || true
     if [ "$moved" -gt 0 ]; then
-      if services_idle; then
+      if timers_stopped && services_idle; then
         # a failure after publishing (daemon-reload, enable): the old files go back and the manager
         # reloads them before any timer runs again, so new scripts never run under old units
         restore_published
         $SYSTEMCTL --user daemon-reload 2>/dev/null || true
         echo "install.sh: failed after publishing; the previous install is restored" >&2
       else
-        # a check is still running (or cannot be read): never replace files under it. Keep the
-        # backups where they survive this script, leave every timer stopped, and say so.
+        # a timer did not stop or a check is still running (or cannot be read): never replace files
+        # under it. Keep the backups where they survive this script, start no timer, and say so.
+        for ((i = 0; i < moved; i++)); do printf '%s\t%s\n' "$i" "${dsts[$i]}"; done > "$stage/old/MANIFEST" 2>/dev/null || true
         keep="$lib/.rollback-$(date +%Y%m%dT%H%M%S)"
-        mkdir -p "$keep" && cp -p "$stage"/old/* "$keep"/ 2>/dev/null || true
-        for ((i = 0; i < moved; i++)); do printf '%s\t%s\n' "$i" "${dsts[$i]}"; done > "$keep/MANIFEST"
-        echo "install.sh: ROLLBACK INCOMPLETE: a check is still running; new files left in place, timers stopped, previous files in $keep (MANIFEST maps each to its path)" >&2
+        if [ -s "$stage/old/MANIFEST" ] && mv -T "$stage/old" "$keep" 2>/dev/null; then
+          echo "install.sh: ROLLBACK INCOMPLETE: a timer or check is still active; new files left in place, timers stopped, previous files in $keep (MANIFEST maps each to its path)" >&2
+        else
+          keep_stage=1   # the move failed: the staging directory is the only copy, so it stays
+          echo "install.sh: ROLLBACK INCOMPLETE: a timer or check is still active and the backups could not be moved; previous files remain in $stage/old" >&2
+        fi
         was_running=()
       fi
     fi
     # then start only the timers that were running before this install
     [ ${#was_running[@]} -eq 0 ] || $SYSTEMCTL --user start "${was_running[@]}" 2>/dev/null || true
   fi
-  rm -rf -- "${stage:?}"
+  [ "$keep_stage" = 1 ] || rm -rf -- "${stage:?}"
 }
 stage=$(mktemp -d "$lib/.stage.XXXXXX"); trap cleanup EXIT
 mkdir "$stage/lib" "$stage/units"

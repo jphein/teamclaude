@@ -19,28 +19,48 @@ exec 8>"$lib/.install.lock"
 flock -n 8 || { echo "install.sh: another install is running; nothing installed" >&2; exit 7; }
 # On ANY exit after the timers were stopped (a refusal, a failed move, or an unexpected set -e
 # failure such as a daemon-reload error) the timers are started again, unless the install finished.
-quiesced=0 finished=0 timers=() was_running=() done_=()
+quiesced=0 finished=0 timers=() services=() was_running=()
+srcs=() dsts=() moved=0   # staged file i goes to dsts[i]; its previous copy is $stage/old/i
 # put back every file this install moved into place (from the copies kept in $stage/old)
 restore_published() {
-  local d o
-  for d in "${done_[@]}"; do
-    o="$stage/old/$(printf '%s' "$d" | tr / %)"
-    if [ -e "$o" ]; then cp -p "$o" "$d"; else rm -f -- "$d"; fi
+  local i
+  for ((i = 0; i < moved; i++)); do
+    if [ -e "$stage/old/$i" ]; then cp -p "$stage/old/$i" "${dsts[$i]}"; else rm -f -- "${dsts[$i]}"; fi
   done
-  done_=()
+  moved=0
+}
+# wait until no check service runs: 0 idle, 1 still busy after the wait, 2 a state cannot be read
+services_idle() {
+  local _ svc st busy
+  for _ in $(seq 1 60); do
+    busy=0
+    for svc in "${services[@]}"; do
+      st=$($SYSTEMCTL --user is-active "$svc" 2>/dev/null) || true
+      case $st in
+        inactive|failed|unknown) ;;
+        active|activating|deactivating|reloading) busy=1 ;;
+        *) echo "install.sh: cannot read the state of $svc (${st:-no answer})" >&2; return 2 ;;
+      esac
+    done
+    [ "$busy" = 0 ] && return 0
+    sleep "${CHECK_INSTALL_WAIT_STEP:-5}"
+  done
+  return 1
 }
 cleanup() {
-  # a failure after publishing (daemon-reload, enable): the old files go back and the manager
-  # reloads them before any timer runs again, so new scripts never run under old units
-  if [ "$finished" = 0 ] && [ ${#done_[@]} -gt 0 ]; then
-    restore_published
-    $SYSTEMCTL --user daemon-reload 2>/dev/null || true
-    echo "install.sh: failed after publishing; the previous install is restored" >&2
-  fi
-  # put the timers back as they were: stop all three (a failed `enable --now` may have started some),
-  # then start only the ones that were running before this install
   if [ "$quiesced" = 1 ] && [ "$finished" = 0 ]; then
+    # quiet first: stop all three timers (a failed `enable --now` may have started some) and let a
+    # check that started finish, so nothing runs while files are put back
     $SYSTEMCTL --user stop "${timers[@]}" 2>/dev/null || true
+    if [ "$moved" -gt 0 ]; then
+      services_idle || echo "install.sh: a check may still be running during the restore" >&2
+      # a failure after publishing (daemon-reload, enable): the old files go back and the manager
+      # reloads them before any timer runs again, so new scripts never run under old units
+      restore_published
+      $SYSTEMCTL --user daemon-reload 2>/dev/null || true
+      echo "install.sh: failed after publishing; the previous install is restored" >&2
+    fi
+    # then start only the timers that were running before this install
     [ ${#was_running[@]} -eq 0 ] || $SYSTEMCTL --user start "${was_running[@]}" 2>/dev/null || true
   fi
   rm -rf -- "${stage:?}"
@@ -66,7 +86,7 @@ done
 for f in "$stage"/lib/*.sh; do bash -n "$f" || { echo "install.sh: $(basename "$f") does not parse; nothing installed" >&2; exit 4; }; done
 # quiesce: stop the timers and wait for a running check to finish, so no check runs while its files
 # are half replaced (a check started mid-publish could load a new lib.sh with an old script)
-services=(); for n in "${checks[@]}"; do services+=("teamclaude-check-$n.service"); done
+for n in "${checks[@]}"; do services+=("teamclaude-check-$n.service"); done
 # remember which timers run now (an unreadable state refuses before anything is stopped)
 for t in "${timers[@]}"; do
   st=$($SYSTEMCTL --user is-active "$t" 2>/dev/null) || true
@@ -89,42 +109,35 @@ for t in "${timers[@]}"; do
     *) echo "install.sh: cannot read the state of $t (${st:-no answer}); nothing installed" >&2; exit 6 ;;
   esac
 done
-for _ in $(seq 1 60); do
-  busy=0
-  for svc in "${services[@]}"; do
-    st=$($SYSTEMCTL --user is-active "$svc" 2>/dev/null) || true
-    case $st in
-      inactive|failed|unknown) ;;
-      active|activating|deactivating|reloading) busy=1 ;;
-      *) echo "install.sh: cannot read the state of $svc (${st:-no answer}); nothing installed" >&2; exit 6 ;;
-    esac
-  done
-  [ "$busy" = 0 ] && break; sleep "${CHECK_INSTALL_WAIT_STEP:-5}"
-done
-[ "$busy" = 0 ] || { echo "install.sh: a check is still running after 5 min; nothing installed" >&2; exit 6; }
+rc=0; services_idle || rc=$?
+case $rc in
+  0) ;;
+  1) echo "install.sh: a check is still running after 5 min; nothing installed" >&2; exit 6 ;;
+  *) echo "install.sh: nothing installed" >&2; exit 6 ;;
+esac
 # publish: the complete, checked payload only. Preflight the destinations, keep a copy of what is
 # there, and put it all back if any move fails, so scripts and units never mix two commits.
 [ -w "$lib" ] && [ -w "$units" ] || { echo "install.sh: $lib or $units is not writable; nothing installed" >&2; exit 5; }
 chmod 755 "$stage"/lib/*; chmod 644 "$stage"/units/*
 mkdir "$stage/old"
-pairs=()
-for f in "$stage"/lib/*; do pairs+=("$f|$lib/$(basename "$f")"); done
-for f in "$stage"/units/*; do pairs+=("$f|$units/$(basename "$f")"); done
-for p in "${pairs[@]}"; do
-  dst=${p#*|}
+# sources and destinations in two arrays (no delimiter, so any character in $HOME is fine)
+for f in "$stage"/lib/*; do srcs+=("$f"); dsts+=("$lib/$(basename "$f")"); done
+for f in "$stage"/units/*; do srcs+=("$f"); dsts+=("$units/$(basename "$f")"); done
+for i in "${!dsts[@]}"; do
+  dst=${dsts[$i]}
   if [ -e "$dst" ] || [ -L "$dst" ]; then
     [ -f "$dst" ] && [ ! -L "$dst" ] || { echo "install.sh: $dst exists and is not a regular file; nothing installed" >&2; exit 5; }
-    cp -p "$dst" "$stage/old/$(printf '%s' "$dst" | tr / %)"
+    cp -p "$dst" "$stage/old/$i"
   fi
 done
-for p in "${pairs[@]}"; do
-  src=${p%%|*} dst=${p#*|}
+for i in "${!dsts[@]}"; do
+  src=${srcs[$i]} dst=${dsts[$i]}
   # CHECK_INSTALL_FAIL_AT=<file name>: tests only, makes that one move fail to prove the restore
   if [ "${CHECK_INSTALL_FAIL_AT:-}" = "$(basename "$dst")" ] || ! mv -fT "$src" "$dst"; then
     restore_published
     echo "install.sh: publishing $dst failed; the previous install is restored" >&2; exit 5
   fi
-  done_+=("$dst")
+  moved=$((i + 1))
 done
 $SYSTEMCTL --user daemon-reload
 $SYSTEMCTL --user enable --now "${timers[@]}"

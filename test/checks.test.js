@@ -653,9 +653,9 @@ test('install: a partial enable --now failure leaves no timer running that was n
   const log = readFileSync(join(h, 'systemctl.log'), 'utf8').trim().split('\n');
   const enable = log.findIndex((l) => l.startsWith('--user enable --now '));
   assert.ok(enable >= 0, log.join(' | '));
-  // restore the files, reload them, then stop all three timers; none was running before
-  assert.equal(log[enable + 1], '--user daemon-reload', log.join(' | '));
-  assert.equal(log[enable + 2], '--user stop teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer', log.join(' | '));
+  // stop all three timers first, then (after the wait) restore the files and reload; none was running before
+  assert.equal(log[enable + 1], '--user stop teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer', log.join(' | '));
+  assert.ok(log.slice(enable + 2).includes('--user daemon-reload'), log.join(' | '));
   assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false, 'a first install that failed must not leave its files');
   assert.equal(log.slice(enable + 1).some((l) => l.startsWith('--user start ')), false);
 });
@@ -694,4 +694,34 @@ test('install: a daemon-reload failure after publishing restores the previous fi
   const log = readFileSync(join(h, 'systemctl.log'), 'utf8').trim().split('\n');
   assert.equal(log.filter((l) => l === '--user daemon-reload').length, 2, log.join(' | '));
   assert.ok(log.lastIndexOf('--user daemon-reload') < log.findIndex((l) => l.startsWith('--user start ')), log.join(' | '));
+});
+
+test('install: a $HOME holding | installs normally', () => {
+  const h = join(fresh(), 'check|home'); mkdirSync(h);
+  const r = install(repoAt(payload()), h);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')));
+  assert.ok(existsSync(join(h, '.config/systemd/user/teamclaude-check-forge-keys.timer')));
+});
+
+test('install: after a failed enable --now, timers are stopped and checks waited for before any file is restored', () => {
+  const h = fresh();
+  assert.equal(install(repoAt(payload()), h).status, 0);
+  rmSync(join(h, 'systemctl.log'));
+  const lib = join(h, '.local/libexec/teamclaude-checks/pool-quota.sh');
+  const before = readFileSync(lib, 'utf8');
+  const changed = payload(); changed['scripts/checks/pool-quota.sh'] = before + '\n# changed\n';
+  // after enable, a check is busy once; the restore must come after that wait
+  const marker = join(h, 'enabled'); const seen = join(h, 'seen');
+  const body = `case "$2:$3" in enable:*) : > '${marker}'; exit 1 ;; is-active:*.service) if [ -e '${marker}' ] && [ ! -e '${seen}' ]; then : > '${seen}'; echo active; exit 0; fi ;; esac`;
+  const r = installWith(repoAt(changed), h, body);
+  assert.notEqual(r.status, 0);
+  assert.equal(readFileSync(lib, 'utf8'), before);
+  const log = readFileSync(join(h, 'systemctl.log'), 'utf8').trim().split('\n');
+  const en = log.findIndex((l) => l.startsWith('--user enable --now '));
+  const after = log.slice(en + 1);
+  assert.ok(after[0].startsWith('--user stop '), after.join(' | '));
+  const waited = after.findIndex((l) => l.startsWith('--user is-active teamclaude-check-'));
+  const reload = after.indexOf('--user daemon-reload');
+  assert.ok(waited > 0 && reload > waited, after.join(' | '));
 });

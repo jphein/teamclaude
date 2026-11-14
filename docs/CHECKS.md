@@ -10,12 +10,10 @@ JP asked for this on 2026-11-14 at 10:1x: "we should have more crons checking th
 
 Where each line goes:
 - **The journal.** Read it with `journalctl --user -u teamclaude-check-<name>`.
-- **`~/.local/state/checks/<name>.last`.** This holds the latest line.
+- **`~/.local/state/checks/<name>.line`.** This holds the latest line, written as `.tmp` then renamed: the fleet's canonical place (FOR-AGENTS rule 24), which Hearth › Checks and the 08:11 pass read.
 - **`~/.local/state/checks/<name>.log`.** This keeps about 3 weeks of history.
 
-How a run exits:
-- `ok` and `warn` exit 0.
-- `fail` exits 1, so the unit also shows up in `systemctl --user --failed`.
+How a run exits: always 0, whatever it found. A check reports, it never gates; `fail` is a line, not a failed unit.
 
 **Daily line.** `~/.local/libexec/teamclaude-checks/summary.sh` prints every check that is not ok. It also prints a check whose last result is older than twice its cadence, or is not exactly one line of the full shape, because a stopped timer or a garbled result is itself a warn. When it prints nothing, every check is ok and fresh. The teamclaude lane copies its output into the daily line.
 

@@ -49,7 +49,7 @@ test('pool-quota: healthy pool is ok, names no seat by email', () => {
   assert.match(r.line, LINE);
   assert.match(r.line, /^CHECK pool-quota ok · 5h 80% left, week 60% left, seats ≥90% used: none, at \d\d:\d\d · /);
   assert.doesNotMatch(r.line, /@/);
-  assert.equal(readFileSync(join(r.state, 'pool-quota.last'), 'utf8').trim(), r.line);
+  assert.equal(readFileSync(join(r.state, 'pool-quota.line'), 'utf8').trim(), r.line);
 });
 
 test('pool-quota: weekly under 30% warns; 5h under 15% warns; seats ≥90% are named by local part', () => {
@@ -84,16 +84,16 @@ test('pool-quota: disabled seats are ignored; a seat not active is named', () =>
   assert.match(r.line, /seats ≥90% used: none, not active: re=needs-reauth, /);
 });
 
-test('pool-quota: no aggregate, bad JSON or no endpoint is a fail (exit 1)', () => {
+test('pool-quota: no aggregate, bad JSON or no endpoint is a fail line (exit 0: a check never gates)', () => {
   for (const body of ['{"accounts":[]}', 'not json',
     '{"aggregate":{"fiveHour":{"remaining":0.8},"weeklyShared":{"remaining":0.8}},"accounts":[]}\n{}',
     '{"aggregate":{"fiveHour":{"remaining":0.8},"weeklyShared":{"remaining":0.8}},"accounts":[]}\n{"aggregate":{"fiveHour":{"remaining":0.8},"weeklyShared":{"remaining":0.8}},"accounts":[]}', '{"aggregate":{"fiveHour":{"remaining":"x"},"weeklyShared":{"remaining":0.5}}}']) {
     const r = pq(body);
-    assert.equal(r.status, 1, body);
+    assert.equal(r.status, 0, body);
     assert.match(r.line, /^CHECK pool-quota fail · quota endpoint answered without aggregate numbers/);
   }
   const r = run('pool-quota.sh', { CHECK_QUOTA_URL: 'http://127.0.0.1:1/teamclaude/quota' });
-  assert.equal(r.status, 1);
+  assert.equal(r.status, 0);
   assert.match(r.line, /^CHECK pool-quota fail · quota endpoint http:\/\/127\.0\.0\.1:1\/teamclaude\/quota did not answer/);
 });
 
@@ -119,7 +119,7 @@ test('proxy-wrapper: another host down or unreachable warns; this host down fail
   r = pw({ [SELF]: OK, waki: '' });
   assert.match(r.line, /^CHECK proxy-wrapper warn · waki unreachable — /);
   r = pw({ [SELF]: 'proxy=502 wrapper=refuses claude=0 direct=0', waki: OK });
-  assert.equal(r.status, 1); assert.match(r.line, new RegExp(`^CHECK proxy-wrapper fail · ${SELF} forwarder 502 — `));
+  assert.equal(r.status, 0); assert.match(r.line, new RegExp(`^CHECK proxy-wrapper fail · ${SELF} forwarder 502 — `));
 });
 
 test('proxy-wrapper: a claude that would run outside the pool warns', () => {
@@ -317,13 +317,13 @@ test('forge-keys: aliases and model names reach the row protocol only through re
 
 test('forge-keys: an unreadable or cut-off database answer fails, never reads as clean', () => {
   let r = fk('', { rc: 1 });
-  assert.equal(r.status, 1); assert.match(r.line, /^CHECK forge-keys fail · cannot read the gateway database/);
+  assert.equal(r.status, 0); assert.match(r.line, /^CHECK forge-keys fail · cannot read the gateway database/);
   r = fk('KEYS|12\nUNKNOWN|0|0\n');
-  assert.equal(r.status, 1); assert.match(r.line, /^CHECK forge-keys fail · gateway database answered incompletely/);
+  assert.equal(r.status, 0); assert.match(r.line, /^CHECK forge-keys fail · gateway database answered incompletely/);
   for (const bad of ['UNKNOWN|0|0\nREFUSED|0|0\nEND\n', 'KEYS|1\nEND\n', 'KEYS|1\nUNKNOWN|garbled|1\nREFUSED|0|0\nEND\n',
     'KEYS|1\nUNKNOWN|0|0\nUNKNOWN|5|1\nREFUSED|0|0\nEND\n', 'KEYS|1\nUNKNOWN|0|0\nREFUSED|0|0\nWHAT|x\nEND\n', 'KEYS|1\nUNKNOWN|0|0\nREFUSED|0|0\nOUT|a|b|many\nEND\n']) {
     r = fk(bad);
-    assert.equal(r.status, 1, bad); assert.match(r.line, /answered incompletely or malformed/, bad);
+    assert.equal(r.status, 0, bad); assert.match(r.line, /answered incompletely or malformed/, bad);
   }
 });
 
@@ -331,7 +331,7 @@ test('forge-keys: an unreadable or cut-off database answer fails, never reads as
 function summary(files, now = Math.floor(Date.now() / 1000)) {
   const d = fresh();
   for (const [name, [line, ageMin]] of Object.entries(files)) {
-    const f = join(d, `${name}.last`); writeFileSync(f, `${line}\n`);
+    const f = join(d, `${name}.line`); writeFileSync(f, `${line}\n`);
     const t = now - ageMin * 60; utimesSync(f, t, t);
   }
   return spawnSync('bash', [join(C, 'summary.sh')], { env: { PATH: process.env.PATH, CHECK_STATE_DIR: d, CHECK_NOW: String(now) }, encoding: 'utf8' });
@@ -359,12 +359,14 @@ test('summary: repeats warn/fail lines, flags a stale result and a missing one',
 });
 
 // ---------- lib
-test('lib: an unknown status becomes fail; the log keeps history', () => {
+test('lib: an unknown status becomes fail (still exit 0); the line file is written; the log keeps history', () => {
   const d = fresh();
   const r = spawnSync('bash', ['-c', `. '${join(C, 'lib.sh')}'; check_emit demo maybe "a fact" "next"`], { env: { ...BASE_ENV, CHECK_STATE_DIR: d }, encoding: 'utf8' });
-  assert.equal(r.status, 1);
+  assert.equal(r.status, 0);
   assert.equal(r.stdout.trim(), 'CHECK demo fail · bad status from the check itself: a fact · next');
   assert.ok(existsSync(join(d, 'demo.log')));
+  assert.equal(readFileSync(join(d, 'demo.line'), 'utf8').trim(), r.stdout.trim());
+  assert.equal(existsSync(join(d, 'demo.line.tmp')), false);
 });
 
 test('units: every check has a service and a timer; services run the installed copy', () => {
@@ -668,7 +670,7 @@ test('install: a partial enable --now failure leaves no timer running that was n
 
 test('proxy-wrapper: a blank host list is a fail, never an empty ok', () => {
   const r = run('proxy-wrapper.sh', { CHECK_HOSTS: '  ' });
-  assert.equal(r.status, 1);
+  assert.equal(r.status, 0);
   assert.match(r.line, /^CHECK proxy-wrapper fail · no hosts to probe/);
 });
 
@@ -680,7 +682,7 @@ test('proxy-wrapper: every line of the host list is probed; an option-like entry
   const multi = run('proxy-wrapper.sh', { CHECK_HOSTS: `${SELF}\nother`, CHECK_PROBE: p });
   assert.match(multi.line, new RegExp(`${SELF} :3456 200.*; other :3456 200`));
   const bad = run('proxy-wrapper.sh', { CHECK_HOSTS: '-oProxyCommand=/bin/true' });
-  assert.equal(bad.status, 1); assert.match(bad.line, /^CHECK proxy-wrapper fail · bad host entry/);
+  assert.equal(bad.status, 0); assert.match(bad.line, /^CHECK proxy-wrapper fail · bad host entry/);
 });
 
 test('install: a daemon-reload failure after publishing restores the previous files and reloads them', () => {

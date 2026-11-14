@@ -861,11 +861,11 @@ test('install: a second signal during the rollback does not cut it short', () =>
   const changed = payload();
   changed['scripts/claude-wrapper.sh'] = NEW_WRAPPER + '\n# changed\n';
   changed['scripts/checks/forge-keys.sh'] = beforeB + '\n# changed\n';
-  const bin = fresh(); const n = join(bin, 'moves'); const once = join(bin, 'cp-once');
-  writeFileSync(join(bin, 'mv'), `#!/bin/sh\n/bin/mv "$@" || exit $?\ncase "$*" in *-fT*) echo x >> '${n}'; [ "$(wc -l < '${n}')" = 2 ] && kill -TERM $PPID ;; esac\n`);
+  const bin = fresh(); const once = join(bin, 'cp-once');
+  // the install fails on its third move (an ordinary exit), and a TERM arrives during the first restore
   writeFileSync(join(bin, 'cp'), `#!/bin/sh\n/bin/cp "$@" || exit $?\nif [ "$1" = -p ]; then case "$2" in */old/*) if [ ! -e '${once}' ]; then : > '${once}'; kill -TERM $PPID; fi ;; esac; fi\n`);
-  chmodSync(join(bin, 'mv'), 0o755); chmodSync(join(bin, 'cp'), 0o755);
-  const r = installWith(repoAt(changed), h, RUNNING(h), { PATH: `${bin}:${process.env.PATH}` });
+  chmodSync(join(bin, 'cp'), 0o755);
+  const r = installWith(repoAt(changed), h, RUNNING(h), { PATH: `${bin}:${process.env.PATH}`, CHECK_INSTALL_FAIL_AT: 'lib.sh' });
   assert.notEqual(r.status, 0);
   assert.ok(existsSync(once), 'the second signal was never sent');
   assert.equal(readFileSync(a, 'utf8'), beforeA);

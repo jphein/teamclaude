@@ -17,7 +17,7 @@ How a run exits:
 - `ok` and `warn` exit 0.
 - `fail` exits 1, so the unit also shows up in `systemctl --user --failed`.
 
-**Daily line.** `~/.local/libexec/teamclaude-checks/summary.sh` prints every check that is not ok. It also prints a check whose last result is older than twice its cadence, because a stopped timer is itself a warn. When it prints nothing, every check is ok and fresh. The teamclaude lane copies its output into the daily line.
+**Daily line.** `~/.local/libexec/teamclaude-checks/summary.sh` prints every check that is not ok. It also prints a check whose last result is older than twice its cadence, or is not exactly one line of the full shape, because a stopped timer or a garbled result is itself a warn. When it prints nothing, every check is ok and fresh. The teamclaude lane copies its output into the daily line.
 
 ## The checks
 
@@ -33,26 +33,27 @@ How a run exits:
   - five-hour remaining is under 0.15;
   - weekly-shared remaining is under 0.30;
   - a seat bucket's `resetAt` is more than 15 minutes in the past and it still shows usage. The numbers have stopped updating; that is the stale data JP named.
-- **fail:** the endpoint does not answer, or it answers without the aggregate numbers.
+- **fail:** the endpoint does not answer, or it answers with anything other than exactly one JSON document holding the aggregate numbers.
 - **Informational:** seats at or above 90 % used (five-hour or weekly) are named by the local part of their address, and seats that are not `active` are listed. Neither causes a warn.
 - **Example:** `CHECK pool-quota warn · 5h 71% left, week 29% left (week under 30%), seats ≥90% used: claude3 jp claude2 claude4, at 10:17 · next run in 15 min · owner teamclaude lane`
 
 ### proxy-wrapper
 
-- **What runs.** `proxy-probe.sh` runs on each host, locally or piped over `ssh <host> bash -s`. It prints `proxy=<code> wrapper=<state>`.
+- **What runs.** `proxy-probe.sh` runs on each host, locally or piped over `ssh <host> bash -s`. It prints `proxy=<code> wrapper=<state>`. The check requires the probe to exit 0 and to print exactly one well-formed line; anything else counts as unreachable.
+- **The wrapper is judged by identity and never run.** Running an unknown `~/.cargo/bin/claude` could start a real session or change state. Instead, the probe compares the wrapper's sha256 with the reviewed wrapper (`scripts/claude-wrapper.sh` at the installed commit, which `install.sh` places beside the checks). The repo's tests prove that the reviewed wrapper exits 69 when its proxy is down.
 - **Wrapper states:**
-  - `refuses`: `~/.cargo/bin/claude` exits 69 when its port is closed. The probe points it at port 1 and at `/bin/true`, so nothing real starts.
-  - `runs-rc<N>`: a wrapper that does not refuse, for example the pre-#66 one.
-  - `envsh-pool`: katana's case. There is no cargo wrapper, and the cc switcher's `env.sh` pins `HTTPS_PROXY` to the pool.
-  - `envsh-off`: `env.sh` does not point at the pool.
+  - `refuses`: byte-identical to the reviewed wrapper.
+  - `wrapper-<sha8>`: any other file, for example the pre-#66 wrapper that fell back to the host's own login.
+  - `envsh-pool`: katana's case. There is no cargo wrapper, and the cc switcher's `env.sh` is sourced in a subshell; it leaves `HTTPS_PROXY` exactly at `http://127.0.0.1:3456` or `https://…@10.0.6.145:3443`. A later `unset` or `export` in the file wins. The value carries a client key, so it is compared inside the subshell and never printed.
+  - `envsh-off`: `env.sh` leaves `HTTPS_PROXY` anywhere else.
   - `none`: neither a wrapper nor `env.sh` exists.
-- **fail:** this host's own forwarder does not answer, since familiar carries the fleet.
-- **warn:** another host's forwarder does not answer; a host is unreachable or its probe output is garbled; or a host's `claude` could run outside the pool (`runs-rc*`, `envsh-off`, `none`).
-- **Example:** `CHECK proxy-wrapper ok · familiar :3456 200, wrapper refuses; wakizashi :3456 200, wrapper refuses; katana :3456 200, wrapper envsh-pool, at 10:17 · next run in 15 min · owner teamclaude lane`
+- **fail:** this host's own forwarder does not answer, since familiar carries the fleet; or the reference wrapper is missing (reinstall).
+- **warn:** another host's forwarder does not answer; a host is unreachable or its probe output is garbled; a host's wrapper is not the reviewed one; or its `claude` could run outside the pool (`envsh-off`, `none`).
+- **Example:** `CHECK proxy-wrapper ok · familiar :3456 200, wrapper refuses; wakizashi :3456 200, wrapper refuses; katana :3456 200, wrapper envsh-pool, at 10:25 · next run in 15 min · owner teamclaude lane`
 
 ### forge-keys
 
-- **What runs.** One read-only SELECT batch through `psql` inside `forge-db-1` on ubox0. The batch must reach its `END` marker; a cut-off answer is a fail, never a clean result.
+- **What runs.** One read-only SELECT batch through `psql` inside `forge-db-1` on ubox0. The answer must reach its `END` marker and hold exactly one numeric `KEYS`, `UNKNOWN` and `REFUSED` row; every other row must be a well-formed `OUT` or `IDLE` row. A cut-off or malformed answer is a fail, never a clean result.
 - **"Spent" and "used" mean `status = 'success'`.** LiteLLM also logs a refused call (a key denied a model) as a `failure` row. Before this rule, the check flagged two of our own denial probes as spend.
 - **warn:**
   - in the last 30 days, a key spent on a model outside its allowlist;
@@ -71,9 +72,10 @@ scripts/checks/install.sh <commit on origin/master>
 ```
 
 The script does the following:
-1. Copies the scripts to `~/.local/libexec/teamclaude-checks/` and the units to `~/.config/systemd/user/`. Each file is written beside its target and moved into place.
-2. Reloads systemd.
-3. Enables and starts the three timers.
+1. Extracts every script, the reviewed `claude-wrapper.sh` and the units into a staging directory, and checks that each one is present and parses. A commit missing any file publishes nothing.
+2. Moves the complete payload into place: scripts to `~/.local/libexec/teamclaude-checks/`, units to `~/.config/systemd/user/`.
+3. Reloads systemd.
+4. Enables and starts the three timers.
 
 To update, run it again with the newer commit. To roll back:
 

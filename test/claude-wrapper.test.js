@@ -17,7 +17,7 @@ after(() => rmSync(dir, { recursive: true, force: true }));
 
 // The fake claude prints its args and the proxy env it was handed.
 const fake = join(dir, 'fake-claude');
-writeFileSync(fake, '#!/bin/sh\necho "ARGS=$*"\necho "HTTPS_PROXY=${HTTPS_PROXY:-unset}"\necho "CA=${NODE_EXTRA_CA_CERTS:-unset}"\necho "BASE=${ANTHROPIC_BASE_URL:-unset}"\n');
+writeFileSync(fake, '#!/bin/sh\necho "ARGC=$#"\nfor a in "$@"; do echo "ARG=[$a]"; done\necho "HTTPS_PROXY=${HTTPS_PROXY:-unset}"\necho "ALL_PROXY=${ALL_PROXY:-unset}"\necho "CA=${NODE_EXTRA_CA_CERTS:-unset}"\necho "BASE=${ANTHROPIC_BASE_URL:-unset}"\n');
 chmodSync(fake, 0o755);
 
 const listen = () => new Promise((resolve) => {
@@ -38,7 +38,7 @@ function run(port, extraEnv = {}) {
     TEAMCLAUDE_PROXY_PORT: String(port), TEAMCLAUDE_REAL_CLAUDE: fake,
     ANTHROPIC_BASE_URL: 'http://stale.example', ...extraEnv,
   };
-  return spawnSync('sh', [WRAPPER, '-p', 'hi there'], { env, encoding: 'utf8', timeout: 10_000 });
+  return spawnSync('sh', [WRAPPER, '-p', 'hi there', ''], { env, encoding: 'utf8', timeout: 10_000 });
 }
 
 test('proxy up: claude runs through it with the CA, ANTHROPIC_BASE_URL cleared, args intact', async () => {
@@ -47,7 +47,7 @@ test('proxy up: claude runs through it with the CA, ANTHROPIC_BASE_URL cleared, 
     const { port } = srv.address();
     const r = run(port);
     assert.equal(r.status, 0, r.stderr);
-    assert.match(r.stdout, /^ARGS=-p hi there$/m);
+    assert.match(r.stdout, /^ARGC=3\nARG=\[-p\]\nARG=\[hi there\]\nARG=\[\]$/m);
     assert.match(r.stdout, new RegExp(`^HTTPS_PROXY=http://127\\.0\\.0\\.1:${port}$`, 'm'));
     assert.match(r.stdout, new RegExp(`^CA=${dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/\\.config/teamclaude-ca\\.pem$`, 'm'));
     assert.match(r.stdout, /^BASE=unset$/m);
@@ -88,4 +88,25 @@ test('TEAMCLAUDE_BYPASS skips an up proxy and says so on stderr', async () => {
     assert.match(r.stdout, /^HTTPS_PROXY=unset$/m);
     assert.match(r.stderr, /TEAMCLAUDE_BYPASS set: running on .+'s own login, outside the teamclaude pool/);
   } finally { await new Promise((res) => srv.close(res)); }
+});
+
+test('the direct paths drop inherited proxy settings', async () => {
+  const inherited = { HTTPS_PROXY: 'http://127.0.0.1:9', ALL_PROXY: 'http://127.0.0.1:9' };
+  const srv = await listen();
+  try {
+    const r = run(srv.address().port, { TEAMCLAUDE_BYPASS: '1', ...inherited });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /^HTTPS_PROXY=unset\nALL_PROXY=unset$/m);
+  } finally { await new Promise((res) => srv.close(res)); }
+  const r = run(await closedPort(), { TEAMCLAUDE_ALLOW_DIRECT: '1', ...inherited });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^HTTPS_PROXY=unset\nALL_PROXY=unset$/m);
+});
+
+test('a port that is not a number is refused before any shell sees it', () => {
+  // The value would run the real claude if it reached bash -c as source text.
+  const r = run('1; exec "$TEAMCLAUDE_REAL_CLAUDE" #');
+  assert.equal(r.status, 64);
+  assert.equal(r.stdout, '', 'the fake claude must not have run');
+  assert.match(r.stderr, /TEAMCLAUDE_PROXY_PORT must be a port number/);
 });

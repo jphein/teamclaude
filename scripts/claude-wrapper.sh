@@ -20,16 +20,24 @@
 PORT=${TEAMCLAUDE_PROXY_PORT:-3456}
 REAL=${TEAMCLAUDE_REAL_CLAUDE:-$(readlink -f "$HOME/.local/bin/claude")}
 HOST=$(hostname -s 2>/dev/null || echo this-host)
+case $PORT in
+  ''|*[!0-9]*) echo "[claude] TEAMCLAUDE_PROXY_PORT must be a port number" >&2; exit 64 ;;
+esac
+# The direct paths drop any inherited proxy settings, so "outside the pool"
+# is what actually happens.
+direct() { unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy ALL_PROXY all_proxy; }
 
 if [ -n "$TEAMCLAUDE_BYPASS" ]; then
+  direct
   echo "[claude] TEAMCLAUDE_BYPASS set: running on $HOST's own login, outside the teamclaude pool" >&2
-elif timeout 2 bash -c ": </dev/tcp/127.0.0.1/$PORT" 2>/dev/null; then
+elif timeout 2 bash -c ': </dev/tcp/127.0.0.1/"$1"' _ "$PORT" 2>/dev/null; then
   P=http://127.0.0.1:$PORT
   export HTTPS_PROXY=$P HTTP_PROXY=$P https_proxy=$P http_proxy=$P
   export NO_PROXY='localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.jphe.in,.realm.watch,.local,familiar,disks,ubox0,nodered,game,katana,gatekeeper' no_proxy='localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.jphe.in,.realm.watch,.local,familiar,disks,ubox0,nodered,game,katana,gatekeeper'
   export NODE_EXTRA_CA_CERTS="$HOME/.config/teamclaude-ca.pem"
   unset ANTHROPIC_BASE_URL
 elif [ "$TEAMCLAUDE_ALLOW_DIRECT" = 1 ]; then
+  direct
   echo "[claude] teamclaude proxy :$PORT down; TEAMCLAUDE_ALLOW_DIRECT=1, so running on $HOST's own login, outside the pool" >&2
 else
   echo "[claude] teamclaude proxy :$PORT down; set TEAMCLAUDE_ALLOW_DIRECT=1 to run on the seat" >&2

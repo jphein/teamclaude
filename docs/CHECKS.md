@@ -44,16 +44,18 @@ How a run exits:
 - **Wrapper states:**
   - `refuses`: byte-identical to the reviewed wrapper.
   - `wrapper-<sha8>`: any other file, for example the pre-#66 wrapper that fell back to the host's own login.
-  - `envsh-pool`: katana's case. There is no cargo wrapper, and the cc switcher's `env.sh` is sourced in a subshell; it leaves `HTTPS_PROXY` exactly at `http://127.0.0.1:3456` or `https://…@10.0.6.145:3443`. A later `unset` or `export` in the file wins. The value carries a client key, so it is compared inside the subshell and never printed.
+  - `envsh-pool`: katana's case. There is no cargo wrapper, and the cc switcher's `env.sh` is **read, never run**. The probe walks its lines in order, applying each `unset` and each literal `export NAME=value`, and the result leaves `HTTPS_PROXY` exactly at `http://127.0.0.1:3456` or `https://…@10.0.6.145:3443`. The value carries a client key, so it is compared in the probe and never printed.
   - `envsh-off`: `env.sh` leaves `HTTPS_PROXY` anywhere else.
+  - `envsh-unverifiable`: `env.sh` has a line other than a comment, `unset NAMES` or a literal `export NAME=value` (a conditional, a `$`, a substitution, a `source`), so its effect cannot be known without running it.
   - `none`: neither a wrapper nor `env.sh` exists.
 - **fail:** this host's own forwarder does not answer, since familiar carries the fleet; or the reference wrapper is missing (reinstall).
-- **warn:** another host's forwarder does not answer; a host is unreachable or its probe output is garbled; a host's wrapper is not the reviewed one; or its `claude` could run outside the pool (`envsh-off`, `none`).
+- **warn:** another host's forwarder does not answer; a host is unreachable or its probe output is garbled; a host's wrapper is not the reviewed one or is not executable (`wrapper-notexec`; PATH would fall through to the native claude); its `env.sh` is unverifiable; or its `claude` could run outside the pool (`envsh-off`, `none`).
 - **Example:** `CHECK proxy-wrapper ok · familiar :3456 200, wrapper refuses; wakizashi :3456 200, wrapper refuses; katana :3456 200, wrapper envsh-pool, at 10:25 · next run in 15 min · owner teamclaude lane`
 
 ### forge-keys
 
 - **What runs.** One read-only SELECT batch through `psql` inside `forge-db-1` on ubox0. The answer must reach its `END` marker and hold exactly one numeric `KEYS`, `UNKNOWN` and `REFUSED` row; every other row must be a well-formed `OUT` or `IDLE` row. A cut-off or malformed answer is a fail, never a clean result.
+- **Aliases and model names are reduced to `[A-Za-z0-9._:/-]` in SQL**, with anything else replaced by `?`, so a `|` or a newline in an alias cannot break the row protocol. Rows are counted, not inferred from their text; an empty alias shows as `(no alias)`.
 - **"Spent" and "used" mean `status = 'success'`.** LiteLLM also logs a refused call (a key denied a model) as a `failure` row. Before this rule, the check flagged two of our own denial probes as spend.
 - **warn:**
   - in the last 30 days, a key spent on a model outside its allowlist;
@@ -72,10 +74,10 @@ scripts/checks/install.sh <commit on origin/master>
 ```
 
 The script does the following:
-1. Extracts every script, the reviewed `claude-wrapper.sh` and the units into a staging directory, and checks that each one is present and parses. A commit missing any file publishes nothing.
-2. Moves the complete payload into place: scripts to `~/.local/libexec/teamclaude-checks/`, units to `~/.config/systemd/user/`.
+1. Extracts every script, the reviewed `claude-wrapper.sh` and the units into a staging directory. It checks that each script is present and parses, and that `scripts/checks/systemd/` holds exactly the six check units. A missing or extra file publishes nothing.
+2. Preflights the destinations (writable directories, existing targets are regular files), keeps a copy of each existing file, and moves the payload into place: scripts to `~/.local/libexec/teamclaude-checks/`, units to `~/.config/systemd/user/`. If any move fails, every file already moved is restored.
 3. Reloads systemd.
-4. Enables and starts the three timers.
+4. Enables and starts exactly the three named timers.
 
 To update, run it again with the newer commit. To roll back:
 

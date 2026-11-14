@@ -59,7 +59,7 @@ How a run exits:
 - **Aliases and model names are reduced to `[A-Za-z0-9._:/-]` in SQL**, with anything else replaced by `?`, so a `|` or a newline in an alias cannot break the row protocol. Rows are counted, not inferred from their text; an empty alias shows as `(no alias)`.
 - **"Spent" and "used" mean `status = 'success'`.** LiteLLM also logs a refused call (a key denied a model) as a `failure` row. Before this rule, the check flagged two of our own denial probes as spend.
 - **warn:**
-  - in the last 30 days, a key spent on a model outside its allowlist;
+  - in the last 30 days, a key spent on a model outside its allowlist (a key with an empty `models` list is unrestricted in LiteLLM and never counts);
   - a key older than 30 days has not been used in 30 days (a prune candidate);
   - a key that is not active, not deleted and not the master spent something in the last 7 days.
 - **Informational:** refused calls by inactive keys in the last 7 days, and how many of those came from deleted keys. Someone trying a revoked key shows up here.
@@ -76,9 +76,10 @@ scripts/checks/install.sh <commit on origin/master>
 
 The script does the following:
 1. Extracts every script, the reviewed `claude-wrapper.sh` and the units into a staging directory. It checks that each script is present and parses, and that `scripts/checks/systemd/` holds exactly the six check units. A missing or extra file publishes nothing.
-2. Preflights the destinations (writable directories, existing targets are regular files), keeps a copy of each existing file, and moves the payload into place: scripts to `~/.local/libexec/teamclaude-checks/`, units to `~/.config/systemd/user/`. If any move fails, every file already moved is restored.
-3. Reloads systemd.
-4. Enables and starts exactly the three named timers.
+2. Stops the three timers and waits (up to 5 minutes) for any running check to finish, so no check runs while its files are half replaced. If one is still running, nothing is published and the timers are started again.
+3. Preflights the destinations (writable directories, existing targets are regular files), keeps a copy of each existing file, and moves the payload into place: scripts to `~/.local/libexec/teamclaude-checks/`, units to `~/.config/systemd/user/`. If any move fails, every file already moved is restored and the timers are started again.
+4. Reloads systemd.
+5. Enables and starts exactly the three named timers.
 
 To update, run it again with the newer commit. To roll back:
 

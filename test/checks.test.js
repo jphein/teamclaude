@@ -3,7 +3,7 @@
 // old claude wrappers for the probe.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync, execFile } from 'node:child_process';
+import { spawnSync, execFile, spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, chmodSync, mkdirSync, rmSync, utimesSync, copyFileSync, existsSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join, dirname } from 'node:path';
@@ -509,14 +509,14 @@ function installWith(repo, h, systemctlBody, extraEnv = {}) {
 test('install: waits for a running check to finish before publishing', () => {
   const h = fresh(); const n = join(h, 'n');
   // the first is-active answers "active", every later one "inactive"
-  const r = installWith(repoAt(payload()), h, `case "$2" in is-active) if [ ! -e '${n}' ]; then : > '${n}'; echo active; else echo inactive; fi ;; esac`);
+  const r = installWith(repoAt(payload()), h, `case "$2:$3" in is-active:*.service) if [ ! -e '${n}' ]; then : > '${n}'; echo active; else echo inactive; fi ;; is-active:*) echo inactive ;; esac`);
   assert.equal(r.status, 0, r.stderr);
   assert.ok(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')));
 });
 
 test('install: a check still running after the wait publishes nothing and restarts the timers', () => {
   const h = fresh();
-  const r = installWith(repoAt(payload()), h, 'case "$2" in is-active) echo active ;; esac');
+  const r = installWith(repoAt(payload()), h, 'case "$2:$3" in is-active:*.service) echo active ;; is-active:*) echo inactive ;; esac');
   assert.equal(r.status, 6);
   assert.match(r.stderr, /still running/);
   assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false);
@@ -539,4 +539,35 @@ test('forge-keys: an empty models list is unrestricted, never "outside its allow
   run('forge-keys.sh', { CHECK_FORGE_PSQL: p });
   const out = readFileSync(sql, 'utf8').split("SELECT 'IDLE'")[0];
   assert.match(out, /AND coalesce\(array_length\(t\.models, 1\), 0\) > 0/);
+});
+
+test('install: a timer that did not stop refuses the install and is started again', () => {
+  const h = fresh();
+  const r = installWith(repoAt(payload()), h, 'case "$2" in stop) exit 1 ;; is-active) case "$3" in *.timer) echo active ;; *) echo inactive ;; esac ;; esac');
+  assert.equal(r.status, 6);
+  assert.match(r.stderr, /did not stop; nothing installed/);
+  assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false);
+  assert.match(readFileSync(join(h, 'systemctl.log'), 'utf8'), /^--user start teamclaude-check-pool-quota\.timer /m);
+});
+
+test('install: an unexpected failure after the stop (daemon-reload) still starts the timers again', () => {
+  const h = fresh();
+  const r = installWith(repoAt(payload()), h, 'case "$2" in daemon-reload) exit 1 ;; esac');
+  assert.notEqual(r.status, 0);
+  const log = readFileSync(join(h, 'systemctl.log'), 'utf8').trim().split('\n');
+  assert.equal(log[log.length - 1], '--user start teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer', log.join(' | '));
+});
+
+test('install: a second install while one holds the lock is refused', async () => {
+  const h = fresh();
+  const lock = join(h, '.local/libexec/teamclaude-checks/.install.lock');
+  mkdirSync(dirname(lock), { recursive: true });
+  const holder = spawn('flock', [lock, '-c', 'sleep 5'], { stdio: 'ignore' });
+  try {
+    await new Promise((r) => setTimeout(r, 300));
+    const r = installWith(repoAt(payload()), h, '');
+    assert.equal(r.status, 7);
+    assert.match(r.stderr, /another install is running/);
+    assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false);
+  } finally { holder.kill(); }
 });

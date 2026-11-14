@@ -14,7 +14,19 @@ sha=$(git rev-parse --verify "$1^{commit}")
 git merge-base --is-ancestor "$sha" origin/master || { echo "install.sh: $1 is not on origin/master; merge first" >&2; exit 3; }
 lib="$HOME/.local/libexec/teamclaude-checks"; units="$HOME/.config/systemd/user"
 mkdir -p "$lib" "$units"
-stage=$(mktemp -d "$lib/.stage.XXXXXX"); trap 'rm -rf -- "${stage:?}"' EXIT
+# one install at a time, for the whole run: a second one would publish while the first restarts timers
+exec 8>"$lib/.install.lock"
+flock -n 8 || { echo "install.sh: another install is running; nothing installed" >&2; exit 7; }
+# On ANY exit after the timers were stopped (a refusal, a failed move, or an unexpected set -e
+# failure such as a daemon-reload error) the timers are started again, unless the install finished.
+quiesced=0 finished=0 timers=()
+cleanup() {
+  if [ "$quiesced" = 1 ] && [ "$finished" = 0 ] && [ ${#timers[@]} -gt 0 ]; then
+    $SYSTEMCTL --user start "${timers[@]}" 2>/dev/null || true
+  fi
+  rm -rf -- "${stage:?}"
+}
+stage=$(mktemp -d "$lib/.stage.XXXXXX"); trap cleanup EXIT
 mkdir "$stage/lib" "$stage/units"
 scripts=(lib.sh pool-quota.sh proxy-probe.sh proxy-wrapper.sh forge-keys.sh summary.sh)
 for f in "${scripts[@]}"; do
@@ -36,7 +48,15 @@ for f in "$stage"/lib/*.sh; do bash -n "$f" || { echo "install.sh: $(basename "$
 # quiesce: stop the timers and wait for a running check to finish, so no check runs while its files
 # are half replaced (a check started mid-publish could load a new lib.sh with an old script)
 services=(); for n in "${checks[@]}"; do services+=("teamclaude-check-$n.service"); done
+quiesced=1
 $SYSTEMCTL --user stop "${timers[@]}" 2>/dev/null || true
+# a stop that failed leaves a timer armed: refuse unless every timer reads inactive (or is not
+# installed yet, which also reads inactive)
+for t in "${timers[@]}"; do
+  case $($SYSTEMCTL --user is-active "$t" 2>/dev/null) in
+    active|activating|reloading) echo "install.sh: $t did not stop; nothing installed" >&2; exit 6 ;;
+  esac
+done
 for _ in $(seq 1 60); do
   busy=0
   for svc in "${services[@]}"; do
@@ -44,11 +64,10 @@ for _ in $(seq 1 60); do
   done
   [ "$busy" = 0 ] && break; sleep "${CHECK_INSTALL_WAIT_STEP:-5}"
 done
-[ "$busy" = 0 ] || { $SYSTEMCTL --user start "${timers[@]}" 2>/dev/null || true; echo "install.sh: a check is still running after 5 min; nothing installed" >&2; exit 6; }
+[ "$busy" = 0 ] || { echo "install.sh: a check is still running after 5 min; nothing installed" >&2; exit 6; }
 # publish: the complete, checked payload only. Preflight the destinations, keep a copy of what is
 # there, and put it all back if any move fails, so scripts and units never mix two commits.
-restart() { $SYSTEMCTL --user start "${timers[@]}" 2>/dev/null || true; }
-[ -w "$lib" ] && [ -w "$units" ] || { restart; echo "install.sh: $lib or $units is not writable; nothing installed" >&2; exit 5; }
+[ -w "$lib" ] && [ -w "$units" ] || { echo "install.sh: $lib or $units is not writable; nothing installed" >&2; exit 5; }
 chmod 755 "$stage"/lib/*; chmod 644 "$stage"/units/*
 mkdir "$stage/old"
 pairs=()
@@ -57,7 +76,7 @@ for f in "$stage"/units/*; do pairs+=("$f|$units/$(basename "$f")"); done
 for p in "${pairs[@]}"; do
   dst=${p#*|}
   if [ -e "$dst" ] || [ -L "$dst" ]; then
-    [ -f "$dst" ] && [ ! -L "$dst" ] || { restart; echo "install.sh: $dst exists and is not a regular file; nothing installed" >&2; exit 5; }
+    [ -f "$dst" ] && [ ! -L "$dst" ] || { echo "install.sh: $dst exists and is not a regular file; nothing installed" >&2; exit 5; }
     cp -p "$dst" "$stage/old/$(printf '%s' "$dst" | tr / %)"
   fi
 done
@@ -70,10 +89,11 @@ for p in "${pairs[@]}"; do
       o="$stage/old/$(printf '%s' "$d" | tr / %)"
       if [ -e "$o" ]; then cp -p "$o" "$d"; else rm -f -- "$d"; fi
     done
-    restart; echo "install.sh: publishing $dst failed; the previous install is restored" >&2; exit 5
+    echo "install.sh: publishing $dst failed; the previous install is restored" >&2; exit 5
   fi
   done_+=("$dst")
 done
 $SYSTEMCTL --user daemon-reload
 $SYSTEMCTL --user enable --now "${timers[@]}"
+finished=1
 echo "installed $(git rev-parse --short "$sha"): ${timers[*]}"

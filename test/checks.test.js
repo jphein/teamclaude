@@ -653,7 +653,10 @@ test('install: a partial enable --now failure leaves no timer running that was n
   const log = readFileSync(join(h, 'systemctl.log'), 'utf8').trim().split('\n');
   const enable = log.findIndex((l) => l.startsWith('--user enable --now '));
   assert.ok(enable >= 0, log.join(' | '));
-  assert.equal(log[enable + 1], '--user stop teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer', log.join(' | '));
+  // restore the files, reload them, then stop all three timers; none was running before
+  assert.equal(log[enable + 1], '--user daemon-reload', log.join(' | '));
+  assert.equal(log[enable + 2], '--user stop teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer', log.join(' | '));
+  assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false, 'a first install that failed must not leave its files');
   assert.equal(log.slice(enable + 1).some((l) => l.startsWith('--user start ')), false);
 });
 
@@ -661,4 +664,34 @@ test('proxy-wrapper: a blank host list is a fail, never an empty ok', () => {
   const r = run('proxy-wrapper.sh', { CHECK_HOSTS: '  ' });
   assert.equal(r.status, 1);
   assert.match(r.line, /^CHECK proxy-wrapper fail · no hosts to probe/);
+});
+
+test('proxy-wrapper: every line of the host list is probed; an option-like entry fails', () => {
+  const r = pw({ [SELF]: OK, waki: 'proxy=000 wrapper=refuses claude=0 direct=0' });
+  assert.match(r.line, /waki forwarder 000/);
+  const d = fresh(); const p = join(d, 'probe');
+  writeFileSync(p, `#!/bin/sh\necho 'proxy=200 wrapper=refuses claude=0 direct=0'\n`); chmodSync(p, 0o755);
+  const multi = run('proxy-wrapper.sh', { CHECK_HOSTS: `${SELF}\nother`, CHECK_PROBE: p });
+  assert.match(multi.line, new RegExp(`${SELF} :3456 200.*; other :3456 200`));
+  const bad = run('proxy-wrapper.sh', { CHECK_HOSTS: '-oProxyCommand=/bin/true' });
+  assert.equal(bad.status, 1); assert.match(bad.line, /^CHECK proxy-wrapper fail · bad host entry/);
+});
+
+test('install: a daemon-reload failure after publishing restores the previous files and reloads them', () => {
+  const h = fresh();
+  assert.equal(install(repoAt(payload()), h).status, 0);
+  const lib = join(h, '.local/libexec/teamclaude-checks/pool-quota.sh');
+  const before = readFileSync(lib, 'utf8');
+  rmSync(join(h, 'systemctl.log'));
+  const changed = payload(); changed['scripts/checks/pool-quota.sh'] = before + '\n# changed\n';
+  const n = join(h, 'reloads');
+  // the first daemon-reload fails, a later one succeeds; timers were running
+  const body = RUNNING(h) + `\ncase "$2" in daemon-reload) if [ ! -e '${n}' ]; then : > '${n}'; exit 1; fi ;; esac`;
+  const r = installWith(repoAt(changed), h, body);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /failed after publishing; the previous install is restored/);
+  assert.equal(readFileSync(lib, 'utf8'), before, 'the new script stayed after a failed install');
+  const log = readFileSync(join(h, 'systemctl.log'), 'utf8').trim().split('\n');
+  assert.equal(log.filter((l) => l === '--user daemon-reload').length, 2, log.join(' | '));
+  assert.ok(log.lastIndexOf('--user daemon-reload') < log.findIndex((l) => l.startsWith('--user start ')), log.join(' | '));
 });

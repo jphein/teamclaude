@@ -21,10 +21,14 @@ want=$(sha256sum "$ref" 2>/dev/null | cut -d' ' -f1)
 probe() {
   if [ -n "${CHECK_PROBE:-}" ]; then $CHECK_PROBE "$1" "$want"; return; fi
   if [ "$1" = "$self" ]; then bash "$here/proxy-probe.sh" "$want"
-  else timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=8 "$1" bash -s -- "$want" < "$here/proxy-probe.sh"; fi
+  else timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=8 -- "$1" bash -s -- "$want" < "$here/proxy-probe.sh"; fi
 }
-read -r -a hosts <<<"${CHECK_HOSTS:-familiar wakizashi katana}"
+# the whole value (every line), each entry a plain host name: never an ssh option
+read -r -d '' -a hosts <<<"${CHECK_HOSTS:-familiar wakizashi katana}" || true
 [ ${#hosts[@]} -gt 0 ] || check_emit "$NAME" fail "no hosts to probe (CHECK_HOSTS is blank), at $(check_now)" "$NEXT"
+for h in "${hosts[@]}"; do
+  [[ "$h" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || check_emit "$NAME" fail "bad host entry in CHECK_HOSTS, at $(check_now)" "$NEXT"
+done
 status=ok; parts=(); bad=()
 for h in "${hosts[@]}"; do
   # the probe must exit 0 AND print exactly one well-formed line

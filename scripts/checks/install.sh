@@ -19,8 +19,24 @@ exec 8>"$lib/.install.lock"
 flock -n 8 || { echo "install.sh: another install is running; nothing installed" >&2; exit 7; }
 # On ANY exit after the timers were stopped (a refusal, a failed move, or an unexpected set -e
 # failure such as a daemon-reload error) the timers are started again, unless the install finished.
-quiesced=0 finished=0 timers=() was_running=()
+quiesced=0 finished=0 timers=() was_running=() done_=()
+# put back every file this install moved into place (from the copies kept in $stage/old)
+restore_published() {
+  local d o
+  for d in "${done_[@]}"; do
+    o="$stage/old/$(printf '%s' "$d" | tr / %)"
+    if [ -e "$o" ]; then cp -p "$o" "$d"; else rm -f -- "$d"; fi
+  done
+  done_=()
+}
 cleanup() {
+  # a failure after publishing (daemon-reload, enable): the old files go back and the manager
+  # reloads them before any timer runs again, so new scripts never run under old units
+  if [ "$finished" = 0 ] && [ ${#done_[@]} -gt 0 ]; then
+    restore_published
+    $SYSTEMCTL --user daemon-reload 2>/dev/null || true
+    echo "install.sh: failed after publishing; the previous install is restored" >&2
+  fi
   # put the timers back as they were: stop all three (a failed `enable --now` may have started some),
   # then start only the ones that were running before this install
   if [ "$quiesced" = 1 ] && [ "$finished" = 0 ]; then
@@ -101,15 +117,11 @@ for p in "${pairs[@]}"; do
     cp -p "$dst" "$stage/old/$(printf '%s' "$dst" | tr / %)"
   fi
 done
-done_=()
 for p in "${pairs[@]}"; do
   src=${p%%|*} dst=${p#*|}
   # CHECK_INSTALL_FAIL_AT=<file name>: tests only, makes that one move fail to prove the restore
   if [ "${CHECK_INSTALL_FAIL_AT:-}" = "$(basename "$dst")" ] || ! mv -fT "$src" "$dst"; then
-    for d in "${done_[@]}"; do
-      o="$stage/old/$(printf '%s' "$d" | tr / %)"
-      if [ -e "$o" ]; then cp -p "$o" "$d"; else rm -f -- "$d"; fi
-    done
+    restore_published
     echo "install.sh: publishing $dst failed; the previous install is restored" >&2; exit 5
   fi
   done_+=("$dst")

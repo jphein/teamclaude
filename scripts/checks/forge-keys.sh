@@ -27,6 +27,7 @@ SELECT 'OUT', regexp_replace(coalesce(t.key_alias, ''), '[^A-Za-z0-9._:/-]', '?'
        regexp_replace(s.model_group, '[^A-Za-z0-9._:/-]', '?', 'g'), count(*)
   FROM "LiteLLM_SpendLogs" s JOIN "LiteLLM_VerificationToken" t ON t.token = s.api_key
  WHERE s."startTime" > now() - interval '30 days' AND coalesce(s.model_group, '') <> '' AND s.status = 'success'
+   AND coalesce(array_length(t.models, 1), 0) > 0           -- an empty list is unrestricted in LiteLLM
    AND NOT ('all-proxy-models' = ANY(coalesce(t.models, '{}')))
    AND NOT (s.model_group = ANY(coalesce(t.models, '{}')))
  GROUP BY 2, 3;

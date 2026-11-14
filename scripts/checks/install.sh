@@ -33,9 +33,22 @@ for b in "${want_units[@]}"; do
     || { echo "install.sh: $b missing at $sha; nothing installed" >&2; exit 4; }
 done
 for f in "$stage"/lib/*.sh; do bash -n "$f" || { echo "install.sh: $(basename "$f") does not parse; nothing installed" >&2; exit 4; }; done
+# quiesce: stop the timers and wait for a running check to finish, so no check runs while its files
+# are half replaced (a check started mid-publish could load a new lib.sh with an old script)
+services=(); for n in "${checks[@]}"; do services+=("teamclaude-check-$n.service"); done
+$SYSTEMCTL --user stop "${timers[@]}" 2>/dev/null || true
+for _ in $(seq 1 60); do
+  busy=0
+  for svc in "${services[@]}"; do
+    case $($SYSTEMCTL --user is-active "$svc" 2>/dev/null) in active|activating|deactivating) busy=1 ;; esac
+  done
+  [ "$busy" = 0 ] && break; sleep "${CHECK_INSTALL_WAIT_STEP:-5}"
+done
+[ "$busy" = 0 ] || { $SYSTEMCTL --user start "${timers[@]}" 2>/dev/null || true; echo "install.sh: a check is still running after 5 min; nothing installed" >&2; exit 6; }
 # publish: the complete, checked payload only. Preflight the destinations, keep a copy of what is
 # there, and put it all back if any move fails, so scripts and units never mix two commits.
-[ -w "$lib" ] && [ -w "$units" ] || { echo "install.sh: $lib or $units is not writable; nothing installed" >&2; exit 5; }
+restart() { $SYSTEMCTL --user start "${timers[@]}" 2>/dev/null || true; }
+[ -w "$lib" ] && [ -w "$units" ] || { restart; echo "install.sh: $lib or $units is not writable; nothing installed" >&2; exit 5; }
 chmod 755 "$stage"/lib/*; chmod 644 "$stage"/units/*
 mkdir "$stage/old"
 pairs=()
@@ -44,7 +57,7 @@ for f in "$stage"/units/*; do pairs+=("$f|$units/$(basename "$f")"); done
 for p in "${pairs[@]}"; do
   dst=${p#*|}
   if [ -e "$dst" ] || [ -L "$dst" ]; then
-    [ -f "$dst" ] && [ ! -L "$dst" ] || { echo "install.sh: $dst exists and is not a regular file; nothing installed" >&2; exit 5; }
+    [ -f "$dst" ] && [ ! -L "$dst" ] || { restart; echo "install.sh: $dst exists and is not a regular file; nothing installed" >&2; exit 5; }
     cp -p "$dst" "$stage/old/$(printf '%s' "$dst" | tr / %)"
   fi
 done
@@ -57,7 +70,7 @@ for p in "${pairs[@]}"; do
       o="$stage/old/$(printf '%s' "$d" | tr / %)"
       if [ -e "$o" ]; then cp -p "$o" "$d"; else rm -f -- "$d"; fi
     done
-    echo "install.sh: publishing $dst failed; the previous install is restored" >&2; exit 5
+    restart; echo "install.sh: publishing $dst failed; the previous install is restored" >&2; exit 5
   fi
   done_+=("$dst")
 done

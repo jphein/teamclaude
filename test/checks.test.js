@@ -490,3 +490,53 @@ test('install: an extra unit file refuses the install; only the three named time
   assert.equal(existsSync(join(h, '.config/systemd/user/unexpected.timer')), false);
   assert.equal(existsSync(join(h, 'systemctl.log')), false);
 });
+
+test('install: timers are stopped before publishing and started again after', () => {
+  const h = fresh(); const r = install(repoAt(payload()), h);
+  assert.equal(r.status, 0, r.stderr);
+  const log = readFileSync(join(h, 'systemctl.log'), 'utf8').trim().split('\n');
+  const stop = log.findIndex((l) => l.startsWith('--user stop teamclaude-check-'));
+  const reload = log.findIndex((l) => l === '--user daemon-reload');
+  assert.ok(stop >= 0 && reload > stop, log.join(' | '));
+});
+
+function installWith(repo, h, systemctlBody, extraEnv = {}) {
+  const fake = join(fresh(), 'systemctl');
+  writeFileSync(fake, `#!/bin/sh\necho "$@" >> '${join(h, 'systemctl.log')}'\n${systemctlBody}\n`); chmodSync(fake, 0o755);
+  return spawnSync('bash', [join(repo.dir, 'scripts', 'checks', 'install.sh'), repo.head], { cwd: repo.dir, env: { PATH: process.env.PATH, HOME: h, CHECK_SYSTEMCTL: fake, CHECK_INSTALL_WAIT_STEP: '0', ...extraEnv }, encoding: 'utf8' });
+}
+
+test('install: waits for a running check to finish before publishing', () => {
+  const h = fresh(); const n = join(h, 'n');
+  // the first is-active answers "active", every later one "inactive"
+  const r = installWith(repoAt(payload()), h, `case "$2" in is-active) if [ ! -e '${n}' ]; then : > '${n}'; echo active; else echo inactive; fi ;; esac`);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')));
+});
+
+test('install: a check still running after the wait publishes nothing and restarts the timers', () => {
+  const h = fresh();
+  const r = installWith(repoAt(payload()), h, 'case "$2" in is-active) echo active ;; esac');
+  assert.equal(r.status, 6);
+  assert.match(r.stderr, /still running/);
+  assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false);
+  assert.match(readFileSync(join(h, 'systemctl.log'), 'utf8'), /^--user start teamclaude-check-pool-quota\.timer /m);
+});
+
+test('install: a failed publish restarts the stopped timers', () => {
+  const h = fresh();
+  assert.equal(install(repoAt(payload()), h).status, 0);
+  rmSync(join(h, 'systemctl.log'));
+  const r = installWith(repoAt(payload()), h, '', { CHECK_INSTALL_FAIL_AT: 'teamclaude-check-proxy-wrapper.timer' });
+  assert.equal(r.status, 5, r.stderr);
+  const log = readFileSync(join(h, 'systemctl.log'), 'utf8');
+  assert.match(log, /^--user stop /m); assert.match(log, /^--user start teamclaude-check-pool-quota\.timer /m);
+});
+
+test('forge-keys: an empty models list is unrestricted, never "outside its allowlist"', () => {
+  const d = fresh(); const p = join(d, 'psql'); const sql = join(d, 'sql');
+  writeFileSync(p, `#!/bin/sh\ncat > '${sql}'\nprintf 'KEYS|1\\nUNKNOWN|0|0\\nREFUSED|0|0\\nEND\\n'\n`); chmodSync(p, 0o755);
+  run('forge-keys.sh', { CHECK_FORGE_PSQL: p });
+  const out = readFileSync(sql, 'utf8').split("SELECT 'IDLE'")[0];
+  assert.match(out, /AND coalesce\(array_length\(t\.models, 1\), 0\) > 0/);
+});

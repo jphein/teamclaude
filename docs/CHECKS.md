@@ -44,12 +44,13 @@ How a run exits:
 - **Wrapper states:**
   - `refuses`: byte-identical to the reviewed wrapper.
   - `wrapper-<sha8>`: any other file, for example the pre-#66 wrapper that fell back to the host's own login.
-  - `envsh-pool`: katana's case. There is no cargo wrapper, and the cc switcher's `env.sh` is **read, never run**. The probe walks its lines in order, applying each `unset` and each literal `export NAME=value`, and the result leaves `HTTPS_PROXY` exactly at `http://127.0.0.1:3456` or `https://…@10.0.6.145:3443`. The value carries a client key, so it is compared in the probe and never printed.
-  - `envsh-off`: `env.sh` leaves `HTTPS_PROXY` anywhere else.
+  - `envsh-pool`: katana's case. There is no cargo wrapper, and the cc switcher's `env.sh` is **read, never run**. The probe walks its lines in order with byte semantics (`LC_ALL=C`, splitting on space and tab only, as bash does), applying each `unset` and each literal `export NAME=value`. The result leaves `HTTPS_PROXY` and/or `https_proxy` (Node reads the lowercase one first) exactly at `http://127.0.0.1:3456` or `https://<token>@10.0.6.145:3443`, with any other set one also at the pool. The value carries a client key, so it is compared in the probe and never printed.
+  - `envsh-off`: `env.sh` leaves the proxy anywhere else, or unset.
+  - `envsh-bypass`: the proxy is the pool, but `NO_PROXY`/`no_proxy` holds `*` or an entry naming anthropic or claude, so claude's API calls skip it.
   - `envsh-unverifiable`: `env.sh` has a line other than a comment, `unset NAMES` or a literal `export NAME=value` (a conditional, a `$`, a substitution, a `source`), so its effect cannot be known without running it.
   - `none`: neither a wrapper nor `env.sh` exists.
 - **fail:** this host's own forwarder does not answer, since familiar carries the fleet; or the reference wrapper is missing (reinstall).
-- **warn:** another host's forwarder does not answer; a host is unreachable or its probe output is garbled; a host's wrapper is not the reviewed one or is not executable (`wrapper-notexec`; PATH would fall through to the native claude); its `env.sh` is unverifiable; or its `claude` could run outside the pool (`envsh-off`, `none`).
+- **warn:** another host's forwarder does not answer; a host is unreachable or its probe output is garbled; a host's wrapper is not the reviewed one or is not executable (`wrapper-notexec`; PATH would fall through to the native claude); its `env.sh` is unverifiable; or its `claude` could run outside the pool (`envsh-off`, `envsh-bypass`, `none`).
 - **Example:** `CHECK proxy-wrapper ok · familiar :3456 200, wrapper refuses; wakizashi :3456 200, wrapper refuses; katana :3456 200, wrapper envsh-pool, at 10:25 · next run in 15 min · owner teamclaude lane`
 
 ### forge-keys

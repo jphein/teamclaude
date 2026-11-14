@@ -18,10 +18,12 @@
 envsh_state() { # read env.sh line by line, as the shell would apply it, without executing anything
   local line val= name v
   local plain='[^[:space:]'"'"'"$`;&|()<>\\]*' sq="'[^']*'" dq='"[^"$`\\]*"'
-  local re_export="^[[:space:]]*export[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)=(${plain}|${sq}|${dq})[[:space:]]*(#.*)?$"
-  local re_unset='^[[:space:]]*unset(([[:space:]]+[A-Za-z_][A-Za-z0-9_]*)+)[[:space:]]*(#.*)?$'
+  # a comment only after whitespace: a # touching a value is part of the shell word (…'x'#$(cmd) runs)
+  local re_export="^[[:space:]]*export[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)=(${plain}|${sq}|${dq})([[:space:]]+#.*)?[[:space:]]*$"
+  local re_unset='^[[:space:]]*unset(([[:space:]]+[A-Za-z_][A-Za-z0-9_]*)+)([[:space:]]+#.*)?[[:space:]]*$'
   while IFS= read -r line || [ -n "$line" ]; do
-    line=${line%$'\r'}
+    # a carriage return becomes part of the value in bash: never normalized, never read past
+    [[ "$line" == *$'\r'* ]] && { echo envsh-unverifiable; return; }
     [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
     if [[ "$line" =~ $re_unset ]]; then
       for name in ${BASH_REMATCH[1]}; do [ "$name" = HTTPS_PROXY ] && val=; done

@@ -635,3 +635,24 @@ test('proxy-probe: a failed connection listing reads "unknown", never 0; the che
   const r = pw({ [SELF]: 'proxy=200 wrapper=refuses claude=1 direct=unknown' });
   assert.match(r.line, new RegExp(`^CHECK proxy-wrapper warn · ${SELF} claude connections could not be read — `));
 });
+
+test('install: after a failure, only the timers that were running are running again', () => {
+  const h = fresh(); const stopped = join(h, 'stopped');
+  // only pool-quota.timer runs before the install; a check stays busy, so the install refuses
+  const body = `case "$2:$3" in stop:*) : > '${stopped}' ;; is-active:teamclaude-check-pool-quota.timer) if [ -e '${stopped}' ]; then echo inactive; exit 3; else echo active; exit 0; fi ;; is-active:*.service) echo active; exit 0 ;; esac`;
+  const r = installWith(repoAt(payload()), h, body);
+  assert.equal(r.status, 6);
+  const starts = readFileSync(join(h, 'systemctl.log'), 'utf8').split('\n').filter((l) => l.startsWith('--user start '));
+  assert.deepEqual(starts, ['--user start teamclaude-check-pool-quota.timer']);
+});
+
+test('install: a partial enable --now failure leaves no timer running that was not before', () => {
+  const h = fresh();
+  const r = installWith(repoAt(payload()), h, 'case "$2" in enable) exit 1 ;; esac');
+  assert.notEqual(r.status, 0);
+  const log = readFileSync(join(h, 'systemctl.log'), 'utf8').trim().split('\n');
+  const enable = log.findIndex((l) => l.startsWith('--user enable --now '));
+  assert.ok(enable >= 0, log.join(' | '));
+  assert.equal(log[enable + 1], '--user stop teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer', log.join(' | '));
+  assert.equal(log.slice(enable + 1).some((l) => l.startsWith('--user start ')), false);
+});

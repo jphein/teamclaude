@@ -21,9 +21,11 @@ flock -n 8 || { echo "install.sh: another install is running; nothing installed"
 # failure such as a daemon-reload error) the timers are started again, unless the install finished.
 quiesced=0 finished=0 timers=() was_running=()
 cleanup() {
-  # start again only the timers that were running before this install stopped them
-  if [ "$quiesced" = 1 ] && [ "$finished" = 0 ] && [ ${#was_running[@]} -gt 0 ]; then
-    $SYSTEMCTL --user start "${was_running[@]}" 2>/dev/null || true
+  # put the timers back as they were: stop all three (a failed `enable --now` may have started some),
+  # then start only the ones that were running before this install
+  if [ "$quiesced" = 1 ] && [ "$finished" = 0 ]; then
+    $SYSTEMCTL --user stop "${timers[@]}" 2>/dev/null || true
+    [ ${#was_running[@]} -eq 0 ] || $SYSTEMCTL --user start "${was_running[@]}" 2>/dev/null || true
   fi
   rm -rf -- "${stage:?}"
 }

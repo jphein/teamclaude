@@ -39,7 +39,7 @@ How a run exits:
 
 ### proxy-wrapper
 
-- **What runs.** `proxy-probe.sh` runs on each host, locally or piped over `ssh <host> bash -s`. It prints `proxy=<code> wrapper=<state>`. The check requires the probe to exit 0 and to print exactly one well-formed line; anything else counts as unreachable.
+- **What runs.** `proxy-probe.sh` runs on each host, locally or piped over `ssh <host> bash -s`. It prints `proxy=<code> wrapper=<state> claude=<running claude CLIs> direct=<those connected around the pool>`. The check requires the probe to exit 0 and to print exactly one well-formed line; anything else counts as unreachable.
 - **The wrapper is judged by identity and never run.** Running an unknown `~/.cargo/bin/claude` could start a real session or change state. Instead, the probe compares the wrapper's sha256 with the reviewed wrapper (`scripts/claude-wrapper.sh` at the installed commit, which `install.sh` places beside the checks). The repo's tests prove that the reviewed wrapper exits 69 when its proxy is down.
 - **Wrapper states:**
   - `refuses`: byte-identical to the reviewed wrapper.
@@ -49,9 +49,10 @@ How a run exits:
   - `envsh-bypass`: the proxy is the pool, but `NO_PROXY`/`no_proxy` holds `*` or an entry that, by NO_PROXY host rules (equal or parent domain, the parent rule applied even without a leading `.` as curl does: claude here is a Bun binary and Node's narrower rule may not hold, so this errs toward a warn; a `:port` read first, and a numeric port other than 443 cannot match; `*` alone matches everything and a leading `*` matches any suffix (Node's rule); entries split on commas and blanks, and any other non-ASCII byte in the list makes the file unverifiable; case-insensitive; never expanded as a file name), matches a host claude calls: `api.anthropic.com`, `console.anthropic.com`, `statsig.anthropic.com`, `mcp-proxy.anthropic.com`, `claude.ai`. Those calls would skip the pool.
   - `envsh-unverifiable`: `env.sh` has a line other than a comment, `unset NAMES` or a literal `export NAME=value` (a conditional, a `$`, a substitution, a `source`, or an unquoted value bash would expand: braces, `~`, `*`, `?`, `[`), or it leaves one of `HTTPS_PROXY`, `https_proxy`, `NO_PROXY`, `no_proxy` to whoever runs claude. Either way its effect cannot be known from the file alone.
   - `none`: neither a wrapper nor `env.sh` exists.
+- **What the running claude CLIs do.** The probe also finds every running claude CLI by its executable path (`…/claude/versions/…`, never by name) and reads its established connections with `ss`. Through the pool, every HTTPS call is a CONNECT to the forwarder (`127.0.0.1:3456`) or to the VM on the LAN. A claude process connected to a **public** address on port 443 is going around the pool, whatever PATH, wrapper or settings started it. This is what catches a shadowed PATH or a stray `--settings`. Reading `/proc/<pid>/environ` is not enough, because `~/.claude/settings.json` sets the proxy inside claude after it starts. Live control on 2026-11-14: a `curl` copied under a `claude/versions/` path, fetching a public URL, was counted (`direct=1`), and was no longer counted once it ended.
 - **fail:** this host's own forwarder does not answer, since familiar carries the fleet; or the reference wrapper is missing (reinstall).
-- **warn:** another host's forwarder does not answer; a host is unreachable or its probe output is garbled; a host's wrapper is not the reviewed one or is not executable (`wrapper-notexec`; PATH would fall through to the native claude); its `env.sh` is unverifiable; or its `claude` could run outside the pool (`envsh-off`, `envsh-bypass`, `none`).
-- **Example:** `CHECK proxy-wrapper ok · familiar :3456 200, wrapper refuses; wakizashi :3456 200, wrapper refuses; katana :3456 200, wrapper envsh-pool, at 10:25 · next run in 15 min · owner teamclaude lane`
+- **warn:** a claude process is connected around the pool; another host's forwarder does not answer; a host is unreachable or its probe output is garbled; a host's wrapper is not the reviewed one or is not executable (`wrapper-notexec`; PATH would fall through to the native claude); its `env.sh` is unverifiable; or its `claude` could run outside the pool (`envsh-off`, `envsh-bypass`, `none`).
+- **Example:** `CHECK proxy-wrapper ok · familiar :3456 200, wrapper refuses, 19 claude running; wakizashi :3456 200, wrapper refuses, 0 claude running; katana :3456 200, wrapper envsh-pool, 2 claude running, at 11:05 · next run in 15 min · owner teamclaude lane`
 
 ### forge-keys
 
@@ -76,7 +77,7 @@ scripts/checks/install.sh <commit on origin/master>
 
 The script does the following:
 1. Extracts every script, the reviewed `claude-wrapper.sh` and the units into a staging directory. It checks that each script is present and parses, and that `scripts/checks/systemd/` holds exactly the six check units. A missing or extra file publishes nothing.
-2. Takes an exclusive lock for the whole run (a second install is refused). Stops the three timers, refuses if one did not stop, and waits (up to 5 minutes) for any running check to finish, so no check runs while its files are half replaced. On any exit after the stop that is not a finished install (a refusal, a failed move, an unexpected error), the timers are started again.
+2. Takes an exclusive lock for the whole run (a second install is refused). Stops the three timers, and refuses if one did not stop or its state cannot be read (an unreachable user manager is not "stopped"), and waits (up to 5 minutes) for any running check to finish, so no check runs while its files are half replaced. On any exit after the stop that is not a finished install (a refusal, a failed move, an unexpected error), the timers are started again.
 3. Preflights the destinations (writable directories, existing targets are regular files), keeps a copy of each existing file, and moves the payload into place: scripts to `~/.local/libexec/teamclaude-checks/`, units to `~/.config/systemd/user/`. If any move fails, every file already moved is restored.
 4. Reloads systemd.
 5. Enables and starts exactly the three named timers.

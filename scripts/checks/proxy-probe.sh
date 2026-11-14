@@ -14,12 +14,14 @@
 #   envsh-bypass   env.sh points at the pool but NO_PROXY/no_proxy holds * or an anthropic/claude
 #                  entry, so claude's API calls skip it
 #   envsh-unverifiable  env.sh has a line that is not a comment, `unset NAMES` or a literal
-#                  `export NAME=value`, so its effect cannot be read without running it
+#                  `export NAME=value`, or it leaves one of HTTPS_PROXY, https_proxy, NO_PROXY,
+#                  no_proxy to the caller's environment, so its effect cannot be read from the file
 #   none           neither exists
 # The HTTPS_PROXY value carries a client key: it is compared here, never printed.
 envsh_state() { # read env.sh line by line, as the shell would apply it, without executing anything
   local LC_ALL=C    # byte semantics: no locale-dependent class may match more than bash splits on
-  local line name v hp= hpl= np= npl= e
+  local line name v hp= hpl= np= npl= e list
+  local -A set=()   # which of the four the file itself settles (exported or unset)
   local B=$' \t'    # bash splits words on space and tab only (\v, \f, U+2003 stay in a value)
   local plain="[^${B}'\"\$\`;&|()<>\\\\]*" sq="'[^']*'" dq="\"[^\"\$\`\\\\]*\""
   # a comment only after a blank: a # touching a value is part of the shell word (…'x'#$(cmd) runs)
@@ -34,6 +36,7 @@ envsh_state() { # read env.sh line by line, as the shell would apply it, without
     if [[ "$line" =~ $re_unset ]]; then
       for name in ${BASH_REMATCH[1]}; do
         case $name in HTTPS_PROXY) hp= ;; https_proxy) hpl= ;; NO_PROXY) np= ;; no_proxy) npl= ;; esac
+        set[$name]=1
       done
       continue
     fi
@@ -41,15 +44,23 @@ envsh_state() { # read env.sh line by line, as the shell would apply it, without
       name=${BASH_REMATCH[1]} v=${BASH_REMATCH[2]}
       case $v in \'*\'|\"*\") v=${v:1:${#v}-2} ;; esac
       case $name in HTTPS_PROXY) hp=$v ;; https_proxy) hpl=$v ;; NO_PROXY) np=$v ;; no_proxy) npl=$v ;; esac
+      set[$name]=1
       continue
     fi
     echo envsh-unverifiable; return
   done < "$1"
+  # the file alone must decide: a variable it neither exports nor unsets comes from whoever runs claude
+  for name in HTTPS_PROXY https_proxy NO_PROXY no_proxy; do
+    [ -n "${set[$name]:-}" ] || { echo envsh-unverifiable; return; }
+  done
   # Node reads https_proxy before HTTPS_PROXY: each set one must be the pool, and one must be set
   { [ -z "$hp" ] || [[ "$hp" =~ $re_pool ]]; } && { [ -z "$hpl" ] || [[ "$hpl" =~ $re_pool ]]; } && [ -n "$hp$hpl" ] \
     || { echo envsh-off; return; }
   # a no-proxy entry of * or naming anthropic/claude sends claude's API calls around the pool
-  for e in ${np//,/ } ${npl//,/ }; do
+  # split into an array (no word splitting, no filename expansion of a *), compare lowercased
+  IFS=, read -r -a list <<<"$np,$npl"
+  for e in "${list[@]}"; do
+    e=${e,,}; e=${e//[ $'\t']/}
     case $e in '*'|*anthropic*|*claude*) echo envsh-bypass; return ;; esac
   done
   echo envsh-pool

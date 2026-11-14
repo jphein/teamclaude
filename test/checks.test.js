@@ -172,8 +172,8 @@ function home(wrapperSrc, envsh) {
 }
 // async: a spawnSync would block this process's event loop, and the test server could never answer
 const sha = (text) => createHash('sha256').update(text).digest('hex');
-const probe = (h, port, extra = {}) => new Promise((resolve, reject) => {
-  execFile('bash', [join(C, 'proxy-probe.sh'), sha(NEW_WRAPPER)], { env: { PATH: process.env.PATH, HOME: h, CHECK_PROXY_PORT: String(port), ...extra }, encoding: 'utf8', timeout: 60_000 },
+const probe = (h, port, extra = {}, opts = {}) => new Promise((resolve, reject) => {
+  execFile('bash', [join(C, 'proxy-probe.sh'), sha(NEW_WRAPPER)], { ...opts, env: { PATH: process.env.PATH, HOME: h, CHECK_PROXY_PORT: String(port), ...extra }, encoding: 'utf8', timeout: 60_000 },
     (err, stdout) => (err && err.code !== 0 ? reject(err) : resolve(stdout.trim())));
 });
 const NEW_WRAPPER = readFileSync(join(ROOT, 'scripts', 'claude-wrapper.sh'), 'utf8');
@@ -193,44 +193,54 @@ test('proxy-probe: the reviewed wrapper reads refuses; any other wrapper is name
   });
 });
 
+// an env.sh body that settles all four proxy variables first, so the case tests its content
+const envs = (body) => home(null, 'unset HTTPS_PROXY https_proxy NO_PROXY no_proxy\n' + body);
 test('proxy-probe: katana-style env.sh is judged by where HTTPS_PROXY points', async () => {
   await withServer(200, async (port) => {
-    assert.equal(await probe(home(null, 'export HTTPS_PROXY=https://key:key@10.0.6.145:3443\n'), port), 'proxy=200 wrapper=envsh-pool');
-    assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:3456\n'), port), 'proxy=200 wrapper=envsh-pool');
-    assert.equal(await probe(home(null, '# cc direct\nunset HTTPS_PROXY\n'), port), 'proxy=200 wrapper=envsh-off');
-    assert.equal(await probe(home(null, '# export HTTPS_PROXY=http://127.0.0.1:3456\n'), port), 'proxy=200 wrapper=envsh-off');
-    assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:34560\n'), port), 'proxy=200 wrapper=envsh-off', 'another port');
-    assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:3456#x\n'), port), 'proxy=200 wrapper=envsh-off', 'a # touching the value is part of it, as in bash');
+    assert.equal(await probe(envs('export HTTPS_PROXY=https://key:key@10.0.6.145:3443\n'), port), 'proxy=200 wrapper=envsh-pool');
+    assert.equal(await probe(envs('export HTTPS_PROXY=http://127.0.0.1:3456\n'), port), 'proxy=200 wrapper=envsh-pool');
+    assert.equal(await probe(envs('# cc direct\nunset HTTPS_PROXY\n'), port), 'proxy=200 wrapper=envsh-off');
+    assert.equal(await probe(envs('# export HTTPS_PROXY=http://127.0.0.1:3456\n'), port), 'proxy=200 wrapper=envsh-off');
+    assert.equal(await probe(envs('export HTTPS_PROXY=http://127.0.0.1:34560\n'), port), 'proxy=200 wrapper=envsh-off', 'another port');
+    assert.equal(await probe(envs('export HTTPS_PROXY=http://127.0.0.1:3456#x\n'), port), 'proxy=200 wrapper=envsh-off', 'a # touching the value is part of it, as in bash');
     for (const loc of ['C', 'C.UTF-8'])
-      assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:3456\u2003\n'), port, { LC_ALL: loc }), 'proxy=200 wrapper=envsh-off', `an EM SPACE stays in the value (${loc})`);
+      assert.equal(await probe(envs('export HTTPS_PROXY=http://127.0.0.1:3456\u2003\n'), port, { LC_ALL: loc }), 'proxy=200 wrapper=envsh-off', `an EM SPACE stays in the value (${loc})`);
     const P = 'export HTTPS_PROXY=http://127.0.0.1:3456\n';
     for (const [body, want, why] of [
       [P + "export NO_PROXY='*'\n", 'envsh-bypass', 'NO_PROXY=*'],
       [P + 'export no_proxy=localhost,.anthropic.com\n', 'envsh-bypass', 'no_proxy names anthropic'],
       [P + 'export NO_PROXY=api.claude.ai\n', 'envsh-bypass', 'NO_PROXY names claude'],
+      [P + 'export NO_PROXY=API.ANTHROPIC.COM\n', 'envsh-bypass', 'host matching is case-insensitive'],
+      [P + 'export NO_PROXY=" localhost , *"\n', 'envsh-bypass', 'a spaced * entry'],
       [P + "export NO_PROXY='*'\nunset NO_PROXY\n", 'envsh-pool', 'a later unset clears the bypass'],
       [P + 'export NO_PROXY=localhost,127.0.0.1,10.0.0.0/8,.jphe.in\n', 'envsh-pool', 'a LAN-only NO_PROXY'],
       [P + 'export https_proxy=http://elsewhere:8080\n', 'envsh-off', 'lowercase https_proxy wins in Node and points elsewhere'],
       ['export https_proxy=http://127.0.0.1:3456\n', 'envsh-pool', 'lowercase alone at the pool'],
       ['export HTTPS_PROXY=https://k@x@10.0.6.145:3443\n', 'envsh-off', 'userinfo is token characters only'],
-    ]) assert.equal(await probe(home(null, body), port), `proxy=200 wrapper=${want}`, why);
+    ]) assert.equal(await probe(envs(body), port), `proxy=200 wrapper=${want}`, why);
     for (const ws of ['\v', '\f'])
-      assert.equal(await probe(home(null, `export HTTPS_PROXY=http://127.0.0.1:3456${ws}\n`), port), 'proxy=200 wrapper=envsh-off', `a trailing ${JSON.stringify(ws)} stays in the value, as in bash`);
-    assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:3456\nunset HTTPS_PROXY\n'), port), 'proxy=200 wrapper=envsh-off', 'a later unset wins');
-    assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:3456\nexport HTTPS_PROXY=http://elsewhere:1\n'), port), 'proxy=200 wrapper=envsh-off', 'a later export wins');
-    assert.equal(await probe(home(null, 'export HTTPS_PROXY=https://k@10.0.6.145:3443.evil\n'), port), 'proxy=200 wrapper=envsh-off', 'anchored host');
-    assert.equal(await probe(home(null, 'unset HTTPS_PROXY; exit 0\n'), port), 'proxy=200 wrapper=envsh-unverifiable', 'a compound line is not read');
-    const mut = home(null, 'touch "$HOME/probe-ran-envsh"\nexport HTTPS_PROXY=http://127.0.0.1:3456\n');
+      assert.equal(await probe(envs(`export HTTPS_PROXY=http://127.0.0.1:3456${ws}\n`), port), 'proxy=200 wrapper=envsh-off', `a trailing ${JSON.stringify(ws)} stays in the value, as in bash`);
+    assert.equal(await probe(envs('export HTTPS_PROXY=http://127.0.0.1:3456\nunset HTTPS_PROXY\n'), port), 'proxy=200 wrapper=envsh-off', 'a later unset wins');
+    assert.equal(await probe(envs('export HTTPS_PROXY=http://127.0.0.1:3456\nexport HTTPS_PROXY=http://elsewhere:1\n'), port), 'proxy=200 wrapper=envsh-off', 'a later export wins');
+    assert.equal(await probe(envs('export HTTPS_PROXY=https://k@10.0.6.145:3443.evil\n'), port), 'proxy=200 wrapper=envsh-off', 'anchored host');
+    assert.equal(await probe(envs('unset HTTPS_PROXY; exit 0\n'), port), 'proxy=200 wrapper=envsh-unverifiable', 'a compound line is not read');
+    const mut = envs('touch "$HOME/probe-ran-envsh"\nexport HTTPS_PROXY=http://127.0.0.1:3456\n');
     assert.equal(await probe(mut, port), 'proxy=200 wrapper=envsh-unverifiable');
     assert.equal(existsSync(join(mut, 'probe-ran-envsh')), false, 'the probe executed env.sh');
     for (const v of ["'http://127.0.0.1:3456'", '"http://127.0.0.1:3456"', 'https://k:k@10.0.6.145:3443 # a comment'])
-      assert.equal(await probe(home(null, `export HTTPS_PROXY=${v}\n`), port), 'proxy=200 wrapper=envsh-pool', v);
+      assert.equal(await probe(envs(`export HTTPS_PROXY=${v}\n`), port), 'proxy=200 wrapper=envsh-pool', v);
     for (const body of ["export HTTPS_PROXY='http://127.0.0.1:3456'#$(printf suffix)\n", "export HTTPS_PROXY='http://127.0.0.1:3456'\r\n",
       'export HTTPS_PROXY=$POOL\n', 'if true; then export HTTPS_PROXY=http://127.0.0.1:3456; fi\n', '. ./other.sh\n', 'export HTTPS_PROXY=`cat x`\n'])
-      assert.equal(await probe(home(null, body), port), 'proxy=200 wrapper=envsh-unverifiable', body);
-    const katana = '# Claude Code active backend: teamclaude\nunset CLAUDE_CODE_USE_BEDROCK ANTHROPIC_BASE_URL\nunset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy NODE_EXTRA_CA_CERTS\nexport TITLE=1  # Let shell set title\nexport HTTPS_PROXY=https://k:k@10.0.6.145:3443\nexport NO_PROXY=localhost,127.0.0.1\nexport NODE_EXTRA_CA_CERTS=/home/u/.config/ca.pem\nunset ANTHROPIC_BASE_URL\n';
+      assert.equal(await probe(envs(body), port), 'proxy=200 wrapper=envsh-unverifiable', body);
+    const katana = '# Claude Code active backend: teamclaude\nunset CLAUDE_CODE_USE_BEDROCK ANTHROPIC_BASE_URL\nunset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy NODE_EXTRA_CA_CERTS\nexport TITLE=1  # Let shell set title\nexport HTTPS_PROXY=https://k:k@10.0.6.145:3443\nexport NO_PROXY=localhost,127.0.0.1\nexport no_proxy=localhost,127.0.0.1\nexport NODE_EXTRA_CA_CERTS=/home/u/.config/ca.pem\nunset ANTHROPIC_BASE_URL\n';
     assert.equal(await probe(home(null, katana), port), 'proxy=200 wrapper=envsh-pool', 'katana-shaped file');
     assert.equal(await probe(home(null, null), port), 'proxy=200 wrapper=none');
+    // the file alone must decide: a variable it neither exports nor unsets comes from the caller
+    assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:3456\n'), port), 'proxy=200 wrapper=envsh-unverifiable', 'https_proxy/NO_PROXY left to the caller');
+    assert.equal(await probe(home(null, 'unset HTTPS_PROXY https_proxy NO_PROXY\nexport HTTPS_PROXY=http://127.0.0.1:3456\n'), port), 'proxy=200 wrapper=envsh-unverifiable', 'no_proxy left to the caller');
+    // a * entry must not be expanded as a file name in the probe's working directory
+    const cwd = fresh(); writeFileSync(join(cwd, 'ordinary'), '');
+    assert.equal(await probe(envs("export HTTPS_PROXY=http://127.0.0.1:3456\nexport NO_PROXY='*'\n"), port, {}, { cwd }), 'proxy=200 wrapper=envsh-bypass', 'glob in cwd');
   });
 });
 

@@ -71,6 +71,14 @@ test('pool-quota: a bucket reset more than 15 min ago that still shows usage is 
   assert.match(r.line, /^CHECK pool-quota warn · .*\(stale buckets: old\)/);
 });
 
+test('pool-quota: seat names cannot carry control characters into the line', () => {
+  const r = pq(quota(0.5, 0.5, [seat('\u001b[2J\u001b[Hspoof@x.org', 0.95, 0.1), seat('re\nx@x.org', 0.1, 0.1, { status: 'bad\u0007' })]));
+  assert.equal(r.status, 0);
+  assert.doesNotMatch(r.stdout, /[\x00-\x09\x0b-\x1f\x7f]/);
+  assert.equal(r.stdout.trim().split('\n').length, 1);
+  assert.match(r.line, /seats ≥90% used: \?\?2J\?\?Hspoof, not active: re\?x=bad\?, /);
+});
+
 test('pool-quota: disabled seats are ignored; a seat not active is named', () => {
   const r = pq(quota(0.8, 0.6, [seat('off@x.org', 0.99, 0.99, { disabled: true }), seat('re@x.org', 0.1, 0.1, { status: 'needs-reauth' })]));
   assert.match(r.line, /seats ≥90% used: none, not active: re=needs-reauth, /);
@@ -215,7 +223,9 @@ test('proxy-probe: katana-style env.sh is judged by where HTTPS_PROXY points', a
       [P + 'export NO_PROXY=anthropic.com\n', 'envsh-bypass', 'a parent domain'],
       [P + "export NO_PROXY='*.anthropic.com:443'\n", 'envsh-bypass', 'a *. entry with a port'],
       [P + 'export NO_PROXY=claude.invalid,anthropic.example.org,notanthropic.com,thropic.com\n', 'envsh-pool', 'look-alikes and substrings are not the hosts'],
-      [P + "export NO_PROXY='*anthropic.com'\n", 'envsh-pool', 'a * that is not *. stays literal'],
+      [P + "export NO_PROXY='*anthropic.com'\n", 'envsh-bypass', 'a leading * matches any suffix (Node)'],
+      [P + "export NO_PROXY='*:0443'\n", 'envsh-bypass', 'a wildcard with a port'],
+      [P + "export NO_PROXY='*.example.org'\n", 'envsh-pool', 'a wildcard for another domain'],
       [P + "export NO_PROXY='api.anthropic.com:80'\n", 'envsh-pool', 'another port does not cover 443'],
       [P + "export NO_PROXY='api.anthropic.com:443'\n", 'envsh-bypass', 'port 443 does'],
       [P + "export NO_PROXY='api.anthropic.com:0443'\n", 'envsh-bypass', '0443 is 443'],

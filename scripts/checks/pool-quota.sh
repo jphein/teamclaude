@@ -19,7 +19,8 @@ else
 fi
 now_ms=${CHECK_NOW_MS:-$(( $(date +%s) * 1000 ))}
 r=$(jq -r -s --argjson now "$now_ms" '
-  def who: (.name // "?") | split("@")[0];
+  # the local part only, reduced to [A-Za-z0-9._-]: a name never carries an escape into the line
+  def who: (.name // "?") | tostring | split("@")[0] | gsub("[^A-Za-z0-9._-]"; "?");
   def used: [.buckets.fiveHour.utilization, .buckets.weeklyShared.utilization] | map(select(type == "number")) | (max // 0);
   if length != 1 or (.[0] | type) != "object" then "BAD" else .[0] end
   | if . == "BAD" then "BAD" else
@@ -31,7 +32,7 @@ r=$(jq -r -s --argjson now "$now_ms" '
               | [.buckets[]? | select(type == "object" and (.resetAt | type) == "number"
                                       and .resetAt < ($now - 900000) and (.utilization // 0) > 0)]
               | select(length > 0) | $s | who] | unique | join(" ")),
-           ([.accounts[]? | select(.disabled != true and .status != "active") | "\(who)=\(.status)"] | join(" "))
+           ([.accounts[]? | select(.disabled != true and .status != "active") | "\(who)=\(.status | tostring | gsub("[^A-Za-z0-9._-]"; "?"))"] | join(" "))
          ] | map(tostring) | join("\u001f") end end' <<<"$body" 2>/dev/null) || r=BAD
 # exactly one record of five fields, or nothing here can be trusted
 [ "$(printf '%s' "$r" | grep -c '')" = 1 ] && [ "$(printf '%s' "$r" | tr -cd '\037' | wc -c)" = 4 ] || r=BAD

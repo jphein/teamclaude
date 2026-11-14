@@ -73,16 +73,20 @@ envsh_state() { # read env.sh line by line, as the shell would apply it, without
   for e in "${list[@]}"; do
     e=${e,,}
     [ -n "$e" ] || continue
-    [ "$e" = '*' ] && { echo envsh-bypass; return; }
-    case $e in '*.'*) e=${e:2} ;; .*) e=${e:1} ;; esac   # only an exact *. or . prefix
+    # the port first: "*:443" is a wildcard once its port is read
     port=
     if [[ "$e" == *:* ]]; then port=${e##*:}; e=${e%:*}; fi
     # claude calls these hosts on 443 only: a numeric port other than 443 (0443 is 443) cannot match;
     # an empty or non-numeric port is read as covering the host (a warn, never a false ok)
     if [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port != 443 )); then continue; fi
+    [ "$e" = '*' ] && { echo envsh-bypass; return; }
     [ -n "$e" ] || continue
     for host in "${hosts[@]}"; do
-      [[ "$host" == "$e" || "$host" == *".$e" ]] && { echo envsh-bypass; return; }
+      case $e in
+        '*'*) [[ "$host" == *"${e#\*}" ]] && { echo envsh-bypass; return; } ;;   # leading * : any suffix
+        .*)   [[ "$host" == *"$e" || "$host" == "${e#.}" ]] && { echo envsh-bypass; return; } ;;
+        *)    [[ "$host" == "$e" || "$host" == *".$e" ]] && { echo envsh-bypass; return; } ;;
+      esac
     done
   done
   echo envsh-pool

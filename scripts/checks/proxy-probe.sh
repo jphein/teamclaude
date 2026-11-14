@@ -78,7 +78,10 @@ envsh_state() { # read env.sh line by line, as the shell would apply it, without
     if [[ "$e" == *:* ]]; then port=${e##*:}; e=${e%:*}; fi
     # claude calls these hosts on 443 only: a numeric port other than 443 (0443 is 443) cannot match;
     # an empty or non-numeric port is read as covering the host (a warn, never a false ok)
-    if [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port != 443 )); then continue; fi
+    if [[ "$port" =~ ^[0-9]+$ ]]; then
+      while [ "${port#0}" != "$port" ]; do port=${port#0}; done   # 0443 is 443; compared as text, no
+      [ "$port" = 443 ] || continue                              # arithmetic that a huge number wraps
+    fi
     [ "$e" = '*' ] && { echo envsh-bypass; return; }
     [ -n "$e" ] || continue
     for host in "${hosts[@]}"; do

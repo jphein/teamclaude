@@ -230,6 +230,8 @@ test('proxy-probe: katana-style env.sh is judged by where HTTPS_PROXY points', a
       [P + "export NO_PROXY='api.anthropic.com:80'\n", 'envsh-pool', 'another port does not cover 443'],
       [P + "export NO_PROXY='api.anthropic.com:443'\n", 'envsh-bypass', 'port 443 does'],
       [P + "export NO_PROXY='api.anthropic.com:0443'\n", 'envsh-bypass', '0443 is 443'],
+      [P + "export NO_PROXY='api.anthropic.com:18446744073709552059'\n", 'envsh-pool', '2^64+443 is not 443'],
+      [P + "export NO_PROXY='api.anthropic.com:0'\n", 'envsh-pool', 'port 0 is not 443'],
       [P + "export NO_PROXY='api.anthropic.com:https'\n", 'envsh-bypass', 'a non-numeric port is read as covering the host'],
       [P + 'export NO_PROXY="api.anthropic.com\vlocalhost"\n', 'envsh-unverifiable', 'a \\v separator'],
       [P + 'export NO_PROXY="localhost\u00a0api.anthropic.com"\n', 'envsh-unverifiable', 'an NBSP separator'],

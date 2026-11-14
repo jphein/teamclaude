@@ -837,3 +837,17 @@ test('install: a timer restart that fails after a rollback is reported with the 
   assert.equal(r.status, 5);
   assert.match(r.stderr, /ROLLBACK INCOMPLETE: the previous install is in place but its timers did not start\. Run: systemctl --user start teamclaude-check-pool-quota\.timer teamclaude-check-proxy-wrapper\.timer teamclaude-check-forge-keys\.timer/);
 });
+
+test('install: a SIGTERM right after the first move still rolls that file back', () => {
+  const h = fresh();
+  assert.equal(install(repoAt(payload()), h).status, 0);
+  const libdir = join(h, '.local/libexec/teamclaude-checks');
+  const first = join(libdir, 'claude-wrapper.sh');   // the first file published (alphabetical)
+  const before = readFileSync(first, 'utf8');
+  const changed = payload(); changed['scripts/claude-wrapper.sh'] = NEW_WRAPPER + '\n# changed\n';
+  const bin = fresh(); const mv = join(bin, 'mv'); const once = join(bin, 'once');
+  writeFileSync(mv, `#!/bin/sh\n/bin/mv "$@" || exit $?\ncase "$*" in *-fT*) if [ ! -e '${once}' ]; then : > '${once}'; kill -TERM $PPID; fi ;; esac\n`); chmodSync(mv, 0o755);
+  const r = installWith(repoAt(changed), h, RUNNING(h), { PATH: `${bin}:${process.env.PATH}` });
+  assert.notEqual(r.status, 0);
+  assert.equal(readFileSync(first, 'utf8'), before, 'the file moved before the signal was left new');
+});

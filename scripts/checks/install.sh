@@ -103,7 +103,7 @@ cleanup() {
   fi
   [ "$keep_stage" = 1 ] || rm -rf -- "${stage:?}"
 }
-stage=$(mktemp -d "$lib/.stage.XXXXXX"); trap cleanup EXIT
+stage=$(mktemp -d "$lib/.stage.XXXXXX"); trap cleanup EXIT; trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
 mkdir "$stage/lib" "$stage/units"
 scripts=(lib.sh pool-quota.sh proxy-probe.sh proxy-wrapper.sh forge-keys.sh summary.sh)
 for f in "${scripts[@]}"; do
@@ -171,10 +171,12 @@ done
 for i in "${!dsts[@]}"; do
   src=${srcs[$i]} dst=${dsts[$i]}
   # CHECK_INSTALL_FAIL_AT=<file name>: tests only, makes that one move fail to prove the restore
+  # coverage first: a signal between the move and this line must not leave the file out of the
+  # rollback (restoring a destination that was not replaced yet, from its backup, is harmless)
+  moved=$((i + 1))
   if [ "${CHECK_INSTALL_FAIL_AT:-}" = "$(basename "$dst")" ] || ! mv -fT "$src" "$dst"; then
     echo "install.sh: publishing $dst failed" >&2; exit 5   # cleanup restores what was moved
   fi
-  moved=$((i + 1))
 done
 $SYSTEMCTL --user daemon-reload
 $SYSTEMCTL --user enable --now "${timers[@]}"

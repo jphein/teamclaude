@@ -213,8 +213,9 @@ test('proxy-probe: katana-style env.sh is judged by where HTTPS_PROXY points', a
       [P + 'export NO_PROXY=api.claude.ai\n', 'envsh-pool', 'a subdomain entry does not cover its parent claude.ai'],
       [P + 'export NO_PROXY=API.ANTHROPIC.COM\n', 'envsh-bypass', 'host matching is case-insensitive'],
       [P + 'export NO_PROXY=anthropic.com\n', 'envsh-bypass', 'a parent domain'],
-      [P + 'export NO_PROXY=*.anthropic.com:443\n', 'envsh-bypass', 'a *. entry with a port'],
-      [P + 'export NO_PROXY=claude.invalid,anthropic.example.org,notanthropic.com\n', 'envsh-pool', 'look-alike names are not the hosts'],
+      [P + "export NO_PROXY='*.anthropic.com:443'\n", 'envsh-bypass', 'a *. entry with a port'],
+      [P + 'export NO_PROXY=claude.invalid,anthropic.example.org,notanthropic.com,thropic.com\n', 'envsh-pool', 'look-alikes and substrings are not the hosts'],
+      [P + "export NO_PROXY='*anthropic.com'\n", 'envsh-pool', 'a * that is not *. stays literal'],
       [P + 'export NO_PROXY=" localhost , *"\n', 'envsh-bypass', 'a spaced * entry'],
       [P + "export NO_PROXY='*'\nunset NO_PROXY\n", 'envsh-pool', 'a later unset clears the bypass'],
       [P + 'export NO_PROXY=localhost,127.0.0.1,10.0.0.0/8,.jphe.in\n', 'envsh-pool', 'a LAN-only NO_PROXY'],
@@ -234,7 +235,7 @@ test('proxy-probe: katana-style env.sh is judged by where HTTPS_PROXY points', a
     for (const v of ["'http://127.0.0.1:3456'", '"http://127.0.0.1:3456"', 'https://k:k@10.0.6.145:3443 # a comment'])
       assert.equal(await probe(envs(`export HTTPS_PROXY=${v}\n`), port), 'proxy=200 wrapper=envsh-pool', v);
     for (const body of ["export HTTPS_PROXY='http://127.0.0.1:3456'#$(printf suffix)\n", "export HTTPS_PROXY='http://127.0.0.1:3456'\r\n",
-      'export HTTPS_PROXY=$POOL\n', 'if true; then export HTTPS_PROXY=http://127.0.0.1:3456; fi\n', '. ./other.sh\n', 'export HTTPS_PROXY=`cat x`\n'])
+      'export HTTPS_PROXY=$POOL\n', 'export HTTPS_PROXY=http://127.0.0.1:3456\nexport NO_PROXY={example.org,anthropic.com}\n', 'export NO_PROXY=~/x\n', 'export NO_PROXY=*\n', 'if true; then export HTTPS_PROXY=http://127.0.0.1:3456; fi\n', '. ./other.sh\n', 'export HTTPS_PROXY=`cat x`\n'])
       assert.equal(await probe(envs(body), port), 'proxy=200 wrapper=envsh-unverifiable', body);
     const katana = '# Claude Code active backend: teamclaude\nunset CLAUDE_CODE_USE_BEDROCK ANTHROPIC_BASE_URL\nunset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy NODE_EXTRA_CA_CERTS\nexport TITLE=1  # Let shell set title\nexport HTTPS_PROXY=https://k:k@10.0.6.145:3443\nexport NO_PROXY=localhost,127.0.0.1\nexport no_proxy=localhost,127.0.0.1\nexport NODE_EXTRA_CA_CERTS=/home/u/.config/ca.pem\nunset ANTHROPIC_BASE_URL\n';
     assert.equal(await probe(home(null, katana), port), 'proxy=200 wrapper=envsh-pool', 'katana-shaped file');

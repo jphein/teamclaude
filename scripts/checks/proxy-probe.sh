@@ -23,7 +23,8 @@ envsh_state() { # read env.sh line by line, as the shell would apply it, without
   local line name v hp= hpl= np= npl= e list
   local -A set=()   # which of the four the file itself settles (exported or unset)
   local B=$' \t'    # bash splits words on space and tab only (\v, \f, U+2003 stay in a value)
-  local plain="[^${B}'\"\$\`;&|()<>\\\\]*" sq="'[^']*'" dq="\"[^\"\$\`\\\\]*\""
+  # unquoted values may not hold anything bash would expand: braces ({a,b} is two words), ~, globs
+  local plain="[^${B}'\"\$\`;&|()<>{}~*?[\\\\]*" sq="'[^']*'" dq="\"[^\"\$\`\\\\]*\""
   # a comment only after a blank: a # touching a value is part of the shell word (…'x'#$(cmd) runs)
   local re_export="^[${B}]*export[${B}]+([A-Za-z_][A-Za-z0-9_]*)=(${plain}|${sq}|${dq})([${B}]+#.*)?[${B}]*\$"
   local re_unset="^[${B}]*unset(([${B}]+[A-Za-z_][A-Za-z0-9_]*)+)([${B}]+#.*)?[${B}]*\$"
@@ -65,7 +66,8 @@ envsh_state() { # read env.sh line by line, as the shell would apply it, without
   for e in "${list[@]}"; do
     e=${e,,}; e=${e//[ $'\t']/}
     [ "$e" = '*' ] && { echo envsh-bypass; return; }
-    e=${e#\*}; e=${e#.}; e=${e%%:*}
+    case $e in '*.'*) e=${e:2} ;; .*) e=${e:1} ;; esac   # only an exact *. or . prefix
+    e=${e%%:*}
     [ -n "$e" ] || continue
     for host in "${hosts[@]}"; do
       [[ "$host" == "$e" || "$host" == *".$e" ]] && { echo envsh-bypass; return; }

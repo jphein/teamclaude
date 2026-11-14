@@ -59,12 +59,16 @@ envsh_state() { # read env.sh line by line, as the shell would apply it, without
     || { echo envsh-off; return; }
   # a no-proxy entry of * or naming anthropic/claude sends claude's API calls around the pool
   # NO_PROXY host rules, against the hosts claude calls: an entry matches a host it equals or a parent
-  # domain of it; a leading "." or "*." and a ":port" are dropped; "*" matches everything. The list is
+  # domain of it, even without a leading "." (curl's rule; Node's proxy-from-env wants the dot, and
+  # claude here is a Bun binary, so the broader reading is kept: a false warn, never a false ok); a leading "." or "*." and a ":port" are dropped; "*" matches everything. The list is
   # split into an array (no word splitting, no filename expansion of a *), entries lowercased.
   local hosts=(api.anthropic.com console.anthropic.com statsig.anthropic.com mcp-proxy.anthropic.com claude.ai) host
   # entries are separated by commas, spaces or tabs (as Node splits NO_PROXY), never joined
   local all="$np,$npl" port
   all=${all//[ $'\t']/,}
+  # any other byte outside printable ASCII (\v, \f, NBSP, U+2003 …) is a separator to some clients
+  # and part of a name to others: the list cannot be read safely
+  [[ "$all" =~ [^\ -~] ]] && { echo envsh-unverifiable; return; }
   IFS=, read -r -a list <<<"$all"
   for e in "${list[@]}"; do
     e=${e,,}
@@ -73,7 +77,9 @@ envsh_state() { # read env.sh line by line, as the shell would apply it, without
     case $e in '*.'*) e=${e:2} ;; .*) e=${e:1} ;; esac   # only an exact *. or . prefix
     port=
     if [[ "$e" == *:* ]]; then port=${e##*:}; e=${e%:*}; fi
-    [ -z "$port" ] || [ "$port" = 443 ] || continue        # claude calls these hosts on 443 only
+    # claude calls these hosts on 443 only: a numeric port other than 443 (0443 is 443) cannot match;
+    # an empty or non-numeric port is read as covering the host (a warn, never a false ok)
+    if [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port != 443 )); then continue; fi
     [ -n "$e" ] || continue
     for host in "${hosts[@]}"; do
       [[ "$host" == "$e" || "$host" == *".$e" ]] && { echo envsh-bypass; return; }

@@ -21,16 +21,16 @@ for f in "${scripts[@]}"; do
   git show "$sha:scripts/checks/$f" > "$stage/lib/$f" || { echo "install.sh: $f missing at $sha; nothing installed" >&2; exit 4; }
 done
 git show "$sha:scripts/claude-wrapper.sh" > "$stage/lib/claude-wrapper.sh" || { echo "install.sh: claude-wrapper.sh missing at $sha; nothing installed" >&2; exit 4; }
-timers=()
-for u in $(git ls-tree --name-only "$sha" scripts/checks/systemd/); do
-  b=$(basename "$u"); git show "$sha:$u" > "$stage/units/$b"
-  case $b in *.timer) timers+=("$b") ;; esac
-done
-# the exact unit set: a service and a timer for each check
-for n in pool-quota proxy-wrapper forge-keys; do
-  for ext in service timer; do
-    [ -s "$stage/units/teamclaude-check-$n.$ext" ] || { echo "install.sh: teamclaude-check-$n.$ext missing at $sha; nothing installed" >&2; exit 4; }
-  done
+# exactly these six units, nothing more: an extra file is refused, not installed or enabled
+checks=(pool-quota proxy-wrapper forge-keys)
+want_units=(); timers=()
+for n in "${checks[@]}"; do want_units+=("teamclaude-check-$n.service" "teamclaude-check-$n.timer"); timers+=("teamclaude-check-$n.timer"); done
+have_units=$(git ls-tree --name-only "$sha" scripts/checks/systemd/ | xargs -rn1 basename | sort)
+[ "$have_units" = "$(printf '%s\n' "${want_units[@]}" | sort)" ] \
+  || { echo "install.sh: scripts/checks/systemd/ at $sha is not exactly the six check units; nothing installed" >&2; exit 4; }
+for b in "${want_units[@]}"; do
+  git show "$sha:scripts/checks/systemd/$b" > "$stage/units/$b" && [ -s "$stage/units/$b" ] \
+    || { echo "install.sh: $b missing at $sha; nothing installed" >&2; exit 4; }
 done
 for f in "$stage"/lib/*.sh; do bash -n "$f" || { echo "install.sh: $(basename "$f") does not parse; nothing installed" >&2; exit 4; }; done
 # publish: the complete, checked payload only. Preflight the destinations, keep a copy of what is

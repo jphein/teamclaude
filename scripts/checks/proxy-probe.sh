@@ -8,11 +8,35 @@
 #   wrapper-notexec ~/.cargo/bin/claude exists but is not executable (PATH falls through to claude)
 #   wrapper-<sha8> a different ~/.cargo/bin/claude (e.g. the pre-#66 one that falls back to the own
 #                  login): not run, reported for a look
-#   envsh-pool     no cargo wrapper; the cc switcher's env.sh, sourced in a subshell, leaves
-#                  HTTPS_PROXY exactly at the pool (http://127.0.0.1:3456 or https://…@10.0.6.145:3443)
+#   envsh-pool     no cargo wrapper; the cc switcher's env.sh, READ (never run), leaves HTTPS_PROXY
+#                  exactly at the pool (http://127.0.0.1:3456 or https://…@10.0.6.145:3443)
 #   envsh-off      no cargo wrapper; env.sh leaves HTTPS_PROXY anywhere else (a run uses the own login)
+#   envsh-unverifiable  env.sh has a line that is not a comment, `unset NAMES` or a literal
+#                  `export NAME=value`, so its effect cannot be read without running it
 #   none           neither exists
-# The HTTPS_PROXY value carries a client key: it is compared inside the subshell, never printed.
+# The HTTPS_PROXY value carries a client key: it is compared here, never printed.
+envsh_state() { # read env.sh line by line, as the shell would apply it, without executing anything
+  local line val= name v
+  local plain='[^[:space:]'"'"'"$`;&|()<>\\]*' sq="'[^']*'" dq='"[^"$`\\]*"'
+  local re_export="^[[:space:]]*export[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)=(${plain}|${sq}|${dq})[[:space:]]*(#.*)?$"
+  local re_unset='^[[:space:]]*unset(([[:space:]]+[A-Za-z_][A-Za-z0-9_]*)+)[[:space:]]*(#.*)?$'
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    if [[ "$line" =~ $re_unset ]]; then
+      for name in ${BASH_REMATCH[1]}; do [ "$name" = HTTPS_PROXY ] && val=; done
+      continue
+    fi
+    if [[ "$line" =~ $re_export ]]; then
+      if [ "${BASH_REMATCH[1]}" = HTTPS_PROXY ]; then
+        v=${BASH_REMATCH[2]}; v=${v#[\'\"]}; v=${v%[\'\"]}; val=$v
+      fi
+      continue
+    fi
+    echo envsh-unverifiable; return
+  done < "$1"
+  if [[ "$val" == "http://127.0.0.1:3456" || "$val" =~ ^https://[^@/[:space:]]+@10\.0\.6\.145:3443/?$ ]]; then echo envsh-pool; else echo envsh-off; fi
+}
 want=${1:-}
 port=${CHECK_PROXY_PORT:-3456}
 code=$(env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy -u ALL_PROXY \
@@ -27,14 +51,7 @@ if [ -e "$w" ]; then
   [ -x "$w" ] || state=wrapper-notexec
 elif [ -f "$HOME/.config/claude-code/env.sh" ]; then
   # the effective value after the whole file ran (a later unset or export wins), in a subshell
-  # the verdict is a word the comparison itself prints: an env.sh that exits early prints nothing
-  verdict=$(env -i HOME="$HOME" PATH=/usr/bin:/bin bash -c '. "$HOME/.config/claude-code/env.sh" >/dev/null 2>&1
-       if [[ "${HTTPS_PROXY:-}" == "http://127.0.0.1:3456" || "${HTTPS_PROXY:-}" =~ ^https://[^@/[:space:]]+@10\.0\.6\.145:3443/?$ ]]; then echo POOL; fi' 2>/dev/null)
-  if [ "$verdict" = POOL ]; then
-    state=envsh-pool
-  else
-    state=envsh-off
-  fi
+  state=$(envsh_state "$HOME/.config/claude-code/env.sh")
 else
   state=none
 fi

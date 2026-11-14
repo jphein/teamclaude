@@ -40,6 +40,7 @@ for h in ${CHECK_HOSTS:-familiar wakizashi katana}; do
   case $state in
     refuses|envsh-pool) ;;
     wrapper-*) bad+=("$h ~/.cargo/bin/claude is not the reviewed wrapper ($state)"); [ "$status" = fail ] || status=warn ;;
+    envsh-unverifiable) bad+=("$h env.sh cannot be read without running it"); [ "$status" = fail ] || status=warn ;;
     *) bad+=("$h claude can run outside the pool ($state)"); [ "$status" = fail ] || status=warn ;;
   esac
 done

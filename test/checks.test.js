@@ -129,6 +129,11 @@ test('proxy-wrapper: a probe that exits non-zero is unreachable even if its line
   assert.match(r.line, /^CHECK proxy-wrapper warn · waki unreachable/);
 });
 
+test('proxy-wrapper: an env.sh that cannot be read without running it warns', () => {
+  const r = pw({ [SELF]: OK, kat: 'proxy=200 wrapper=envsh-unverifiable' });
+  assert.match(r.line, /^CHECK proxy-wrapper warn · kat env\.sh cannot be read without running it — /);
+});
+
 test('proxy-wrapper: a wrapper that is not the reviewed one warns', () => {
   const r = pw({ [SELF]: OK, waki: 'proxy=200 wrapper=wrapper-1b2c3d4e' });
   assert.match(r.line, /^CHECK proxy-wrapper warn · waki ~\/\.cargo\/bin\/claude is not the reviewed wrapper \(wrapper-1b2c3d4e\) — /);
@@ -193,7 +198,16 @@ test('proxy-probe: katana-style env.sh is judged by where HTTPS_PROXY points', a
     assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:3456\nunset HTTPS_PROXY\n'), port), 'proxy=200 wrapper=envsh-off', 'a later unset wins');
     assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:3456\nexport HTTPS_PROXY=http://elsewhere:1\n'), port), 'proxy=200 wrapper=envsh-off', 'a later export wins');
     assert.equal(await probe(home(null, 'export HTTPS_PROXY=https://k@10.0.6.145:3443.evil\n'), port), 'proxy=200 wrapper=envsh-off', 'anchored host');
-    assert.equal(await probe(home(null, 'unset HTTPS_PROXY; exit 0\n'), port), 'proxy=200 wrapper=envsh-off', 'an early exit is not a pass');
+    assert.equal(await probe(home(null, 'unset HTTPS_PROXY; exit 0\n'), port), 'proxy=200 wrapper=envsh-unverifiable', 'a compound line is not read');
+    const mut = home(null, 'touch "$HOME/probe-ran-envsh"\nexport HTTPS_PROXY=http://127.0.0.1:3456\n');
+    assert.equal(await probe(mut, port), 'proxy=200 wrapper=envsh-unverifiable');
+    assert.equal(existsSync(join(mut, 'probe-ran-envsh')), false, 'the probe executed env.sh');
+    for (const v of ["'http://127.0.0.1:3456'", '"http://127.0.0.1:3456"', 'https://k:k@10.0.6.145:3443 # a comment'])
+      assert.equal(await probe(home(null, `export HTTPS_PROXY=${v}\n`), port), 'proxy=200 wrapper=envsh-pool', v);
+    for (const body of ['export HTTPS_PROXY=$POOL\n', 'if true; then export HTTPS_PROXY=http://127.0.0.1:3456; fi\n', '. ./other.sh\n', 'export HTTPS_PROXY=`cat x`\n'])
+      assert.equal(await probe(home(null, body), port), 'proxy=200 wrapper=envsh-unverifiable', body);
+    const katana = '# Claude Code active backend: teamclaude\nunset CLAUDE_CODE_USE_BEDROCK ANTHROPIC_BASE_URL\nunset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy NODE_EXTRA_CA_CERTS\nexport TITLE=1  # Let shell set title\nexport HTTPS_PROXY=https://k:k@10.0.6.145:3443\nexport NO_PROXY=localhost,127.0.0.1\nexport NODE_EXTRA_CA_CERTS=/home/u/.config/ca.pem\nunset ANTHROPIC_BASE_URL\n';
+    assert.equal(await probe(home(null, katana), port), 'proxy=200 wrapper=envsh-pool', 'katana-shaped file');
     assert.equal(await probe(home(null, null), port), 'proxy=200 wrapper=none');
   });
 });
@@ -231,6 +245,16 @@ test('forge-keys: spend outside an allowlist, an idle key or an unknown spender 
   r = fk('KEYS|3\nUNKNOWN|7|3\nREFUSED|0|0\nEND\n');
   assert.match(r.line, /^CHECK forge-keys warn · .*unknown keys spent: 7 calls from 3 keys in 7 days/);
   assert.equal(r.status, 0);
+});
+
+test('forge-keys: aliases and model names reach the row protocol only through regexp_replace', () => {
+  const d = fresh(); const p = join(d, 'psql'); const sql = join(d, 'sql');
+  writeFileSync(p, `#!/bin/sh\ncat > '${sql}'\nprintf 'KEYS|1\\nUNKNOWN|0|0\\nREFUSED|0|0\\nEND\\n'\n`); chmodSync(p, 0o755);
+  run('forge-keys.sh', { CHECK_FORGE_PSQL: p });
+  const q = readFileSync(sql, 'utf8');
+  assert.match(q, /SELECT 'OUT', regexp_replace\(coalesce\(t\.key_alias, ''\), '\[\^A-Za-z0-9\._:\/-\]', '\?', 'g'\),\s+regexp_replace\(s\.model_group, /);
+  assert.match(q, /SELECT 'IDLE', regexp_replace\(coalesce\(t\.key_alias, ''\), /);
+  assert.doesNotMatch(q, /SELECT 'OUT', coalesce\(t\.key_alias/);
 });
 
 test('forge-keys: an unreadable or cut-off database answer fails, never reads as clean', () => {
@@ -320,7 +344,7 @@ test('install: a complete merged commit is published and its timers enabled', ()
   assert.equal(r.status, 0, r.stderr);
   assert.equal(readFileSync(join(h, '.local/libexec/teamclaude-checks/claude-wrapper.sh'), 'utf8'), NEW_WRAPPER);
   assert.ok(existsSync(join(h, '.config/systemd/user/teamclaude-check-forge-keys.timer')));
-  assert.match(readFileSync(join(h, 'systemctl.log'), 'utf8'), /--user enable --now teamclaude-check-forge-keys\.timer teamclaude-check-pool-quota\.timer teamclaude-check-proxy-wrapper\.timer/);
+  assert.match(readFileSync(join(h, 'systemctl.log'), 'utf8'), /^--user enable --now teamclaude-check-pool-quota\.timer teamclaude-check-proxy-wrapper\.timer teamclaude-check-forge-keys\.timer$/m);
 });
 
 test('install: a commit missing a file publishes nothing over the existing install', () => {
@@ -352,7 +376,7 @@ test('install: a commit missing one unit publishes nothing', () => {
   const files = payload(); delete files['scripts/checks/systemd/teamclaude-check-forge-keys.service'];
   const r = install(repoAt(files), h);
   assert.equal(r.status, 4);
-  assert.match(r.stderr, /teamclaude-check-forge-keys\.service missing/);
+  assert.match(r.stderr, /not exactly the six check units; nothing installed/);
   assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false);
 });
 
@@ -400,4 +424,14 @@ test('install: an unwritable destination publishes nothing', () => {
     assert.equal(r.status, 5, r.stderr);
     assert.equal(readFileSync(lib, 'utf8'), before);
   } finally { chmodSync(join(h, '.config/systemd/user'), 0o755); }
+});
+
+test('install: an extra unit file refuses the install; only the three named timers are enabled', () => {
+  const h = fresh();
+  const files = payload(); files['scripts/checks/systemd/unexpected.timer'] = '[Timer]\nOnCalendar=*:*\n'; files['scripts/checks/systemd/unexpected.service'] = '[Service]\nExecStart=/bin/true\n';
+  const r = install(repoAt(files), h);
+  assert.equal(r.status, 4);
+  assert.match(r.stderr, /not exactly the six check units/);
+  assert.equal(existsSync(join(h, '.config/systemd/user/unexpected.timer')), false);
+  assert.equal(existsSync(join(h, 'systemctl.log')), false);
 });

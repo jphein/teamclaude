@@ -8,7 +8,9 @@
 #         trying a revoked key shows here); this alone does not warn
 #   fail: the gateway's database cannot be read
 # Read-only: one SELECT batch through psql inside forge-db-1. Key hashes are LiteLLM's sha256 of
-# the key, never a key; the line names aliases only.
+# the key, never a key; the line names aliases only. Aliases and model names are reduced to
+# [A-Za-z0-9._:/-] in SQL (anything else becomes ?), so a | or a newline in one cannot break the
+# row protocol below.
 # Inputs (tests): CHECK_FORGE_PSQL (a command that reads SQL on stdin and prints psql -At output).
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -21,13 +23,14 @@ psql_cmd() {
 }
 out=$(psql_cmd <<'SQL' 2>/dev/null
 SELECT 'KEYS', count(*) FROM "LiteLLM_VerificationToken";
-SELECT 'OUT', coalesce(t.key_alias, '(no alias)'), s.model_group, count(*)
+SELECT 'OUT', regexp_replace(coalesce(t.key_alias, ''), '[^A-Za-z0-9._:/-]', '?', 'g'),
+       regexp_replace(s.model_group, '[^A-Za-z0-9._:/-]', '?', 'g'), count(*)
   FROM "LiteLLM_SpendLogs" s JOIN "LiteLLM_VerificationToken" t ON t.token = s.api_key
  WHERE s."startTime" > now() - interval '30 days' AND coalesce(s.model_group, '') <> '' AND s.status = 'success'
    AND NOT ('all-proxy-models' = ANY(coalesce(t.models, '{}')))
    AND NOT (s.model_group = ANY(coalesce(t.models, '{}')))
  GROUP BY 2, 3;
-SELECT 'IDLE', coalesce(t.key_alias, '(no alias)')
+SELECT 'IDLE', regexp_replace(coalesce(t.key_alias, ''), '[^A-Za-z0-9._:/-]', '?', 'g')
   FROM "LiteLLM_VerificationToken" t
  WHERE t.created_at < now() - interval '30 days'
    AND NOT EXISTS (SELECT 1 FROM "LiteLLM_SpendLogs" s WHERE s.api_key = t.token AND s.status = 'success' AND s."startTime" > now() - interval '30 days');

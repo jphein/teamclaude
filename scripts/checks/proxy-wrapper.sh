@@ -23,8 +23,10 @@ probe() {
   if [ "$1" = "$self" ]; then bash "$here/proxy-probe.sh" "$want"
   else timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=8 "$1" bash -s -- "$want" < "$here/proxy-probe.sh"; fi
 }
+read -r -a hosts <<<"${CHECK_HOSTS:-familiar wakizashi katana}"
+[ ${#hosts[@]} -gt 0 ] || check_emit "$NAME" fail "no hosts to probe (CHECK_HOSTS is blank), at $(check_now)" "$NEXT"
 status=ok; parts=(); bad=()
-for h in ${CHECK_HOSTS:-familiar wakizashi katana}; do
+for h in "${hosts[@]}"; do
   # the probe must exit 0 AND print exactly one well-formed line
   out=$(probe "$h" 2>/dev/null); prc=$?
   if [ "$prc" != 0 ] || [[ ! "$out" =~ ^proxy=([0-9]{3})\ wrapper=([a-z0-9-]+)\ claude=([0-9]+)\ direct=([0-9]+|unknown)$ ]]; then

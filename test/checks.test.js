@@ -656,3 +656,9 @@ test('install: a partial enable --now failure leaves no timer running that was n
   assert.equal(log[enable + 1], '--user stop teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer', log.join(' | '));
   assert.equal(log.slice(enable + 1).some((l) => l.startsWith('--user start ')), false);
 });
+
+test('proxy-wrapper: a blank host list is a fail, never an empty ok', () => {
+  const r = run('proxy-wrapper.sh', { CHECK_HOSTS: '  ' });
+  assert.equal(r.status, 1);
+  assert.match(r.line, /^CHECK proxy-wrapper fail · no hosts to probe/);
+});

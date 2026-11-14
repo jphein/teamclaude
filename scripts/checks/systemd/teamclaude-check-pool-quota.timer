@@ -1,0 +1,10 @@
+[Unit]
+Description=CHECK pool-quota timer (*:00/15)
+
+[Timer]
+OnCalendar=*:00/15
+Persistent=true
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

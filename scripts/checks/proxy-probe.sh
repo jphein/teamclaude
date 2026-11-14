@@ -17,14 +17,15 @@
 # The HTTPS_PROXY value carries a client key: it is compared here, never printed.
 envsh_state() { # read env.sh line by line, as the shell would apply it, without executing anything
   local line val= name v
-  local plain='[^[:space:]'"'"'"$`;&|()<>\\]*' sq="'[^']*'" dq='"[^"$`\\]*"'
-  # a comment only after whitespace: a # touching a value is part of the shell word (…'x'#$(cmd) runs)
-  local re_export="^[[:space:]]*export[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)=(${plain}|${sq}|${dq})([[:space:]]+#.*)?[[:space:]]*$"
-  local re_unset='^[[:space:]]*unset(([[:space:]]+[A-Za-z_][A-Za-z0-9_]*)+)([[:space:]]+#.*)?[[:space:]]*$'
+  local plain='[^[:blank:]'"'"'"$`;&|()<>\\]*' sq="'[^']*'" dq='"[^"$`\\]*"'
+  # [[:blank:]] (space, tab) and never [[:space:]]: bash splits on blanks only, so \v or \f stays in
+  # the value. A comment only after whitespace: a # touching a value is part of the shell word (…'x'#$(cmd) runs)
+  local re_export="^[[:blank:]]*export[[:blank:]]+([A-Za-z_][A-Za-z0-9_]*)=(${plain}|${sq}|${dq})([[:blank:]]+#.*)?[[:blank:]]*$"
+  local re_unset='^[[:blank:]]*unset(([[:blank:]]+[A-Za-z_][A-Za-z0-9_]*)+)([[:blank:]]+#.*)?[[:blank:]]*$'
   while IFS= read -r line || [ -n "$line" ]; do
     # a carriage return becomes part of the value in bash: never normalized, never read past
     [[ "$line" == *$'\r'* ]] && { echo envsh-unverifiable; return; }
-    [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    [[ "$line" =~ ^[[:blank:]]*(#.*)?$ ]] && continue
     if [[ "$line" =~ $re_unset ]]; then
       for name in ${BASH_REMATCH[1]}; do [ "$name" = HTTPS_PROXY ] && val=; done
       continue

@@ -1,0 +1,9 @@
+[Unit]
+Description=CHECK forge-keys: forge gateway keys inside their allowlists, none idle (teamclaude docs/CHECKS.md)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/libexec/teamclaude-checks/forge-keys.sh
+TimeoutStartSec=300
+Nice=10

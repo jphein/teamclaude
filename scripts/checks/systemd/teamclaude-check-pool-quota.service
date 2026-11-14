@@ -1,0 +1,9 @@
+[Unit]
+Description=CHECK pool-quota: pool 5-hour and weekly headroom (teamclaude docs/CHECKS.md)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/libexec/teamclaude-checks/pool-quota.sh
+TimeoutStartSec=300
+Nice=10

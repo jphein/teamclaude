@@ -76,8 +76,8 @@ scripts/checks/install.sh <commit on origin/master>
 
 The script does the following:
 1. Extracts every script, the reviewed `claude-wrapper.sh` and the units into a staging directory. It checks that each script is present and parses, and that `scripts/checks/systemd/` holds exactly the six check units. A missing or extra file publishes nothing.
-2. Stops the three timers and waits (up to 5 minutes) for any running check to finish, so no check runs while its files are half replaced. If one is still running, nothing is published and the timers are started again.
-3. Preflights the destinations (writable directories, existing targets are regular files), keeps a copy of each existing file, and moves the payload into place: scripts to `~/.local/libexec/teamclaude-checks/`, units to `~/.config/systemd/user/`. If any move fails, every file already moved is restored and the timers are started again.
+2. Takes an exclusive lock for the whole run (a second install is refused). Stops the three timers, refuses if one did not stop, and waits (up to 5 minutes) for any running check to finish, so no check runs while its files are half replaced. On any exit after the stop that is not a finished install (a refusal, a failed move, an unexpected error), the timers are started again.
+3. Preflights the destinations (writable directories, existing targets are regular files), keeps a copy of each existing file, and moves the payload into place: scripts to `~/.local/libexec/teamclaude-checks/`, units to `~/.config/systemd/user/`. If any move fails, every file already moved is restored.
 4. Reloads systemd.
 5. Enables and starts exactly the three named timers.
 

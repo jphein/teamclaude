@@ -11,34 +11,48 @@
 #   envsh-pool     no cargo wrapper; the cc switcher's env.sh, READ (never run), leaves HTTPS_PROXY
 #                  exactly at the pool (http://127.0.0.1:3456 or https://…@10.0.6.145:3443)
 #   envsh-off      no cargo wrapper; env.sh leaves HTTPS_PROXY anywhere else (a run uses the own login)
+#   envsh-bypass   env.sh points at the pool but NO_PROXY/no_proxy holds * or an anthropic/claude
+#                  entry, so claude's API calls skip it
 #   envsh-unverifiable  env.sh has a line that is not a comment, `unset NAMES` or a literal
 #                  `export NAME=value`, so its effect cannot be read without running it
 #   none           neither exists
 # The HTTPS_PROXY value carries a client key: it is compared here, never printed.
 envsh_state() { # read env.sh line by line, as the shell would apply it, without executing anything
-  local line val= name v
-  local plain='[^[:blank:]'"'"'"$`;&|()<>\\]*' sq="'[^']*'" dq='"[^"$`\\]*"'
-  # [[:blank:]] (space, tab) and never [[:space:]]: bash splits on blanks only, so \v or \f stays in
-  # the value. A comment only after whitespace: a # touching a value is part of the shell word (…'x'#$(cmd) runs)
-  local re_export="^[[:blank:]]*export[[:blank:]]+([A-Za-z_][A-Za-z0-9_]*)=(${plain}|${sq}|${dq})([[:blank:]]+#.*)?[[:blank:]]*$"
-  local re_unset='^[[:blank:]]*unset(([[:blank:]]+[A-Za-z_][A-Za-z0-9_]*)+)([[:blank:]]+#.*)?[[:blank:]]*$'
+  local LC_ALL=C    # byte semantics: no locale-dependent class may match more than bash splits on
+  local line name v hp= hpl= np= npl= e
+  local B=$' \t'    # bash splits words on space and tab only (\v, \f, U+2003 stay in a value)
+  local plain="[^${B}'\"\$\`;&|()<>\\\\]*" sq="'[^']*'" dq="\"[^\"\$\`\\\\]*\""
+  # a comment only after a blank: a # touching a value is part of the shell word (…'x'#$(cmd) runs)
+  local re_export="^[${B}]*export[${B}]+([A-Za-z_][A-Za-z0-9_]*)=(${plain}|${sq}|${dq})([${B}]+#.*)?[${B}]*\$"
+  local re_unset="^[${B}]*unset(([${B}]+[A-Za-z_][A-Za-z0-9_]*)+)([${B}]+#.*)?[${B}]*\$"
+  local re_skip="^[${B}]*(#.*)?\$"
+  local re_pool="^(http://127\\.0\\.0\\.1:3456|https://[A-Za-z0-9._~%:+=-]+@10\\.0\\.6\\.145:3443/?)\$"
   while IFS= read -r line || [ -n "$line" ]; do
     # a carriage return becomes part of the value in bash: never normalized, never read past
     [[ "$line" == *$'\r'* ]] && { echo envsh-unverifiable; return; }
-    [[ "$line" =~ ^[[:blank:]]*(#.*)?$ ]] && continue
+    [[ "$line" =~ $re_skip ]] && continue
     if [[ "$line" =~ $re_unset ]]; then
-      for name in ${BASH_REMATCH[1]}; do [ "$name" = HTTPS_PROXY ] && val=; done
+      for name in ${BASH_REMATCH[1]}; do
+        case $name in HTTPS_PROXY) hp= ;; https_proxy) hpl= ;; NO_PROXY) np= ;; no_proxy) npl= ;; esac
+      done
       continue
     fi
     if [[ "$line" =~ $re_export ]]; then
-      if [ "${BASH_REMATCH[1]}" = HTTPS_PROXY ]; then
-        v=${BASH_REMATCH[2]}; v=${v#[\'\"]}; v=${v%[\'\"]}; val=$v
-      fi
+      name=${BASH_REMATCH[1]} v=${BASH_REMATCH[2]}
+      case $v in \'*\'|\"*\") v=${v:1:${#v}-2} ;; esac
+      case $name in HTTPS_PROXY) hp=$v ;; https_proxy) hpl=$v ;; NO_PROXY) np=$v ;; no_proxy) npl=$v ;; esac
       continue
     fi
     echo envsh-unverifiable; return
   done < "$1"
-  if [[ "$val" == "http://127.0.0.1:3456" || "$val" =~ ^https://[^@/[:space:]]+@10\.0\.6\.145:3443/?$ ]]; then echo envsh-pool; else echo envsh-off; fi
+  # Node reads https_proxy before HTTPS_PROXY: each set one must be the pool, and one must be set
+  { [ -z "$hp" ] || [[ "$hp" =~ $re_pool ]]; } && { [ -z "$hpl" ] || [[ "$hpl" =~ $re_pool ]]; } && [ -n "$hp$hpl" ] \
+    || { echo envsh-off; return; }
+  # a no-proxy entry of * or naming anthropic/claude sends claude's API calls around the pool
+  for e in ${np//,/ } ${npl//,/ }; do
+    case $e in '*'|*anthropic*|*claude*) echo envsh-bypass; return ;; esac
+  done
+  echo envsh-pool
 }
 want=${1:-}
 port=${CHECK_PROXY_PORT:-3456}

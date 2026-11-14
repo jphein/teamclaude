@@ -129,6 +129,11 @@ test('proxy-wrapper: a probe that exits non-zero is unreachable even if its line
   assert.match(r.line, /^CHECK proxy-wrapper warn · waki unreachable/);
 });
 
+test('proxy-wrapper: an env.sh whose NO_PROXY skips the pool warns', () => {
+  const r = pw({ [SELF]: OK, kat: 'proxy=200 wrapper=envsh-bypass' });
+  assert.match(r.line, /^CHECK proxy-wrapper warn · kat env\.sh NO_PROXY lets claude skip the pool — /);
+});
+
 test('proxy-wrapper: an env.sh that cannot be read without running it warns', () => {
   const r = pw({ [SELF]: OK, kat: 'proxy=200 wrapper=envsh-unverifiable' });
   assert.match(r.line, /^CHECK proxy-wrapper warn · kat env\.sh cannot be read without running it — /);
@@ -167,8 +172,8 @@ function home(wrapperSrc, envsh) {
 }
 // async: a spawnSync would block this process's event loop, and the test server could never answer
 const sha = (text) => createHash('sha256').update(text).digest('hex');
-const probe = (h, port) => new Promise((resolve, reject) => {
-  execFile('bash', [join(C, 'proxy-probe.sh'), sha(NEW_WRAPPER)], { env: { PATH: process.env.PATH, HOME: h, CHECK_PROXY_PORT: String(port) }, encoding: 'utf8', timeout: 60_000 },
+const probe = (h, port, extra = {}) => new Promise((resolve, reject) => {
+  execFile('bash', [join(C, 'proxy-probe.sh'), sha(NEW_WRAPPER)], { env: { PATH: process.env.PATH, HOME: h, CHECK_PROXY_PORT: String(port), ...extra }, encoding: 'utf8', timeout: 60_000 },
     (err, stdout) => (err && err.code !== 0 ? reject(err) : resolve(stdout.trim())));
 });
 const NEW_WRAPPER = readFileSync(join(ROOT, 'scripts', 'claude-wrapper.sh'), 'utf8');
@@ -196,6 +201,19 @@ test('proxy-probe: katana-style env.sh is judged by where HTTPS_PROXY points', a
     assert.equal(await probe(home(null, '# export HTTPS_PROXY=http://127.0.0.1:3456\n'), port), 'proxy=200 wrapper=envsh-off');
     assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:34560\n'), port), 'proxy=200 wrapper=envsh-off', 'another port');
     assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:3456#x\n'), port), 'proxy=200 wrapper=envsh-off', 'a # touching the value is part of it, as in bash');
+    for (const loc of ['C', 'C.UTF-8'])
+      assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:3456\u2003\n'), port, { LC_ALL: loc }), 'proxy=200 wrapper=envsh-off', `an EM SPACE stays in the value (${loc})`);
+    const P = 'export HTTPS_PROXY=http://127.0.0.1:3456\n';
+    for (const [body, want, why] of [
+      [P + "export NO_PROXY='*'\n", 'envsh-bypass', 'NO_PROXY=*'],
+      [P + 'export no_proxy=localhost,.anthropic.com\n', 'envsh-bypass', 'no_proxy names anthropic'],
+      [P + 'export NO_PROXY=api.claude.ai\n', 'envsh-bypass', 'NO_PROXY names claude'],
+      [P + "export NO_PROXY='*'\nunset NO_PROXY\n", 'envsh-pool', 'a later unset clears the bypass'],
+      [P + 'export NO_PROXY=localhost,127.0.0.1,10.0.0.0/8,.jphe.in\n', 'envsh-pool', 'a LAN-only NO_PROXY'],
+      [P + 'export https_proxy=http://elsewhere:8080\n', 'envsh-off', 'lowercase https_proxy wins in Node and points elsewhere'],
+      ['export https_proxy=http://127.0.0.1:3456\n', 'envsh-pool', 'lowercase alone at the pool'],
+      ['export HTTPS_PROXY=https://k@x@10.0.6.145:3443\n', 'envsh-off', 'userinfo is token characters only'],
+    ]) assert.equal(await probe(home(null, body), port), `proxy=200 wrapper=${want}`, why);
     for (const ws of ['\v', '\f'])
       assert.equal(await probe(home(null, `export HTTPS_PROXY=http://127.0.0.1:3456${ws}\n`), port), 'proxy=200 wrapper=envsh-off', `a trailing ${JSON.stringify(ws)} stays in the value, as in bash`);
     assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:3456\nunset HTTPS_PROXY\n'), port), 'proxy=200 wrapper=envsh-off', 'a later unset wins');

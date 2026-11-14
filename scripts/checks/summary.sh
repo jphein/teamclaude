@@ -11,7 +11,10 @@ for spec in pool-quota:30 proxy-wrapper:30 forge-keys:2880; do
   if [ ! -s "$f" ]; then echo "CHECK $name warn · no result yet (timer not run or not installed) · owner teamclaude lane"; continue; fi
   age=$(( (now - $(stat -c %Y "$f")) / 60 ))
   line=$(head -n 1 "$f")
-  if [ "$age" -gt "$max" ]; then echo "CHECK $name warn · last result is $age min old (max $max): timer stopped? last: ${line#CHECK $name } · owner teamclaude lane"
-  else case $line in "CHECK $name ok "*) ;; *) echo "$line" ;; esac; fi
+  # one line of the full shape, or it is not a result
+  if [ "$(grep -c '' "$f")" != 1 ] || [[ ! "$line" =~ ^CHECK\ $name\ (ok|warn|fail)\ ·\ .+\ ·\ .+$ ]]; then
+    echo "CHECK $name warn · last result is malformed; look at $f · owner teamclaude lane"
+  elif [ "$age" -gt "$max" ]; then echo "CHECK $name warn · last result is $age min old (max $max): timer stopped? last: ${line#CHECK $name } · owner teamclaude lane"
+  else case $line in "CHECK $name ok · "*) ;; *) echo "$line" ;; esac; fi
 done
 exit 0

@@ -8,6 +8,7 @@ import { mkdtempSync, writeFileSync, readFileSync, chmodSync, mkdirSync, rmSync,
 import { createServer } from 'node:http';
 import { join, dirname } from 'node:path';
 import { tmpdir, hostname } from 'node:os';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -76,7 +77,9 @@ test('pool-quota: disabled seats are ignored; a seat not active is named', () =>
 });
 
 test('pool-quota: no aggregate, bad JSON or no endpoint is a fail (exit 1)', () => {
-  for (const body of ['{"accounts":[]}', 'not json', '{"aggregate":{"fiveHour":{"remaining":"x"},"weeklyShared":{"remaining":0.5}}}']) {
+  for (const body of ['{"accounts":[]}', 'not json',
+    '{"aggregate":{"fiveHour":{"remaining":0.8},"weeklyShared":{"remaining":0.8}},"accounts":[]}\n{}',
+    '{"aggregate":{"fiveHour":{"remaining":0.8},"weeklyShared":{"remaining":0.8}},"accounts":[]}\n{"aggregate":{"fiveHour":{"remaining":0.8},"weeklyShared":{"remaining":0.8}},"accounts":[]}', '{"aggregate":{"fiveHour":{"remaining":"x"},"weeklyShared":{"remaining":0.5}}}']) {
     const r = pq(body);
     assert.equal(r.status, 1, body);
     assert.match(r.line, /^CHECK pool-quota fail · quota endpoint answered without aggregate numbers/);
@@ -112,11 +115,30 @@ test('proxy-wrapper: another host down or unreachable warns; this host down fail
 });
 
 test('proxy-wrapper: a claude that would run outside the pool warns', () => {
-  for (const state of ['runs-rc0', 'envsh-off', 'none']) {
+  for (const state of ['envsh-off', 'none']) {
     const r = pw({ [SELF]: OK, waki: `proxy=200 wrapper=${state}` });
     assert.equal(r.status, 0);
     assert.match(r.line, new RegExp(`^CHECK proxy-wrapper warn · waki claude can run outside the pool \\(${state}\\) — `), state);
   }
+});
+
+test('proxy-wrapper: a probe that exits non-zero is unreachable even if its line looks healthy', () => {
+  const d = fresh(); const p = join(d, 'probe');
+  writeFileSync(p, `#!/bin/sh\necho 'proxy=200 wrapper=refuses'\nexit 1\n`); chmodSync(p, 0o755);
+  const r = run('proxy-wrapper.sh', { CHECK_HOSTS: 'waki', CHECK_PROBE: p });
+  assert.match(r.line, /^CHECK proxy-wrapper warn · waki unreachable/);
+});
+
+test('proxy-wrapper: a wrapper that is not the reviewed one warns', () => {
+  const r = pw({ [SELF]: OK, waki: 'proxy=200 wrapper=wrapper-1b2c3d4e' });
+  assert.match(r.line, /^CHECK proxy-wrapper warn · waki ~\/\.cargo\/bin\/claude is not the reviewed wrapper \(wrapper-1b2c3d4e\) — /);
+});
+
+test('proxy-wrapper: the probe is handed the reviewed wrapper\'s sha256', () => {
+  const d = fresh(); const p = join(d, 'probe'); const seen = join(d, 'seen');
+  writeFileSync(p, `#!/bin/sh\necho "$2" > '${seen}'\necho 'proxy=200 wrapper=refuses'\n`); chmodSync(p, 0o755);
+  run('proxy-wrapper.sh', { CHECK_HOSTS: 'waki', CHECK_PROBE: p });
+  assert.equal(readFileSync(seen, 'utf8').trim(), sha(NEW_WRAPPER));
 });
 
 test('proxy-wrapper: a garbled probe line counts as unreachable', () => {
@@ -139,18 +161,23 @@ function home(wrapperSrc, envsh) {
   return h;
 }
 // async: a spawnSync would block this process's event loop, and the test server could never answer
+const sha = (text) => createHash('sha256').update(text).digest('hex');
 const probe = (h, port) => new Promise((resolve, reject) => {
-  execFile('bash', [join(C, 'proxy-probe.sh')], { env: { PATH: process.env.PATH, HOME: h, CHECK_PROXY_PORT: String(port) }, encoding: 'utf8', timeout: 60_000 },
+  execFile('bash', [join(C, 'proxy-probe.sh'), sha(NEW_WRAPPER)], { env: { PATH: process.env.PATH, HOME: h, CHECK_PROXY_PORT: String(port) }, encoding: 'utf8', timeout: 60_000 },
     (err, stdout) => (err && err.code !== 0 ? reject(err) : resolve(stdout.trim())));
 });
 const NEW_WRAPPER = readFileSync(join(ROOT, 'scripts', 'claude-wrapper.sh'), 'utf8');
 // the pre-#66 wrapper: falls back to the own login when :3456 is down
 const OLD_WRAPPER = '#!/bin/sh\nREAL=$(readlink -f "$HOME/.local/bin/claude")\nif [ -z "$TEAMCLAUDE_BYPASS" ] && timeout 2 bash -c \': </dev/tcp/127.0.0.1/3456\' 2>/dev/null; then\n  export HTTPS_PROXY=http://127.0.0.1:3456\nelse\n  echo "[claude] teamclaude tunnel down; using own login" >&2\nfi\nexec "$REAL" "$@"\n';
 
-test('proxy-probe: the current wrapper refuses; the old fallback wrapper is caught', async () => {
+test('proxy-probe: the reviewed wrapper reads refuses; any other wrapper is named by hash and never run', async () => {
   await withServer(200, async (port) => {
     assert.equal(await probe(home(NEW_WRAPPER), port), 'proxy=200 wrapper=refuses');
-    assert.equal(await probe(home(OLD_WRAPPER), port), 'proxy=200 wrapper=runs-rc0');
+    assert.equal(await probe(home(OLD_WRAPPER), port), `proxy=200 wrapper=wrapper-${sha(OLD_WRAPPER).slice(0, 8)}`);
+    const rogue = '#!/bin/sh\ntouch "$HOME/probe-ran-me"\nexit 69\n';
+    const h = home(rogue);
+    assert.equal(await probe(h, port), `proxy=200 wrapper=wrapper-${sha(rogue).slice(0, 8)}`);
+    assert.equal(existsSync(join(h, 'probe-ran-me')), false, 'the probe executed the wrapper');
   });
 });
 
@@ -160,6 +187,10 @@ test('proxy-probe: katana-style env.sh is judged by where HTTPS_PROXY points', a
     assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:3456\n'), port), 'proxy=200 wrapper=envsh-pool');
     assert.equal(await probe(home(null, '# cc direct\nunset HTTPS_PROXY\n'), port), 'proxy=200 wrapper=envsh-off');
     assert.equal(await probe(home(null, '# export HTTPS_PROXY=http://127.0.0.1:3456\n'), port), 'proxy=200 wrapper=envsh-off');
+    assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:34560\n'), port), 'proxy=200 wrapper=envsh-off', 'another port');
+    assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:3456\nunset HTTPS_PROXY\n'), port), 'proxy=200 wrapper=envsh-off', 'a later unset wins');
+    assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:3456\nexport HTTPS_PROXY=http://elsewhere:1\n'), port), 'proxy=200 wrapper=envsh-off', 'a later export wins');
+    assert.equal(await probe(home(null, 'export HTTPS_PROXY=https://k@10.0.6.145:3443.evil\n'), port), 'proxy=200 wrapper=envsh-off', 'anchored host');
     assert.equal(await probe(home(null, null), port), 'proxy=200 wrapper=none');
   });
 });
@@ -200,8 +231,11 @@ test('forge-keys: an unreadable or cut-off database answer fails, never reads as
   assert.equal(r.status, 1); assert.match(r.line, /^CHECK forge-keys fail · cannot read the gateway database/);
   r = fk('KEYS|12\nUNKNOWN|0|0\n');
   assert.equal(r.status, 1); assert.match(r.line, /^CHECK forge-keys fail · gateway database answered incompletely/);
-  r = fk('UNKNOWN|0|0\nREFUSED|0|0\nEND\n');
-  assert.equal(r.status, 1); assert.match(r.line, /answered incompletely/);
+  for (const bad of ['UNKNOWN|0|0\nREFUSED|0|0\nEND\n', 'KEYS|1\nEND\n', 'KEYS|1\nUNKNOWN|garbled|1\nREFUSED|0|0\nEND\n',
+    'KEYS|1\nUNKNOWN|0|0\nUNKNOWN|5|1\nREFUSED|0|0\nEND\n', 'KEYS|1\nUNKNOWN|0|0\nREFUSED|0|0\nWHAT|x\nEND\n', 'KEYS|1\nUNKNOWN|0|0\nREFUSED|0|0\nOUT|a|b|many\nEND\n']) {
+    r = fk(bad);
+    assert.equal(r.status, 1, bad); assert.match(r.line, /answered incompletely or malformed/, bad);
+  }
 });
 
 // ---------- summary
@@ -217,6 +251,14 @@ function summary(files, now = Math.floor(Date.now() / 1000)) {
 test('summary: silent when every check is ok and fresh', () => {
   const r = summary({ 'pool-quota': ['CHECK pool-quota ok · x · y', 5], 'proxy-wrapper': ['CHECK proxy-wrapper ok · x · y', 5], 'forge-keys': ['CHECK forge-keys ok · x · y', 600] });
   assert.equal(r.status, 0); assert.equal(r.stdout, '');
+});
+
+test('summary: a malformed or multi-line result is a warn, never silence', () => {
+  const r = summary({ 'pool-quota': ['CHECK pool-quota ok garbage', 5], 'proxy-wrapper': ['CHECK proxy-wrapper ok · x · y\nCHECK proxy-wrapper fail · z · y', 5], 'forge-keys': ['CHECK forge-keys ok · x · y', 5] });
+  const lines = r.stdout.trim().split('\n');
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /^CHECK pool-quota warn · last result is malformed/);
+  assert.match(lines[1], /^CHECK proxy-wrapper warn · last result is malformed/);
 });
 
 test('summary: repeats warn/fail lines, flags a stale result and a missing one', () => {
@@ -242,4 +284,58 @@ test('units: every check has a service and a timer; services run the installed c
     assert.match(svc, new RegExp(`^ExecStart=%h/\\.local/libexec/teamclaude-checks/${name}\\.sh$`, 'm'));
     assert.match(readFileSync(join(C, 'systemd', `teamclaude-check-${name}.timer`), 'utf8'), /^Persistent=true$/m);
   }
+});
+
+// ---------- install (a real run into a temporary HOME, from a temporary repo whose origin/master is set)
+function repoAt(files) {
+  const d = fresh();
+  const g = (...a) => spawnSync('git', a, { cwd: d, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
+  g('init', '-q');
+  for (const [p, body] of Object.entries(files)) { mkdirSync(dirname(join(d, p)), { recursive: true }); writeFileSync(join(d, p), body); }
+  g('add', '-A'); g('commit', '-q', '-m', 'x');
+  g('update-ref', 'refs/remotes/origin/master', 'HEAD');
+  return { dir: d, head: g('rev-parse', 'HEAD').stdout.trim() };
+}
+const payload = (omit = []) => {
+  const files = {};
+  for (const f of ['lib.sh', 'pool-quota.sh', 'proxy-probe.sh', 'proxy-wrapper.sh', 'forge-keys.sh', 'summary.sh', 'install.sh']) if (!omit.includes(f)) files[`scripts/checks/${f}`] = readFileSync(join(C, f), 'utf8');
+  for (const n of ['pool-quota', 'proxy-wrapper', 'forge-keys']) for (const ext of ['service', 'timer']) files[`scripts/checks/systemd/teamclaude-check-${n}.${ext}`] = readFileSync(join(C, 'systemd', `teamclaude-check-${n}.${ext}`), 'utf8');
+  files['scripts/claude-wrapper.sh'] = NEW_WRAPPER;
+  return files;
+};
+function install(repo, h) {
+  const fake = join(fresh(), 'systemctl'); writeFileSync(fake, `#!/bin/sh\necho "$@" >> '${join(h, 'systemctl.log')}'\n`); chmodSync(fake, 0o755);
+  return spawnSync('bash', [join(repo.dir, 'scripts', 'checks', 'install.sh'), repo.head], { cwd: repo.dir, env: { PATH: process.env.PATH, HOME: h, CHECK_SYSTEMCTL: fake }, encoding: 'utf8' });
+}
+
+test('install: a complete merged commit is published and its timers enabled', () => {
+  const h = fresh(); const r = install(repoAt(payload()), h);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(readFileSync(join(h, '.local/libexec/teamclaude-checks/claude-wrapper.sh'), 'utf8'), NEW_WRAPPER);
+  assert.ok(existsSync(join(h, '.config/systemd/user/teamclaude-check-forge-keys.timer')));
+  assert.match(readFileSync(join(h, 'systemctl.log'), 'utf8'), /--user enable --now teamclaude-check-forge-keys\.timer teamclaude-check-pool-quota\.timer teamclaude-check-proxy-wrapper\.timer/);
+});
+
+test('install: a commit missing a file publishes nothing over the existing install', () => {
+  const h = fresh();
+  assert.equal(install(repoAt(payload()), h).status, 0);
+  const before = readFileSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh'), 'utf8');
+  const broken = payload(['summary.sh']); broken['scripts/checks/pool-quota.sh'] = before + '\n# changed\n';
+  const r = install(repoAt(broken), h);
+  assert.equal(r.status, 4);
+  assert.equal(readFileSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh'), 'utf8'), before, 'a partial payload was published');
+});
+
+test('install: a commit not on origin/master is refused', () => {
+  const repo = repoAt(payload());
+  spawnSync('git', ['update-ref', '-d', 'refs/remotes/origin/master'], { cwd: repo.dir });
+  spawnSync('git', ['commit', '-q', '--allow-empty', '-m', 'base'], { cwd: repo.dir, env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
+  spawnSync('git', ['update-ref', 'refs/remotes/origin/master', 'HEAD'], { cwd: repo.dir });
+  spawnSync('git', ['checkout', '-q', '-b', 'side', 'HEAD~1'], { cwd: repo.dir });
+  spawnSync('git', ['commit', '-q', '--allow-empty', '-m', 'side'], { cwd: repo.dir, env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
+  const side = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repo.dir, encoding: 'utf8' }).stdout.trim();
+  const h = fresh();
+  const r = spawnSync('bash', [join(repo.dir, 'scripts', 'checks', 'install.sh'), side], { cwd: repo.dir, env: { PATH: process.env.PATH, HOME: h, CHECK_SYSTEMCTL: '/bin/false' }, encoding: 'utf8' });
+  assert.equal(r.status, 3);
+  assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false);
 });

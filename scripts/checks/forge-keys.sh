@@ -44,8 +44,11 @@ SELECT 'END';
 SQL
 ) || check_emit "$NAME" fail "cannot read the gateway database (forge-db-1 on ubox0) at $(check_now)" "$NEXT"
 # a cut-off answer must not read as "nothing wrong": the batch has to reach its END marker
-grep -qx 'END' <<<"$out" && grep -qE '^KEYS\|[0-9]+$' <<<"$out" \
-  || check_emit "$NAME" fail "gateway database answered incompletely at $(check_now)" "$NEXT"
+# exactly one numeric KEYS, UNKNOWN and REFUSED row, every other row OUT|…|…|n or IDLE|…
+one() { [ "$(grep -cE "$1" <<<"$out")" = 1 ]; }
+{ grep -qx 'END' <<<"$out" && one '^KEYS\|[0-9]+$' && one '^UNKNOWN\|[0-9]+\|[0-9]+$' && one '^REFUSED\|[0-9]+\|[0-9]+$' \
+  && ! grep -vqE '^(END|KEYS\|[0-9]+|UNKNOWN\|[0-9]+\|[0-9]+|REFUSED\|[0-9]+\|[0-9]+|OUT\|[^|]*\|[^|]*\|[0-9]+|IDLE\|[^|]*)$' <<<"$out"; } \
+  || check_emit "$NAME" fail "gateway database answered incompletely or malformed at $(check_now)" "$NEXT"
 keys=$(sed -n 's/^KEYS|//p' <<<"$out")
 outside=$(awk -F'|' '$1=="OUT" {printf "%s%s→%s ×%s", (n++ ? ", " : ""), $2, $3, $4}' <<<"$out")
 idle=$(awk -F'|' '$1=="IDLE" {printf "%s%s", (n++ ? " " : ""), $2}' <<<"$out")
@@ -54,7 +57,7 @@ IFS='|' read -r _ ref_all ref_del <<<"$(grep '^REFUSED|' <<<"$out")"
 status=ok; why=()
 [ -n "$outside" ] && { status=warn; why+=("spend outside allowlist: $outside"); }
 [ -n "$idle" ] && { status=warn; why+=("unused 30 days (prune candidates): $idle"); }
-[ "${unk_rows:-0}" -gt 0 ] 2>/dev/null && { status=warn; why+=("unknown keys spent: $unk_rows calls from $unk_keys keys in 7 days"); }
+[ "$unk_rows" -gt 0 ] && { status=warn; why+=("unknown keys spent: $unk_rows calls from $unk_keys keys in 7 days"); }
 fact="$keys active keys"
 if [ ${#why[@]} -gt 0 ]; then fact+=", $(IFS=';'; echo "${why[*]}" | sed 's/;/; /g')"
 else fact+=", none outside its allowlist, none idle 30 days, no unknown spenders"; fi

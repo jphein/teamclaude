@@ -18,9 +18,11 @@ else
     || check_emit "$NAME" fail "quota endpoint $url did not answer at $(check_now)" "$NEXT"
 fi
 now_ms=${CHECK_NOW_MS:-$(( $(date +%s) * 1000 ))}
-r=$(jq -r --argjson now "$now_ms" '
+r=$(jq -r -s --argjson now "$now_ms" '
   def who: (.name // "?") | split("@")[0];
   def used: [.buckets.fiveHour.utilization, .buckets.weeklyShared.utilization] | map(select(type == "number")) | (max // 0);
+  if length != 1 or (.[0] | type) != "object" then "BAD" else .[0] end
+  | if . == "BAD" then "BAD" else
   .aggregate as $a
   | if ($a.fiveHour.remaining | type) != "number" or ($a.weeklyShared.remaining | type) != "number" then "BAD"
     else [ $a.fiveHour.remaining, $a.weeklyShared.remaining,
@@ -30,7 +32,9 @@ r=$(jq -r --argjson now "$now_ms" '
                                       and .resetAt < ($now - 900000) and (.utilization // 0) > 0)]
               | select(length > 0) | $s | who] | unique | join(" ")),
            ([.accounts[]? | select(.disabled != true and .status != "active") | "\(who)=\(.status)"] | join(" "))
-         ] | map(tostring) | join("\u001f") end' <<<"$body" 2>/dev/null) || r=BAD
+         ] | map(tostring) | join("\u001f") end end' <<<"$body" 2>/dev/null) || r=BAD
+# exactly one record of five fields, or nothing here can be trusted
+[ "$(printf '%s' "$r" | grep -c '')" = 1 ] && [ "$(printf '%s' "$r" | tr -cd '\037' | wc -c)" = 4 ] || r=BAD
 [ "$r" = BAD ] || [ -z "$r" ] && check_emit "$NAME" fail "quota endpoint answered without aggregate numbers at $(check_now)" "$NEXT"
 # \x1f, not a tab: read collapses runs of a whitespace IFS, so an empty field would shift the rest
 IFS=$'\x1f' read -r five week hot stale inactive <<<"$r"

@@ -30,13 +30,17 @@ timers_stopped() {
   done
   return 0
 }
-# put back every file this install moved into place (from the copies kept in $stage/old)
+# put back every file this install moved into place (from the copies kept in $stage/old); every
+# step is checked, nothing aborts halfway: 0 when all are back, 1 when any failed (listed in $failed)
+failed=()
 restore_published() {
-  local i
+  local i ok=0
+  failed=()
   for ((i = 0; i < moved; i++)); do
-    if [ -e "$stage/old/$i" ]; then cp -p "$stage/old/$i" "${dsts[$i]}"; else rm -f -- "${dsts[$i]}"; fi
+    if [ -e "$stage/old/$i" ]; then cp -p "$stage/old/$i" "${dsts[$i]}" 2>/dev/null || { failed+=("${dsts[$i]}"); ok=1; }
+    else rm -f -- "${dsts[$i]}" 2>/dev/null || { failed+=("${dsts[$i]}"); ok=1; }; fi
   done
-  moved=0
+  return $ok
 }
 # wait until no check service runs: 0 idle, 1 still busy after the wait, 2 a state cannot be read
 services_idle() {
@@ -56,39 +60,46 @@ services_idle() {
   done
   return 1
 }
+# keep the previous files where they survive this script (one rename), or keep the staging dir
+# (sets $kept and, when the rename fails, keep_stage=1: never call it in a $(…) subshell)
+kept=
+keep_backups() {
+  local i
+  for ((i = 0; i < moved; i++)); do printf '%s\t%s\n' "$i" "${dsts[$i]}"; done > "$stage/old/MANIFEST" 2>/dev/null
+  kept="$lib/.rollback-$(date +%Y%m%dT%H%M%S)"
+  if ! { [ -s "$stage/old/MANIFEST" ] && mv -T "$stage/old" "$kept" 2>/dev/null; }; then
+    keep_stage=1; kept="$stage/old"
+  fi
+}
+incomplete() { # why
+  keep_backups
+  echo "install.sh: ROLLBACK INCOMPLETE: $1; timers left stopped; previous files in $kept (MANIFEST maps each to its path)" >&2
+}
 cleanup() {
+  set +e   # an EXIT trap under set -e would stop at the first failing command: every step is checked here
   if [ "$quiesced" = 1 ] && [ "$finished" = 0 ]; then
     # quiet first: stop all three timers (a failed `enable --now` may have started some) and let a
     # check that started finish, so nothing runs while files are put back
-    $SYSTEMCTL --user stop "${timers[@]}" 2>/dev/null || true
+    $SYSTEMCTL --user stop "${timers[@]}" 2>/dev/null
+    local start_ok=1
     if [ "$moved" -gt 0 ]; then
-      if timers_stopped && services_idle; then
-        # a failure after publishing (daemon-reload, enable): the old files go back and the manager
-        # reloads them before any timer runs again, so new scripts never run under old units
-        restore_published
-        if $SYSTEMCTL --user daemon-reload 2>/dev/null; then
-          echo "install.sh: failed after publishing; the previous install is restored" >&2
-        else
-          # the files are back but the manager still holds the new units: start nothing
-          echo "install.sh: ROLLBACK INCOMPLETE: previous files restored but systemd did not reload them; timers left stopped. Run: systemctl --user daemon-reload, then start ${was_running[*]:-nothing}" >&2
-          was_running=()
-        fi
+      start_ok=0
+      if ! { timers_stopped && services_idle; }; then
+        incomplete "a timer or check is still active, so no file was replaced under it; the new files are in place"
+      elif ! restore_published; then
+        incomplete "could not restore ${failed[*]}"
+      elif ! $SYSTEMCTL --user daemon-reload 2>/dev/null; then
+        echo "install.sh: ROLLBACK INCOMPLETE: previous files restored but systemd did not reload them; timers left stopped. Run: systemctl --user daemon-reload, then start ${was_running[*]:-nothing}" >&2
       else
-        # a timer did not stop or a check is still running (or cannot be read): never replace files
-        # under it. Keep the backups where they survive this script, start no timer, and say so.
-        for ((i = 0; i < moved; i++)); do printf '%s\t%s\n' "$i" "${dsts[$i]}"; done > "$stage/old/MANIFEST" 2>/dev/null || true
-        keep="$lib/.rollback-$(date +%Y%m%dT%H%M%S)"
-        if [ -s "$stage/old/MANIFEST" ] && mv -T "$stage/old" "$keep" 2>/dev/null; then
-          echo "install.sh: ROLLBACK INCOMPLETE: a timer or check is still active; new files left in place, timers stopped, previous files in $keep (MANIFEST maps each to its path)" >&2
-        else
-          keep_stage=1   # the move failed: the staging directory is the only copy, so it stays
-          echo "install.sh: ROLLBACK INCOMPLETE: a timer or check is still active and the backups could not be moved; previous files remain in $stage/old" >&2
-        fi
-        was_running=()
+        echo "install.sh: failed after publishing; the previous install is restored" >&2
+        start_ok=1
       fi
     fi
-    # then start only the timers that were running before this install
-    [ ${#was_running[@]} -eq 0 ] || $SYSTEMCTL --user start "${was_running[@]}" 2>/dev/null || true
+    # then start only the timers that were running before this install, and say if that fails
+    if [ "$start_ok" = 1 ] && [ ${#was_running[@]} -gt 0 ]; then
+      $SYSTEMCTL --user start "${was_running[@]}" 2>/dev/null \
+        || echo "install.sh: ROLLBACK INCOMPLETE: the previous install is in place but its timers did not start. Run: systemctl --user start ${was_running[*]}" >&2
+    fi
   fi
   [ "$keep_stage" = 1 ] || rm -rf -- "${stage:?}"
 }
@@ -161,8 +172,7 @@ for i in "${!dsts[@]}"; do
   src=${srcs[$i]} dst=${dsts[$i]}
   # CHECK_INSTALL_FAIL_AT=<file name>: tests only, makes that one move fail to prove the restore
   if [ "${CHECK_INSTALL_FAIL_AT:-}" = "$(basename "$dst")" ] || ! mv -fT "$src" "$dst"; then
-    restore_published
-    echo "install.sh: publishing $dst failed; the previous install is restored" >&2; exit 5
+    echo "install.sh: publishing $dst failed" >&2; exit 5   # cleanup restores what was moved
   fi
   moved=$((i + 1))
 done

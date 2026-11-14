@@ -784,7 +784,7 @@ test('install: if the backups cannot be moved aside, the staging copy is kept an
   const body = RUNNING(h) + `\ncase "$2:$3" in enable:*) : > '${marker}'; exit 1 ;; is-active:*.service) if [ -e '${marker}' ]; then echo active; exit 0; fi ;; esac`;
   const r = installWith(repoAt(changed), h, body, { PATH: `${bin}:${process.env.PATH}` });
   assert.notEqual(r.status, 0);
-  const m = r.stderr.match(/previous files remain in (\S+)/);
+  const m = r.stderr.match(/previous files in (\S+)/);
   assert.ok(m, r.stderr);
   const manifest = readFileSync(join(m[1], 'MANIFEST'), 'utf8');
   const idx = manifest.split('\n').find((l) => l.endsWith('/pool-quota.sh')).split('\t')[0];
@@ -807,4 +807,33 @@ test('install: a failed reload during rollback starts no timer and says how to f
   assert.equal(readFileSync(lib, 'utf8'), before);
   const after = readFileSync(join(h, 'systemctl.log'), 'utf8').split('--user enable --now')[1];
   assert.doesNotMatch(after, /^--user start /m);
+});
+
+test('install: a restore that fails partway is reported, keeps the backups and starts no timer', () => {
+  const h = fresh();
+  assert.equal(install(repoAt(payload()), h).status, 0);
+  rmSync(join(h, 'systemctl.log'));
+  const libdir = join(h, '.local/libexec/teamclaude-checks');
+  const before = readFileSync(join(libdir, 'summary.sh'), 'utf8');
+  const changed = payload(); changed['scripts/checks/summary.sh'] = before + '\n# changed\n';
+  // the publishing reload makes one published file read-only, then fails
+  const body = RUNNING(h) + `\ncase "$2" in daemon-reload) if [ ! -e '${join(h, 'r1')}' ]; then : > '${join(h, 'r1')}'; chmod 0444 '${join(libdir, 'summary.sh')}'; exit 1; fi ;; esac`;
+  const r = installWith(repoAt(changed), h, body);
+  try {
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /ROLLBACK INCOMPLETE: could not restore \S*summary\.sh/);
+    const keep = r.stderr.match(/previous files in (\S+)/)[1];
+    const idx = readFileSync(join(keep, 'MANIFEST'), 'utf8').split('\n').find((l) => l.endsWith('/summary.sh')).split('\t')[0];
+    assert.equal(readFileSync(join(keep, idx), 'utf8'), before);
+    assert.doesNotMatch(readFileSync(join(h, 'systemctl.log'), 'utf8').split('--user daemon-reload')[1], /^--user start /m);
+  } finally { chmodSync(join(libdir, 'summary.sh'), 0o644); }
+});
+
+test('install: a timer restart that fails after a rollback is reported with the retry command', () => {
+  const h = fresh();
+  assert.equal(install(repoAt(payload()), h).status, 0);
+  const body = RUNNING(h) + '\ncase "$2" in start) exit 1 ;; esac';
+  const r = installWith(repoAt(payload()), h, body, { CHECK_INSTALL_FAIL_AT: 'pool-quota.sh' });
+  assert.equal(r.status, 5);
+  assert.match(r.stderr, /ROLLBACK INCOMPLETE: the previous install is in place but its timers did not start\. Run: systemctl --user start teamclaude-check-pool-quota\.timer teamclaude-check-proxy-wrapper\.timer teamclaude-check-forge-keys\.timer/);
 });

@@ -251,7 +251,7 @@ test('proxy-probe: katana-style env.sh is judged by where HTTPS_PROXY points', a
     const mut = envs('touch "$HOME/probe-ran-envsh"\nexport HTTPS_PROXY=http://127.0.0.1:3456\n');
     assert.equal(await probe(mut, port), 'proxy=200 wrapper=envsh-unverifiable claude=0 direct=0');
     assert.equal(existsSync(join(mut, 'probe-ran-envsh')), false, 'the probe executed env.sh');
-    for (const v of ["'http://127.0.0.1:3456'", '"http://127.0.0.1:3456"', 'https://k:k@10.0.6.145:3443 # a comment'])
+    for (const v of ["'http://127.0.0.1:3456'", '"http://127.0.0.1:3456"', 'https://k:k@10.0.6.145:3443 # a comment', 'http://127.0.0.1:3456/'])
       assert.equal(await probe(envs(`export HTTPS_PROXY=${v}\n`), port), 'proxy=200 wrapper=envsh-pool claude=0 direct=0', v);
     for (const body of ["export HTTPS_PROXY='http://127.0.0.1:3456'#$(printf suffix)\n", "export HTTPS_PROXY='http://127.0.0.1:3456'\r\n",
       'export HTTPS_PROXY=$POOL\n', 'export HTTPS_PROXY=http://127.0.0.1:3456\nexport NO_PROXY={example.org,anthropic.com}\n', 'export NO_PROXY=~/x\n', 'export NO_PROXY=*\n', 'if true; then export HTTPS_PROXY=http://127.0.0.1:3456; fi\n', '. ./other.sh\n', 'export HTTPS_PROXY=`cat x`\n'])
@@ -555,7 +555,8 @@ test('install: a timer that did not stop refuses the install and is started agai
 
 test('install: an unexpected failure after the stop (daemon-reload) still starts the timers again', () => {
   const h = fresh();
-  const r = installWith(repoAt(payload()), h, RUNNING(h) + '\ncase "$2" in daemon-reload) exit 1 ;; esac');
+  const once = join(h, 'reloaded-once');
+  const r = installWith(repoAt(payload()), h, RUNNING(h) + `\ncase "$2" in daemon-reload) if [ ! -e '${once}' ]; then : > '${once}'; exit 1; fi ;; esac`);
   assert.notEqual(r.status, 0);
   const log = readFileSync(join(h, 'systemctl.log'), 'utf8').trim().split('\n');
   assert.equal(log[log.length - 1], '--user start teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer', log.join(' | '));
@@ -591,6 +592,8 @@ test('proxy-probe: counts running claude CLIs and those connected to a public :4
     '0 0 10.0.6.107:50008 10.0.6.11:443 users:(("claude",pid=101,fd=11))',
     '0 0 10.0.6.107:50009 [::ffff:10.0.6.11]:443 users:(("claude",pid=101,fd=12))',
     '0 0 10.0.6.107:50010 169.254.1.1:443 users:(("claude",pid=101,fd=13))',
+    '0 0 10.0.6.107:50011 [fe90::1%eth0]:443 users:(("claude",pid=101,fd=14))',
+    '0 0 10.0.6.107:50012 [feb0::2]:443 users:(("claude",pid=101,fd=15))',
     '0 0 10.0.6.107:50004 [2606:4700::1]:443 users:(("claude",pid=103,fd=9))',
     '0 0 10.0.6.107:50005 160.79.104.10:8443 users:(("claude",pid=101,fd=9))',
     '0 0 10.0.6.107:50006 93.184.216.34:443 users:(("curl",pid=200,fd=3))',
@@ -786,4 +789,22 @@ test('install: if the backups cannot be moved aside, the staging copy is kept an
   const manifest = readFileSync(join(m[1], 'MANIFEST'), 'utf8');
   const idx = manifest.split('\n').find((l) => l.endsWith('/pool-quota.sh')).split('\t')[0];
   assert.equal(readFileSync(join(m[1], idx), 'utf8'), before);
+});
+
+test('install: a failed reload during rollback starts no timer and says how to finish', () => {
+  const h = fresh();
+  assert.equal(install(repoAt(payload()), h).status, 0);
+  rmSync(join(h, 'systemctl.log'));
+  const lib = join(h, '.local/libexec/teamclaude-checks/pool-quota.sh');
+  const before = readFileSync(lib, 'utf8');
+  const changed = payload(); changed['scripts/checks/pool-quota.sh'] = before + '\n# changed\n';
+  const marker = join(h, 'enabled');
+  // the publishing reload works, enable fails, the rollback reload fails; timers were running
+  const body = RUNNING(h) + `\ncase "$2" in enable) : > '${marker}'; exit 1 ;; daemon-reload) [ -e '${marker}' ] && exit 1 ;; esac`;
+  const r = installWith(repoAt(changed), h, body);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /ROLLBACK INCOMPLETE: previous files restored but systemd did not reload them/);
+  assert.equal(readFileSync(lib, 'utf8'), before);
+  const after = readFileSync(join(h, 'systemctl.log'), 'utf8').split('--user enable --now')[1];
+  assert.doesNotMatch(after, /^--user start /m);
 });

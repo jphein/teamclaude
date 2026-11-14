@@ -29,7 +29,7 @@ envsh_state() { # read env.sh line by line, as the shell would apply it, without
   local re_export="^[${B}]*export[${B}]+([A-Za-z_][A-Za-z0-9_]*)=(${plain}|${sq}|${dq})([${B}]+#.*)?[${B}]*\$"
   local re_unset="^[${B}]*unset(([${B}]+[A-Za-z_][A-Za-z0-9_]*)+)([${B}]+#.*)?[${B}]*\$"
   local re_skip="^[${B}]*(#.*)?\$"
-  local re_pool="^(http://127\\.0\\.0\\.1:3456|https://[A-Za-z0-9._~%:+=-]+@10\\.0\\.6\\.145:3443/?)\$"
+  local re_pool="^(http://127\\.0\\.0\\.1:3456/?|https://[A-Za-z0-9._~%:+=-]+@10\\.0\\.6\\.145:3443/?)\$"
   while IFS= read -r line || [ -n "$line" ]; do
     # a carriage return becomes part of the value in bash: never normalized, never read past
     [[ "$line" == *$'\r'* ]] && { echo envsh-unverifiable; return; }
@@ -117,7 +117,7 @@ fi
 private() { # host -> 0 when loopback, LAN or link-local
   local h=${1#[}; h=${h%]}; h=${h#::ffff:}
   case $h in
-    127.*|10.*|192.168.*|169.254.*|::1|fe80:*|fc*|fd*|localhost) return 0 ;;
+    127.*|10.*|192.168.*|169.254.*|::1|fe[89ab]?:*|fc*|fd*|localhost) return 0 ;;   # fe80::/10 is fe8x-febx
     172.*) local o=${h#172.}; o=${o%%.*}; [[ "$o" =~ ^[0-9]+$ ]] && (( o >= 16 && o <= 31 )) && return 0 ;;
   esac
   return 1

@@ -66,8 +66,13 @@ cleanup() {
         # a failure after publishing (daemon-reload, enable): the old files go back and the manager
         # reloads them before any timer runs again, so new scripts never run under old units
         restore_published
-        $SYSTEMCTL --user daemon-reload 2>/dev/null || true
-        echo "install.sh: failed after publishing; the previous install is restored" >&2
+        if $SYSTEMCTL --user daemon-reload 2>/dev/null; then
+          echo "install.sh: failed after publishing; the previous install is restored" >&2
+        else
+          # the files are back but the manager still holds the new units: start nothing
+          echo "install.sh: ROLLBACK INCOMPLETE: previous files restored but systemd did not reload them; timers left stopped. Run: systemctl --user daemon-reload, then start ${was_running[*]:-nothing}" >&2
+          was_running=()
+        fi
       else
         # a timer did not stop or a check is still running (or cannot be read): never replace files
         # under it. Keep the backups where they survive this script, start no timer, and say so.

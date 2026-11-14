@@ -178,6 +178,8 @@ test('proxy-probe: the reviewed wrapper reads refuses; any other wrapper is name
     const h = home(rogue);
     assert.equal(await probe(h, port), `proxy=200 wrapper=wrapper-${sha(rogue).slice(0, 8)}`);
     assert.equal(existsSync(join(h, 'probe-ran-me')), false, 'the probe executed the wrapper');
+    const nx = home(NEW_WRAPPER); chmodSync(join(nx, '.cargo', 'bin', 'claude'), 0o644);
+    assert.equal(await probe(nx, port), 'proxy=200 wrapper=wrapper-notexec', 'a non-executable reviewed wrapper is skipped by PATH');
   });
 });
 
@@ -191,6 +193,7 @@ test('proxy-probe: katana-style env.sh is judged by where HTTPS_PROXY points', a
     assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:3456\nunset HTTPS_PROXY\n'), port), 'proxy=200 wrapper=envsh-off', 'a later unset wins');
     assert.equal(await probe(home(null, 'export HTTPS_PROXY=http://127.0.0.1:3456\nexport HTTPS_PROXY=http://elsewhere:1\n'), port), 'proxy=200 wrapper=envsh-off', 'a later export wins');
     assert.equal(await probe(home(null, 'export HTTPS_PROXY=https://k@10.0.6.145:3443.evil\n'), port), 'proxy=200 wrapper=envsh-off', 'anchored host');
+    assert.equal(await probe(home(null, 'unset HTTPS_PROXY; exit 0\n'), port), 'proxy=200 wrapper=envsh-off', 'an early exit is not a pass');
     assert.equal(await probe(home(null, null), port), 'proxy=200 wrapper=none');
   });
 });
@@ -219,6 +222,10 @@ test('forge-keys: a clean gateway is ok and reports refused calls by inactive ke
 test('forge-keys: spend outside an allowlist, an idle key or an unknown spender warns, naming aliases', () => {
   let r = fk(`KEYS|3\nOUT|ha-ember-2|donkey|2\n${END}`);
   assert.match(r.line, /^CHECK forge-keys warn · 3 active keys, spend outside allowlist: ha-ember-2→donkey ×2, /);
+  r = fk(`KEYS|1\nIDLE|\n${END}`);
+  assert.match(r.line, /^CHECK forge-keys warn · .*unused 30 days \(prune candidates\): \(no alias\)/);
+  r = fk(`KEYS|1\nOUT||ember|1\n${END}`);
+  assert.match(r.line, /^CHECK forge-keys warn · .*spend outside allowlist: \(no alias\)→ember ×1/);
   r = fk(`KEYS|3\nIDLE|mail-sort\nIDLE|star-route\n${END}`);
   assert.match(r.line, /unused 30 days \(prune candidates\): mail-sort star-route/);
   r = fk('KEYS|3\nUNKNOWN|7|3\nREFUSED|0|0\nEND\n');
@@ -338,4 +345,59 @@ test('install: a commit not on origin/master is refused', () => {
   const r = spawnSync('bash', [join(repo.dir, 'scripts', 'checks', 'install.sh'), side], { cwd: repo.dir, env: { PATH: process.env.PATH, HOME: h, CHECK_SYSTEMCTL: '/bin/false' }, encoding: 'utf8' });
   assert.equal(r.status, 3);
   assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false);
+});
+
+test('install: a commit missing one unit publishes nothing', () => {
+  const h = fresh();
+  const files = payload(); delete files['scripts/checks/systemd/teamclaude-check-forge-keys.service'];
+  const r = install(repoAt(files), h);
+  assert.equal(r.status, 4);
+  assert.match(r.stderr, /teamclaude-check-forge-keys\.service missing/);
+  assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false);
+});
+
+test('install: a destination that is not a regular file publishes nothing', () => {
+  const h = fresh();
+  assert.equal(install(repoAt(payload()), h).status, 0);
+  const lib = join(h, '.local/libexec/teamclaude-checks/pool-quota.sh');
+  const before = readFileSync(lib, 'utf8');
+  const unit = join(h, '.config/systemd/user/teamclaude-check-proxy-wrapper.timer');
+  rmSync(unit); mkdirSync(join(unit, 'x'), { recursive: true });
+  const changed = payload(); changed['scripts/checks/pool-quota.sh'] = before + '\n# changed\n';
+  const r = install(repoAt(changed), h);
+  assert.equal(r.status, 5, r.stderr);
+  assert.match(r.stderr, /is not a regular file; nothing installed/);
+  assert.equal(readFileSync(lib, 'utf8'), before);
+});
+
+test('install: a move that fails mid-publish restores every file already moved', () => {
+  const h = fresh();
+  assert.equal(install(repoAt(payload()), h).status, 0);
+  const lib = join(h, '.local/libexec/teamclaude-checks/pool-quota.sh');
+  const unit = join(h, '.config/systemd/user/teamclaude-check-pool-quota.timer');
+  const before = readFileSync(lib, 'utf8'), unitBefore = readFileSync(unit, 'utf8');
+  const changed = payload();
+  changed['scripts/checks/pool-quota.sh'] = before + '\n# changed\n';
+  changed['scripts/checks/systemd/teamclaude-check-pool-quota.timer'] = unitBefore + '\n# changed\n';
+  const fake = join(fresh(), 'systemctl'); writeFileSync(fake, '#!/bin/sh\n'); chmodSync(fake, 0o755);
+  const repo = repoAt(changed);
+  const r = spawnSync('bash', [join(repo.dir, 'scripts', 'checks', 'install.sh'), repo.head], { cwd: repo.dir, env: { PATH: process.env.PATH, HOME: h, CHECK_SYSTEMCTL: fake, CHECK_INSTALL_FAIL_AT: 'teamclaude-check-proxy-wrapper.timer' }, encoding: 'utf8' });
+  assert.equal(r.status, 5, r.stderr);
+  assert.match(r.stderr, /previous install is restored/);
+  assert.equal(readFileSync(lib, 'utf8'), before, 'a moved script was not restored');
+  assert.equal(readFileSync(unit, 'utf8'), unitBefore, 'a moved unit was not restored');
+});
+
+test('install: an unwritable destination publishes nothing', () => {
+  const h = fresh();
+  assert.equal(install(repoAt(payload()), h).status, 0);
+  const lib = join(h, '.local/libexec/teamclaude-checks/pool-quota.sh');
+  const before = readFileSync(lib, 'utf8');
+  chmodSync(join(h, '.config/systemd/user'), 0o555);
+  try {
+    const changed = payload(); changed['scripts/checks/pool-quota.sh'] = before + '\n# changed\n';
+    const r = install(repoAt(changed), h);
+    assert.equal(r.status, 5, r.stderr);
+    assert.equal(readFileSync(lib, 'utf8'), before);
+  } finally { chmodSync(join(h, '.config/systemd/user'), 0o755); }
 });

@@ -5,6 +5,7 @@
 # real session or change state. Instead:
 #   refuses        ~/.cargo/bin/claude is byte-identical to the reviewed wrapper ($1 = its sha256),
 #                  which exits 69 when its proxy is down (tested in the repo, test/claude-wrapper)
+#   wrapper-notexec ~/.cargo/bin/claude exists but is not executable (PATH falls through to claude)
 #   wrapper-<sha8> a different ~/.cargo/bin/claude (e.g. the pre-#66 one that falls back to the own
 #                  login): not run, reported for a look
 #   envsh-pool     no cargo wrapper; the cc switcher's env.sh, sourced in a subshell, leaves
@@ -22,10 +23,14 @@ if [ -e "$w" ]; then
   have=$(sha256sum "$w" 2>/dev/null | cut -d' ' -f1)
   if [ -n "$want" ] && [ "$have" = "$want" ]; then state=refuses; else state="wrapper-${have:0:8}"; fi
   [ -n "$have" ] || state=wrapper-unreadable
+  # bash skips a wrapper it cannot execute and runs the next claude on PATH (the own login)
+  [ -x "$w" ] || state=wrapper-notexec
 elif [ -f "$HOME/.config/claude-code/env.sh" ]; then
   # the effective value after the whole file ran (a later unset or export wins), in a subshell
-  if env -i HOME="$HOME" PATH=/usr/bin:/bin bash -c '. "$HOME/.config/claude-code/env.sh" >/dev/null 2>&1
-       [[ "${HTTPS_PROXY:-}" == "http://127.0.0.1:3456" || "${HTTPS_PROXY:-}" =~ ^https://[^@/[:space:]]+@10\.0\.6\.145:3443/?$ ]]'; then
+  # the verdict is a word the comparison itself prints: an env.sh that exits early prints nothing
+  verdict=$(env -i HOME="$HOME" PATH=/usr/bin:/bin bash -c '. "$HOME/.config/claude-code/env.sh" >/dev/null 2>&1
+       if [[ "${HTTPS_PROXY:-}" == "http://127.0.0.1:3456" || "${HTTPS_PROXY:-}" =~ ^https://[^@/[:space:]]+@10\.0\.6\.145:3443/?$ ]]; then echo POOL; fi' 2>/dev/null)
+  if [ "$verdict" = POOL ]; then
     state=envsh-pool
   else
     state=envsh-off

@@ -62,12 +62,18 @@ envsh_state() { # read env.sh line by line, as the shell would apply it, without
   # domain of it; a leading "." or "*." and a ":port" are dropped; "*" matches everything. The list is
   # split into an array (no word splitting, no filename expansion of a *), entries lowercased.
   local hosts=(api.anthropic.com console.anthropic.com statsig.anthropic.com mcp-proxy.anthropic.com claude.ai) host
-  IFS=, read -r -a list <<<"$np,$npl"
+  # entries are separated by commas, spaces or tabs (as Node splits NO_PROXY), never joined
+  local all="$np,$npl" port
+  all=${all//[ $'\t']/,}
+  IFS=, read -r -a list <<<"$all"
   for e in "${list[@]}"; do
-    e=${e,,}; e=${e//[ $'\t']/}
+    e=${e,,}
+    [ -n "$e" ] || continue
     [ "$e" = '*' ] && { echo envsh-bypass; return; }
     case $e in '*.'*) e=${e:2} ;; .*) e=${e:1} ;; esac   # only an exact *. or . prefix
-    e=${e%%:*}
+    port=
+    if [[ "$e" == *:* ]]; then port=${e##*:}; e=${e%:*}; fi
+    [ -z "$port" ] || [ "$port" = 443 ] || continue        # claude calls these hosts on 443 only
     [ -n "$e" ] || continue
     for host in "${hosts[@]}"; do
       [[ "$host" == "$e" || "$host" == *".$e" ]] && { echo envsh-bypass; return; }

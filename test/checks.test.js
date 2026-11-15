@@ -52,14 +52,37 @@ test('pool-quota: healthy pool is ok, names no seat by email', () => {
   assert.equal(readFileSync(join(r.state, 'pool-quota.line'), 'utf8').trim(), r.line);
 });
 
-test('pool-quota: weekly under 30% warns; 5h under 15% warns; seats ≥90% are named by local part', () => {
-  let r = pq(quota(0.8, 0.29, [seat('claude3@x.org', null, 0.9), seat('b@x.org', 0.95, 0.1), seat('c@x.org', 0.2, 0.89)]));
+test('pool-quota: weekly at or under 15% warns, at or under 5% fails; 5h under 15% warns; seats ≥90% named', () => {
+  let r = pq(quota(0.8, 0.15, [seat('claude3@x.org', null, 0.9), seat('b@x.org', 0.95, 0.1), seat('c@x.org', 0.2, 0.89)]));
   assert.equal(r.status, 0);
-  assert.match(r.line, /^CHECK pool-quota warn · 5h 80% left, week 29% left \(week under 30%\), seats ≥90% used: claude3 b, /);
+  assert.match(r.line, /^CHECK pool-quota warn · 5h 80% left, week 15% left \(week at or under 15%\), seats ≥90% used: claude3 b, /);
+  r = pq(quota(0.8, 0.05, [seat('a@x.org', 0.2, 0.95)]));
+  assert.equal(r.status, 0, 'a check never gates, even on fail');
+  assert.match(r.line, /^CHECK pool-quota fail · 5h 80% left, week 5% left \(week at or under 5%\)/);
   r = pq(quota(0.14, 0.5, [seat('a@x.org', 0.86, 0.5)]));
   assert.match(r.line, /^CHECK pool-quota warn · 5h 14% left, week 50% left \(5h under 15%\)/);
-  r = pq(quota(0.15, 0.30, [seat('a@x.org', 0.85, 0.7)]));
-  assert.match(r.line, /^CHECK pool-quota ok /, 'exactly at the thresholds is not under them');
+  r = pq(quota(0.15, 0.151, [seat('a@x.org', 0.85, 0.7)]));
+  assert.match(r.line, /^CHECK pool-quota ok /, '5h exactly 15% and week just over 15% are ok');
+  r = pq(quota(0.8, 0.29, [seat('a@x.org', 0.2, 0.7)]));
+  assert.match(r.line, /^CHECK pool-quota ok · 5h 80% left, week 29% left, /, 'the old 30% weekly floor no longer warns (7-day cap 100%)');
+});
+
+test('pool-quota: the line names the weekly reset when the proxy reports it, and only a sane one', () => {
+  const at = NOW + 2 * 86_400_000;
+  const want = new Date(at).toLocaleString('en-US', { weekday: 'short', timeZone: 'UTC' });
+  const body = quota(0.8, 0.12, [seat('a@x.org', 0.2, 0.9)]);
+  body.aggregate.weeklyShared.nextResetAt = at;
+  let r = pq(body, { TZ: 'UTC' });
+  const d = new Date(at);
+  const hhmm = `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+  const mmdd = `${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+  assert.ok(r.line.includes(`week 12% left (week at or under 15%), week resets ${want} ${mmdd} ${hhmm}, seats`), r.line);
+  for (const bad of ['soon', -1, 0, 1e20]) {
+    body.aggregate.weeklyShared.nextResetAt = bad;
+    r = pq(body);
+    assert.match(r.line, /^CHECK pool-quota warn · /);
+    assert.doesNotMatch(r.line, /resets/, `nextResetAt ${bad} is not printed`);
+  }
 });
 
 test('pool-quota: a bucket reset more than 15 min ago that still shows usage is stale and warns', () => {

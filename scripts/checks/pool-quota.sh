@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # CHECK pool-quota: the teamclaude pool's 5-hour and weekly headroom, every 15 minutes (docs/CHECKS.md).
-#   warn: five-hour remaining < 0.15, weekly-shared remaining < 0.30, or a seat bucket whose reset
+#   warn: five-hour remaining < 0.15, weekly-shared remaining <= 0.15, or a seat bucket whose reset
 #         time is more than 15 minutes past while it still shows usage (the numbers stopped updating)
-#   fail: the quota endpoint does not answer, or answers without the aggregate numbers
+#   fail: weekly-shared remaining <= 0.05, the quota endpoint does not answer, or it answers without
+#         the aggregate numbers
+# The weekly limits follow the 7-day switch threshold: at 1.0 (JP, 2026-11-15) seats are used to the
+# end of their week, so a weekly pool under 30 % is normal, not a warning. The line names the
+# weekly reset (aggregate.weeklyShared.nextResetAt) whenever the proxy reports it.
 # Seats at or above 90 % used (5-hour or weekly) are named in the line; alone they do not warn.
 # Inputs (tests): CHECK_QUOTA_FILE (read instead of the endpoint), CHECK_QUOTA_URL, CHECK_NOW_MS.
 set -uo pipefail
@@ -32,20 +36,24 @@ r=$(jq -r -s --argjson now "$now_ms" '
               | [.buckets[]? | select(type == "object" and (.resetAt | type) == "number"
                                       and .resetAt < ($now - 900000) and (.utilization // 0) > 0)]
               | select(length > 0) | $s | who] | unique | join(" ")),
-           ([.accounts[]? | select(.disabled != true and .status != "active") | "\(who)=\(.status | tostring | gsub("[^A-Za-z0-9._-]"; "?"))"] | join(" "))
+           ([.accounts[]? | select(.disabled != true and .status != "active") | "\(who)=\(.status | tostring | gsub("[^A-Za-z0-9._-]"; "?"))"] | join(" ")),
+           (if ($a.weeklyShared.nextResetAt | type) == "number" and $a.weeklyShared.nextResetAt > 0
+              then ($a.weeklyShared.nextResetAt / 1000 | floor) else "" end)
          ] | map(tostring) | join("\u001f") end end' <<<"$body" 2>/dev/null) || r=BAD
-# exactly one record of five fields, or nothing here can be trusted
-[ "$(printf '%s' "$r" | grep -c '')" = 1 ] && [ "$(printf '%s' "$r" | tr -cd '\037' | wc -c)" = 4 ] || r=BAD
+# exactly one record of six fields, or nothing here can be trusted
+[ "$(printf '%s' "$r" | grep -c '')" = 1 ] && [ "$(printf '%s' "$r" | tr -cd '\037' | wc -c)" = 5 ] || r=BAD
 [ "$r" = BAD ] || [ -z "$r" ] && check_emit "$NAME" fail "quota endpoint answered without aggregate numbers at $(check_now)" "$NEXT"
 # \x1f, not a tab: read collapses runs of a whitespace IFS, so an empty field would shift the rest
-IFS=$'\x1f' read -r five week hot stale inactive <<<"$r"
+IFS=$'\x1f' read -r five week hot stale inactive reset_s <<<"$r"
 pct() { awk -v x="$1" 'BEGIN { printf "%d%%", x * 100 + 0.5 }'; }
 status=ok; why=()
 awk -v x="$five" 'BEGIN { exit !(x < 0.15) }' && { status=warn; why+=("5h under 15%"); }
-awk -v x="$week" 'BEGIN { exit !(x < 0.30) }' && { status=warn; why+=("week under 30%"); }
-[ -n "$stale" ] && { status=warn; why+=("stale buckets: $stale"); }
+if awk -v x="$week" 'BEGIN { exit !(x <= 0.05) }'; then status=fail; why+=("week at or under 5%")
+elif awk -v x="$week" 'BEGIN { exit !(x <= 0.15) }'; then status=warn; why+=("week at or under 15%"); fi
+[ -n "$stale" ] && { [ "$status" = fail ] || status=warn; why+=("stale buckets: $stale"); }
 fact="5h $(pct "$five") left, week $(pct "$week") left"
 [ ${#why[@]} -gt 0 ] && fact+=" ($(IFS=';'; echo "${why[*]}" | sed 's/;/; /g'))"
+[[ $reset_s =~ ^[0-9]{9,11}$ ]] && fact+=", week resets $(date -d "@$reset_s" '+%a %m-%d %H:%M')"
 fact+=", seats ≥90% used: ${hot:-none}"
 [ -n "$inactive" ] && fact+=", not active: $inactive"
 fact+=", at $(check_now)"

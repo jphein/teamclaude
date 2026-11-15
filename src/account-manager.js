@@ -180,6 +180,13 @@ const FAMILY_WEEKLY_BUCKETS = [
 const CAPPED_FAMILY_HOLD_MS = 7 * 24 * 3600_000;
 
 /**
+ * Whether a utilization reading proves headroom: known and under 1.0. Null is
+ * unknown, never zero (see gatingUtilization), so it fails.
+ * @param {number|null|undefined} v
+ */
+const underOne = v => v != null && v < 1;
+
+/**
  * The quota fields a Codex account only ever LEARNS — from a `/wham/usage`
  * payload, or for `resetCredits` from the state restored off disk — so
  * `emptyQuota` below does not seed them. Absent is meaningful for each: it says
@@ -833,14 +840,15 @@ export class AccountManager {
    * @param {string|null} [model]
    */
   capExceeded(account, model = null) {
-    // The money cap first: it is the budget the usage caps exist to protect, and
-    // it is account-wide — no model is exempt from costing money. `spend` is the
-    // upstream month-to-date record, refreshed only by the quota probe
+    // The money cap first: it is the budget the usage caps exist to protect.
+    // Past it the account is held to its included quota, as if every bucket
+    // this request meters had a hard cap of 1.0 — see _spendCapBinds. `spend`
+    // is the upstream month-to-date record, refreshed only by the quota probe
     // (prober.js, on its interval) and the TUI's `p` refresh — a response
     // carries no spend figure — so the cap binds within one probe interval of
     // the figure being reached, and a new month lifts it on the next reading
     // by itself.
-    if (account?.maxSpend != null && spendCapReached(account.maxSpend, account.quota?.spend)) return 'spend';
+    if (this._spendCapBinds(account, model)) return 'spend';
     if (!account?.maxUsage) return null;
     const q = account.quota;
     // Same reason _isNearQuota does this first: a window that has already reset
@@ -879,10 +887,95 @@ export class AccountManager {
     return null;
   }
 
-  /** The family weekly bucket that has reached its cap for `model`, or null.
-   * The advisor check needs this narrower form: the shared buckets were already
-   * decided for the executor model, and only the advisor's own family is new. */
+  /**
+   * Whether this account has spent its money cap (accounts[].maxSpend) this
+   * month. Says nothing about a request: see _spendCapBinds for that.
+   * @param {Record<string, any>} account
+   */
+  _spendCapReached(account) {
+    return account?.maxSpend != null && spendCapReached(account.maxSpend, account.quota?.spend);
+  }
+
+  /**
+   * Whether the money cap bars a request for `model` on `account`.
+   *
+   * The cap is on what the account BILLS, and a request served from included
+   * subscription quota bills nothing. So past the cap the account is held to
+   * that quota for the rest of the month — as if it had a hard `maxUsage` of
+   * 1.0 on every bucket the request meters — and serves only a request that is
+   * provably free: the shared 5-hour and shared weekly readings both known and
+   * under 1.0, plus, for a model with its own family bucket (Fable, Sonnet, or
+   * a route's `bucket`), that bucket under 1.0 too, since family spend meters
+   * into both (#175) — a family bucket the plan does not report leaves the
+   * shared ones to govern (see _familySpendCapBinds). With no model (a status read) only the
+   * shared buckets are judged, as the maxUsage path does.
+   *
+   * Unknown is never proof a request is free, so a missing reading binds:
+   * expired windows are cleared first, so a reading past its reset is unknown
+   * rather than an old number, and a fresh upstream `rejected` binds too. The
+   * one absence that does not bind is a stated one: a plan that meters no
+   * weekly window (`weeklyWindowStated === false`, a Team seat) has no weekly
+   * quota to run past, and one that meters no session window
+   * (`sessionWindowStated === false`) has no 5-hour quota to run past. The usage probe's spend record carries no "billing
+   * right now" flag — the overage-status headers are not kept (see server.js)
+   * — so the buckets are the only evidence, and utilization reaching 1.0 is
+   * what overage looks like in them.
+   *
+   * The margin is 1.0, not the switch threshold: under the threshold is a
+   * rotation preference, under 1.0 is free. The slack is no wider than the
+   * dollar figure's: readings come from responses and the probe, so what can
+   * still bill is a request in flight when a bucket fills, or a reading that
+   * drifted since the last one.
+   *
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
+   */
+  _spendCapBinds(account, model = null) {
+    if (!this._spendCapReached(account)) return false;
+    this._clearExpiredQuotas(account);
+    const q = account.quota;
+    if (q.unifiedStatus === 'rejected') return true;
+    if (q.unified5h != null ? !underOne(q.unified5h) : q.sessionWindowStated !== false) return true;
+    if (q.unified7d != null ? !underOne(q.unified7d) : q.weeklyWindowStated !== false) return true;
+    return this._familySpendCapBinds(account, model);
+  }
+
+  /** The family half of _spendCapBinds: whether `model`'s own weekly bucket, if
+   * it has one, is spent on an account past its money cap. Callers have already
+   * established the cap is reached and cleared expired windows.
+   *
+   * A null family reading does not bind, unlike a null shared one: most plans
+   * meter no Sonnet (or Fable) bucket at all, and an expired one has reset, so
+   * either way the shared buckets — already required known and under 1.0 —
+   * govern the request, as they do in _isNearQuota. Treating null as spent
+   * would bar a whole family on every plan without its bucket for the month.
+   * The probe that maxSpend requires reads every family bucket the plan has.
+   * A learned scoped weekly bucket for the family counts too, as it does in
+   * _governingWeekly: spent, it is overage like any other.
+   * @param {Record<string, any>} account
+   * @param {string|null} model
+   */
+  _familySpendCapBinds(account, model) {
+    const key = this._weeklyBucketFor(model);
+    const v = account.quota[key];
+    if (key !== 'unified7d' && v != null && v >= 1) return true;
+    const scoped = this._scopedWeekly(account, model)?.utilization;
+    return scoped != null && scoped >= 1;
+  }
+
+  /** The family weekly bucket that has reached its cap for `model`, or null —
+   * or 'spend' when the account is past its money cap and that bucket is not
+   * provably free (see _spendCapBinds). The advisor check needs this narrower
+   * form: the shared buckets were already decided for the executor model, and
+   * only the advisor's own family is new.
+   * @param {Record<string, any>} account
+   * @param {string|null} model
+   */
   _familyCapExceeded(account, model) {
+    if (this._spendCapReached(account)) {
+      this._clearExpiredQuotas(account);
+      if (this._familySpendCapBinds(account, model)) return 'spend';
+    }
     if (!account?.maxUsage) return null;
     const key = this._weeklyBucketFor(model);
     if (key === 'unified7d') return null;
@@ -897,8 +990,10 @@ export class AccountManager {
    * cap. For the paths that pick an account without unavailableReason — the
    * exhausted-fleet probe, the paid fallback, the all-unavailable revival, a
    * pin, the re-check after admission — so a cap binds on every path a request
-   * can take. Under `advisorEligibility: "prefer"` the advisor is a preference
-   * rather than a requirement, so only the executor's caps apply.
+   * can take. Returns 'spend' when the money cap binds on the executor's
+   * buckets or the advisor's family. Under `advisorEligibility: "prefer"` the
+   * advisor is a preference rather than a requirement, so only the executor's
+   * caps apply.
    *
    * @param {Record<string, any>} account
    * @param {string|null} [model]
@@ -1215,10 +1310,14 @@ export class AccountManager {
     // one provider that is a single slot for several fleets, so a request whose
     // provider does not own it borrows the slot for the walk and hands it back.
     //
-    // With one provider `borrowed` is always false, so the `providerCursors`
-    // entry this method writes has no reader at all. Its one reader is the
-    // `providerCursors.get(provider)` inside `if (borrowed)`, which only a
-    // borrowed walk reaches.
+    // When every request's provider owns the slot, `borrowed` is always false,
+    // the re-seed below never runs, and nothing reads the `providerCursors`
+    // entry this method writes. For a provider that does not own the slot the
+    // entry is read twice over: by the re-seed, and by
+    // `_currentIndexForProvider`, which status's `currentAccounts`,
+    // `currentIndexes` and route targets, the TUI's ► in a mixed fleet,
+    // `releasePins` and `_unstrandCursor` go by. It names an account by
+    // position, so removeAccount renumbers it.
     const owner = providerOf(this.accounts[this.currentIndex]);
     const borrowed = !!this.accounts.length && owner !== provider;
     const saved = this.currentIndex;
@@ -1671,15 +1770,19 @@ export class AccountManager {
     if (advisorModel) {
       const account = this._select(exclude, model, advisorModel, false);
       if (account) return account;
-      // Throttled so a busy advisor session doesn't flood the activity log.
-      if (Date.now() >= (this._advisorDegradeLogAt || 0)) {
-        this._advisorDegradeLogAt = Date.now() + 60_000;
-        // The model names come out of the client's request body, so they are
-        // stripped before reaching the log (see safe-text.js).
-        console.log(`[TeamClaude] No account eligible for advisor model "${safeLine(advisorModel, 64)}" — routing by request model only`);
-      }
     }
-    return this._select(exclude, model, null, true);
+    const degraded = this._select(exclude, model, null, true);
+    // Said after the walk, so the line can say how it ended: "routing by request
+    // model only" ahead of a walk that finds nobody sends the operator after the
+    // wrong cause of the 429 that follows (#628).
+    // Throttled so a busy advisor session doesn't flood the activity log.
+    if (advisorModel && Date.now() >= (this._advisorDegradeLogAt || 0)) {
+      this._advisorDegradeLogAt = Date.now() + 60_000;
+      // The model names come out of the client's request body, so they are
+      // stripped before reaching the log (see safe-text.js).
+      console.log(`[TeamClaude] No account eligible for advisor model "${safeLine(advisorModel, 64)}" — ${degraded ? 'routing by request model only' : 'and no account is available for the request model either, so no account was selected'}`);
+    }
+    return degraded;
   }
 
   /** The selection walk getActiveAccount runs: manual pin → current account →
@@ -2365,11 +2468,18 @@ export class AccountManager {
       return {
         index: a.index,
         name: a.name,
+        // The account's own provider, which decides how its row is labelled:
+        // `bucket` below is a Claude family name, and means nothing for a Codex
+        // account, whose score comes from its own quota windows.
+        provider: providerOf(a),
         // Requested family and the actual quota window supplying the adaptive
         // score. They differ when a family request is constrained by shared
         // weekly quota.
         bucket,
         window: window.bucket,
+        // The ChatGPT plan name a Codex account reported (display only; the
+        // weight above comes from quotaTier, which knows only Claude tiers).
+        planType: a.quota?.planType ?? null,
         competing: inTier.has(a.index),
         sessions: this.sessionTracker.activeCountFor(a.index, now),
         inFlight: a.inFlight || 0,
@@ -2482,11 +2592,21 @@ export class AccountManager {
     return this._currentIndexForProvider(provider);
   }
 
-  /** The cursor owned by one provider, falling back to the account that its
-   * next request would start from before that provider has seen traffic. */
+  /** The shared slot for the provider that owns it, else the cursor owned by
+   * one provider, falling back to the account that its next request would
+   * start from before that provider has seen traffic. */
   _currentIndexForProvider(provider) {
     const excluded = this._excludeOtherProviders(null, provider);
     const allowed = index => index != null && this.accounts[index] && !excluded?.has(index);
+    // The provider that owns the shared slot walks from the slot, not from its
+    // cursor: getActiveAccount borrows the slot only for the others. So the
+    // slot is its answer, as it is currentAccount's; where preemption then
+    // lands that walk is defaultTargets' to say. Asked of the cursor first,
+    // status named an account the provider's walk no longer starts from: one it
+    // had rested on before a removal handed it the slot, or before another
+    // provider's walk parked the slot on a shared API key, which reads as this
+    // provider's.
+    if (allowed(this.currentIndex) && providerOf(this.accounts[this.currentIndex]) === provider) return this.currentIndex;
     const own = this.providerCursors.get(provider);
     if (allowed(own)) return own;
     if (allowed(this.currentIndex)) return this.currentIndex;
@@ -2747,8 +2867,11 @@ export class AccountManager {
    * (a remembered verdict) — because those are exactly what free headroom or
    * overage lets an account serve past. Every hard gate still binds, and
    * unavailableReason reports those first: disabled, the operator's `maxUsage`
-   * cap, an entitlement cooldown, a live 429 hold (upstream actually refusing,
-   * overage or not), error. Such an account is neither used nor waited for: it
+   * cap, the `maxSpend` cap (past it an account may still be the FREE pick,
+   * while every bucket it meters is known and under 1.0, but never the paid
+   * one: a paid pick is at 1.0 or `rejected`, which is exactly what binds the
+   * cap — see _spendCapBinds), an entitlement cooldown, a live 429 hold
+   * (upstream actually refusing, overage or not), error. Such an account is neither used nor waited for: it
    * counts as unable to serve, so the tiers are chosen among the rest. Route
    * ownership is checked separately because unavailableReason reaches it only
    * after `quota`. A paid candidate whose usage probe has positively said
@@ -2822,8 +2945,11 @@ export class AccountManager {
 
     // An operator budget cap. Checked here, above every transient state, because
     // it is a decision rather than an estimate — and unlike the switch threshold
-    // nothing overrides it: _selectProbe skips a capped account too, so an
-    // account at its cap receives no requests at all.
+    // nothing overrides it: _selectProbe and the fallback skip a capped account
+    // too. A usage cap bars every request it covers; the money cap bars only a
+    // request that is not provably on included quota (see _spendCapBinds), so a
+    // spend-capped account still serves while its buckets are under 1.0, and
+    // reads `spend-capped` once they are not or are unknown.
     const cap = this.capExceeded(account, model);
     if (cap === 'spend') return 'spend-capped';
     if (cap) return 'capped';
@@ -2880,8 +3006,13 @@ export class AccountManager {
     // model: its family bucket must have headroom (the shared buckets were
     // already checked above for the executor) and any route/ownership rule for
     // it must allow this account.
+    // The money cap on the advisor's family reads as `spend-capped`, not
+    // `advisor-capped`: the reason is the account's bill, whichever model's
+    // bucket showed it, and `advisor-capped` names a maxUsage cap.
     if (advisorModel) {
-      if (this._familyCapExceeded(account, advisorModel)) return 'advisor-capped';
+      const advisorCap = this._familyCapExceeded(account, advisorModel);
+      if (advisorCap === 'spend') return 'spend-capped';
+      if (advisorCap) return 'advisor-capped';
       if (this._modelWeeklyExhausted(account, advisorModel)) return 'advisor-quota';
       if (!this._routeAllows(account, advisorModel)) return 'advisor-route';
     }
@@ -5425,6 +5556,16 @@ export class AccountManager {
         };
         const newTokens = await this._refreshCoordinator(account, refresh, { force });
         if (newTokens == null) return;
+        // A removal (the TUI, remove_account, a reload, a tombstone) can land while
+        // the grant is in flight and renumber the fleet, so `accountIndex` may now
+        // name a different account: persisting against it would write these
+        // tokens into that account's config row. Everything below goes by the
+        // refreshed account's CURRENT index; one no longer in the fleet has no
+        // row to persist to (removeAccount leaves it at index -1).
+        if (this.accounts[account.index] !== account) {
+          console.log(`[TeamClaude] Discarding refresh result for account "${safeLine(account.name, 64)}" — it was removed while the refresh was in flight`);
+          return;
+        }
         if (account.refreshToken !== sent) {
           console.log(`[TeamClaude] Discarding refresh result for account "${safeLine(account.name, 64)}" — its tokens were replaced while the refresh was in flight`);
           return;
@@ -5439,7 +5580,7 @@ export class AccountManager {
         // Set before the listener runs: it is what lets the sync store them.
         account._minted = minted;
         console.log(`[TeamClaude] Token refreshed for account "${safeLine(account.name, 64)}"`);
-        this._onTokenRefresh?.(accountIndex, newTokens);
+        this._onTokenRefresh?.(account.index, newTokens);
       } catch (/** @type {any} */ err) {
         console.error(`[TeamClaude] Token refresh failed for "${safeLine(account.name, 64)}": ${err.message}`);
         // Why, until a refresh succeeds: what the client is told when this
@@ -5448,7 +5589,7 @@ export class AccountManager {
         // The refresh never reached the token endpoint: the account's own
         // routing proxy is down. The forward that follows would fail the same
         // way, so hold the account out of rotation now rather than after it.
-        if (isRoutingFailure(err)) this.markRoutingFailed(accountIndex);
+        if (isRoutingFailure(err)) this.markRoutingFailed(account.index);
         // Reserve 'error' (which drops the account from rotation until re-login)
         // for a GENUINE auth rejection: the refresh token itself is no longer
         // valid — revoked, or invalidated by an account/plan migration. A
@@ -5616,6 +5757,13 @@ export class AccountManager {
     const [removed] = this.accounts.splice(index, 1);
     this._onAccountRemoved?.(removed);
     this.accounts.forEach((a, i) => a.index = i);
+    // Work still holding the removed account (a request awaiting upstream, a
+    // token refresh, a sync pass) reaches the manager by `account.index`. Left
+    // at its old value, that index now names whichever account slid into the
+    // slot, and a 401, a quota reading or new tokens would land on it. At -1 it
+    // names no account, and every index-taking method already ignores one it
+    // cannot find.
+    removed.index = -1;
     if (this.currentIndex >= this.accounts.length) {
       this.currentIndex = Math.max(0, this.accounts.length - 1);
     } else if (this.currentIndex > index) {
@@ -5632,6 +5780,19 @@ export class AccountManager {
     for (const [name, idx] of [...this.routeCursors.entries()]) {
       if (idx === index) this.routeCursors.delete(name);
       else if (idx > index) this.routeCursors.set(name, idx - 1);
+    }
+    // And each provider's cursor. Left at its old number, one above the removed
+    // account names the account above it: the next walk of a provider that does
+    // not hold currentIndex re-seeds from there (see getActiveAccount), so its
+    // traffic moved accounts on a removal that had nothing to do with it, and
+    // status and the TUI named that account as its current one meanwhile. One on
+    // the removed account is dropped, as a route's is, rather than handed to
+    // whichever account slid into its slot: a provider without the shared slot
+    // then re-picks on merit, and one that holds it goes by currentIndex, which
+    // the neighbor rule above has placed.
+    for (const [provider, idx] of [...this.providerCursors.entries()]) {
+      if (idx === index) this.providerCursors.delete(provider);
+      else if (idx > index) this.providerCursors.set(provider, idx - 1);
     }
     // Session pins are positions in the same list and shift the same way, and so
     // are the rollover observations hanging off them and off the current account.

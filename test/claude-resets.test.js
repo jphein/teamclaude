@@ -484,3 +484,57 @@ test('POST /teamclaude/resets/redeem passes fiveHour through and refuses a non-b
     assert.deepEqual(seen, [{ seat: 'claude', fiveHour: true }]);
   } finally { proxy.close(); }
 });
+
+// ---------- scoped keys (the plan's Seats tile Reset button, Sen 2026-11-16)
+test('a scoped key opens only the routes it lists (from the fixed set), never settings, the model API or other routes', async () => {
+  const PLAN = 'p'.repeat(32);
+  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 'token' }], 0.98);
+  const seen = [];
+  const logs = [];
+  const orig = console.log; console.log = (...a) => { logs.push(a.join(' ')); };
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test', trustLoopback: false,
+    scopedKeys: [{ name: 'plan', key: PLAN, allow: ['GET /teamclaude/quota', 'GET /teamclaude/resets', 'POST /teamclaude/resets/redeem', 'POST /teamclaude/threshold'] }] }, upstream: 'http://127.0.0.1:9' }, {
+    getQuotaExtra: () => ({}),
+    getSeatResets: async () => ({ armed: false, probedAt: null, seats: [] }),
+    redeemSeatReset: async (o) => { seen.push({ seat: o.seat, dryRun: o.dryRun, via: o.via }); return { redeemed: !o.dryRun, account: o.seat, reason: 'x' }; },
+  });
+  await new Promise(resolve => proxy.listen(0, '127.0.0.1', resolve));
+  const port = proxy.address().port;
+  const call = (method, path, body, extra = {}) => fetch(`http://127.0.0.1:${port}${path}`, { method, headers: { 'x-api-key': PLAN, 'content-type': 'application/json', ...extra }, body: body == null ? undefined : JSON.stringify(body) });
+  try {
+    assert.equal((await call('GET', '/teamclaude/quota')).status, 200);
+    assert.equal((await call('GET', '/teamclaude/resets?probe=1')).status, 200, 'a query string does not change the route');
+    assert.equal((await call('POST', '/teamclaude/resets/redeem', { seat: 'claude2', dryRun: true })).status, 200, 'a dry run needs no confirm');
+    assert.equal((await call('POST', '/teamclaude/resets/redeem', { seat: 'claude2' })).status, 400, 'a spend must repeat the seat');
+    assert.equal((await call('POST', '/teamclaude/resets/redeem', { seat: 'claude2', confirm: 'claude3' })).status, 400);
+    const ok = await call('POST', '/teamclaude/resets/redeem', { seat: 'claude2', confirm: 'claude2' }, { 'x-teamclaude-device': 'jp-phone' });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(seen.map(s => [s.seat, s.dryRun]), [['claude2', true], ['claude2', false]]);
+    assert.equal(seen[1].via, 'via key "plan" (device "jp-phone")');
+    for (const [m, p] of [['POST', '/teamclaude/threshold'], ['GET', '/teamclaude/settings'], ['POST', '/teamclaude/settings'], ['POST', '/v1/messages'], ['GET', '/teamclaude/status'], ['POST', '/teamclaude/reload'], ['POST', '/teamclaude/account'], ['GET', '/teamclaude/quota/'], ['GET', '//teamclaude/quota'], ['HEAD', '/teamclaude/quota'], ['GET', '/teamclaude/%71uota']]) {
+      assert.equal((await call(m, p, m === 'POST' ? {} : null)).status, 403, `${m} ${p}`);
+    }
+    // the same value configured as a client key too is still only a scoped key, everywhere
+    const { resolveClientAuth } = await import('../src/server.js');
+    assert.equal(resolveClientAuth({ apiKey: 'tc-test', scopedKeys: [{ name: 'plan', key: PLAN, allow: [] }], clientKeys: [{ name: 'lane', key: PLAN }] }, PLAN).ok, false);
+    assert.equal(resolveClientAuth({ apiKey: PLAN, scopedKeys: [{ name: 'plan', key: PLAN, allow: [] }] }, PLAN).ok, false, 'nor as the shared key');
+    assert.equal(resolveClientAuth({ apiKey: 'tc-test', scopedKeys: [{ name: 'plan', key: PLAN, allow: [] }] }, 'tc-test').ok, true, 'the shared key still works');
+    const short = createProxyServer(am, { proxy: { apiKey: 'tc-test', trustLoopback: false, scopedKeys: [{ name: 'weak', key: 'short', allow: ['GET /teamclaude/quota'] }] }, upstream: 'http://127.0.0.1:9' }, {});
+    await new Promise(resolve => short.listen(0, '127.0.0.1', resolve));
+    const r = await fetch(`http://127.0.0.1:${short.address().port}/teamclaude/quota`, { headers: { 'x-api-key': 'short' } });
+    assert.equal(r.status, 401, 'a key under 24 characters is never a scoped key');
+    short.close();
+  } finally { console.log = orig; proxy.close(); }
+});
+
+test('Settings keep a scoped key write-only, carry its allow list, and validate it', async () => {
+  const { publicSettings, applySettingsChanges, MASK } = await import('../src/settings.js');
+  const cfg = { proxy: { apiKey: 'shared-key', scopedKeys: [{ name: 'plan', key: 'p'.repeat(32), allow: ['GET /teamclaude/quota'] }] } };
+  const shown = publicSettings(cfg).fields.find((f) => f.key === 'proxy.scopedKeys').value;
+  assert.deepEqual(shown, [{ name: 'plan', key: MASK, allow: ['GET /teamclaude/quota'] }]);
+  assert.doesNotMatch(JSON.stringify(publicSettings(cfg)), /pppppppp/);
+  const bad = (() => { try { applySettingsChanges(JSON.parse(JSON.stringify(cfg)), { set: { 'proxy.scopedKeys': [{ name: 'plan', key: 'x'.repeat(30), allow: 'GET /' }] } }); return null; } catch (e) { return e; } })();
+  assert.ok(bad?.problems?.some((p) => /allow must be a list/.test(p)));
+  const clash = (() => { try { applySettingsChanges(JSON.parse(JSON.stringify({ proxy: { apiKey: 'shared-key', clientKeys: [{ name: 'lane', key: 'q'.repeat(30) }] } })), { set: { 'proxy.scopedKeys': [{ name: 'plan', key: 'q'.repeat(30), allow: [] }] } }); return null; } catch (e) { return e; } })();
+  assert.ok(clash?.problems?.some((p) => /scoped key and a client key cannot be the same/.test(p)));
+});

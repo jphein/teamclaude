@@ -591,6 +591,8 @@ async function serverCommand() {
     // key add/rotate/revoke needs — no restart).
     if (config.proxy && diskConfig.proxy) {
       config.proxy.clientKeys = diskConfig.proxy.clientKeys;
+      // Scoped keys (the plan's Reset button key) are read per request the same way.
+      config.proxy.scopedKeys = diskConfig.proxy.scopedKeys;
       // Dimensions are resolved per request from this same object, so a
       // reload adds or drops one without a restart.
       config.proxy.usageDimensions = diskConfig.proxy.usageDimensions;

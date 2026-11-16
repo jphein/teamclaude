@@ -996,6 +996,17 @@ async function serverCommand() {
     if (dryRun) for (const r of seats) console.log(`[TeamClaude] Resets dry run: "${r.name}" would ${r.redeem?.would ? '' : 'NOT '}redeem: ${r.redeem?.reason}`);
     return { armed: config.autoRedeemResets === true, probedAt: resetsProbe.lastProbeAt ? new Date(resetsProbe.lastProbeAt).toISOString() : null, seats };
   };
+  // The operator's single-seat spend (POST /teamclaude/resets/redeem, `teamclaude resets redeem <seat>`).
+  // One line in the journal per call, with the weekly use before and after; a real spend refreshes the
+  // seat rows so /teamclaude/quota stops showing the spent reset.
+  /** @type {any} */ (hooks).redeemSeatReset = async (/** @type {{ seat: string, dryRun?: boolean, via?: string }} */ { seat, dryRun = false, via = '' }) => {
+    const r = await claudeRedeemer.redeemNamed(seat, { dryRun });
+    const pct = (/** @type {number|null|undefined} */ v) => (v == null ? '?' : `${Math.round(v * 100)}%`);
+    const verdict = r.redeemed ? `REDEEMED (${r.result}, ${r.resetsLeft ?? '?'} left, cleared ${(r.cleared || []).join(', ') || '?'})` : r.maybeSpent ? 'NO VERDICT (may be spent)' : r.wouldRedeem ? 'would redeem' : 'not redeemed';
+    console.log(`[TeamClaude] Seat reset ${dryRun ? 'dry run' : 'redeem'} ${via} for "${safeLine(r.account || seat, 64)}": ${verdict} — ${r.reason}; weekly ${pct(r.weeklyBefore)} → ${pct(r.weeklyAfter)}`);
+    if (r.redeemed) await resetsProbe.probe({ force: true }).catch((/** @type {any} */ e) => console.error(`[TeamClaude] Seat resets probe failed: ${e?.message || e}`));
+    return r;
+  };
 
   // Web-dashboard control hooks — consumed by the /teamclaude/* endpoints in
   // server.js. They work with or without the TUI, so the browser dashboard can
@@ -1942,6 +1953,7 @@ async function statusCommand() {
 // redeem rule's verdict per seat; --json prints the raw shape (documented in the lexicon entry).
 async function resetsCommand() {
   const config = await loadOrCreateConfig();
+  if (args[1] === 'redeem') { await resetsRedeemCommand(config); return; }
   const qs = [args.includes('--probe') && 'probe=1', args.includes('--dry-run') && 'dryRun=1'].filter(Boolean).join('&');
   const url = `http://localhost:${config.proxy.port}/teamclaude/resets${qs ? `?${qs}` : ''}`;
   /** @type {any} */
@@ -1965,6 +1977,47 @@ async function resetsCommand() {
     lines.push(`  ${String(r.name).split('@')[0].padEnd(9)} resets: ${resets} · ${win} · ${now}${r.redeem ? ` · dry run: ${r.redeem.would ? 'WOULD redeem' : 'no'} (${r.redeem.reason})` : ''}`);
   }
   await writeStdout(`${lines.join('\n')}\n`);
+}
+
+// `teamclaude resets redeem <seat> [--dry-run | --yes] [--json]`: spend ONE banked reset on ONE named
+// seat. Irreversible, so a spend needs --yes; --dry-run runs every check and stops before the claim.
+/** @param {any} config */
+async function resetsRedeemCommand(config) {
+  const seat = args[2];
+  const dryRun = args.includes('--dry-run');
+  if (!seat || seat.startsWith('-')) {
+    console.error('Usage: teamclaude resets redeem <seat> [--dry-run | --yes] [--json]');
+    process.exit(22);
+  }
+  if (!dryRun && !args.includes('--yes')) {
+    console.error(`This spends one banked reset on "${seat}" and cannot be undone. Check first with --dry-run; spend with --yes.`);
+    process.exit(22);
+  }
+  /** @type {any} */
+  let data;
+  try {
+    const res = await fetch(`http://localhost:${config.proxy.port}/teamclaude/resets/redeem`, {
+      method: 'POST',
+      headers: { 'x-api-key': config.proxy.apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ seat, dryRun }),
+      signal: AbortSignal.timeout(90_000),
+    });
+    data = await res.json();
+    if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+  } catch (/** @type {any} */ err) {
+    console.error(`Cannot reach the proxy at localhost:${config.proxy.port}: ${err?.message || err}. If a spend was sent, it may still have gone through: read \`teamclaude resets --probe\` before trying again.`);
+    process.exit(1);
+  }
+  if (args.includes('--json')) { await writeStdout(`${JSON.stringify(data, null, 2)}\n`); }
+  else {
+    const pct = (/** @type {number|null|undefined} */ v) => (v == null ? '?' : `${Math.round(v * 100)}%`);
+    const head = data.redeemed ? `REDEEMED on ${data.account}: ${data.result}, ${data.resetsLeft ?? '?'} left, cleared ${(data.cleared || []).join(', ') || '?'}`
+      : data.maybeSpent ? `UNKNOWN on ${data.account}: the reset MAY have been spent. Read \`teamclaude resets --probe\` before trying again (the fleet holds off 30 min)`
+      : data.wouldRedeem ? `Dry run on ${data.account}: WOULD redeem (nothing spent)` : `Not redeemed${data.account ? ` on ${data.account}` : ''} (nothing spent)`;
+    await writeStdout(`${head}\n  ${data.reason}\n  weekly use ${pct(data.weeklyBefore)} → ${pct(data.weeklyAfter)}\n`);
+  }
+  if (data.maybeSpent) process.exit(5);
+  if (!data.redeemed && !data.wouldRedeem) process.exit(3);
 }
 
 // ── attach ──────────────────────────────────────────────────
@@ -3152,9 +3205,12 @@ Commands:
                       (LaunchAgent on macOS, systemd --user unit on Linux;
                       'print' writes the unit to stdout without touching anything)
   status [--json]     Show rich proxy/account/probe status (live)
+                      Use --color=always|never to control ANSI colors
   resets [--probe] [--dry-run] [--json]
                       Banked resets and windows left per seat (read-only)
-                      Use --color=always|never to control ANSI colors
+  resets redeem <seat> --dry-run|--yes
+                      Spend ONE banked reset on ONE named seat (irreversible;
+                      --dry-run checks only, --yes spends)
   attach              Open the live dashboard against a running server; s
                       switches account, R reloads config, q leaves it running
   dashboard           Open the web dashboard of a running server in the browser

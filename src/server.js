@@ -474,6 +474,8 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   // anything.
   ['/teamclaude/account', 'a client key cannot change accounts'],
   ['/teamclaude/restart', 'a client key cannot restart the service'],
+  // Spends a banked reset: irreversible, and the operator's call alone.
+  ['/teamclaude/resets/redeem', 'a client key cannot spend a banked reset'],
   // Add account (review, 2026-10-25): unlike Reauth there is no identity to
   // check a new seat against, so a tenant could add a Claude account it controls
   // and have other tenants' prompts routed through it. The code and cancel
@@ -497,6 +499,7 @@ const SSO_REFUSED_PATHS = new Map([
   ['/teamclaude/add-account/code', 'adding an account needs the proxy key (use the desktop launcher)'],
   ['/teamclaude/add-account/cancel', 'adding an account needs the proxy key (use the desktop launcher)'],
   ['/teamclaude/ui-ticket', 'a dashboard ticket carries a key; an SSO sign-in has none'],
+  ['/teamclaude/resets/redeem', 'spending a banked reset needs the proxy key, not the SSO sign-in'],
 ]);
 
 /** Who a reauth session belongs to: a client key by name, else the operator (shared key, loopback, SSO). @param {any} req */
@@ -927,6 +930,34 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         } catch (/** @type {any} */ err) {
           console.error('[TeamClaude] Seat resets failed:', err?.message || err);
           json(res, 500, { error: 'seat resets failed; see the proxy log' });
+        }
+        return;
+      }
+
+      // Spend ONE banked reset on ONE named seat (src/claude-resets.js redeemNamed): the operator's
+      // `teamclaude resets redeem <seat>`. Irreversible, so admin only, as for saving settings: the
+      // shared proxy key, or a key-less same-origin caller on this host. Client keys and SSO are refused
+      // above, before the body is read. Body: {"seat": "<name>", "dryRun": true|false}; a dry run reads
+      // the seat's status and stops before the claim.
+      if (req.method === 'POST' && req.url === '/teamclaude/resets/redeem') {
+        const h = /** @type {any} */ (hooks);
+        if (!h.redeemSeatReset) { json(res, 501, { ok: false, error: 'redeem not supported' }); return; }
+        const keysConfigured = !resolveClientAuth(config.proxy, undefined).ok;
+        const admin = !sso && (keysConfigured && auth.ok
+          ? auth.client == null
+          : isLocal && isSameOriginControlRequest(req) && isLocalHostHeader(req.headers.host ?? req.headers[':authority'], config.proxy?.host));
+        if (!admin) { json(res, 403, { ok: false, error: 'spending a banked reset needs the shared proxy key' }); return; }
+        /** @type {any} */
+        let body;
+        try { body = JSON.parse((await readControlBody(req, 4096)) || '{}'); } catch { json(res, 400, { ok: false, error: 'body must be JSON' }); return; }
+        if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.seat !== 'string' || !body.seat || body.seat.length > 128) { json(res, 400, { ok: false, error: 'name one seat: {"seat": "<name>"}' }); return; }
+        if (Object.hasOwn(body, 'dryRun') && typeof body.dryRun !== 'boolean') { json(res, 400, { ok: false, error: 'dryRun must be true or false' }); return; }
+        try {
+          const r = await h.redeemSeatReset({ seat: body.seat, dryRun: body.dryRun === true, via: viaWhom(req) });
+          json(res, 200, { ok: true, ...r });
+        } catch (/** @type {any} */ err) {
+          console.error('[TeamClaude] Seat reset redeem failed:', err?.message || err);
+          json(res, 500, { ok: false, error: 'redeem failed; see the proxy log' });
         }
         return;
       }

@@ -125,6 +125,8 @@ test('over plain HTTP with requireTls off: SSO is the operator on the dashboard 
     // nor does a stale key that rode along with it.
     assert.equal((await call('/teamclaude/ui-ticket', { method: 'POST', headers: HOP })).status, 403);
     assert.equal((await call('/teamclaude/ui-ticket', { method: 'POST', headers: { ...HOP, 'x-api-key': 'stale' } })).status, 403);
+    // Spending a banked reset is irreversible: the proxy key's call alone, never an SSO sign-in.
+    assert.equal((await call('/teamclaude/resets/redeem', { method: 'POST', headers: { ...HOP, 'content-type': 'application/json' }, body: JSON.stringify({ seat: 'a' }) })).status, 403);
     // A page on a sibling site rides the parent-domain cookie: not signed in, reads included.
     assert.equal((await call('/teamclaude/status', { headers: { ...HOP, origin: 'https://plan.realm.watch', 'sec-fetch-site': 'same-site' } })).status, 401);
     assert.equal((await call('/teamclaude/account', { method: 'POST', headers: { ...HOP, origin: 'https://plan.realm.watch', 'sec-fetch-site': 'same-site' }, body: '{}' })).status, 401);
@@ -148,7 +150,7 @@ test('an SSO sign-in may not change danger settings or add accounts; the key sti
     await plain({ ...SSO, requireTls: false }, async ({ call }) => {
       const post = (path, body, headers = HOP) => call(path, { method: 'POST', headers: { ...headers, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' }, body: JSON.stringify(body) });
       const st = await (await call('/teamclaude/status', { headers: HOP })).json();
-      assert.deepEqual(st.caller.refused.sort(), ['/teamclaude/add-account', '/teamclaude/add-account/cancel', '/teamclaude/add-account/code', '/teamclaude/ui-ticket']);
+      assert.deepEqual(st.caller.refused.sort(), ['/teamclaude/add-account', '/teamclaude/add-account/cancel', '/teamclaude/add-account/code', '/teamclaude/resets/redeem', '/teamclaude/ui-ticket']);
       assert.ok((await (await call('/teamclaude/settings', { headers: HOP })).json()).ssoEditable.includes('switchThreshold'));
       for (const body of [
         { set: { 'service.restart': { command: ['/bin/true'] } } },

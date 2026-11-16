@@ -85,6 +85,7 @@ test('quota summary returns per-account buckets and tier-weighted fleet totals',
     remaining: 0.3,
     knownAccounts: 2,
     nextResetAt: resetPro,
+    servableRemaining: 0.3, // no seat with a spent week here, so all of it can serve
   });
   assert.deepEqual(summary.aggregate.weeklyShared, {
     capacityWeight: 6,

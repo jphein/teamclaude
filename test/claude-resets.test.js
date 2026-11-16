@@ -467,3 +467,20 @@ test('a vanished pending grant fails closed WITHOUT a status read per request af
   assert.equal(calls.status - reads, 1, 'one read, then the seat cools down');
   assert.equal(calls.claim.length, 1);
 });
+
+test('POST /teamclaude/resets/redeem passes fiveHour through and refuses a non-boolean one', async () => {
+  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 'token' }], 0.98);
+  const seen = [];
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test', trustLoopback: false }, upstream: 'http://127.0.0.1:9' }, {
+    redeemSeatReset: async (o) => { seen.push({ seat: o.seat, fiveHour: o.fiveHour }); return { redeemed: false, account: o.seat, reason: 'x' }; },
+  });
+  await new Promise(resolve => proxy.listen(0, '127.0.0.1', resolve));
+  const port = proxy.address().port;
+  const post = (raw) => fetch(`http://127.0.0.1:${port}/teamclaude/resets/redeem`, { method: 'POST', headers: { 'x-api-key': 'tc-test', 'content-type': 'application/json' }, body: raw });
+  try {
+    assert.equal((await post('{"seat":"claude","fiveHour":true,"dryRun":true}')).status, 200);
+    assert.equal((await post('{"seat":"claude","fiveHour":"yes"}')).status, 400);
+    assert.equal((await post('{"seat":"claude","fiveHour":null}')).status, 400);
+    assert.deepEqual(seen, [{ seat: 'claude', fiveHour: true }]);
+  } finally { proxy.close(); }
+});

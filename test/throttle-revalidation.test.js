@@ -95,3 +95,26 @@ test('natural hold expiry still clears state fully', () => {
 function exclude(account) {
   return new Set([account.index]);
 }
+
+// 2026-11-16 09:58 PST: a request sent before claude's 5-hour 429 answered 200 ten seconds later and lifted
+// the hold; refresh routing then sent the fleet back into the wall.
+test('a response to a request sent BEFORE the hold was armed does not lift it; one sent after does', () => {
+  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 't' }, { name: 'b', type: 'oauth', accessToken: 't' }], 0.98);
+  const stale = am.nextDispatchSeq(); // sent first...
+  am.markRateLimited(0, 3600);         // ...then the hold, even within the same millisecond
+  am.clearRateLimited(0, { sentSeq: stale });
+  assert.equal(am.accounts[0].status, 'throttled', 'a stale response leaves the hold');
+  assert.ok(am.accounts[0].rateLimitedUntil > Date.now());
+  const probe = am.nextDispatchSeq();   // a revalidation probe sent after the hold
+  am.clearRateLimited(0, { sentSeq: probe });
+  assert.equal(am.accounts[0].status, 'active', 'a request sent after the hold is live proof');
+  am.markRateLimited(1, 3600);
+  am.clearRateLimited(1);
+  assert.equal(am.accounts[1].status, 'active', 'callers without a dispatch number (a landed reset) still clear it');
+});
+
+test('dispatch numbers strictly increase (no ties, no clock)', () => {
+  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 't' }], 0.98);
+  const xs = Array.from({ length: 1000 }, () => am.nextDispatchSeq());
+  assert.ok(xs.every((x, i) => i === 0 || x > xs[i - 1]));
+});

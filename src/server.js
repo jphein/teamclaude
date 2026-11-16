@@ -952,8 +952,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         try { body = JSON.parse((await readControlBody(req, 4096)) || '{}'); } catch { json(res, 400, { ok: false, error: 'body must be JSON' }); return; }
         if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.seat !== 'string' || !body.seat || body.seat.length > 128) { json(res, 400, { ok: false, error: 'name one seat: {"seat": "<name>"}' }); return; }
         if (Object.hasOwn(body, 'dryRun') && typeof body.dryRun !== 'boolean') { json(res, 400, { ok: false, error: 'dryRun must be true or false' }); return; }
+        if (Object.hasOwn(body, 'fiveHour') && typeof body.fiveHour !== 'boolean') { json(res, 400, { ok: false, error: 'fiveHour must be true or false' }); return; }
         try {
-          const r = await h.redeemSeatReset({ seat: body.seat, dryRun: body.dryRun === true, via: viaWhom(req) });
+          const r = await h.redeemSeatReset({ seat: body.seat, dryRun: body.dryRun === true, fiveHour: body.fiveHour === true, via: viaWhom(req) });
           json(res, 200, { ok: true, ...r });
         } catch (/** @type {any} */ err) {
           console.error('[TeamClaude] Seat reset redeem failed:', err?.message || err);
@@ -4685,6 +4686,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     /** @type {any} */
     let upstreamRes;
     let admittedLoad = 0;
+    // This request's place in dispatch order: only a request sent AFTER a rate-limit hold was armed is
+    // proof that the hold no longer binds (see clearRateLimited).
+    const sentSeq = accountManager.nextDispatchSeq();
     try {
       upstreamRes = await upstreamFetch(upstreamUrl, {
         method,
@@ -4747,7 +4751,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Any non-429 response is live proof a rate-limit hold no longer binds —
     // this is what lets a revalidation probe (a throttled account selected by
     // _selectProbe) clear its own hold and return the fleet to service.
-    if (upstreamRes.status !== 429) accountManager.clearRateLimited(account.index);
+    if (upstreamRes.status !== 429) accountManager.clearRateLimited(account.index, { sentSeq });
     // An account answered successfully: the fleet can serve, failover's clock resets.
     if (upstreamRes.status < 400) ctx.failoverState?.noteServable();
 

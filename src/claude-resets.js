@@ -337,11 +337,13 @@ export class ClaudeResetRedeemer {
    * cooldown, only `next_grant_id`, the request id replayed after an unread answer). `dryRun` runs every
    * check, reads the seat's status (zero spend) and stops before the claim, leaving no cooldown behind.
    *
+   * `fiveHour`: spend a reset that clears the seat's 5-hour wall (never one that clears the weekly)
+   * instead of a weekly wall: the five-hour rule's checks, without its pool trigger (the operator decided).
    * @param {unknown} seat
-   * @param {{ dryRun?: boolean }} [opts]
-   * @returns {Promise<ClaudeRedeemResult & { wouldRedeem?: boolean, weeklyBefore?: number|null, weeklyAfter?: number|null }>}
+   * @param {{ dryRun?: boolean, fiveHour?: boolean }} [opts]
+   * @returns {Promise<ClaudeRedeemResult & { wouldRedeem?: boolean, weeklyBefore?: number|null, weeklyAfter?: number|null, fiveHourBefore?: number|null, fiveHourAfter?: number|null, grantId?: string|null }>}
    */
-  async redeemNamed(seat, { dryRun = false } = {}) {
+  async redeemNamed(seat, { dryRun = false, fiveHour = false } = {}) {
     if (typeof seat !== 'string' || !seat || seat.length > 128) return { redeemed: false, reason: 'no seat named' };
     const account = this._seatNamed(seat);
     if (!account) return { redeemed: false, reason: 'no single seat by that name' };
@@ -355,11 +357,11 @@ export class ClaudeResetRedeemer {
     const savedCooldown = state.cooldownUntil;
     // Measured, never cached: before = the status read just ahead of the claim, after = the re-read once
     // it landed. Either stays null when that read did not happen or failed.
-    const observe = { weeklyBefore: /** @type {number|null} */ (null), weeklyAfter: /** @type {number|null} */ (null) };
-    const attempt = this._redeem(account, now + CLAUDE_MANUAL_REDEEM_BUDGET_MS, { why: 'the operator asked for this seat', dryRun, observe })
+    const observe = { weeklyBefore: /** @type {number|null} */ (null), weeklyAfter: /** @type {number|null} */ (null), fiveHourBefore: /** @type {number|null} */ (null), fiveHourAfter: /** @type {number|null} */ (null), grantId: /** @type {string|null} */ (null) };
+    const attempt = this._redeem(account, now + CLAUDE_MANUAL_REDEEM_BUDGET_MS, { why: `the operator asked for this seat${fiveHour ? ' (5-hour wall)' : ''}`, dryRun, observe, ...(fiveHour ? { rule: /** @type {'five-hour'} */ ('five-hour'), pool5h: () => 0 } : {}) })
       .then(r => {
         if (dryRun) state.cooldownUntil = savedCooldown;
-        return { ...r, weeklyBefore: observe.weeklyBefore, weeklyAfter: observe.weeklyAfter };
+        return { ...r, ...observe };
       })
       .finally(() => { this.inFlight = null; });
     this.inFlight = attempt;

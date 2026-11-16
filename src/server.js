@@ -999,11 +999,15 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.seat !== 'string' || !body.seat || body.seat.length > 128) { json(res, 400, { ok: false, error: 'name one seat: {"seat": "<name>"}' }); return; }
         if (Object.hasOwn(body, 'dryRun') && typeof body.dryRun !== 'boolean') { json(res, 400, { ok: false, error: 'dryRun must be true or false' }); return; }
         if (Object.hasOwn(body, 'fiveHour') && typeof body.fiveHour !== 'boolean') { json(res, 400, { ok: false, error: 'fiveHour must be true or false' }); return; }
+        if (Object.hasOwn(body, 'breakHold') && typeof body.breakHold !== 'boolean') { json(res, 400, { ok: false, error: 'breakHold must be true or false' }); return; }
+        // Breaking the fleet hold is the operator's word on the command line (the shared key), never a
+        // scoped key's (the plan's Reset button).
+        if (body.breakHold === true && /** @type {any} */ (req).tcScoped) { json(res, 403, { ok: false, error: 'a scoped key cannot break the reset hold' }); return; }
         // A scoped key (the plan's Reset button) must repeat the seat to spend: a replayed or blind POST
         // with only a seat name cannot.
         if (/** @type {any} */ (req).tcScoped && body.dryRun !== true && body.confirm !== body.seat) { json(res, 400, { ok: false, error: 'a scoped key must repeat the seat in "confirm" to spend' }); return; }
         try {
-          const r = await h.redeemSeatReset({ seat: body.seat, dryRun: body.dryRun === true, fiveHour: body.fiveHour === true, via: viaWhom(req) });
+          const r = await h.redeemSeatReset({ seat: body.seat, dryRun: body.dryRun === true, fiveHour: body.fiveHour === true, breakHold: body.breakHold === true, via: viaWhom(req) });
           json(res, 200, { ok: true, ...r });
         } catch (/** @type {any} */ err) {
           console.error('[TeamClaude] Seat reset redeem failed:', err?.message || err);
@@ -3620,6 +3624,25 @@ function waitForDrain(res, signal) {
 }
 
 /**
+ * The answer for a Claude-only client (failover.claudeOnly) when no Claude seat can serve: a 503
+ * overloaded_error, which Claude Code retries with backoff, never the 429 it reads as a usage limit
+ * (and never the local stand-in). Retry-After is capped at 30 s so the client keeps asking while a
+ * reset or another seat comes back; the message keeps the real wait.
+ * @param {any} res @param {any} ctx @param {number} retryAfter @param {string} message
+ */
+function claudeOnlyUnavailable(res, ctx, retryAfter, message) {
+  ctx.status = 503;
+  if (res.headersSent) return;
+  res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': String(Math.max(1, Math.min(30, Math.ceil(retryAfter) || 10))) });
+  res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: `No Claude seat can serve this client right now (Claude-only: no stand-in). ${message}` } }));
+}
+
+/** Whether this request's client is on failover.claudeOnly (named as fable.allow names it). @param {any} ctx */
+function claudeOnlyClient(ctx) {
+  return !!ctx.failover?.claudeOnly?.includes(ctx.client || '(shared key)');
+}
+
+/**
  * Fail over when the WHOLE fleet cannot serve this request (not merely this
  * request's tried set) and the guards in failover.js allow it. `immediate`
  * skips the hysteresis wait: the caller already knows this is not a blip (a
@@ -4460,9 +4483,6 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
       return;
     }
-    // Local-model failover: ahead of holding or answering 429, so agents
-    // degrade instead of stopping. Guards and reasons live in failover.js.
-    if (await maybeFailover(req, res, body, ctx, accountManager, { immediate: false })) return;
     ctx.status = 429;
     ctx.account = '(none available)';
 
@@ -4513,6 +4533,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       }
     }
 
+    // Local-model failover: ahead of holding or answering 429, so agents
+    // degrade instead of stopping; AFTER the banked-reset offer above, so a
+    // reset that brings a Claude seat back always wins over the stand-in. A
+    // request that arrives while another request's redemption is in flight
+    // waits for that same attempt (maybeRedeemForPool returns it) and is
+    // re-dispatched when it lands. 2026-11-16 12:26: the stand-in answered
+    // Squire in the same second a reset brought claude6 back, because the
+    // failover was tried first. Guards and reasons live in failover.js.
+    if (await maybeFailover(req, res, body, ctx, accountManager, { immediate: !!ctx.failoverImmediate })) return;
+
     // Measured once and used twice: the accounts the message counts and the
     // windows the retry-after is read from have to be the same accounts, or the
     // two halves of one sentence contradict each other.
@@ -4544,6 +4574,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (clientGone(res)) { ctx.abandoned = true; return; }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
+    if (claudeOnlyClient(ctx)) { claudeOnlyUnavailable(res, ctx, retryAfter, exhaustedMessage(candidates, ctx.model, retryAfter)); return; }
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
@@ -5090,9 +5121,19 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // With failover on and no other account able to serve, a long retry-after
       // is the fleet being out, not a blip: answer from the local model now.
       // Short retries that merely ran out keep the hysteresis wait.
+      // With no other account able to serve, the dry-pool path offers a banked reset first and only then
+      // the stand-in (2026-11-16 12:26): send this request there once, keeping the "fleet is out, not a
+      // blip" verdict for its failover decision.
+      if (ctx.pinnedIndex == null && !ctx.resetRedeemTried && retryCount < maxRetries
+        && (ctx.provider || DEFAULT_PROVIDER) === DEFAULT_PROVIDER && hooks.redeemClaudeResetForPool
+        && !accountManager.accounts.some((/** @type {any} */ a) => accountManager._isAvailable(a, ctx.model, ctx.advisorModel) && !accountManager.isPaused?.(a.index))) {
+        ctx.failoverImmediate = retryAfter > RATE_LIMIT_ABSORB_MAX_SECONDS;
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
+      }
       if (await maybeFailover(req, res, body, ctx, accountManager, { immediate: retryAfter > RATE_LIMIT_ABSORB_MAX_SECONDS })) return;
       console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — retry-after ${retryAfter}s over inline cap; returning 429 to client (no switch)`);
       ctx.status = 429;
+      if (claudeOnlyClient(ctx) && !res.headersSent && !clientGone(res)) { claudeOnlyUnavailable(res, ctx, retryAfter, `Rate limited; retry in ${retryAfter}s.`); return; }
       if (!res.headersSent && !clientGone(res)) {
         res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
         res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: `Rate limited; retry in ${retryAfter}s.` } }));

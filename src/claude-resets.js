@@ -340,10 +340,13 @@ export class ClaudeResetRedeemer {
    * `fiveHour`: spend a reset that clears the seat's 5-hour wall (never one that clears the weekly)
    * instead of a weekly wall: the five-hour rule's checks, without its pool trigger (the operator decided).
    * @param {unknown} seat
-   * @param {{ dryRun?: boolean, fiveHour?: boolean }} [opts]
-   * @returns {Promise<ClaudeRedeemResult & { wouldRedeem?: boolean, weeklyBefore?: number|null, weeklyAfter?: number|null, fiveHourBefore?: number|null, fiveHourAfter?: number|null, grantId?: string|null }>}
+   * `breakHold`: the operator's explicit word (the CLI's --break-hold) to spend inside the fleet hold a
+   * recent spend set (Sen 2026-11-16: the hold blocked a 5-hour spend while a live sitting had no seat).
+   * Every other check stays; the result carries `holdBroken: true` so the log says so.
+   * @param {{ dryRun?: boolean, fiveHour?: boolean, breakHold?: boolean }} [opts]
+   * @returns {Promise<ClaudeRedeemResult & { wouldRedeem?: boolean, weeklyBefore?: number|null, weeklyAfter?: number|null, fiveHourBefore?: number|null, fiveHourAfter?: number|null, grantId?: string|null, holdBroken?: boolean }>}
    */
-  async redeemNamed(seat, { dryRun = false, fiveHour = false } = {}) {
+  async redeemNamed(seat, { dryRun = false, fiveHour = false, breakHold = false } = {}) {
     if (typeof seat !== 'string' || !seat || seat.length > 128) return { redeemed: false, reason: 'no seat named' };
     const account = this._seatNamed(seat);
     if (!account) return { redeemed: false, reason: 'no single seat by that name' };
@@ -352,7 +355,9 @@ export class ClaudeResetRedeemer {
     if (account.disabled) return { redeemed: false, account: name, reason: 'the seat is disabled' };
     if (this.inFlight) return { redeemed: false, account: name, reason: 'another reset attempt is in flight' };
     const now = this.now();
-    if (now < this.fleetHoldUntil) return { redeemed: false, account: name, reason: 'holding off after a recent Claude reset attempt' };
+    const held = now < this.fleetHoldUntil;
+    if (held && breakHold !== true) return { redeemed: false, account: name, reason: 'holding off after a recent Claude reset attempt' };
+    const holdBroken = held;
     const state = this._stateFor(account);
     const savedCooldown = state.cooldownUntil;
     // Measured, never cached: before = the status read just ahead of the claim, after = the re-read once
@@ -361,7 +366,7 @@ export class ClaudeResetRedeemer {
     const attempt = this._redeem(account, now + CLAUDE_MANUAL_REDEEM_BUDGET_MS, { why: `the operator asked for this seat${fiveHour ? ' (5-hour wall)' : ''}`, dryRun, observe, ...(fiveHour ? { rule: /** @type {'five-hour'} */ ('five-hour'), pool5h: () => 0 } : {}) })
       .then(r => {
         if (dryRun) state.cooldownUntil = savedCooldown;
-        return { ...r, ...observe };
+        return { ...r, ...observe, ...(holdBroken ? { holdBroken: true } : {}) };
       })
       .finally(() => { this.inFlight = null; });
     this.inFlight = attempt;

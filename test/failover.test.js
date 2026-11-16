@@ -80,7 +80,7 @@ test('prepareForClaude: removes unsigned thinking; turns thinking off when the l
 });
 
 // ── through the real proxy ───────────────────────────────────────────────
-async function setup({ failover = {}, exhausted = true, localStatus = 200, claudeHits = [], claude429 = false, localMode = 'ok', redirectTo = 'http://127.0.0.1:9/v1/messages', tokenizeCount = null, claudeRetryAfter = '3600', claudeBurst = false, proxyConf = {} } = {}) {
+async function setup({ failover = {}, exhausted = true, localStatus = 200, claudeHits = [], claude429 = false, localMode = 'ok', redirectTo = 'http://127.0.0.1:9/v1/messages', tokenizeCount = null, claudeRetryAfter = '3600', claudeBurst = false, proxyConf = {}, hooks = {}, accounts = null, claude429Count = Infinity } = {}) {
   const localSeen = [];
   const local = http.createServer((req, res) => {
     let raw = ''; req.on('data', (c) => { raw += c; }); req.on('end', () => {
@@ -103,20 +103,20 @@ async function setup({ failover = {}, exhausted = true, localStatus = 200, claud
   const claude = http.createServer((req, res) => {
     let raw = ''; req.on('data', (c) => { raw += c; }); req.on('end', () => {
       claudeHits.push(JSON.parse(raw));
-      if (claude429) { res.writeHead(429, { 'content-type': 'application/json', 'retry-after': claudeRetryAfter, ...(claudeBurst ? { 'anthropic-ratelimit-requests-remaining': '0' } : { 'anthropic-ratelimit-unified-status': 'rejected' }) }); res.end('{"type":"error","error":{"type":"rate_limit_error","message":"out"}}'); return; }
+      if (claude429 && claudeHits.length <= claude429Count) { res.writeHead(429, { 'content-type': 'application/json', 'retry-after': claudeRetryAfter, ...(claudeBurst ? { 'anthropic-ratelimit-requests-remaining': '0' } : { 'anthropic-ratelimit-unified-status': 'rejected' }) }); res.end('{"type":"error","error":{"type":"rate_limit_error","message":"out"}}'); return; }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ id: 'c1', type: 'message', role: 'assistant', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'claude' }], usage: { input_tokens: 1, output_tokens: 1 } }));
     });
   });
   const [lp, cp] = [await listen(local), await listen(claude)];
-  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.98);
+  const am = new AccountManager(accounts ?? [{ name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.98);
   if (exhausted) { am.accounts[0].quota.unified5h = 1; am.accounts[0].quota.unified5hReset = Date.now() + 3 * 3600_000; am.accounts[0].probing = false; }
   // The exhausted-fleet probe would forward one request to Claude anyway; a
   // probe already spent this hour is the state a real stall is in.
   am._nextProbeAt = Date.now() + 3600_000;
   const config = { proxy: { apiKey: 'k', ...proxyConf }, upstream: `http://127.0.0.1:${cp}`, failover: { enabled: true, url: `http://127.0.0.1:${lp}`, afterSeconds: 20, ...failover } };
   const logs = []; const orig = console.log; console.log = (...a) => { logs.push(a.join(' ')); };
-  const proxy = createProxyServer(am, config, {});
+  const proxy = createProxyServer(am, config, typeof hooks === 'function' ? hooks(am) : hooks);
   const port = await listen(proxy);
   return {
     am, localSeen, claudeHits, logs,
@@ -511,5 +511,116 @@ test('end to end: a local answer that is not a message gets the usual 429, never
     const res = await t.post(MSG);
     assert.equal(res.status, 429);
     assert.equal(res.headers.get('x-teamclaude-failover'), null);
+  } finally { t.close(); }
+});
+
+
+// ── a banked reset before the stand-in; Claude-only clients (2026-11-16 12:26: the stand-in answered
+// Squire, a browser-driving session with JP at the keys, in the same second a reset brought claude6 back)
+const clearFiveHour = (/** @type {any} */ a) => { a.quota.unified5h = 0; a.quota.unified5hReset = Date.now() + 5 * 3600_000; };
+
+test('a dry pool spends a banked reset BEFORE the stand-in: the request is served by Claude, nothing sent locally', async () => {
+  const asked = [];
+  const t = await setup({ hooks: (am) => ({ redeemClaudeResetForPool: async (cands) => { asked.push(cands.map((a) => a.name)); clearFiveHour(am.accounts[0]); return { redeemed: true }; } }) });
+  try {
+    const res = await t.post(MSG);
+    const body = await res.json();
+    assert.equal(res.status, 200);
+    assert.equal(body.model, 'claude-opus-5-5', 'Claude answered');
+    assert.deepEqual(asked, [['a']]);
+    assert.equal(t.localSeen.length, 0, 'the stand-in was never asked');
+  } finally { t.close(); }
+});
+
+test('requests racing one in-flight redemption all wait for it and are served by Claude', async () => {
+  let release; const gate = new Promise((r) => { release = r; });
+  let attempt = null; let calls = 0;
+  const t = await setup({ hooks: (am) => ({ redeemClaudeResetForPool: () => { calls++; attempt ??= gate.then(() => { clearFiveHour(am.accounts[0]); return { redeemed: true }; }); return attempt; } }) });
+  try {
+    const both = Promise.all([t.post(MSG), t.post(MSG)]);
+    await new Promise((r) => setTimeout(r, 100));
+    release();
+    const [one, two] = await both;
+    assert.equal(one.status, 200); assert.equal(two.status, 200);
+    assert.equal((await one.json()).model, 'claude-opus-5-5');
+    assert.equal((await two.json()).model, 'claude-opus-5-5');
+    assert.equal(t.localSeen.length, 0, 'neither went to the stand-in');
+    assert.equal(calls, 2, 'both asked, one attempt shared');
+  } finally { t.close(); }
+});
+
+test('the last account answering 429 with a long retry-after: a reset on another seat is offered before the stand-in', async () => {
+  const offered = [];
+  const t = await setup({
+    exhausted: false, claude429: true, claude429Count: 1,
+    accounts: [
+      { name: 'a', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+      { name: 'b', type: 'oauth', accessToken: 't2', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 },
+    ],
+    hooks: (am) => {
+      Object.assign(am.accounts[1].quota, { unified5h: 1, unified5hReset: Date.now() + 3 * 3600_000 });
+      return { redeemClaudeResetForPool: async (cands) => { offered.push(cands.map((a) => a.name)); clearFiveHour(am.accounts[1]); return { redeemed: true }; } };
+    },
+  });
+  try {
+    const res = await t.post(MSG);
+    const body = await res.json();
+    assert.equal(res.status, 200);
+    assert.equal(body.model, 'claude-opus-5-5');
+    assert.equal(t.claudeHits.length, 2, 'a 429ed, then b after its reset');
+    assert.equal(offered.length, 1, 'one offer for this request');
+    assert.ok(offered[0].includes('b'), 'the seat a reset brings back was offered');
+    assert.equal(t.localSeen.length, 0);
+  } finally { t.close(); }
+});
+
+test('the long-429 path with no reset to spend still fails over at once', async () => {
+  const t = await setup({ exhausted: false, claude429: true, hooks: { redeemClaudeResetForPool: async () => ({ redeemed: false, reason: 'none' }) } });
+  try {
+    const res = await t.post(MSG);
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).model, FAILOVER_LABEL, 'the "fleet is out" verdict survived the redispatch');
+  } finally { t.close(); }
+});
+
+test('policy and eligibility: claudeOnly takes names only and refuses the stand-in, saying why', () => {
+  const p = failoverPolicy({ failover: { enabled: true, url: 'http://x', claudeOnly: ['katana', 3, '', null] } });
+  assert.deepEqual(p.claudeOnly, ['katana']);
+  assert.deepEqual(failoverPolicy({}).claudeOnly, []);
+  const el = failoverEligibility({ policy: p, state: new FailoverState(), method: 'POST', url: '/v1/messages', allQuota: true, unservableMs: 0, bodyBytes: 10, client: 'katana' });
+  assert.deepEqual(el, { ok: false, why: 'client "katana" is Claude-only' });
+});
+
+test('a Claude-only client with no seat to serve it gets a retryable 503 overloaded_error, never the stand-in or a 429', async () => {
+  const t = await setup({ failover: { claudeOnly: ['katana'] }, proxyConf: { clientKeys: [{ name: 'katana', key: 'k-katana' }] } });
+  try {
+    const res = await t.post(MSG, null, 'k-katana');
+    const body = await res.json();
+    assert.equal(res.status, 503);
+    assert.equal(body.error.type, 'overloaded_error');
+    const ra = Number(res.headers.get('retry-after'));
+    assert.ok(ra >= 1 && ra <= 30, `retry-after ${ra} capped at 30 s`);
+    assert.match(body.error.message, /Claude-only: no stand-in/);
+    assert.equal(t.localSeen.length, 0);
+    const other = await t.post(MSG);
+    assert.equal(other.status, 200, 'the shared key still gets the stand-in');
+  } finally { t.close(); }
+});
+
+test('a Claude-only client on the long-429 path also gets the 503, never the stand-in', async () => {
+  const t = await setup({ exhausted: false, claude429: true, failover: { claudeOnly: ['katana'] }, proxyConf: { clientKeys: [{ name: 'katana', key: 'k-katana' }] } });
+  try {
+    const res = await t.post(MSG, null, 'k-katana');
+    assert.equal(res.status, 503);
+    assert.equal((await res.json()).error.type, 'overloaded_error');
+    assert.equal(t.localSeen.length, 0);
+  } finally { t.close(); }
+});
+
+test('claudeOnly holds with failover switched off: still a 503, not a 429', async () => {
+  const t = await setup({ failover: { enabled: false, claudeOnly: ['katana'] }, proxyConf: { clientKeys: [{ name: 'katana', key: 'k-katana' }] } });
+  try {
+    const res = await t.post(MSG, null, 'k-katana');
+    assert.equal(res.status, 503);
   } finally { t.close(); }
 });

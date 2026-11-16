@@ -72,6 +72,7 @@ test('windowsLeft: whole windows at the measured burn; "measuring" until one win
   assert.deepEqual(windowsLeft(0.6, { burn: null, windows: 0 }), { windowsLeft: null, basis: 'measuring' });
   assert.deepEqual(windowsLeft(null, { burn: 0.1, windows: 1 }), { windowsLeft: null, basis: 'weekly use unknown' });
   assert.equal(windowsLeft(1.2, { burn: 0.1, windows: 1 }).windowsLeft, 0);
+  assert.deepEqual(windowsLeft(1, { burn: null, windows: 0 }), { windowsLeft: 0, basis: 'weekly spent' });
 });
 
 // ---------- the opt-in redeem rule, as a verdict
@@ -158,8 +159,8 @@ test('seatRows: window state, next window from the stagger, windows left, resets
   assert.equal(b.inWindow, false);
   assert.equal(b.nextWindowAt, new Date(NOW + 4 * H).toISOString());
   assert.equal(b.nextWindowBasis, 'stagger slot');
-  assert.equal(b.windowsLeft, null);
-  assert.equal(b.windowsLeftBasis, 'measuring');
+  assert.equal(b.windowsLeft, 0); // its week is spent: 0 without any measured burn
+  assert.equal(b.windowsLeftBasis, 'weekly spent');
   assert.equal(b.resets.available, 1);
   assert.equal(b.resets.weeklyApplicable, 1);
   assert.equal(b.resetsError, null);

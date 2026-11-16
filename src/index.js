@@ -1955,7 +1955,7 @@ async function resetsCommand() {
     process.exit(1);
   }
   if (args.includes('--json')) { await writeStdout(`${JSON.stringify(data, null, 2)}\n`); return; }
-  const t = (/** @type {string|null} */ v) => (v ? new Date(v).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' }) : '-');
+  const t = (/** @type {string|null} */ v) => (v ? new Date(v).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' }) : '-');
   const lines = [`Banked resets ${data.armed ? 'auto-redeem ARMED' : 'auto-redeem off (dry run only)'} · probed ${data.probedAt ? t(data.probedAt) : 'not yet'}`];
   for (const r of data.seats || []) {
     const rs = r.resets;

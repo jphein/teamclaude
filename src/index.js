@@ -39,7 +39,7 @@ import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
 import { WindowLedger, ResetsProbe, seatRows } from './seat-resets.js';
 import { drain, drainMsFrom, DRAIN_MARKER } from './drain.js';
-import { ruleFor } from './reset-rules.js';
+import { ruleFor, atWall } from './reset-rules.js';
 import { Warmer, warmApplicable } from './warmer.js';
 import { StaggerAnchors } from './warm-stagger.js';
 import { RoutingEvents } from './routing-events.js';
@@ -1011,10 +1011,15 @@ async function serverCommand() {
     if (config.autoRedeemResets !== true || account?.disabled) return;
     const kept = resetsProbe.byName.get(account.name)?.kept;
     // the pool summary only matters at a 5-hour wall; skip building it on every other response
-    const pool5hRemaining = (account.quota?.unified5h ?? 0) >= 0.98 ? accountManager.getQuotaSummary()?.aggregate?.fiveHour?.remaining ?? null : null;
-    const pick = ruleFor(account, { now: Date.now(), kept, idleMs, pool5hRemaining });
+    // The pool figure is the SERVABLE 5-hour remaining: seats whose week is spent cannot serve whatever
+    // their 5h says (2026-11-16 13:08–14:30: the plain remaining read ~60 % through a full wall, so the
+    // rule never fired). The wall is the seat's own 5h switch threshold (see reset-rules.js).
+    const fiveHourWall = accountManager.thresholdFor('unified5h', account);
+    const servable5h = () => accountManager.getQuotaSummary()?.aggregate?.fiveHour?.servableRemaining ?? null;
+    const pool5hRemaining = (account.quota?.unified5h ?? 0) >= atWall(fiveHourWall) ? servable5h() : null;
+    const pick = ruleFor(account, { now: Date.now(), kept, idleMs, pool5hRemaining, fiveHourWall });
     if (!pick) return;
-    claudeRedeemer.redeemByRule(account, pick.rule, pick.reason, { pool5h: () => accountManager.getQuotaSummary()?.aggregate?.fiveHour?.remaining ?? null }).then((r) => {
+    claudeRedeemer.redeemByRule(account, pick.rule, pick.reason, { pool5h: servable5h }).then((r) => {
       const pct = (/** @type {number|null|undefined} */ v) => (v == null ? '?' : `${Math.round(v * 100)}%`);
       // the cheap refusals (hold, cooldown, spacing, lock) would log on every response; a live read's
       // verdict, a spend or a no-verdict always logs

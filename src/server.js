@@ -431,7 +431,38 @@ function usableClientKeys(clientKeys) {
   return clientKeys.filter(e => typeof e?.name === 'string' && e.name.trim() && e.key);
 }
 
+// Scoped keys (proxy.scopedKeys: [{ name, key, allow: ["GET /teamclaude/quota", ...] }]): a key that
+// opens ONLY the routes it lists, and only from this set: reads of the quota and the reset rows, and the
+// one-seat reset spend. Built for the plan's Seats tile Reset button (Sen 2026-11-16): the plan holds a key
+// that can spend a reset on a seat it names and read the numbers, and nothing else (no model API, no
+// CONNECT, no settings). Anything else in `allow` is ignored.
+// Not /teamclaude/status: it carries operator detail (accounts, client names) the tile does not need.
+export const SCOPED_ROUTES = new Set(['GET /teamclaude/quota', 'GET /teamclaude/resets', 'POST /teamclaude/resets/redeem']);
+const SCOPED_KEY_MIN = 24;
+
+/**
+ * The scoped key `presented` matches: its name and the routes it may reach. Null when none does.
+ * @param {any} proxyConfig @param {unknown} presented
+ * @returns {{ name: string, allow: Set<string> }|null}
+ */
+export function scopedKeyFor(proxyConfig, presented) {
+  const list = Array.isArray(proxyConfig?.scopedKeys) ? proxyConfig.scopedKeys : [];
+  if (typeof presented !== 'string' || !presented) return null;
+  for (const e of list) {
+    const name = typeof e?.name === 'string' ? e.name.trim() : '';
+    if (!name || typeof e?.key !== 'string' || e.key.length < SCOPED_KEY_MIN) continue;
+    if (safeKeyEqual(presented, e.key)) {
+      const allow = new Set((Array.isArray(e.allow) ? e.allow : []).filter((/** @type {unknown} */ r) => typeof r === 'string' && SCOPED_ROUTES.has(r)));
+      return { name, allow };
+    }
+  }
+  return null;
+}
+
 export function resolveClientAuth(proxyConfig, presented) {
+  // A scoped key is never a full credential, whatever entry point asks (CONNECT, WebSocket upgrade,
+  // Proxy-Authorization), even if the same string were also configured as a client or shared key.
+  if (scopedKeyFor(proxyConfig, presented)) return { ok: false, client: null };
   const shared = proxyConfig?.apiKey;
   const clientKeys = Array.isArray(proxyConfig?.clientKeys) ? usableClientKeys(proxyConfig.clientKeys) : [];
   if (!shared && clientKeys.length === 0) return { ok: true, client: null };
@@ -509,6 +540,11 @@ function reauthOwner(req) {
 
 /** How a control-plane log line names its caller. @param {any} req */
 function viaWhom(req) {
+  if (req?.tcScoped) {
+    const device = req.headers?.['x-teamclaude-device'];
+    const d = typeof device === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(device) ? ` (device "${device}")` : '';
+    return `via key "${safeLine(req.tcScoped, 40)}"${d}`;
+  }
   if (req?.tcSso) return `via SSO as "${req.tcSso}"`;
   if (req?.tcClient) return `via client key "${req.tcClient}"`;
   return 'via UI';
@@ -753,7 +789,17 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // an allowed user, sent by the dashboard page itself) stands in as the
       // operator — on /teamclaude/* only. The front proxy's headers are then
       // dropped, so nothing below can relay them.
-      let keyAuth = resolveClientAuth(config.proxy, clientKey);
+      // A scoped key opens the routes it lists and nothing else, before any other route is reached.
+      const scoped = scopedKeyFor(config.proxy, clientKey);
+      if (scoped) {
+        const route = `${req.method} ${String(req.url || '').split('?')[0]}`;
+        if (!scoped.allow.has(route)) {
+          json(res, 403, { ok: false, error: `the "${safeLine(scoped.name, 40)}" key cannot reach ${safeLine(route, 80)}` });
+          return;
+        }
+        /** @type {any} */ (req).tcScoped = scoped.name;
+      }
+      let keyAuth = scoped ? { ok: true, client: null } : resolveClientAuth(config.proxy, clientKey);
       // A plain-HTTP forward request (absolute-form URL: HTTP_PROXY) carries its
       // key the way a CONNECT does, in Proxy-Authorization — the only place an
       // HTTP_PROXY=http://<key>@host URL can put it. Accepted for that form
@@ -953,6 +999,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.seat !== 'string' || !body.seat || body.seat.length > 128) { json(res, 400, { ok: false, error: 'name one seat: {"seat": "<name>"}' }); return; }
         if (Object.hasOwn(body, 'dryRun') && typeof body.dryRun !== 'boolean') { json(res, 400, { ok: false, error: 'dryRun must be true or false' }); return; }
         if (Object.hasOwn(body, 'fiveHour') && typeof body.fiveHour !== 'boolean') { json(res, 400, { ok: false, error: 'fiveHour must be true or false' }); return; }
+        // A scoped key (the plan's Reset button) must repeat the seat to spend: a replayed or blind POST
+        // with only a seat name cannot.
+        if (/** @type {any} */ (req).tcScoped && body.dryRun !== true && body.confirm !== body.seat) { json(res, 400, { ok: false, error: 'a scoped key must repeat the seat in "confirm" to spend' }); return; }
         try {
           const r = await h.redeemSeatReset({ seat: body.seat, dryRun: body.dryRun === true, fiveHour: body.fiveHour === true, via: viaWhom(req) });
           json(res, 200, { ok: true, ...r });

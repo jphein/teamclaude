@@ -182,6 +182,8 @@ export const FIELDS = [
     help: 'The shared key clients present. It also unlocks this Settings view. Write-only; cannot be cleared here.' },
   { key: 'proxy.clientKeys', group: 'Proxy & access', label: 'Client keys', type: 'secretList', apply: 'hot', def: [], danger: true,
     help: 'Per-client keys ({ name, key }); usage is booked per name. Keys are write-only; a masked key means keep it.' },
+  { key: 'proxy.scopedKeys', group: 'Proxy & access', label: 'Scoped keys', type: 'secretList', apply: 'hot', def: [], danger: true,
+    help: 'Keys that open only the routes they list ({ name, key, allow: ["GET /teamclaude/quota", "GET /teamclaude/resets", "POST /teamclaude/resets/redeem"] }); any other route, the model API and CONNECT are refused. A spend with one must repeat the seat in "confirm". Keys are write-only.' },
   { key: 'proxy.trustLoopback', group: 'Proxy & access', label: 'Trust loopback', type: 'bool', apply: 'restart', def: true, danger: true,
     help: 'Let callers on this host skip the key. Turn off behind a reverse proxy on the same host.' },
   // Dashboard SSO through a front proxy (sso.js). All three of users, from and
@@ -373,7 +375,7 @@ function maskUrlCredentials(v) {
 /** @param {Field} f @param {any} v */
 function displayValue(f, v) {
   if (f.type === 'secret') return v ? MASK : null;   // any shape: only set / not set
-  if (f.type === 'secretList') return Array.isArray(v) ? v.map((e) => ({ name: typeof e?.name === 'string' ? e.name : '', key: e?.key ? MASK : '' })) : [];
+  if (f.type === 'secretList') return Array.isArray(v) ? v.map((e) => ({ name: typeof e?.name === 'string' ? e.name : '', key: e?.key ? MASK : '', ...(Array.isArray(e?.allow) ? { allow: [...e.allow] } : {}) })) : [];
   if (f.credUrl) return maskUrlCredentials(v);
   return v;
 }
@@ -484,7 +486,7 @@ function normalise(f, v) {
     if (v === '') v = null;
     else if (f.allowFalse && v.toLowerCase() === 'false') v = false;
   }
-  if (f.type === 'secretList' && Array.isArray(v)) v = v.map((e) => (isObj(e) ? { name: typeof e.name === 'string' ? e.name.trim() : e.name, key: e.key } : e));
+  if (f.type === 'secretList' && Array.isArray(v)) v = v.map((e) => (isObj(e) ? { name: typeof e.name === 'string' ? e.name.trim() : e.name, key: e.key, ...(Object.hasOwn(e, 'allow') ? { allow: e.allow } : {}) } : e));
   if (v === null && f.clearToDefault) v = f.def;
   return v;
 }
@@ -504,10 +506,17 @@ function problemFor(f, v, cfg) {
     case 'secret': if (typeof v !== 'string') return 'must be text'; break;
     case 'secretList':
       if (!Array.isArray(v) || !v.every((/** @type {any} */ e) => isObj(e) && typeof e.name === 'string' && e.name.trim() && typeof e.key === 'string' && e.key)) return 'must be a list of { name, key }';
+      if (!v.every((/** @type {any} */ e) => e.allow === undefined || (Array.isArray(e.allow) && e.allow.every((/** @type {any} */ r) => typeof r === 'string')))) return 'allow must be a list of "METHOD /path" routes';
       if (new Set(v.map((/** @type {any} */ e) => e.name)).size !== v.length) return 'each name may appear once';
       // Client keys are matched first, so one equal to the shared key would turn
       // the admin into that client and lock the Settings view.
       if (cfg?.proxy?.apiKey && v.some((/** @type {any} */ e) => e.key === cfg.proxy.apiKey)) return 'a client key cannot be the same as the shared proxy key';
+      {
+        // A scoped key and a client key may never share a value (the scoped one would lose its scope).
+        const other = f.key === 'proxy.scopedKeys' ? cfg?.proxy?.clientKeys : f.key === 'proxy.clientKeys' ? cfg?.proxy?.scopedKeys : null;
+        const keys = new Set((Array.isArray(other) ? other : []).map((/** @type {any} */ e) => e?.key).filter(Boolean));
+        if (v.some((/** @type {any} */ e) => keys.has(e.key))) return 'a scoped key and a client key cannot be the same';
+      }
       break;
     default: break;
   }

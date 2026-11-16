@@ -25,7 +25,7 @@ test('resetSummary counts live resets, the soonest expiry and what they clear, a
     { id: 'cg_03', resetsLeft: 1, clears: ['seven_day'], usableNow: true, paused: false, endsAt: NOW - H },
     { id: 'cg_04', resetsLeft: 0, clears: ['seven_day'], usableNow: true, paused: false, endsAt: null },
   ] }), NOW);
-  assert.deepEqual(s, { eligible: true, ineligibleReason: null, available: 3, applicable: 1, expiresAt: NOW + 5 * 24 * H, weeklyApplicable: 1, weeklyExpiresAt: NOW + 5 * 24 * H, atLimit: false, cooldownUntil: null, clears: ['five_hour', 'seven_day'] });
+  assert.deepEqual(s, { eligible: true, ineligibleReason: null, available: 3, applicable: 1, expiresAt: NOW + 5 * 24 * H, weeklyApplicable: 1, weeklyExpiresAt: NOW + 5 * 24 * H, weeklyBanked: 1, weeklyBankedExpiresAt: NOW + 5 * 24 * H, otherExpiresAt: NOW + 9 * 24 * H, atLimit: false, cooldownUntil: null, clears: ['five_hour', 'seven_day'] });
   assert.doesNotMatch(JSON.stringify(s), /cg_/, 'no grant id in the summary');
 });
 
@@ -326,4 +326,55 @@ test('ResetsProbe: a 401 twice is recorded once (no loop); a failed refresh is i
   await q.probe({ force: true });
   assert.equal(reads, 0);
   assert.equal(q.byName.get('a')?.error, 'token refresh failed');
+});
+
+// ---------- 2026-11-16: claude5/claude6 kept an import-time team_standard tier after becoming premium
+test('ResetsProbe re-reads each seat profile on the first probe, then at most daily, and applies it', async () => {
+  let now = NOW;
+  const reads = [], applied = [];
+  const acct = { name: 'a', type: 'oauth', credential: 't', seatTier: 'team_standard' };
+  const p = new ResetsProbe({
+    accounts: () => [acct],
+    fetchStatus: async () => ({ reset: status(), usage: null }),
+    fetchProfile: async (/** @type {any} */ a) => { reads.push(a.name); return { seatTier: 'team_bendep_nonprofit_premium', rateLimitTier: 'default_claude_max_5x' }; },
+    applyProfile: (/** @type {any} */ a, /** @type {any} */ prof) => { applied.push(prof.seatTier); a.seatTier = prof.seatTier; },
+    now: () => now,
+  });
+  await p.probe({ force: true });
+  assert.deepEqual(reads, ['a']);
+  assert.equal(acct.seatTier, 'team_bendep_nonprofit_premium');
+  now += 23 * H; await p.probe({ force: true });
+  assert.equal(reads.length, 1, 'not again within a day');
+  now += 2 * H; await p.probe({ force: true });
+  assert.equal(reads.length, 2, 'again after a day');
+});
+
+test('ResetsProbe: a failing profile read changes nothing, does not fail the reset reading, and waits a day', async () => {
+  let now = NOW; let reads = 0; const applied = [];
+  const p = new ResetsProbe({
+    accounts: () => [{ name: 'a', type: 'oauth', credential: 't' }],
+    fetchStatus: async () => ({ reset: status(), usage: null }),
+    fetchProfile: async () => { reads++; if (reads === 1) return { error: 'HTTP 500' }; throw new Error('boom'); },
+    applyProfile: (_a, prof) => applied.push(prof),
+    now: () => now,
+  });
+  await p.probe({ force: true });
+  assert.equal(p.byName.get('a')?.error, null);
+  now += 25 * H; await p.probe({ force: true });
+  assert.equal(p.byName.get('a')?.error, null);
+  assert.equal(reads, 2);
+  assert.deepEqual(applied, []);
+});
+
+test('resetSummary: weeklyBanked counts weekly-clearing resets not usable yet; otherExpiresAt is the 5h-only soonest', () => {
+  const s = resetSummary(status({ grants: [
+    { id: GRANT, resetsLeft: 1, clears: ['five_hour', 'seven_day'], usableNow: false, paused: false, endsAt: NOW + 3 * 24 * H },
+    { id: 'cg_02', resetsLeft: 2, clears: ['five_hour'], usableNow: true, paused: false, endsAt: NOW + 90 * 24 * H },
+    { id: 'cg_03', resetsLeft: 1, clears: ['five_hour'], usableNow: false, paused: false, endsAt: NOW + 80 * 24 * H },
+  ] }), NOW);
+  assert.equal(s?.weeklyApplicable, 0);
+  assert.equal(s?.weeklyBanked, 1);
+  assert.equal(s?.weeklyBankedExpiresAt, NOW + 3 * 24 * H);
+  assert.equal(s?.otherExpiresAt, NOW + 80 * 24 * H);
+  assert.equal(s?.expiresAt, NOW + 3 * 24 * H);
 });

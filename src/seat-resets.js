@@ -23,13 +23,17 @@ const HOUR_MS = 3600_000;
 const SAME_WEEK_MS = HOUR_MS;
 /** A probe of every seat costs one usage request each; asking again within this window reuses it. */
 export const PROBE_MIN_INTERVAL_MS = 10 * 60_000;
+// A seat's subscription tier is re-read from its OAuth profile at most this often (a seat upgraded after
+// it was added otherwise keeps its import-time tier: 2026-11-16, claude5/claude6 read team_standard for
+// weeks after becoming premium, so the pool's capacity weight was 27 instead of 35).
+export const PROFILE_REFRESH_MS = 24 * 3600_000;
 
 /**
  * @typedef {{ id: string, resetsLeft: number, clears: string[], usableNow: boolean, paused: boolean, endsAt: number|null }} Grant
  * @typedef {{ eligible: boolean, ineligibleReason: string|null, atLimit: boolean, exhausted: string[], nextGrantId: string|null, cooldownUntil: number|null, grants: Grant[] }} ResetStatus
  * @typedef {{ resetsLeft: number, clearsWeekly: boolean, clears: string[], usable: boolean, endsAt: number|null }} KeptGrant
  * @typedef {{ eligible: boolean, ineligibleReason: string|null, atLimit: boolean, cooldownUntil: number|null, grants: KeptGrant[] }} KeptStatus
- * @typedef {{ eligible: boolean, ineligibleReason: string|null, available: number, applicable: number, expiresAt: number|null, weeklyApplicable: number, weeklyExpiresAt: number|null, atLimit: boolean, cooldownUntil: number|null, clears: string[] }} ResetSummary
+ * @typedef {{ eligible: boolean, ineligibleReason: string|null, available: number, applicable: number, expiresAt: number|null, weeklyApplicable: number, weeklyExpiresAt: number|null, weeklyBanked: number, weeklyBankedExpiresAt: number|null, otherExpiresAt: number|null, atLimit: boolean, cooldownUntil: number|null, clears: string[] }} ResetSummary
  * @typedef {{ start: number, weeklyAtStart: number|null, weekResetAt?: number|null, burn?: number|null }} WindowRecord
  */
 
@@ -47,6 +51,8 @@ export function keepStatus(status) {
     atLimit: status.atLimit,
     cooldownUntil: status.cooldownUntil,
     grants: status.grants.map((g) => ({
+      // the one grant a spend may name (upstream spends only next_grant_id); a flag, never the id
+      next: status.nextGrantId != null && g.id === status.nextGrantId,
       resetsLeft: g.resetsLeft,
       clearsWeekly: g.clears.includes('seven_day'),
       clears: [...g.clears].sort(),
@@ -74,6 +80,12 @@ export function resetSummary(status, now) {
   let expiresAt = null;
   /** @type {number|null} */
   let weeklyExpiresAt = null;
+  // banked whether usable now or not, split by what they clear (the pass line and the CHECK)
+  let weeklyBanked = 0;
+  /** @type {number|null} */
+  let weeklyBankedExpiresAt = null;
+  /** @type {number|null} */
+  let otherExpiresAt = null;
   /** @type {Set<string>} */
   const clears = new Set();
   for (const g of kept.grants) {
@@ -82,6 +94,10 @@ export function resetSummary(status, now) {
     available += g.resetsLeft;
     if (g.endsAt != null && (expiresAt == null || g.endsAt < expiresAt)) expiresAt = g.endsAt;
     for (const c of g.clears) clears.add(c);
+    if (g.clearsWeekly) {
+      weeklyBanked += g.resetsLeft;
+      if (g.endsAt != null && (weeklyBankedExpiresAt == null || g.endsAt < weeklyBankedExpiresAt)) weeklyBankedExpiresAt = g.endsAt;
+    } else if (g.endsAt != null && (otherExpiresAt == null || g.endsAt < otherExpiresAt)) otherExpiresAt = g.endsAt;
     if (!g.usable) continue;
     applicable += g.resetsLeft;
     if (!g.clearsWeekly) continue;
@@ -96,6 +112,9 @@ export function resetSummary(status, now) {
     expiresAt,
     weeklyApplicable,
     weeklyExpiresAt,
+    weeklyBanked,
+    weeklyBankedExpiresAt,
+    otherExpiresAt,
     atLimit: kept.atLimit,
     cooldownUntil: kept.cooldownUntil,
     clears: [...clears].sort(),
@@ -272,12 +291,18 @@ export class ResetsProbe {
    * `refresh(account, force)` makes the seat's access token current before the read (the account
    * manager's ensureTokenFresh). Without it a seat with no recent traffic is read with an expired token
    * and answers 401 (live 2026-11-16: 5 of 7 seats, last good reads 3-8 h old).
-   * @param {{ accounts: () => Record<string, any>[], fetchStatus?: Function, refresh?: (account: Record<string, any>, force: boolean) => Promise<void>, applyUsage?: (account: Record<string, any>, usage: any) => void, now?: () => number }} opts
+   * `fetchProfile(account)` / `applyProfile(account, profile)`: the seat's tier, re-read once per
+   * PROFILE_REFRESH_MS (the first probe after a start reads every seat). Off when not given.
+   * @param {{ accounts: () => Record<string, any>[], fetchStatus?: Function, refresh?: (account: Record<string, any>, force: boolean) => Promise<void>, applyUsage?: (account: Record<string, any>, usage: any) => void, fetchProfile?: ((account: Record<string, any>) => Promise<any>)|null, applyProfile?: (account: Record<string, any>, profile: any) => void, now?: () => number }} opts
    */
-  constructor({ accounts, fetchStatus = fetchClaudeResetStatus, refresh = async () => {}, applyUsage = () => {}, now = Date.now }) {
+  constructor({ accounts, fetchStatus = fetchClaudeResetStatus, refresh = async () => {}, applyUsage = () => {}, fetchProfile = null, applyProfile = () => {}, now = Date.now }) {
     this.accounts = accounts;
     this.fetchStatus = fetchStatus;
     this.refresh = refresh;
+    this.fetchProfile = fetchProfile;
+    this.applyProfile = applyProfile;
+    /** @type {Map<string, number>} when each seat's profile was last read (tried) */
+    this.profileAt = new Map();
     this.applyUsage = applyUsage;
     this.now = now;
     /** @type {Map<string, { kept: KeptStatus|null, okAt: number|null, triedAt: number, error: string|null }>} */
@@ -311,6 +336,14 @@ export class ResetsProbe {
             this.byName.set(account.name, { kept: keepStatus(read.reset ?? null), okAt: at, triedAt: at, error: read.reset ? null : 'no reset block' });
             if (read.usage && !read.usage.error) {
               try { this.applyUsage(account, read.usage); } catch { /* the reset reading stands without it */ }
+            }
+            const lastProfile = this.profileAt.get(account.name);
+            if (this.fetchProfile && (lastProfile == null || this.now() - lastProfile >= PROFILE_REFRESH_MS)) {
+              this.profileAt.set(account.name, this.now()); // tried: a failing profile read waits a day too
+              try {
+                const profile = await this.fetchProfile(account);
+                if (profile && !profile.error) this.applyProfile(account, profile);
+              } catch { /* the tier stays as it was; the reset reading stands */ }
             }
           } catch (e) {
             fail(e); // a malformed reading is a failed read of this seat, not an escape past the cooldown
@@ -371,9 +404,11 @@ export function seatRows({ accounts, ledger, probe, staggerSeats = [], poolWeekl
       windowsLeft: w.windowsLeft,
       windowsLeftBasis: w.basis,
       resets: summary
-        ? { ...summary, expiresAt: iso(summary.expiresAt), weeklyExpiresAt: iso(summary.weeklyExpiresAt), cooldownUntil: iso(summary.cooldownUntil), seenAt: iso(seen?.okAt) }
+        ? { ...summary, expiresAt: iso(summary.expiresAt), weeklyExpiresAt: iso(summary.weeklyExpiresAt), weeklyBankedExpiresAt: iso(summary.weeklyBankedExpiresAt), otherExpiresAt: iso(summary.otherExpiresAt), cooldownUntil: iso(summary.cooldownUntil), seenAt: iso(seen?.okAt) }
         : null,
       resetsError: seen ? seen.error : 'not probed yet',
+      // banked resets spent on this seat in the last 7 days (any path: pool-dry, rule, operator)
+      resetsSpent7d: (Array.isArray(a.quota?.claudeResetSpends) ? a.quota.claudeResetSpends : []).filter((/** @type {unknown} */ t) => typeof t === 'number' && t <= now && now - t < 7 * 24 * HOUR_MS).length,
       resetsTriedAt: iso(seen?.triedAt),
     };
     if (dryRun) {

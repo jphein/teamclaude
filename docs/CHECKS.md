@@ -25,6 +25,7 @@ How a run exits: always 0, whatever it found. A check reports, it never gates; `
 | `proxy-wrapper` | `teamclaude-check-proxy-wrapper.timer` | every 5 min (:02/:07/…/:57; was 15 min until the 2026-11-15 outage) | On familiar, wakizashi and katana: whether `:3456` answers `/teamclaude/quota`, and whether `claude` fails closed | teamclaude lane | Before #66, the wrapper silently ran claude on the host's own login whenever `:3456` was down. That billed a seat outside the pool (Sen, 2026-11-14 06:4x). |
 | `forge-keys` | `teamclaude-check-forge-keys.timer` | daily 07:20 | The forge gateway's (LiteLLM, ubox0) virtual keys: spend outside a key's allowlist, keys unused for 30 days, spend by unknown keys, and refused calls by inactive keys | teamclaude lane; gateway owned by palace-nemotron | The 2026-11-14 Ember key rotation. A key fragment leaked, and the only way to tell whether anyone tried the old key was a manual SQL read. |
 | `fable-use` | `teamclaude-check-fable-use.timer` | daily 07:40 | `GET 127.0.0.1:3456/teamclaude/quota`: each seat's Fable weekly bucket (`buckets.weeklyFable`), its used % and when it resets | teamclaude lane | On 2026-11-16 every seat's Fable week stood at 0 % used. The proxy rations Fable to the `fable.allow` client keys (JP, 2026-10-11), so a whole week's Fable allowance can expire unused with nobody seeing it. This check is the mechanism for JP's "use down all credits" rule on this pool (Sen, 2026-11-16 08:0x). |
+| `resets-banked` | `teamclaude-check-resets-banked.timer` | daily 07:45 | `GET 127.0.0.1:3456/teamclaude/quota` → `seats[].resets`: banked Claude usage-limit resets split weekly-clearing / 5h-only with each soonest expiry, and `resetsSpent7d` | teamclaude lane | On 2026-11-16 every seat's reset count read empty to the fleet lead (the field it looked at did not exist) and 5 of 7 seats' readings were 3–8 h stale behind 401s. A reset that expires unspent is lost, and the automatic reset strategy (JP, 2026-11-16 08:26) needs the count to be trusted. |
 
 ### pool-quota
 
@@ -82,6 +83,15 @@ How a run exits: always 0, whatever it found. A check reports, it never gates; `
 - **What to do on a warn.** Use the named seats' Fable before the reset (a lane on a `fable.allow` key), or ask JP to widen `fable.allow`; the allow list is his rationing rule, so widening it is his word.
 - **Example:** `CHECK fable-use warn · Fable week used: pool avg 0% (claude3 0%, jp 0%, claude 0%, claude2 0%, claude4 0%, claude5 0%, claude6 0%); ending unused within 24 h: claude3 jp claude4, at 08:02 · next run tomorrow 07:40 · owner teamclaude lane` (the first live run, 2026-11-16).
 
+### resets-banked
+
+- **The line** is the pass's reset count: `banked: weekly-clearing N (soonest expiry …), 5h-only M (soonest expiry …); spent in 7 days: K`. "Spent" counts every path (pool-dry, rule, operator), from each seat's saved spend times.
+- **warn:** a seat holds a reset that expires within 48 hours unspent.
+- **Fresh only:** a seat's reading counts only if its `seenAt` is under 2 hours old (the probe runs every 30 minutes). An older reading is named as stale, left out of the counts, and warns; if no seat is fresh, the check fails.
+- **fail:** the endpoint does not answer or holds no valid `seats` list (a malformed `resets` block included), or no seat has a fresh reading (the probe is down; a stale count must not read as ok).
+- **Informational:** seats without a reading are named.
+- **Example:** `CHECK resets-banked ok · banked: weekly-clearing 2 (soonest expiry Dec 10), 5h-only 14 (soonest expiry Mar 9); spent in 7 days: 2, at 07:45 · next run tomorrow 07:45 · owner teamclaude lane`
+
 ## Install, update and rollback
 
 Install only from a merged commit, never from a working tree:
@@ -91,16 +101,16 @@ scripts/checks/install.sh <commit on origin/master>
 ```
 
 The script does the following:
-1. Extracts every script, the reviewed `claude-wrapper.sh` and the units into a staging directory. It checks that each script is present and parses, and that `scripts/checks/systemd/` holds exactly the eight check units. A missing or extra file publishes nothing.
-2. Takes an exclusive lock for the whole run (a second install is refused). Records which timers are running (an unreadable state refuses before anything stops). Stops the four timers, and refuses if one did not stop or its state cannot be read (an unreachable user manager is not "stopped"), and waits (up to 5 minutes) for any running check to finish, so no check runs while its files are half replaced. On any exit after the stop that is not a finished install (a refusal, a failed move, an unexpected error), all four timers are stopped first (a failed `enable --now` may have started some) and any running check is waited for; then every file already published is restored and systemd reloads it; then the timers that were running are started again, and only those. Every rollback step is checked: if a file cannot be restored or systemd cannot reload, the backups are kept and no timer is started; if the timers do not start again, the exact `systemctl --user start …` command is printed. If a timer did not stop or a check is still running after the wait, no file is replaced under it: the previous files are moved (one rename) to `~/.local/libexec/teamclaude-checks/.rollback-<time>/` with a `MANIFEST`, or, if that fails, left in the named staging directory; every timer stays stopped, and the install reports `ROLLBACK INCOMPLETE`.
+1. Extracts every script, the reviewed `claude-wrapper.sh` and the units into a staging directory. It checks that each script is present and parses, and that `scripts/checks/systemd/` holds exactly the ten check units. A missing or extra file publishes nothing.
+2. Takes an exclusive lock for the whole run (a second install is refused). Records which timers are running (an unreadable state refuses before anything stops). Stops the five timers, and refuses if one did not stop or its state cannot be read (an unreachable user manager is not "stopped"), and waits (up to 5 minutes) for any running check to finish, so no check runs while its files are half replaced. On any exit after the stop that is not a finished install (a refusal, a failed move, an unexpected error), all five timers are stopped first (a failed `enable --now` may have started some) and any running check is waited for; then every file already published is restored and systemd reloads it; then the timers that were running are started again, and only those. Every rollback step is checked: if a file cannot be restored or systemd cannot reload, the backups are kept and no timer is started; if the timers do not start again, the exact `systemctl --user start …` command is printed. If a timer did not stop or a check is still running after the wait, no file is replaced under it: the previous files are moved (one rename) to `~/.local/libexec/teamclaude-checks/.rollback-<time>/` with a `MANIFEST`, or, if that fails, left in the named staging directory; every timer stays stopped, and the install reports `ROLLBACK INCOMPLETE`.
 3. Preflights the destinations (writable directories, existing targets are regular files), keeps a copy of each existing file, and moves the payload into place: scripts to `~/.local/libexec/teamclaude-checks/`, units to `~/.config/systemd/user/`. If any move fails, every file already moved is restored.
 4. Reloads systemd.
-5. Enables and starts exactly the four named timers.
+5. Enables and starts exactly the five named timers.
 
 To update, run it again with the newer commit. To roll back:
 
 ```
-systemctl --user disable --now teamclaude-check-{pool-quota,proxy-wrapper,forge-keys,fable-use}.timer
+systemctl --user disable --now teamclaude-check-{pool-quota,proxy-wrapper,forge-keys,fable-use,resets-banked}.timer
 ```
 
 ## Adding a check

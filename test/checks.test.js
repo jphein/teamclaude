@@ -357,6 +357,59 @@ test('fable-use: no accounts list, bad JSON or no endpoint is a fail line (exit 
   assert.match(r.line, /^CHECK fable-use fail · quota endpoint http:\/\/127\.0\.0\.1:1\/teamclaude\/quota did not answer/);
 });
 
+// ---------- resets-banked
+const iso = (ms) => new Date(ms).toISOString();
+const rseat = (name, r, spent = 0) => ({ name, resets: r, resetsSpent7d: spent });
+const rb = (avail, weeklyBanked, wexpIn, oexpIn, extra = {}) => ({ eligible: true, available: avail, weeklyApplicable: 0, weeklyBanked,
+  weeklyBankedExpiresAt: wexpIn == null ? null : iso(NOW + wexpIn), otherExpiresAt: oexpIn == null ? null : iso(NOW + oexpIn),
+  expiresAt: iso(NOW + Math.min(...[wexpIn, oexpIn].filter((x) => x != null))), seenAt: iso(NOW - 600_000), ...extra });
+function rbk(body) {
+  const f = join(fresh(), 'q.json');
+  writeFileSync(f, typeof body === 'string' ? body : JSON.stringify(body));
+  return run('resets-banked.sh', { CHECK_QUOTA_FILE: f, CHECK_NOW_MS: String(NOW) });
+}
+const D = 86_400_000;
+
+test('resets-banked: splits weekly-clearing from 5h-only with each soonest expiry, and counts spends in 7 days', () => {
+  const r = rbk({ seats: [rseat('claude5@x.org', rb(3, 1, 24 * D, 113 * D), 1), rseat('claude3@x.org', rb(2, 0, null, 112 * D), 0)] });
+  assert.equal(r.status, 0);
+  assert.match(r.line, LINE);
+  assert.match(r.line, /^CHECK resets-banked ok · banked: weekly-clearing 1 \(soonest expiry \w{3} \d+\), 5h-only 4 \(soonest expiry \w{3} \d+\); spent in 7 days: 1, at /);
+});
+
+test('resets-banked: a reset expiring within 48 h warns naming the seat; an unread seat is named', () => {
+  const r = rbk({ seats: [rseat('a@x.org', rb(1, 1, 47 * 3_600_000, null)), rseat('b@x.org', rb(2, 0, null, 49 * 3_600_000)), rseat('c@x.org', null)] });
+  assert.match(r.line, /^CHECK resets-banked warn · .*; expiring within 48 h unspent: a, no reading: c, at /);
+});
+
+test('resets-banked: no reading anywhere, a malformed reset block, or no endpoint fails (exit 0)', () => {
+  assert.match(rbk({ seats: [rseat('a@x.org', null)] }).line, /^CHECK resets-banked fail · no seat has a fresh reset reading/);
+  for (const body of ['{}', 'nope', { seats: [7] }, { seats: [rseat('a@x.org', { available: -1, weeklyBanked: 0 })] }, { seats: [rseat('a@x.org', { available: 1, weeklyBanked: 2 })] }, { seats: [rseat('a@x.org', 'x')] }, { seats: [rseat('a@x.org', { available: 1.5, weeklyBanked: 0 })] }]) {
+    const r = rbk(body);
+    assert.equal(r.status, 0);
+    assert.match(r.line, /^CHECK resets-banked fail · quota endpoint answered without a valid seats list/, JSON.stringify(body));
+  }
+  const r = run('resets-banked.sh', { CHECK_QUOTA_URL: 'http://127.0.0.1:1/teamclaude/quota' });
+  assert.match(r.line, /^CHECK resets-banked fail · quota endpoint http:\/\/127\.0\.0\.1:1\/teamclaude\/quota did not answer/);
+});
+
+test('resets-banked (xreview 2): readings over 2 h old are stale: named, not counted, warn; all stale fails', () => {
+  const r = rbk({ seats: [rseat('a@x.org', rb(3, 1, 20 * D, 90 * D)), rseat('b@x.org', rb(2, 0, null, 90 * D, { seenAt: iso(NOW - 3 * 3_600_000) }))] });
+  assert.match(r.line, /^CHECK resets-banked warn · banked: weekly-clearing 1 .*, 5h-only 2 .*; stale over 2 h \(not counted\): b, at /);
+  const all = rbk({ seats: [rseat('a@x.org', rb(3, 1, 20 * D, 90 * D, { seenAt: iso(NOW - 8 * 3_600_000) })), rseat('b@x.org', rb(2, 0, null, 90 * D, { seenAt: null }))] });
+  assert.match(all.line, /^CHECK resets-banked fail · no seat has a fresh reset reading \(probe down\?\), stale over 2 h: a b, at /);
+  assert.match(rbk({ seats: [rseat('a@x.org', rb(3, 1, 20 * D, 90 * D, { seenAt: 'garbage' }))] }).line, /^CHECK resets-banked fail · quota endpoint answered without a valid seats list/);
+});
+
+test('resets-banked (xreview): resets false, a malformed expiry, or a proxy without weeklyBanked fails, never ok', () => {
+  for (const r of [false, 0, { ...rb(1, 1, D, null), weeklyBankedExpiresAt: 'garbage' }, { ...rb(1, 0, null, D), otherExpiresAt: 7 }, { ...rb(1, 1, D, null), expiresAt: 'garbage' },
+    { eligible: true, available: 3, weeklyApplicable: 0, expiresAt: iso(NOW + D) }]) {
+    const out = rbk({ seats: [rseat('a@x.org', rb(1, 0, null, 9 * D)), rseat('b@x.org', r)] });
+    assert.match(out.line, /^CHECK resets-banked fail · quota endpoint answered without a valid seats list/, JSON.stringify(r));
+  }
+  assert.match(rbk({ seats: [rseat('a@x.org', { eligible: true, available: 1, weeklyApplicable: 0, weeklyBanked: 0, weeklyBankedExpiresAt: null, otherExpiresAt: null, expiresAt: null, seenAt: iso(NOW - 60_000) })] }).line, /^CHECK resets-banked ok · /, 'null expiries are legitimate');
+});
+
 // ---------- forge-keys (canned psql output)
 function fk(out, { rc = 0 } = {}) {
   const d = fresh(); const p = join(d, 'psql');
@@ -419,12 +472,12 @@ function summary(files, now = Math.floor(Date.now() / 1000)) {
 }
 
 test('summary: silent when every check is ok and fresh', () => {
-  const r = summary({ 'pool-quota': ['CHECK pool-quota ok · x · y', 5], 'proxy-wrapper': ['CHECK proxy-wrapper ok · x · y', 5], 'forge-keys': ['CHECK forge-keys ok · x · y', 600], 'fable-use': ['CHECK fable-use ok · x · y', 600] });
+  const r = summary({ 'pool-quota': ['CHECK pool-quota ok · x · y', 5], 'proxy-wrapper': ['CHECK proxy-wrapper ok · x · y', 5], 'forge-keys': ['CHECK forge-keys ok · x · y', 600], 'fable-use': ['CHECK fable-use ok · x · y', 600], 'resets-banked': ['CHECK resets-banked ok · x · y', 600] });
   assert.equal(r.status, 0); assert.equal(r.stdout, '');
 });
 
 test('summary: a malformed or multi-line result is a warn, never silence', () => {
-  const r = summary({ 'pool-quota': ['CHECK pool-quota ok garbage', 5], 'proxy-wrapper': ['CHECK proxy-wrapper ok · x · y\nCHECK proxy-wrapper fail · z · y', 5], 'forge-keys': ['CHECK forge-keys ok · x · y', 5], 'fable-use': ['CHECK fable-use ok · x · y', 5] });
+  const r = summary({ 'pool-quota': ['CHECK pool-quota ok garbage', 5], 'proxy-wrapper': ['CHECK proxy-wrapper ok · x · y\nCHECK proxy-wrapper fail · z · y', 5], 'forge-keys': ['CHECK forge-keys ok · x · y', 5], 'fable-use': ['CHECK fable-use ok · x · y', 5], 'resets-banked': ['CHECK resets-banked ok · x · y', 5] });
   const lines = r.stdout.trim().split('\n');
   assert.equal(lines.length, 2);
   assert.match(lines[0], /^CHECK pool-quota warn · last result is malformed/);
@@ -438,6 +491,7 @@ test('summary: repeats warn/fail lines, flags a stale result and a missing one',
   assert.match(lines[1], /^CHECK proxy-wrapper warn · last result is 11 min old \(max 10\): timer stopped\? last: ok · x · y/);
   assert.match(lines[2], /^CHECK forge-keys warn · no result yet/);
   assert.match(lines[3], /^CHECK fable-use warn · no result yet/);
+  assert.match(lines[4], /^CHECK resets-banked warn · no result yet/);
 });
 
 // ---------- lib
@@ -452,7 +506,7 @@ test('lib: an unknown status becomes fail (still exit 0); the line file is writt
 });
 
 test('units: every check has a service and a timer; services run the installed copy', () => {
-  for (const name of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use']) {
+  for (const name of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use', 'resets-banked']) {
     const svc = readFileSync(join(C, 'systemd', `teamclaude-check-${name}.service`), 'utf8');
     assert.match(svc, new RegExp(`^ExecStart=%h/\\.local/libexec/teamclaude-checks/${name}\\.sh$`, 'm'));
     assert.match(readFileSync(join(C, 'systemd', `teamclaude-check-${name}.timer`), 'utf8'), /^Persistent=true$/m);
@@ -471,8 +525,8 @@ function repoAt(files) {
 }
 const payload = (omit = []) => {
   const files = {};
-  for (const f of ['lib.sh', 'pool-quota.sh', 'proxy-probe.sh', 'proxy-wrapper.sh', 'forge-keys.sh', 'fable-use.sh', 'summary.sh', 'install.sh']) if (!omit.includes(f)) files[`scripts/checks/${f}`] = readFileSync(join(C, f), 'utf8');
-  for (const n of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use']) for (const ext of ['service', 'timer']) files[`scripts/checks/systemd/teamclaude-check-${n}.${ext}`] = readFileSync(join(C, 'systemd', `teamclaude-check-${n}.${ext}`), 'utf8');
+  for (const f of ['lib.sh', 'pool-quota.sh', 'proxy-probe.sh', 'proxy-wrapper.sh', 'forge-keys.sh', 'fable-use.sh', 'resets-banked.sh', 'summary.sh', 'install.sh']) if (!omit.includes(f)) files[`scripts/checks/${f}`] = readFileSync(join(C, f), 'utf8');
+  for (const n of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use', 'resets-banked']) for (const ext of ['service', 'timer']) files[`scripts/checks/systemd/teamclaude-check-${n}.${ext}`] = readFileSync(join(C, 'systemd', `teamclaude-check-${n}.${ext}`), 'utf8');
   files['scripts/claude-wrapper.sh'] = NEW_WRAPPER;
   return files;
 };
@@ -486,7 +540,7 @@ test('install: a complete merged commit is published and its timers enabled', ()
   assert.equal(r.status, 0, r.stderr);
   assert.equal(readFileSync(join(h, '.local/libexec/teamclaude-checks/claude-wrapper.sh'), 'utf8'), NEW_WRAPPER);
   assert.ok(existsSync(join(h, '.config/systemd/user/teamclaude-check-forge-keys.timer')));
-  assert.match(readFileSync(join(h, 'systemctl.log'), 'utf8'), /^--user enable --now teamclaude-check-pool-quota\.timer teamclaude-check-proxy-wrapper\.timer teamclaude-check-forge-keys\.timer teamclaude-check-fable-use\.timer$/m);
+  assert.match(readFileSync(join(h, 'systemctl.log'), 'utf8'), /^--user enable --now teamclaude-check-pool-quota\.timer teamclaude-check-proxy-wrapper\.timer teamclaude-check-forge-keys\.timer teamclaude-check-fable-use\.timer teamclaude-check-resets-banked\.timer$/m);
 });
 
 test('install: a commit missing a file publishes nothing over the existing install', () => {
@@ -518,7 +572,7 @@ test('install: a commit missing one unit publishes nothing', () => {
   const files = payload(); delete files['scripts/checks/systemd/teamclaude-check-forge-keys.service'];
   const r = install(repoAt(files), h);
   assert.equal(r.status, 4);
-  assert.match(r.stderr, /not exactly the eight check units; nothing installed/);
+  assert.match(r.stderr, /not exactly the ten check units; nothing installed/);
   assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false);
 });
 
@@ -573,7 +627,7 @@ test('install: an extra unit file refuses the install; only the three named time
   const files = payload(); files['scripts/checks/systemd/unexpected.timer'] = '[Timer]\nOnCalendar=*:*\n'; files['scripts/checks/systemd/unexpected.service'] = '[Service]\nExecStart=/bin/true\n';
   const r = install(repoAt(files), h);
   assert.equal(r.status, 4);
-  assert.match(r.stderr, /not exactly the eight check units/);
+  assert.match(r.stderr, /not exactly the ten check units/);
   assert.equal(existsSync(join(h, '.config/systemd/user/unexpected.timer')), false);
   assert.equal(existsSync(join(h, 'systemctl.log')), false);
 });
@@ -645,7 +699,7 @@ test('install: an unexpected failure after the stop (daemon-reload) still starts
   const r = installWith(repoAt(payload()), h, RUNNING(h) + `\ncase "$2" in daemon-reload) if [ ! -e '${once}' ]; then : > '${once}'; exit 1; fi ;; esac`);
   assert.notEqual(r.status, 0);
   const log = readFileSync(join(h, 'systemctl.log'), 'utf8').trim().split('\n');
-  assert.equal(log[log.length - 1], '--user start teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer', log.join(' | '));
+  assert.equal(log[log.length - 1], '--user start teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer teamclaude-check-resets-banked.timer', log.join(' | '));
 });
 
 test('install: a second install while one holds the lock is refused', async () => {
@@ -744,7 +798,7 @@ test('install: a partial enable --now failure leaves no timer running that was n
   const enable = log.findIndex((l) => l.startsWith('--user enable --now '));
   assert.ok(enable >= 0, log.join(' | '));
   // stop all three timers first, then (after the wait) restore the files and reload; none was running before
-  assert.equal(log[enable + 1], '--user stop teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer', log.join(' | '));
+  assert.equal(log[enable + 1], '--user stop teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer teamclaude-check-resets-banked.timer', log.join(' | '));
   assert.ok(log.slice(enable + 2).includes('--user daemon-reload'), log.join(' | '));
   assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false, 'a first install that failed must not leave its files');
   assert.equal(log.slice(enable + 1).some((l) => l.startsWith('--user start ')), false);
@@ -921,7 +975,7 @@ test('install: a timer restart that fails after a rollback is reported with the 
   const body = RUNNING(h) + '\ncase "$2" in start) exit 1 ;; esac';
   const r = installWith(repoAt(payload()), h, body, { CHECK_INSTALL_FAIL_AT: 'pool-quota.sh' });
   assert.equal(r.status, 5);
-  assert.match(r.stderr, /ROLLBACK INCOMPLETE: the previous install is in place but its timers did not start\. Run: systemctl --user start teamclaude-check-pool-quota\.timer teamclaude-check-proxy-wrapper\.timer teamclaude-check-forge-keys\.timer teamclaude-check-fable-use\.timer/);
+  assert.match(r.stderr, /ROLLBACK INCOMPLETE: the previous install is in place but its timers did not start\. Run: systemctl --user start teamclaude-check-pool-quota\.timer teamclaude-check-proxy-wrapper\.timer teamclaude-check-forge-keys\.timer teamclaude-check-fable-use\.timer teamclaude-check-resets-banked\.timer/);
 });
 
 test('install: a SIGTERM right after the first move still rolls that file back', () => {

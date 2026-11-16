@@ -915,6 +915,22 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // Banked resets and windows per seat (src/seat-resets.js). READ-ONLY: it never spends a reset;
+      // ?probe=1 refreshes the reading (one zero-spend usage request per seat, at most once per 10
+      // minutes), ?dryRun=1 adds the opt-in redeem rule's verdict per seat and logs it.
+      if (req.method === 'GET' && (req.url === '/teamclaude/resets' || req.url?.startsWith('/teamclaude/resets?'))) {
+        const h = /** @type {any} */ (hooks);
+        if (!h.getSeatResets) { json(res, 501, { error: 'resets not supported' }); return; }
+        const q = new URL(req.url, 'http://x').searchParams;
+        try {
+          json(res, 200, await h.getSeatResets({ probe: q.get('probe') === '1', dryRun: q.get('dryRun') === '1' }));
+        } catch (/** @type {any} */ err) {
+          console.error('[TeamClaude] Seat resets failed:', err?.message || err);
+          json(res, 500, { error: 'seat resets failed; see the proxy log' });
+        }
+        return;
+      }
+
       // Reload endpoint — re-sync accounts from config without a restart. This
       // is the headless equivalent of pressing 'R' in the TUI. Local control
       // only (no upstream calls); the auth gate above already applies.

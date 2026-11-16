@@ -37,6 +37,7 @@ import { ensureCerts, mitmHosts, caCertPath, rotateMitm, probeProxyListening } f
 import { Prober, probeApplicable } from './prober.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
+import { WindowLedger, ResetsProbe, seatRows } from './seat-resets.js';
 import { Warmer, warmApplicable } from './warmer.js';
 import { StaggerAnchors } from './warm-stagger.js';
 import { RoutingEvents } from './routing-events.js';
@@ -207,6 +208,10 @@ switch (command) {
     break;
   case 'status':
     await statusCommand();
+    process.exit(0);
+    break;
+  case 'resets':
+    await resetsCommand();
     process.exit(0);
     break;
   case 'attach':
@@ -962,7 +967,35 @@ async function serverCommand() {
       })),
     },
   });
-  hooks.getQuotaExtra = () => ({ warmup: resolveWarmupConfig(config), stagger: stagger?.status() || { enabled: false } });
+  // Per-seat view for the plan's Seats tile and `teamclaude resets` (src/seat-resets.js): banked resets
+  // (read-only; nothing here spends), windows left this week from a ledger of window starts, and the
+  // next window. The probe is one zero-spend usage request per seat: shortly after start, every 3 h,
+  // and on demand (GET /teamclaude/resets?probe=1), at most once per 10 minutes.
+  const windowLedger = new WindowLedger({ statePath: getConfigPath().replace(/\.json$/, '') + '-windows.json' });
+  accountManager.on5hWindowStarted((/** @type {{ account: Record<string, any> }} */ { account }) => windowLedger.record(account.name, account.quota?.unified7d, account.quota?.unified7dReset));
+  const resetsProbe = new ResetsProbe({
+    accounts: () => accountManager.accounts,
+    applyUsage: (account, usage) => accountManager.applyUsageData(account.index, usage),
+  });
+  const probeResetsQuietly = () => resetsProbe.probe().catch((/** @type {any} */ e) => console.error(`[TeamClaude] Seat resets probe failed: ${e?.message || e}`));
+  setTimeout(probeResetsQuietly, 60_000).unref?.();
+  setInterval(probeResetsQuietly, 3 * 3600_000).unref?.();
+  const seatView = (/** @type {{ dryRun?: boolean }} */ { dryRun = false } = {}) => seatRows({
+    accounts: accountManager.accounts,
+    ledger: windowLedger,
+    probe: resetsProbe,
+    staggerSeats: /** @type {any} */ (stagger?.status())?.seats || [],
+    poolWeeklyRemaining: accountManager.getQuotaSummary()?.aggregate?.weeklyShared?.remaining ?? null,
+    now: Date.now(),
+    dryRun,
+  });
+  hooks.getQuotaExtra = () => ({ warmup: resolveWarmupConfig(config), stagger: stagger?.status() || { enabled: false }, seats: seatView() });
+  /** @type {any} */ (hooks).getSeatResets = async (/** @type {{ probe?: boolean, dryRun?: boolean }} */ { probe = false, dryRun = false } = {}) => {
+    if (probe) await resetsProbe.probe();
+    const seats = seatView({ dryRun });
+    if (dryRun) for (const r of seats) console.log(`[TeamClaude] Resets dry run: "${r.name}" would ${r.redeem?.would ? '' : 'NOT '}redeem: ${r.redeem?.reason}`);
+    return { armed: config.autoRedeemResets === true, probedAt: resetsProbe.lastProbeAt ? new Date(resetsProbe.lastProbeAt).toISOString() : null, seats };
+  };
 
   // Web-dashboard control hooks — consumed by the /teamclaude/* endpoints in
   // server.js. They work with or without the TUI, so the browser dashboard can
@@ -1899,6 +1932,39 @@ async function statusCommand() {
     if (err?.message) console.error(`Details: ${err.message}`);
     process.exit(1);
   }
+}
+
+// ── resets ──────────────────────────────────────────────────
+
+// Banked usage-limit resets and windows left, per seat, from the running proxy. Read-only: it never
+// spends a reset (redeeming stays with the opt-in redeemer behind autoRedeemResets). --probe refreshes
+// the reading (one zero-spend usage request per seat, at most once per 10 minutes); --dry-run adds the
+// redeem rule's verdict per seat; --json prints the raw shape (documented in the lexicon entry).
+async function resetsCommand() {
+  const config = await loadOrCreateConfig();
+  const qs = [args.includes('--probe') && 'probe=1', args.includes('--dry-run') && 'dryRun=1'].filter(Boolean).join('&');
+  const url = `http://localhost:${config.proxy.port}/teamclaude/resets${qs ? `?${qs}` : ''}`;
+  /** @type {any} */
+  let data;
+  try {
+    const res = await fetch(url, { headers: { 'x-api-key': config.proxy.apiKey }, signal: AbortSignal.timeout(90_000) });
+    data = await res.json();
+    if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+  } catch (/** @type {any} */ err) {
+    console.error(`Cannot read seat resets from the proxy at localhost:${config.proxy.port}: ${err?.message || err}`);
+    process.exit(1);
+  }
+  if (args.includes('--json')) { await writeStdout(`${JSON.stringify(data, null, 2)}\n`); return; }
+  const t = (/** @type {string|null} */ v) => (v ? new Date(v).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' }) : '-');
+  const lines = [`Banked resets ${data.armed ? 'auto-redeem ARMED' : 'auto-redeem off (dry run only)'} · probed ${data.probedAt ? t(data.probedAt) : 'not yet'}`];
+  for (const r of data.seats || []) {
+    const rs = r.resets;
+    const resets = !rs ? (r.resetsError || 'unknown') : !rs.eligible ? `ineligible (${rs.ineligibleReason || '?'})` : `${rs.available} left${rs.applicable !== rs.available ? `, ${rs.applicable} usable now` : ''}${rs.expiresAt ? `, expires ${t(rs.expiresAt)}` : ''}`;
+    const win = r.windowsLeft == null ? `windows ? (${r.windowsLeftBasis})` : `${r.windowsLeft} window${r.windowsLeft === 1 ? '' : 's'} left`;
+    const now = r.inWindow ? `in window to ${t(r.windowEndsAt)}` : `next ${t(r.nextWindowAt)} (${r.nextWindowBasis})`;
+    lines.push(`  ${String(r.name).split('@')[0].padEnd(9)} resets: ${resets} · ${win} · ${now}${r.redeem ? ` · dry run: ${r.redeem.would ? 'WOULD redeem' : 'no'} (${r.redeem.reason})` : ''}`);
+  }
+  await writeStdout(`${lines.join('\n')}\n`);
 }
 
 // ── attach ──────────────────────────────────────────────────
@@ -3086,6 +3152,8 @@ Commands:
                       (LaunchAgent on macOS, systemd --user unit on Linux;
                       'print' writes the unit to stdout without touching anything)
   status [--json]     Show rich proxy/account/probe status (live)
+  resets [--probe] [--dry-run] [--json]
+                      Banked resets and windows left per seat (read-only)
                       Use --color=always|never to control ANSI colors
   attach              Open the live dashboard against a running server; s
                       switches account, R reloads config, q leaves it running

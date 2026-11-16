@@ -234,6 +234,7 @@ teamclaude env               # Print export lines for routing claude yourself
 teamclaude alias             # Print/install a `claude` alias that routes via the proxy
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude status            # Show live proxy status (requires running server)
+teamclaude resets [--probe] [--dry-run] [--json]  # Banked resets + windows left per seat (read-only)
 teamclaude attach            # Open the live dashboard against a running server
 teamclaude dashboard         # Open the web dashboard in the browser (needs server)
 teamclaude service install   # Run the proxy as a login service (uninstall/status/print)

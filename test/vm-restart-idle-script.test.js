@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync, existsSync, symlinkSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 // The VM restart script must never put the operator key where `ps` shows it:
 // no argv, no environment, no shell variable. Node reads it from the config
@@ -158,14 +158,14 @@ async function restartRun(o) {
           PATH: process.env.PATH ?? '', HOME: d, WAIT: o.idle === 'false' ? '2' : '20', TC_IDLE_CMD: o.idle ?? 'true',
           TC_RESTART_CMD: expand(o.restart), TC_CHILD_FILE: `${d}/${o.childFile ?? 'child_pid'}`, TC_PROC: `${d}/proc`,
           TC_LISTENER_CMD: o.listenerCmd ? expand(o.listenerCmd) : `cat ${d}/listener`, TC_QUOTA_URL: `http://127.0.0.1:${port}/teamclaude/quota`,
-          TC_VERIFY_WAIT: '3', TC_STEP: '1',
+          TC_VERIFY_WAIT: '3', TC_STEP: '1', ...(o.phase ? { PHASE: o.phase } : {}),
         },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       let out = '', err = '';
       child.stdout.on('data', c => { out += c; });
       child.stderr.on('data', c => { err += c; });
-      child.on('exit', code => resolve({ code, out, err }));
+      child.on('exit', code => resolve({ code, out, err, dir: d }));
       child.stdin.end(remote);
     });
   } finally {
@@ -234,10 +234,26 @@ test('the same pid reused by a new child (new start time) counts as a new child'
   assert.match(r.out, /new child 4242:999 alone on :3456/);
 });
 
-test('never idle → exit 1, no restart attempted', async () => {
-  const r = await restartRun({ restart: 'touch $D/restarted', idle: 'false' });
+test('wait phase never idle → exit 1, no restart attempted', async () => {
+  const r = await restartRun({ restart: 'touch $D/restarted', idle: 'false', phase: 'wait' });
   assert.equal(r.code, 1);
   assert.match(r.err, /never at 0 in-flight/);
+  assert.equal(existsSync(join(r.dir, 'restarted')), false);
+});
+
+test('wait phase idle → exit 0 and nothing restarted (the restart is the second phase)', async () => {
+  const r = await restartRun({ restart: 'touch $D/restarted', phase: 'wait' });
+  assert.equal(r.code, 0);
+  assert.equal(existsSync(join(r.dir, 'restarted')), false);
+});
+
+test('restart phase busy → exit 10 at once, no waiting, nothing restarted', async () => {
+  const t0 = Date.now();
+  const r = await restartRun({ restart: 'touch $D/restarted', idle: 'false' });
+  assert.equal(r.code, 10);
+  assert.match(r.err, /busy again at the restart moment/);
+  assert.ok(Date.now() - t0 < 1500, 'did not wait for idle');
+  assert.equal(existsSync(join(r.dir, 'restarted')), false);
 });
 
 test('the new child plus an orphan both on :3456 (different addresses) → exit 3, both named', async () => {
@@ -298,4 +314,169 @@ test('a listener lookup that fails after printing the new pid is not a listener 
   const r = await restartRun({ restart: 'OLDGONE; NEWCHILD(5151,200); LISTENER(5151); echo "cat $D/listener; exit 1" > $D/lcmd' , listenerCmd: 'sh $D/lcmd' });
   assert.equal(r.code, 3);
   assert.match(r.err, /listener lookup failed or timed out/);
+});
+
+// ---------- JP's sittings (Sen 2026-11-16 11:4x: a drained restart still cut a live Squire sitting into a
+// retryable 503). The whole script runs with a fake `ssh` first on PATH that records whether it was called.
+async function gateRun(/** @type {{ flagAgeS?: number|null, args?: string[], ok?: boolean, onWait?: string, waitRc?: number, onRestart?: string, restartRcFirst?: number, setup?: (d: string, flag: string) => void }} */ o) {
+  const d = mkdtempSync(join(tmpdir(), 'tc-sitting-'));
+  mkdirSync(join(d, 'bin'));
+  mkdirSync(join(d, 'state'));
+  const flag = join(d, 'state', 'sitting.active');
+  // the fake ssh logs each phase it is asked to run; during PHASE=wait it may run a fixture edit and exit waitRc
+  writeFileSync(join(d, 'bin', 'ssh'), [
+    '#!/bin/sh', 'cat >/dev/null', 'for a; do last=$a; done', `echo "$last" >> ${d}/ssh.args`,
+    `case $last in *PHASE=wait*) echo wait >> ${d}/ssh.log; ${o.onWait ?? ':'}; exit ${o.waitRc ?? 0} ;; esac`,
+    `echo restart >> ${d}/ssh.log`, `n=$(grep -c restart ${d}/ssh.log)`,
+    `if [ "$n" = 1 ]; then ${o.onRestart ?? ':'}; exit ${o.restartRcFirst ?? 0}; fi`, 'exit 0', ''].join('\n'), { mode: 0o755 });
+  if (o.flagAgeS != null) {
+    writeFileSync(flag, '');
+    const t = (Date.now() / 1000) - o.flagAgeS;
+    utimesSync(flag, t, t);
+  }
+  o.setup?.(d, flag);
+  try {
+    return await new Promise(resolve => {
+      const child = spawn('sh', [new URL('../scripts/vm-restart-idle.sh', import.meta.url).pathname, ...(o.args ?? [])], {
+        env: { PATH: `${d}/bin:${process.env.PATH ?? ''}`, HOME: d, TC_SITTING_FLAG: flag, FLAG: flag, ...(o.ok ? { TC_SITTING_OK: '1' } : {}) },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let out = '', err = '';
+      child.stdout.on('data', c => { out += c; });
+      child.stderr.on('data', c => { err += c; });
+      child.on('exit', code => {
+        const phases = existsSync(join(d, 'ssh.log')) ? readFileSync(join(d, 'ssh.log'), 'utf8').trim().split('\n') : [];
+        resolve({ code, out, err, phases, sshArgs: existsSync(join(d, 'ssh.args')) ? readFileSync(join(d, 'ssh.args'), 'utf8') : '', sshCalled: phases.length > 0, restarted: phases.includes('restart') });
+      });
+    });
+  } finally {
+    spawn('chmod', ['-R', 'u+rwx', d]).on('exit', () => {});
+    await new Promise(r => setTimeout(r, 50));
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+
+test('a JP sitting flag under 2 h old → exit 75, nothing restarted, "JP sitting since <time>; retry later"', async () => {
+  const r = await gateRun({ flagAgeS: 600 });
+  assert.equal(r.code, 75);
+  assert.equal(r.sshCalled, false, 'the VM was never contacted');
+  assert.match(r.err, /^JP sitting since \d\d:\d\d \S+; retry later/);
+});
+
+test('no sitting flag → wait phase, then the restart phase', async () => {
+  const r = await gateRun({ flagAgeS: null });
+  assert.equal(r.code, 0);
+  assert.deepEqual(r.phases, ['wait', 'restart']);
+});
+
+test('a sitting flag over 2 h old is stale: warned, and the restart proceeds', async () => {
+  const r = await gateRun({ flagAgeS: 7300 });
+  assert.equal(r.restarted, true);
+  assert.match(r.err, /stale sitting flag/);
+});
+
+test('a flag dated in the future still counts as a sitting (fail closed)', async () => {
+  const r = await gateRun({ flagAgeS: -600 });
+  assert.equal(r.code, 75);
+  assert.equal(r.sshCalled, false);
+});
+
+test('a dangling flag symlink (start unreadable) counts as a sitting', async () => {
+  const r = await gateRun({ setup: (d, flag) => symlinkSync(join(d, 'nowhere'), flag) });
+  assert.equal(r.code, 75);
+  assert.equal(r.sshCalled, false);
+});
+
+test('an old symlink to a fresh flag: the start time of its target counts (stat -L) → sitting', async () => {
+  const r = await gateRun({ setup: (d, flag) => {
+    writeFileSync(join(d, 'target'), '');
+    symlinkSync(join(d, 'target'), flag);
+    const old = (Date.now() / 1000) - 9000;
+    spawnSync('touch', ['-h', '-d', `@${Math.floor(old)}`, flag]);
+  } });
+  assert.equal(r.code, 75);
+  assert.equal(r.sshCalled, false);
+});
+
+test('a flag directory that cannot be searched is not proof of absence → sitting (fail closed)', async () => {
+  const r = await gateRun({ flagAgeS: 60, setup: (d) => chmodSync(join(d, 'state'), 0o600) });
+  if (process.getuid?.() === 0) return; // root searches anything
+  assert.equal(r.code, 75);
+  assert.equal(r.sshCalled, false);
+  assert.match(r.err, /cannot be checked/);
+});
+
+test('a missing flag directory under a searchable parent is proved absent → restart proceeds', async () => {
+  const r = await gateRun({ setup: (d) => rmSync(join(d, 'state'), { recursive: true }) });
+  assert.deepEqual(r.phases, ['wait', 'restart']);
+});
+
+test('a sitting that starts during the idle wait is seen before the restart → exit 75, no restart phase', async () => {
+  const r = await gateRun({ onWait: 'touch "$FLAG"' });
+  assert.equal(r.code, 75);
+  assert.deepEqual(r.phases, ['wait'], 'the restart phase never ran');
+  assert.match(r.err, /^JP sitting since .*; retry later/);
+});
+
+test('busy again at the restart moment → back to the wait phase, the flag re-read: a sitting begun meanwhile stops it', async () => {
+  const r = await gateRun({ restartRcFirst: 10, onRestart: 'touch "$FLAG"' });
+  assert.equal(r.code, 75);
+  assert.deepEqual(r.phases, ['wait', 'restart', 'wait']);
+});
+
+test('busy again at the restart moment, no sitting → wait and restart again', async () => {
+  const r = await gateRun({ restartRcFirst: 10 });
+  assert.equal(r.code, 0);
+  assert.deepEqual(r.phases, ['wait', 'restart', 'wait', 'restart']);
+});
+
+test('the restart phase gets only the time left of the overall wait, never a fresh budget', async () => {
+  const r = await gateRun({ args: ['jp@vm', '7'] });
+  assert.equal(r.code, 0);
+  const log = r.sshArgs.trim().split('\n');
+  const waits = log.map(l => Number(/WAIT=(\d+)/.exec(l)?.[1]));
+  assert.ok(waits.length === 2 && waits[1] <= 7 && waits[1] >= 1, `restart phase WAIT ${waits[1]} within the 7 s overall`);
+});
+
+test('the wait phase answers only at the deadline → exit 1, the restart phase never runs', async () => {
+  const r = await gateRun({ args: ['jp@vm', '2'], onWait: 'sleep 3' });
+  assert.equal(r.code, 1);
+  assert.deepEqual(r.phases, ['wait']);
+  assert.match(r.err, /not restarted/);
+});
+
+test('a symlinked flag directory whose target is unsearchable is not proof of absence → sitting', async () => {
+  if (process.getuid?.() === 0) return;
+  const r = await gateRun({ setup: (d, flag) => {
+    rmSync(join(d, 'state'), { recursive: true });
+    mkdirSync(join(d, 'locked'));
+    mkdirSync(join(d, 'locked', 'inner'));
+    chmodSync(join(d, 'locked'), 0o600);
+    symlinkSync(join(d, 'locked', 'inner'), join(d, 'state'));
+  } });
+  assert.equal(r.code, 75);
+  assert.equal(r.sshCalled, false);
+});
+
+test('no idle moment in the wait phase → its exit code, no restart phase', async () => {
+  const r = await gateRun({ waitRc: 1 });
+  assert.equal(r.code, 1);
+  assert.deepEqual(r.phases, ['wait']);
+});
+
+test('TC_SITTING_OK=1 overrides a sitting and says so', async () => {
+  const r = await gateRun({ flagAgeS: 60, ok: true });
+  assert.equal(r.restarted, true);
+  assert.match(r.err, /TC_SITTING_OK=1: restarting despite: JP sitting since/);
+});
+
+test('--sitting reports the state for the restart notice and never restarts', async () => {
+  const busy = await gateRun({ flagAgeS: 60, args: ['--sitting'] });
+  assert.equal(busy.code, 75);
+  assert.match(busy.out, /^JP sitting since/);
+  assert.equal(busy.sshCalled, false);
+  const free = await gateRun({ flagAgeS: null, args: ['--sitting'] });
+  assert.equal(free.code, 0);
+  assert.match(free.out, /^no JP sitting/);
+  assert.equal(free.sshCalled, false);
 });

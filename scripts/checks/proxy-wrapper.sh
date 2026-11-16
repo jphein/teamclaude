@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # CHECK proxy-wrapper: on each client host, the local teamclaude forwarder answers (:3456 serves
-# /teamclaude/quota) and `claude` cannot run outside the pool (docs/CHECKS.md). Every 15 minutes.
+# /teamclaude/quota) and `claude` cannot run outside the pool (docs/CHECKS.md). Every 5 minutes (2026-11-15: the proxy was down 7.5 h; a 5-minute line makes the summary flag it within minutes).
 #   fail: this host's own forwarder does not answer (familiar carries the fleet)
 #   warn: another host's forwarder does not answer, a host is unreachable, or a host's claude would
 #         run on its own login (wrapper runs-rc*, envsh-off, none)
@@ -10,7 +10,7 @@ set -uo pipefail
 here=$(dirname "$0")
 . "$here/lib.sh"
 NAME=proxy-wrapper
-NEXT="next run in 15 min · owner teamclaude lane"
+NEXT="next run in 5 min · owner teamclaude lane"
 self=$(hostname -s 2>/dev/null || echo localhost)
 # the reviewed wrapper (installed beside these scripts from the same merged commit): a host's
 # ~/.cargo/bin/claude must be byte-identical to it

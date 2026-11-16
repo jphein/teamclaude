@@ -1,10 +1,10 @@
 [Unit]
-Description=CHECK proxy-wrapper timer (*:07/15)
+Description=CHECK proxy-wrapper timer (*:02/5)
 
 [Timer]
-OnCalendar=*:07/15
+OnCalendar=*:02/5
 Persistent=true
-RandomizedDelaySec=30
+RandomizedDelaySec=20
 
 [Install]
 WantedBy=timers.target

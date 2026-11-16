@@ -1,0 +1,9 @@
+[Unit]
+Description=CHECK fable-use: each seat's Fable weekly bucket used before it resets (teamclaude docs/CHECKS.md)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/libexec/teamclaude-checks/fable-use.sh
+TimeoutStartSec=120
+Nice=10

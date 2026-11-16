@@ -29,11 +29,18 @@ How a run exits: always 0, whatever it found. A check reports, it never gates; `
 
 - **warn:**
   - five-hour remaining is under 0.15;
-  - weekly-shared remaining is under 0.30;
+  - weekly-shared remaining is at or under 0.15;
   - a seat bucket's `resetAt` is more than 15 minutes in the past and it still shows usage. The numbers have stopped updating; that is the stale data JP named.
-- **fail:** the endpoint does not answer, or it answers with anything other than exactly one JSON document holding the aggregate numbers.
-- **Informational:** seats at or above 90 % used (five-hour or weekly) are named by the local part of their address, and seats that are not `active` are listed. Neither causes a warn.
-- **Example:** `CHECK pool-quota warn · 5h 71% left, week 29% left (week under 30%), seats ≥90% used: claude3 jp claude2 claude4, at 10:17 · next run in 15 min · owner teamclaude lane`
+- **fail:**
+  - weekly-shared remaining is at or under 0.05;
+  - the endpoint does not answer, or it answers with anything other than exactly one JSON document holding the aggregate numbers.
+- **Why these weekly numbers:** they follow the dashboard's 7-day switch threshold (`switchThreshold.unified7d`). JP moved it from 0.90 to 1.00 on 2026-11-15 at 10:03 (log: `Switch threshold (unified7d) set to 100% via SSO as "jp"`), so seats are used to the end of their week. Under the old 0.30 floor the check would read WARN most of every week by construction. If the slider moves again, move these numbers with it.
+- **Informational:**
+  - The weekly reset (`aggregate.weeklyShared.nextResetAt`) is printed as `week resets <day> <mm-dd> <hh:mm>` whenever the proxy reports a sane one.
+  - Seats at or above 90 % used (five-hour or weekly) are named by the local part of their address.
+  - Seats that are not `active` are listed.
+  - None of these causes a warn.
+- **Example:** `CHECK pool-quota warn · 5h 63% left, week 12% left (week at or under 15%), week resets Mon 11-16 17:00, seats ≥90% used: claude3 jp claude2 claude4, at 10:45 · next run in 15 min · owner teamclaude lane`
 
 ### proxy-wrapper
 

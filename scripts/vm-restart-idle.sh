@@ -132,7 +132,7 @@ idle() {
   if [ -n "${TC_IDLE_CMD:-}" ]; then sh -c "$TC_IDLE_CMD"; return; fi
   /opt/node/bin/node - 2>/dev/null <<'JS'
 // Exit 0 only on a proven idle proxy: an ok HTTP status, a non-empty account
-// list and a non-negative whole inFlight on every account. Anything else
+// list and a non-negative whole inFlight (and openStreams, when reported) on every account. Anything else
 // (error status, bad JSON, missing or negative counters, timeout) exits 2,
 // which the loop treats as "not idle" (xreview 2026-11-07).
 // Everything inside one try: a bad config must exit 2 without printing (a JSON
@@ -149,7 +149,11 @@ try {
       let n = 0;
       for (const a of accounts) {
         if (!a || !Number.isInteger(a.inFlight) || a.inFlight < 0) throw new Error('bad inFlight');
-        n += a.inFlight;
+        // openStreams: responses still being delivered (a stream until its last byte). inFlight alone
+        // drops at the headers, so a gate on it restarted under live streams (2026-11-16). Absent on a
+        // proxy older than the field (counted as 0 there); present but malformed is not idle.
+        if (a.openStreams !== undefined && (!Number.isInteger(a.openStreams) || a.openStreams < 0)) throw new Error('bad openStreams');
+        n += a.inFlight + (a.openStreams ?? 0);
       }
       process.exit(n === 0 ? 0 : 1);
     })

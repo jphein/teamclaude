@@ -106,6 +106,8 @@ export const FIELDS = [
   { key: 'quotaProbeSeconds', group: 'Rotation & quota', label: 'Quota probe interval (s)', type: 'int', apply: 'hot', def: 0, min: 0, max: 7 * 24 * 3600,
     help: 'Re-read every account\'s quota from the zero-cost usage endpoint this often. 0 = off.',
     check: (v) => (v > 0 && v < 30 ? 'must be 0 (off) or at least 30' : null) },
+  { key: 'drainSeconds', group: 'Rotation & quota', label: 'Restart drain (s)', type: 'int', apply: 'hot', def: 8, min: 0, max: 600,
+    help: 'On a restart, let responses already streaming finish for up to this long before closing (new requests get a retryable 503). Keep it below the service manager\'s TERM-to-KILL wait (the VM\'s OpenRC sends KILL after 10 s).' },
   { key: 'holdSeconds', group: 'Rotation & quota', label: 'Hold when all spent (s)', type: 'int', apply: 'restart', def: 0, min: 0,
     help: 'When every account is spent, hold the request this long waiting for one to recover. 0 = answer 429 at once.' },
   { key: 'blockedModels', group: 'Rotation & quota', label: 'Blocked models', type: 'list', apply: 'hot', def: [],

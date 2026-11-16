@@ -42,6 +42,11 @@ export function failoverPolicy(config) {
     // answering the lead's scheduled prompts as the lead, asked JP for
     // credentials and reported actions nobody took.
     excludeClients: Array.isArray(f?.excludeClients) ? f.excludeClients.filter((/** @type {unknown} */ c) => typeof c === 'string' && c) : [],
+    // Client-key names that must only ever be served by Claude (2026-11-16: the stand-in answered
+    // Squire, a browser-driving session, with JP at the keys). Never a stand-in, and when no Claude
+    // seat can serve they get a retryable 503 overloaded_error (Claude Code retries it) instead of
+    // the 429 that reads as a usage limit.
+    claudeOnly: Array.isArray(f?.claudeOnly) ? f.claudeOnly.filter((/** @type {unknown} */ c) => typeof c === 'string' && c) : [],
   };
 }
 
@@ -176,6 +181,7 @@ export function failoverEligibility(a) {
   // for the shared proxy key and key-less loopback.
   const who = a.client || '(shared key)';
   if (policy.excludeClients?.includes(who)) return { ok: false, why: `client "${who}" is excluded from failover` };
+  if (policy.claudeOnly?.includes(who)) return { ok: false, why: `client "${who}" is Claude-only` };
   if (a.contentEncoding && a.contentEncoding !== 'identity') return { ok: false, why: 'compressed body' };
   if (!a.allQuota && a.unservableMs < policy.afterSeconds * 1000) return { ok: false, why: `fleet unservable for ${Math.round(a.unservableMs / 1000)}s < ${policy.afterSeconds}s` };
   // Best effort, not a guarantee (see estimateInputTokens). A request that

@@ -237,6 +237,7 @@ teamclaude status            # Show live proxy status (requires running server)
 teamclaude resets [--probe] [--dry-run] [--json]  # Banked resets + windows left per seat (read-only)
 teamclaude resets redeem <seat> --dry-run  # Check a one-seat reset spend (nothing spent)
 teamclaude resets redeem <seat> --yes      # Spend ONE banked reset on that seat (irreversible; logs weekly before/after)
+teamclaude resets redeem <seat> --five-hour --break-hold --yes  # Spend a 5-hour reset inside the fleet hold a recent spend set (the operator's word; logged "hold broken by operator")
 teamclaude attach            # Open the live dashboard against a running server
 teamclaude dashboard         # Open the web dashboard in the browser (needs server)
 teamclaude service install   # Run the proxy as a login service (uninstall/status/print)

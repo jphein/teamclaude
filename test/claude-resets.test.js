@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { readFileSync } from 'node:fs';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
 import { createDefaultConfig } from '../src/config.js';
@@ -537,4 +538,56 @@ test('Settings keep a scoped key write-only, carry its allow list, and validate 
   assert.ok(bad?.problems?.some((p) => /allow must be a list/.test(p)));
   const clash = (() => { try { applySettingsChanges(JSON.parse(JSON.stringify({ proxy: { apiKey: 'shared-key', clientKeys: [{ name: 'lane', key: 'q'.repeat(30) }] } })), { set: { 'proxy.scopedKeys': [{ name: 'plan', key: 'q'.repeat(30), allow: [] }] } }); return null; } catch (e) { return e; } })();
   assert.ok(clash?.problems?.some((p) => /scoped key and a client key cannot be the same/.test(p)));
+});
+
+// ── --break-hold (Sen 2026-11-16 12:3x: the fleet hold blocked a 5-hour spend while a live sitting had no seat)
+test('redeemNamed: breakHold spends inside the fleet hold and says so; without it the hold stands', async () => {
+  const { redeemer, calls } = harness({ accounts: [oauth('a@x.org'), oauth('b@x.org')], config: {} });
+  const first = await redeemer.redeemNamed('a');
+  assert.equal(first.redeemed, true);
+  assert.equal(first.holdBroken, undefined, 'no hold to break on the first spend');
+  assert.equal((await redeemer.redeemNamed('b')).reason, 'holding off after a recent Claude reset attempt');
+  const broken = await redeemer.redeemNamed('b', { breakHold: true });
+  assert.equal(broken.redeemed, true);
+  assert.equal(broken.holdBroken, true);
+  assert.deepEqual(calls.claim, ['a@x.org', 'b@x.org']);
+});
+
+test('redeemNamed: breakHold breaks only the hold, never the in-flight lock', async () => {
+  const { redeemer, calls } = harness({ accounts: [oauth('a@x.org'), oauth('b@x.org')], config: {} });
+  const [one, two] = await Promise.all([redeemer.redeemNamed('a'), redeemer.redeemNamed('b', { breakHold: true })]);
+  assert.equal(one.redeemed, true);
+  assert.equal(two.reason, 'another reset attempt is in flight');
+  assert.deepEqual(calls.claim, ['a@x.org']);
+});
+
+test('the redeem route: the shared key may break the hold (passed through); a scoped key never; a non-boolean is refused', async () => {
+  const PLAN = 'q'.repeat(32);
+  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 'token' }], 0.98);
+  const seen = [];
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test', trustLoopback: false,
+    scopedKeys: [{ name: 'plan', key: PLAN, allow: ['POST /teamclaude/resets/redeem'] }] }, upstream: 'http://127.0.0.1:9' }, {
+    redeemSeatReset: async (o) => { seen.push(o.breakHold); return { redeemed: true, account: o.seat, reason: 'x', holdBroken: o.breakHold }; },
+  });
+  await new Promise(resolve => proxy.listen(0, '127.0.0.1', resolve));
+  const call = (key, body) => fetch(`http://127.0.0.1:${proxy.address().port}/teamclaude/resets/redeem`, { method: 'POST', headers: { 'x-api-key': key, 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const orig = console.log; console.log = () => {};
+  try {
+    const ok = await call('tc-test', { seat: 'claude2', fiveHour: true, breakHold: true });
+    assert.equal(ok.status, 200);
+    assert.equal((await ok.json()).holdBroken, true);
+    assert.equal((await call(PLAN, { seat: 'claude2', confirm: 'claude2', breakHold: true })).status, 403, 'a scoped key cannot break the hold');
+    assert.equal((await call(PLAN, { seat: 'claude2', dryRun: true, breakHold: true })).status, 403, 'not even on a dry run');
+    assert.equal((await call('tc-test', { seat: 'claude2', breakHold: 'yes' })).status, 400);
+    assert.equal((await call(PLAN, { seat: 'claude2', confirm: 'claude2' })).status, 200, 'the scoped key still spends without it');
+    assert.deepEqual(seen, [true, false]);
+  } finally { console.log = orig; proxy.close(); }
+});
+
+test('the CLI sends breakHold only on --break-hold, and documents it in the usage line', () => {
+  const src = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+  assert.match(src, /const breakHold = args\.includes\('--break-hold'\);/);
+  assert.match(src, /body: JSON\.stringify\(\{ seat, dryRun, fiveHour, \.\.\.\(breakHold \? \{ breakHold: true \} : \{\}\) \}\)/);
+  assert.match(src, /Usage: teamclaude resets redeem <seat> \[--five-hour\] \[--break-hold\]/);
+  assert.match(src, /hold broken by operator/);
 });

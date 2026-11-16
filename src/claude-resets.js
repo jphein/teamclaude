@@ -25,6 +25,7 @@
 // seven_day, seven_day_overage_included]`, `resets_left: 0`).
 
 import { randomUUID } from 'node:crypto';
+import { atWall } from './reset-rules.js';
 
 import { USAGE_URL, OAUTH_USAGE_BETA, USAGE_USER_AGENT, normalizeUsagePayload } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER } from './provider.js';
@@ -315,6 +316,16 @@ export class ClaudeResetRedeemer {
   }
 
   /**
+   * A seat's 5-hour wall for the five-hour rule: the proxy's own 5h switch threshold (at most 98 %). A
+   * seat the proxy has stopped routing to at that threshold never reaches upstream's 100 %, so upstream's
+   * `exhausted` alone would never call it walled (2026-11-16 13:08–14:30: every seat stopped at 97 %).
+   * @param {Record<string, any>} account
+   */
+  _fiveHourWall(account) {
+    return atWall(this.am.thresholdFor?.('unified5h', account));
+  }
+
+  /**
    * The one account `seat` names: its full name, or the part before the `@` when exactly one account
    * has it. Null when nothing (or more than one account) matches, so a typo never lands on a sibling.
    *
@@ -449,6 +460,7 @@ export class ClaudeResetRedeemer {
       return { redeemed: false, account: name, reason: 'holds no usable reset' };
     }
     const liveWeekly = weeklyOf(read.usage);
+    const liveFive = fiveHourOf(read.usage);
     if (rule === 'expiry') {
       // A weekly-clearing reset that would expire before the seat's own week resets: spend it at >= 60 %
       // weekly (live), never on a seat whose week resets first.
@@ -463,7 +475,7 @@ export class ClaudeResetRedeemer {
       // Only at a live 5-hour wall with weekly room, and never with a reset that would clear the weekly.
       const no = grant.clears.includes('seven_day') ? 'its next reset clears the weekly; kept for a weekly wall'
         : !grant.clears.includes('five_hour') ? 'its next reset does not clear the 5-hour window'
-          : !status.exhausted.includes('five_hour') ? 'not at its 5-hour wall'
+          : !(status.exhausted.includes('five_hour') || (liveFive != null && liveFive >= this._fiveHourWall(account))) ? 'not at its 5-hour wall'
             : status.exhausted.some((/** @type {string} */ l) => l.startsWith('seven_day')) || liveWeekly == null || liveWeekly >= 0.7 ? 'its week has no room'
               : null;
       if (no) { state.cooldownUntil = now + DECLINED_COOLDOWN_MS; return { redeemed: false, account: name, reason: no }; }

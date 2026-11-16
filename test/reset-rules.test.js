@@ -2,6 +2,7 @@
 // (ClaudeResetRedeemer.redeemByRule). Nothing reaches the network: every fetch is injected.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { ruleFor, WORK_BLOCK_IDLE_MS } from '../src/reset-rules.js';
 import { AccountManager } from '../src/account-manager.js';
 import { parseResetStatus, ClaudeResetRedeemer, RULE_SPACING_MS } from '../src/claude-resets.js';
@@ -305,4 +306,43 @@ test('servableRemaining counts 5h room only on seats whose week is not spent and
   assert.equal(f.servableRemaining, 0.225, 'only seat a can serve: 0.9 * 5 / 20');
   const unknownWeek = buildQuotaSummary([seatQ('a', 0.1, 0.25), { ...seatQ('e', 0, null), quota: { unified5h: 0, unified5hReset: Date.now() + H } }]);
   assert.equal(unknownWeek.aggregate.fiveHour.servableRemaining, 0.45, 'a seat with no weekly reading is not room: 0.9 * 5 / 10');
+});
+
+// ---------- 2026-11-16 13:08–14:30: every seat stopped at the proxy's 97 % 5h threshold, three seats'
+// weeks were spent, and the five-hour rule never fired: the wall was "98 % cached + upstream exhausted"
+// (never reached by a seat the proxy stops routing to at 97 %), and the pool figure counted the
+// spent-week seats' 5h room (~60 % remaining through the whole wall).
+test('five-hour: the wall is the seat\'s own 5h switch threshold (capped at 98 %)', () => {
+  const base = { now: NOW, kept: kept(g()), idleMs: 0, pool5hRemaining: 0.05 };
+  assert.equal(ruleFor(seat({ unified5h: 0.97, unified7d: 0.4 }), { ...base, fiveHourWall: 0.97 })?.rule, 'five-hour', 'at 97 % with a 97 % threshold');
+  assert.equal(ruleFor(seat({ unified5h: 0.96, unified7d: 0.4 }), { ...base, fiveHourWall: 0.97 }), null, 'under the threshold');
+  assert.equal(ruleFor(seat({ unified5h: 0.97, unified7d: 0.4 }), { ...base, fiveHourWall: 1 }), null, 'a threshold above 98 % is capped at 98 %');
+  assert.equal(ruleFor(seat({ unified5h: 0.98, unified7d: 0.4 }), { ...base, fiveHourWall: 1 })?.rule, 'five-hour');
+  assert.equal(ruleFor(seat({ unified5h: 0.97, unified7d: 0.4 }), { ...base, fiveHourWall: null }), null, 'no threshold known: 98 %');
+  assert.equal(ruleFor(seat({ unified5h: 0.6, unified7d: 0.4 }), { ...base, fiveHourWall: 0.5 }), null, 'a low threshold (a reservation) is floored at 90 %');
+  assert.equal(ruleFor(seat({ unified5h: 0.9, unified7d: 0.4 }), { ...base, fiveHourWall: 0.5 })?.rule, 'five-hour');
+  assert.equal(ruleFor(seat({ unified5h: 0.95, unified7d: 0.4 }), { ...base, fiveHourWall: Number.NaN }), null, 'NaN: 98 %');
+});
+
+test('redeemByRule five-hour: a live 5h use at the proxy\'s threshold is the wall, even before upstream says exhausted', async () => {
+  const five = [{ id: 'gr-5h', resets_left: 1, clears: FIVE, usable_now: true, paused: false, ends_at: new Date(Date.now() + 90 * DAY).toISOString() }];
+  const at97 = rig({ status: () => block({ next_grant_id: 'gr-5h' }, five), claim: () => ({ result: 'reset', resetsLeft: 0, cleared: FIVE }), usage: { week: 0.4, five: 0.97 } });
+  at97.am.thresholdFor = () => 0.97;
+  const r = await at97.redeemer.redeemByRule(at97.am.accounts[0], 'five-hour', '', { pool5h: () => 0.05 });
+  assert.equal(r.redeemed, true, r.reason);
+  assert.deepEqual(at97.calls.claim, [['a@x.org', 'gr-5h']]);
+  const at96 = rig({ status: () => block({ next_grant_id: 'gr-5h' }, five), usage: { week: 0.4, five: 0.96 } });
+  at96.am.thresholdFor = () => 0.97;
+  assert.equal((await at96.redeemer.redeemByRule(at96.am.accounts[0], 'five-hour', '', { pool5h: () => 0.05 })).reason, 'not at its 5-hour wall');
+  assert.equal(at96.calls.claim.length, 0);
+});
+
+test('the rule trigger reads the SERVABLE pool figure and the seat\'s 5h threshold', () => {
+  const src = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+  const body = src.slice(src.indexOf('const tryResetRule ='), src.indexOf('accountManager.onSeatRequest('));
+  assert.match(body, /aggregate\?\.fiveHour\?\.servableRemaining/);
+  assert.doesNotMatch(body, /aggregate\?\.fiveHour\?\.remaining/, 'never the plain remaining (it counts spent-week seats)');
+  assert.match(body, /thresholdFor\('unified5h', account\)/);
+  assert.match(body, /ruleFor\(account, \{[^}]*fiveHourWall/);
+  assert.match(body, /pool5h: servable5h/);
 });

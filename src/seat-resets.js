@@ -205,6 +205,8 @@ export class WindowLedger {
  */
 export function windowsLeft(weeklyUsed, measured) {
   if (typeof weeklyUsed !== 'number' || !Number.isFinite(weeklyUsed)) return { windowsLeft: null, basis: 'weekly use unknown' };
+  // A spent week covers no more windows whatever the burn: no measurement is needed to say 0.
+  if (weeklyUsed >= 1) return { windowsLeft: 0, basis: 'weekly spent' };
   if (measured.burn == null) return { windowsLeft: null, basis: 'measuring' };
   const left = Math.max(0, 1 - weeklyUsed);
   return { windowsLeft: Math.floor(left / measured.burn + 1e-9), basis: `median burn ${(measured.burn * 100).toFixed(1)}% over ${measured.windows} window${measured.windows === 1 ? '' : 's'}` };

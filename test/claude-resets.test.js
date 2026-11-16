@@ -253,3 +253,200 @@ test('without the hook nothing changes', async () => {
   assert.notEqual(r.status, 200);
   assert.equal(r.hits, 0);
 });
+
+// ── the operator's single-seat spend (`teamclaude resets redeem <seat>`) ─────
+
+test('redeemNamed spends exactly the named seat, with the auto switch OFF, and reports weekly before/after', async () => {
+  const { am, redeemer, calls } = harness({ accounts: [oauth('a@x.org'), oauth('b@x.org'), oauth('c@x.org')], config: {} });
+  // The fresh reads, not the cached quota (0.5): 100% just before the claim, 0% on the re-read after it.
+  const reads = [1, 0];
+  const inner = redeemer.statusFn;
+  redeemer.statusFn = async (/** @type {any} */ a, /** @type {any} */ o) => { const r = await inner(a, o); return { ...r, usage: { ...r.usage, sevenDay: { utilization: reads.shift() } } }; };
+  const r = await redeemer.redeemNamed('b');
+  assert.equal(r.redeemed, true);
+  assert.deepEqual(calls.claim, ['b@x.org'], 'only the named seat; never the one that would wait longest (c)');
+  assert.equal(r.reason, 'the operator asked for this seat');
+  assert.equal(r.weeklyBefore, 1, 'measured by the status read just ahead of the claim');
+  assert.equal(r.weeklyAfter, 0, 'measured by the re-read after the spend');
+  assert.equal(am.accounts[1].quota.unified7dFable, 0);
+});
+
+test('redeemNamed: a failed re-read after the spend reports the after value as unknown, never the cached one', async () => {
+  const { redeemer } = harness({ accounts: [oauth('a@x.org')], config: {} });
+  let n = 0;
+  const inner = redeemer.statusFn;
+  redeemer.statusFn = async (/** @type {any} */ a, /** @type {any} */ o) => (++n === 1 ? inner(a, o) : { error: 'HTTP 503' });
+  const r = await redeemer.redeemNamed('a');
+  assert.equal(r.redeemed, true);
+  assert.equal(r.weeklyAfter, null);
+});
+
+test('an unread claim whose grant is no longer listed fails closed: no second spend on a fresh grant', async () => {
+  let fail = true;
+  let clock = Date.now();
+  let listA = true;
+  const one = block().grants[0];
+  const grants = [];
+  const { redeemer } = harness({ accounts: [oauth('a@x.org')], config: {},
+    status: () => (listA ? block({ next_grant_id: 'grant-a' }, { id: 'grant-a' }) : { ...block({ next_grant_id: 'grant-b' }), grants: [{ ...one, id: 'grant-b' }] }),
+    claim: (_n, c) => { grants.push(c.grantId); return fail ? { error: 'socket hang up' } : { result: 'reset', resetsLeft: 0, cleared: ['seven_day'] }; } });
+  redeemer.now = () => clock;
+  assert.equal((await redeemer.redeemNamed('a')).maybeSpent, true);
+  fail = false; listA = false;
+  clock += 31 * 60 * 1000;
+  for (const dryRun of [true, false]) {
+    const r = await redeemer.redeemNamed('a', { dryRun });
+    assert.equal(r.redeemed, false);
+    assert.equal(r.maybeSpent, true);
+    assert.match(r.reason, /no longer listed/);
+  }
+  assert.deepEqual(grants, ['grant-a'], 'grant-b was never claimed');
+});
+
+test('redeemNamed: an unknown, ambiguous, empty or non-string seat spends nothing', async () => {
+  const { redeemer, calls } = harness({ accounts: [oauth('a@x.org'), oauth('a@y.org'), oauth('b@x.org')], config: {} });
+  for (const seat of ['a', 'zz', '', undefined, 7, 'x'.repeat(200)]) {
+    const r = await redeemer.redeemNamed(seat);
+    assert.equal(r.redeemed, false, String(seat));
+  }
+  assert.equal((await redeemer.redeemNamed('a')).reason, 'no single seat by that name');
+  assert.equal(calls.claim.length, 0);
+  assert.equal(calls.status, 0, 'not even a status read');
+  assert.equal((await redeemer.redeemNamed('a@y.org')).redeemed, true, 'the full name picks one of the two');
+  assert.deepEqual(calls.claim, ['a@y.org']);
+});
+
+test('redeemNamed dry run: every check, a status read, no claim, and no cooldown left behind', async () => {
+  let atLimit = false;
+  const { am, redeemer, calls } = harness({ accounts: [oauth('a@x.org')], config: {}, status: () => block({ at_limit: atLimit }) });
+  const no = await redeemer.redeemNamed('a', { dryRun: true });
+  assert.equal(no.redeemed, false);
+  assert.equal(no.wouldRedeem, undefined);
+  assert.equal(no.reason, 'not at a usage limit');
+  assert.equal(redeemer._stateFor(am.accounts[0]).cooldownUntil, 0, 'a dry run never cools the seat down');
+  atLimit = true;
+  const yes = await redeemer.redeemNamed('a', { dryRun: true });
+  assert.equal(yes.wouldRedeem, true);
+  assert.equal(yes.redeemed, false);
+  assert.match(yes.reason, /^would redeem: at seven_day_overage_included, its reset clears five_hour, seven_day, seven_day_overage_included$/);
+  assert.equal(calls.claim.length, 0);
+  assert.equal(calls.status, 2);
+  assert.equal(redeemer.fleetHoldUntil, 0, 'no fleet hold from a dry run');
+  assert.equal((await redeemer.redeemNamed('a')).redeemed, true, 'and the real spend right after is not held off');
+});
+
+test('redeemNamed honours the fleet hold, the in-flight lock, and every pool-path refusal', async () => {
+  const { am, redeemer, calls } = harness({ accounts: [oauth('a@x.org'), oauth('b@x.org')], config: {} });
+  assert.equal((await redeemer.redeemNamed('a')).redeemed, true);
+  const held = await redeemer.redeemNamed('b');
+  assert.equal(held.redeemed, false);
+  assert.equal(held.reason, 'holding off after a recent Claude reset attempt');
+  assert.deepEqual(calls.claim, ['a@x.org']);
+
+  const two = harness({ accounts: [oauth('a@x.org'), oauth('b@x.org')], config: {} });
+  const [first, second] = await Promise.all([two.redeemer.redeemNamed('a'), two.redeemer.redeemNamed('b')]);
+  assert.equal(first.redeemed, true);
+  assert.equal(second.reason, 'another reset attempt is in flight');
+  assert.deepEqual(two.calls.claim, ['a@x.org']);
+
+  const weekly = harness({ accounts: [oauth('a@x.org')], config: {}, status: () => block({ exhausted: ['seven_day'] }, { clears: ['five_hour', 'seven_day_overage_included'] }) });
+  assert.equal((await weekly.redeemer.redeemNamed('a')).reason, 'its reset does not clear seven_day');
+  const fiveHour = harness({ accounts: [oauth('a@x.org')], config: {}, status: () => block({ exhausted: ['five_hour'] }) });
+  assert.equal((await fiveHour.redeemer.redeemNamed('a')).reason, 'no weekly limit is exhausted');
+  assert.equal(weekly.calls.claim.length + fiveHour.calls.claim.length, 0);
+
+  const off = harness({ accounts: [oauth('a@x.org', { disabled: true }), oauth('b@x.org', { orgUuid: undefined }), { name: 'k@x.org', type: 'apikey', apiKey: 'sk-test' }], config: {} });
+  assert.equal((await off.redeemer.redeemNamed('a')).reason, 'the seat is disabled');
+  assert.equal((await off.redeemer.redeemNamed('b')).reason, 'not a Claude subscription seat');
+  assert.equal((await off.redeemer.redeemNamed('k')).reason, 'not a Claude subscription seat');
+  assert.equal(off.calls.claim.length, 0);
+  void am;
+});
+
+test('POST /teamclaude/resets/redeem: shared key only, one named seat, dryRun passed through; client keys refused', async () => {
+  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 'token' }], 0.98);
+  const seen = [];
+  // trustLoopback off, as on the VM: the test's loopback caller is then just a caller with a key.
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test', trustLoopback: false, clientKeys: [{ name: 'lane', key: 'lane-key' }] }, upstream: 'http://127.0.0.1:9' }, {
+    redeemSeatReset: async (/** @type {any} */ o) => { seen.push({ seat: o.seat, dryRun: o.dryRun }); return { redeemed: false, wouldRedeem: true, account: o.seat, reason: 'would redeem' }; },
+  });
+  await new Promise(resolve => proxy.listen(0, '127.0.0.1', resolve));
+  const port = proxy.address().port;
+  const post = (body, key = 'tc-test', raw) => fetch(`http://127.0.0.1:${port}/teamclaude/resets/redeem`, {
+    method: 'POST', headers: { 'x-api-key': key, 'content-type': 'application/json' }, body: raw ?? JSON.stringify(body),
+  });
+  try {
+    const ok = await post({ seat: 'claude2', dryRun: true });
+    assert.equal(ok.status, 200);
+    assert.equal((await ok.json()).wouldRedeem, true);
+    assert.equal((await post({ seat: 'claude2' })).status, 200);
+    assert.deepEqual(seen, [{ seat: 'claude2', dryRun: true }, { seat: 'claude2', dryRun: false }]);
+    assert.equal((await post({ seat: 'claude2' }, 'lane-key')).status, 403, 'a client key never spends');
+    assert.equal((await post({ seat: 'claude2' }, 'wrong')).status, 401);
+    for (const bad of [{}, { seat: '' }, { seat: 7 }, { seat: ['a'] }, { seat: 'a', dryRun: 'yes' }, { seat: 'x'.repeat(129) }]) {
+      assert.equal((await post(bad)).status, 400, JSON.stringify(bad));
+    }
+    assert.equal((await post(null, 'tc-test', '{not json')).status, 400);
+    const page = await fetch(`http://127.0.0.1:${port}/teamclaude/resets/redeem`, { method: 'POST', headers: { 'x-api-key': 'tc-test', origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' }, body: '{"seat":"claude2"}' });
+    assert.equal(page.status, 403, 'never from a web page');
+    assert.equal(seen.length, 2, 'only the two shared-key calls reached the hook');
+  } finally { proxy.close(); }
+});
+
+// ── xreview round 1 (redeem verb) ───────────────────────────────────────────
+
+test('a 2xx with no known verdict is no verdict: maybeSpent, the fleet holds, the key is kept for a replay', async () => {
+  let answer = { result: null };
+  let clock = Date.now();
+  const { am, redeemer, calls } = harness({ accounts: [oauth('a@x.org'), oauth('b@x.org')], config: {}, claim: () => answer });
+  redeemer.now = () => clock;
+  for (const odd of [{ result: null }, { result: 'spent_maybe' }, {}]) {
+    answer = odd;
+    clock += 31 * 60 * 1000;
+    const r = await redeemer.redeemNamed('a');
+    assert.equal(r.redeemed, false);
+    assert.equal(r.maybeSpent, true, JSON.stringify(odd));
+    assert.match(r.reason, /may still have gone through/);
+    assert.ok(redeemer.fleetHoldUntil > clock, 'the fleet holds off');
+    assert.match((await redeemer.redeemNamed('b')).reason, /holding off/, 'no sibling is spent meanwhile');
+  }
+  assert.equal(new Set(calls.keys).size, 1, 'every retry replayed the same request id');
+  void am;
+});
+
+test('an unread claim is replayed on ITS grant even when upstream now names another next grant', async () => {
+  let fail = true;
+  let clock = Date.now();
+  const grants = [];
+  const one = block().grants[0];
+  const both = (/** @type {string} */ next) => ({ ...block({ next_grant_id: next }), grants: [{ ...one, id: 'grant-a' }, { ...one, id: 'grant-b' }] });
+  let next = 'grant-a';
+  const { redeemer, calls } = harness({ accounts: [oauth('a@x.org')], config: {}, status: () => both(next),
+    claim: (_n, c) => { grants.push(c.grantId); return fail ? { error: 'socket hang up' } : { result: 'already_used', resetsLeft: 0, cleared: ['seven_day'] }; } });
+  redeemer.now = () => clock;
+  assert.equal((await redeemer.redeemNamed('a')).maybeSpent, true);
+  fail = false;
+  next = 'grant-b';
+  clock += 31 * 60 * 1000;
+  const later = await redeemer.redeemNamed('a');
+  assert.equal(later.redeemed, true);
+  assert.deepEqual(grants, ['grant-a', 'grant-a'], 'the pending grant, not the new next one');
+  assert.equal(calls.keys[0], calls.keys[1]);
+});
+
+test('POST /teamclaude/resets/redeem: a present dryRun that is not a boolean (null included) is refused, never a spend', async () => {
+  const am = new AccountManager([{ name: 'a', type: 'oauth', accessToken: 'token' }], 0.98);
+  let calls = 0;
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-test', trustLoopback: false }, upstream: 'http://127.0.0.1:9' }, {
+    redeemSeatReset: async () => { calls++; return { redeemed: true, account: 'a', reason: 'x' }; },
+  });
+  await new Promise(resolve => proxy.listen(0, '127.0.0.1', resolve));
+  const port = proxy.address().port;
+  try {
+    for (const raw of ['{"seat":"a","dryRun":null}', '{"seat":"a","dryRun":0}', '{"seat":"a","dryRun":"false"}', '["a"]', 'null', '"a"']) {
+      const r = await fetch(`http://127.0.0.1:${port}/teamclaude/resets/redeem`, { method: 'POST', headers: { 'x-api-key': 'tc-test', 'content-type': 'application/json' }, body: raw });
+      assert.equal(r.status, 400, raw);
+    }
+    assert.equal(calls, 0);
+  } finally { proxy.close(); }
+});

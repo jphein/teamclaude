@@ -235,6 +235,8 @@ teamclaude alias             # Print/install a `claude` alias that routes via th
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude status            # Show live proxy status (requires running server)
 teamclaude resets [--probe] [--dry-run] [--json]  # Banked resets + windows left per seat (read-only)
+teamclaude resets redeem <seat> --dry-run  # Check a one-seat reset spend (nothing spent)
+teamclaude resets redeem <seat> --yes      # Spend ONE banked reset on that seat (irreversible; logs weekly before/after)
 teamclaude attach            # Open the live dashboard against a running server
 teamclaude dashboard         # Open the web dashboard in the browser (needs server)
 teamclaude service install   # Run the proxy as a login service (uninstall/status/print)

@@ -374,10 +374,10 @@ test('summary: a malformed or multi-line result is a warn, never silence', () =>
 });
 
 test('summary: repeats warn/fail lines, flags a stale result and a missing one', () => {
-  const r = summary({ 'pool-quota': ['CHECK pool-quota warn · week 29% · y', 5], 'proxy-wrapper': ['CHECK proxy-wrapper ok · x · y', 31] });
+  const r = summary({ 'pool-quota': ['CHECK pool-quota warn · week 29% · y', 5], 'proxy-wrapper': ['CHECK proxy-wrapper ok · x · y', 11] });
   const lines = r.stdout.trim().split('\n');
   assert.equal(lines[0], 'CHECK pool-quota warn · week 29% · y');
-  assert.match(lines[1], /^CHECK proxy-wrapper warn · last result is 31 min old \(max 30\): timer stopped\? last: ok · x · y/);
+  assert.match(lines[1], /^CHECK proxy-wrapper warn · last result is 11 min old \(max 10\): timer stopped\? last: ok · x · y/);
   assert.match(lines[2], /^CHECK forge-keys warn · no result yet/);
 });
 

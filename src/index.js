@@ -969,17 +969,19 @@ async function serverCommand() {
   });
   // Per-seat view for the plan's Seats tile and `teamclaude resets` (src/seat-resets.js): banked resets
   // (read-only; nothing here spends), windows left this week from a ledger of window starts, and the
-  // next window. The probe is one zero-spend usage request per seat: shortly after start, every 3 h,
+  // next window. The probe is one zero-spend usage request per seat: shortly after start, every 30 min,
   // and on demand (GET /teamclaude/resets?probe=1), at most once per 10 minutes.
   const windowLedger = new WindowLedger({ statePath: getConfigPath().replace(/\.json$/, '') + '-windows.json' });
   accountManager.on5hWindowStarted((/** @type {{ account: Record<string, any> }} */ { account }) => windowLedger.record(account.name, account.quota?.unified7d, account.quota?.unified7dReset));
   const resetsProbe = new ResetsProbe({
     accounts: () => accountManager.accounts,
+    refresh: (account, force) => accountManager.ensureTokenFresh(account.index, force),
     applyUsage: (account, usage) => accountManager.applyUsageData(account.index, usage),
   });
   const probeResetsQuietly = () => resetsProbe.probe().catch((/** @type {any} */ e) => console.error(`[TeamClaude] Seat resets probe failed: ${e?.message || e}`));
   setTimeout(probeResetsQuietly, 60_000).unref?.();
-  setInterval(probeResetsQuietly, 3 * 3600_000).unref?.();
+  // every 30 min (Sen 2026-11-16, JP's reset strategy item 1): one zero-spend usage read per seat
+  setInterval(probeResetsQuietly, 30 * 60_000).unref?.();
   const seatView = (/** @type {{ dryRun?: boolean }} */ { dryRun = false } = {}) => seatRows({
     accounts: accountManager.accounts,
     ledger: windowLedger,

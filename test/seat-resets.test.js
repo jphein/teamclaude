@@ -295,3 +295,35 @@ test('an unrepresentable weekly reset time is unknown to the verdict too, not "f
   assert.equal(rows[0].weeklyResetAt, null);
   assert.deepEqual(rows[0].redeem, { would: false, reason: 'its weekly reset time is unknown' });
 });
+
+// ---------- 2026-11-16: 401s on seats with no recent traffic (the probe never refreshed tokens)
+test('ResetsProbe refreshes each seat token before reading, and on a 401 forces one refresh and reads once more', async () => {
+  const refreshed = [];
+  let calls = 0;
+  const p = new ResetsProbe({
+    accounts: () => [{ name: 'a', type: 'oauth', credential: 'old' }],
+    refresh: async (/** @type {any} */ acct, /** @type {boolean} */ force) => { refreshed.push(force); acct.credential = force ? 'new' : acct.credential; },
+    fetchStatus: async (/** @type {any} */ acct) => { calls++; return acct.credential === 'new' ? { reset: status(), usage: null } : { error: 'HTTP 401', status: 401 }; },
+    now: () => NOW,
+  });
+  await p.probe({ force: true });
+  assert.deepEqual(refreshed, [false, true]);
+  assert.equal(calls, 2);
+  assert.equal(p.byName.get('a')?.error, null);
+  assert.ok(p.byName.get('a')?.okAt);
+});
+
+test('ResetsProbe: a 401 twice is recorded once (no loop); a failed refresh is its own category and reads nothing', async () => {
+  let calls = 0;
+  const p = new ResetsProbe({ accounts: () => [{ name: 'a', type: 'oauth', credential: 't' }], refresh: async () => {},
+    fetchStatus: async () => { calls++; return { error: 'HTTP 401', status: 401 }; }, now: () => NOW });
+  await p.probe({ force: true });
+  assert.equal(calls, 2);
+  assert.equal(p.byName.get('a')?.error, 'http 401');
+  let reads = 0;
+  const q = new ResetsProbe({ accounts: () => [{ name: 'a', type: 'oauth', credential: 't' }], refresh: async () => { throw new Error('invalid_grant'); },
+    fetchStatus: async () => { reads++; return { reset: null }; }, now: () => NOW });
+  await q.probe({ force: true });
+  assert.equal(reads, 0);
+  assert.equal(q.byName.get('a')?.error, 'token refresh failed');
+});

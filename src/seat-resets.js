@@ -257,6 +257,7 @@ function errorCategory(e) {
   if (http) return `http ${http[1]}`;
   if (/timeout|timed out|aborted/i.test(s)) return 'timeout';
   if (/no credential/i.test(s)) return 'no credential';
+  if (/token refresh/i.test(s)) return 'token refresh failed';
   if (/ENOTFOUND|ECONN|EAI_AGAIN|socket|network|fetch failed/i.test(s)) return 'network';
   return 'read failed';
 }
@@ -268,11 +269,15 @@ function errorCategory(e) {
  */
 export class ResetsProbe {
   /**
-   * @param {{ accounts: () => Record<string, any>[], fetchStatus?: Function, applyUsage?: (account: Record<string, any>, usage: any) => void, now?: () => number }} opts
+   * `refresh(account, force)` makes the seat's access token current before the read (the account
+   * manager's ensureTokenFresh). Without it a seat with no recent traffic is read with an expired token
+   * and answers 401 (live 2026-11-16: 5 of 7 seats, last good reads 3-8 h old).
+   * @param {{ accounts: () => Record<string, any>[], fetchStatus?: Function, refresh?: (account: Record<string, any>, force: boolean) => Promise<void>, applyUsage?: (account: Record<string, any>, usage: any) => void, now?: () => number }} opts
    */
-  constructor({ accounts, fetchStatus = fetchClaudeResetStatus, applyUsage = () => {}, now = Date.now }) {
+  constructor({ accounts, fetchStatus = fetchClaudeResetStatus, refresh = async () => {}, applyUsage = () => {}, now = Date.now }) {
     this.accounts = accounts;
     this.fetchStatus = fetchStatus;
+    this.refresh = refresh;
     this.applyUsage = applyUsage;
     this.now = now;
     /** @type {Map<string, { kept: KeptStatus|null, okAt: number|null, triedAt: number, error: string|null }>} */
@@ -293,7 +298,14 @@ export class ResetsProbe {
           const before = this.byName.get(account.name);
           const fail = (/** @type {unknown} */ e) => this.byName.set(account.name, { kept: before?.kept ?? null, okAt: before?.okAt ?? null, triedAt: this.now(), error: errorCategory(e) });
           try {
-            const read = await this.fetchStatus(account);
+            try { await this.refresh(account, false); } catch { fail('token refresh failed'); continue; }
+            let read = await this.fetchStatus(account);
+            // A 401 on a token we believed fresh (revoked, or refreshed elsewhere): force one refresh and
+            // read once more. Never loops.
+            if (read?.status === 401) {
+              try { await this.refresh(account, true); } catch { fail('token refresh failed'); continue; }
+              read = await this.fetchStatus(account);
+            }
             if (!read || read.error) { fail(read?.error ?? 'read failed'); continue; }
             const at = this.now();
             this.byName.set(account.name, { kept: keepStatus(read.reset ?? null), okAt: at, triedAt: at, error: read.reset ? null : 'no reset block' });

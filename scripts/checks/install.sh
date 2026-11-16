@@ -5,7 +5,7 @@
 # published (scripts to ~/.local/libexec/teamclaude-checks/, units to ~/.config/systemd/user/), each
 # file moved into place. A commit missing any file publishes nothing. The reviewed claude wrapper
 # goes beside the scripts as the reference proxy-wrapper compares each host's wrapper against.
-# Rollback: systemctl --user disable --now teamclaude-check-{pool-quota,proxy-wrapper,forge-keys}.timer
+# Rollback: systemctl --user disable --now teamclaude-check-{pool-quota,proxy-wrapper,forge-keys,fable-use}.timer
 set -euo pipefail
 [ $# -eq 1 ] || { echo "usage: scripts/checks/install.sh <commit>" >&2; exit 22; }
 cd "$(dirname "$0")/../.."
@@ -79,7 +79,7 @@ cleanup() {
   trap '' TERM INT HUP   # a second signal must not cut the rollback short
   set +e   # an EXIT trap under set -e would stop at the first failing command: every step is checked here
   if [ "$quiesced" = 1 ] && [ "$finished" = 0 ]; then
-    # quiet first: stop all three timers (a failed `enable --now` may have started some) and let a
+    # quiet first: stop all four timers (a failed `enable --now` may have started some) and let a
     # check that started finish, so nothing runs while files are put back
     $SYSTEMCTL --user stop "${timers[@]}" 2>/dev/null
     local start_ok=1
@@ -106,18 +106,18 @@ cleanup() {
 }
 stage=$(mktemp -d "$lib/.stage.XXXXXX"); trap cleanup EXIT; trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
 mkdir "$stage/lib" "$stage/units"
-scripts=(lib.sh pool-quota.sh proxy-probe.sh proxy-wrapper.sh forge-keys.sh summary.sh)
+scripts=(lib.sh pool-quota.sh proxy-probe.sh proxy-wrapper.sh forge-keys.sh fable-use.sh summary.sh)
 for f in "${scripts[@]}"; do
   git show "$sha:scripts/checks/$f" > "$stage/lib/$f" || { echo "install.sh: $f missing at $sha; nothing installed" >&2; exit 4; }
 done
 git show "$sha:scripts/claude-wrapper.sh" > "$stage/lib/claude-wrapper.sh" || { echo "install.sh: claude-wrapper.sh missing at $sha; nothing installed" >&2; exit 4; }
-# exactly these six units, nothing more: an extra file is refused, not installed or enabled
-checks=(pool-quota proxy-wrapper forge-keys)
+# exactly these eight units, nothing more: an extra file is refused, not installed or enabled
+checks=(pool-quota proxy-wrapper forge-keys fable-use)
 want_units=(); timers=()
 for n in "${checks[@]}"; do want_units+=("teamclaude-check-$n.service" "teamclaude-check-$n.timer"); timers+=("teamclaude-check-$n.timer"); done
 have_units=$(git ls-tree --name-only "$sha" scripts/checks/systemd/ | xargs -rn1 basename | sort)
 [ "$have_units" = "$(printf '%s\n' "${want_units[@]}" | sort)" ] \
-  || { echo "install.sh: scripts/checks/systemd/ at $sha is not exactly the six check units; nothing installed" >&2; exit 4; }
+  || { echo "install.sh: scripts/checks/systemd/ at $sha is not exactly the eight check units; nothing installed" >&2; exit 4; }
 for b in "${want_units[@]}"; do
   git show "$sha:scripts/checks/systemd/$b" > "$stage/units/$b" && [ -s "$stage/units/$b" ] \
     || { echo "install.sh: $b missing at $sha; nothing installed" >&2; exit 4; }

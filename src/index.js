@@ -38,7 +38,7 @@ import { Prober, probeApplicable } from './prober.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
 import { WindowLedger, ResetsProbe, seatRows } from './seat-resets.js';
-import { drain, drainMsFrom } from './drain.js';
+import { drain, drainMsFrom, DRAIN_MARKER } from './drain.js';
 import { ruleFor } from './reset-rules.js';
 import { Warmer, warmApplicable } from './warmer.js';
 import { StaggerAnchors } from './warm-stagger.js';
@@ -1306,6 +1306,7 @@ async function serverCommand() {
     await drain({
       am: accountManager,
       drainMs,
+      marker: DRAIN_MARKER,
       closeListeners: () => { tlsServer?.close(); server.close(); server.closeIdleConnections?.(); },
       closeAll: () => { /** @type {any} */ (tlsServer)?.closeAllConnections?.(); server.closeAllConnections?.(); },
     });

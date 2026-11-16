@@ -1036,11 +1036,11 @@ async function serverCommand() {
   // The operator's single-seat spend (POST /teamclaude/resets/redeem, `teamclaude resets redeem <seat>`).
   // One line in the journal per call, with the weekly use before and after; a real spend refreshes the
   // seat rows so /teamclaude/quota stops showing the spent reset.
-  /** @type {any} */ (hooks).redeemSeatReset = async (/** @type {{ seat: string, dryRun?: boolean, via?: string }} */ { seat, dryRun = false, via = '' }) => {
-    const r = await claudeRedeemer.redeemNamed(seat, { dryRun });
+  /** @type {any} */ (hooks).redeemSeatReset = async (/** @type {{ seat: string, dryRun?: boolean, fiveHour?: boolean, via?: string }} */ { seat, dryRun = false, fiveHour = false, via = '' }) => {
+    const r = await claudeRedeemer.redeemNamed(seat, { dryRun, fiveHour });
     const pct = (/** @type {number|null|undefined} */ v) => (v == null ? '?' : `${Math.round(v * 100)}%`);
     const verdict = r.redeemed ? `REDEEMED (${r.result}, ${r.resetsLeft ?? '?'} left, cleared ${(r.cleared || []).join(', ') || '?'})` : r.maybeSpent ? 'NO VERDICT (may be spent)' : r.wouldRedeem ? 'would redeem' : 'not redeemed';
-    console.log(`[TeamClaude] Seat reset ${dryRun ? 'dry run' : 'redeem'} ${via} for "${safeLine(r.account || seat, 64)}": ${verdict} — ${r.reason}; weekly ${pct(r.weeklyBefore)} → ${pct(r.weeklyAfter)}`);
+    console.log(`[TeamClaude] Seat reset ${dryRun ? 'dry run' : 'redeem'}${fiveHour ? ' (5-hour)' : ''} ${via} for "${safeLine(r.account || seat, 64)}" (grant ${r.grantId ?? '?'}): ${verdict} — ${r.reason}; weekly ${pct(r.weeklyBefore)} → ${pct(r.weeklyAfter)}, 5h ${pct(r.fiveHourBefore)} → ${pct(r.fiveHourAfter)}`);
     if (r.redeemed) await resetsProbe.probe({ force: true }).catch((/** @type {any} */ e) => console.error(`[TeamClaude] Seat resets probe failed: ${e?.message || e}`));
     return r;
   };
@@ -2022,8 +2022,9 @@ async function resetsCommand() {
 async function resetsRedeemCommand(config) {
   const seat = args[2];
   const dryRun = args.includes('--dry-run');
+  const fiveHour = args.includes('--five-hour');
   if (!seat || seat.startsWith('-')) {
-    console.error('Usage: teamclaude resets redeem <seat> [--dry-run | --yes] [--json]');
+    console.error('Usage: teamclaude resets redeem <seat> [--five-hour] [--dry-run | --yes] [--json]');
     process.exit(22);
   }
   if (!dryRun && !args.includes('--yes')) {
@@ -2036,7 +2037,7 @@ async function resetsRedeemCommand(config) {
     const res = await fetch(`http://localhost:${config.proxy.port}/teamclaude/resets/redeem`, {
       method: 'POST',
       headers: { 'x-api-key': config.proxy.apiKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ seat, dryRun }),
+      body: JSON.stringify({ seat, dryRun, fiveHour }),
       signal: AbortSignal.timeout(90_000),
     });
     data = await res.json();
@@ -2051,7 +2052,7 @@ async function resetsRedeemCommand(config) {
     const head = data.redeemed ? `REDEEMED on ${data.account}: ${data.result}, ${data.resetsLeft ?? '?'} left, cleared ${(data.cleared || []).join(', ') || '?'}`
       : data.maybeSpent ? `UNKNOWN on ${data.account}: the reset MAY have been spent. Read \`teamclaude resets --probe\` before trying again (the fleet holds off 30 min)`
       : data.wouldRedeem ? `Dry run on ${data.account}: WOULD redeem (nothing spent)` : `Not redeemed${data.account ? ` on ${data.account}` : ''} (nothing spent)`;
-    await writeStdout(`${head}\n  ${data.reason}\n  weekly use ${pct(data.weeklyBefore)} → ${pct(data.weeklyAfter)}\n`);
+    await writeStdout(`${head}\n  ${data.reason}\n  weekly use ${pct(data.weeklyBefore)} → ${pct(data.weeklyAfter)}, 5h use ${pct(data.fiveHourBefore)} → ${pct(data.fiveHourAfter)}${data.grantId ? `, grant ${data.grantId}` : ''}\n`);
   }
   if (data.maybeSpent) process.exit(5);
   if (!data.redeemed && !data.wouldRedeem) process.exit(3);
@@ -3245,9 +3246,10 @@ Commands:
                       Use --color=always|never to control ANSI colors
   resets [--probe] [--dry-run] [--json]
                       Banked resets and windows left per seat (read-only)
-  resets redeem <seat> --dry-run|--yes
+  resets redeem <seat> [--five-hour] --dry-run|--yes
                       Spend ONE banked reset on ONE named seat (irreversible;
-                      --dry-run checks only, --yes spends)
+                      --dry-run checks only, --yes spends; --five-hour clears
+                      a 5-hour wall with a reset that does not clear the weekly)
   attach              Open the live dashboard against a running server; s
                       switches account, R reloads config, q leaves it running
   dashboard           Open the web dashboard of a running server in the browser

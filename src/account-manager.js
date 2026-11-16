@@ -458,6 +458,9 @@ function makeAccount(acct, index, listener = null) {
     },
     rateLimitedUntil: null,
     throttledAt: null,
+    // the hold's place in dispatch order (nextDispatchSeq; clearRateLimited)
+    /** @type {number|null} */
+    throttledSeq: null,
     // Organization policy can reject OAuth while the credential itself remains
     // valid. This cross-request cooldown is intentionally ephemeral: unlike
     // quota, it is a live routing observation and is re-learned after restart.
@@ -5446,17 +5449,40 @@ export class AccountManager {
     // after throttleProbeFloorMs from here, so a probe that 429s again pushes
     // the next probe out by a full floor rather than hammering upstream.
     account.throttledAt = Date.now();
+    // Ordering, not time: the hold's place in the same sequence dispatches draw from (clearRateLimited).
+    account.throttledSeq = this.nextDispatchSeq();
     console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" rate limited for ${retryAfterSeconds}s`);
+  }
+
+  /**
+   * A strictly increasing, process-local sequence number. Every upstream dispatch and every
+   * rate-limit hold draws one, so "was this request sent after that hold" is an exact comparison,
+   * immune to millisecond ties and wall-clock adjustments.
+   * @returns {number}
+   */
+  nextDispatchSeq() {
+    this._dispatchSeq = (this._dispatchSeq || 0) + 1;
+    return this._dispatchSeq;
   }
 
   /**
    * Clear a rate-limit hold after live proof it no longer binds: any non-429
    * upstream response on a throttled account (a revalidation probe reaching
    * here, or a hold armed moments before traffic resumed). No-op otherwise.
+   *
+   * `sentSeq`: the answering request's dispatch number (nextDispatchSeq). A request
+   * sent BEFORE the hold was armed proves nothing about it: upstream admitted it
+   * before the wall. On
+   * 2026-11-16 09:58 PST a slow-to-first-byte request to claude answered 200 ten
+   * seconds after claude's own 5-hour 429, lifted the hold, and refresh routing
+   * sent the fleet straight back into the wall (a second 429 at 09:59).
+   * @param {number} accountIndex
+   * @param {{ sentSeq?: number }} [opts]
    */
-  clearRateLimited(accountIndex) {
+  clearRateLimited(accountIndex, { sentSeq } = {}) {
     const account = this.accounts[accountIndex];
     if (!account || account.status !== 'throttled') return;
+    if (Number.isFinite(sentSeq) && Number.isFinite(account.throttledSeq) && /** @type {number} */ (sentSeq) < account.throttledSeq) return;
     account.status = 'active';
     account.rateLimitedUntil = null;
     account.throttledAt = null;

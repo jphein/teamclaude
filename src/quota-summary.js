@@ -139,9 +139,26 @@ export function buildQuotaSummary(accounts) {
       tier: quotaTier(account),
       buckets: accountBuckets(account.quota || {}),
     }));
+  /** @type {Record<string, any>} */
+  const aggregate = Object.fromEntries(BUCKETS.map(key => [key, aggregateBucket(summaries, key)]));
+  // The 5h headroom the fleet can actually SERVE: a seat whose week is spent, or that is disabled, has
+  // an empty 5h window that serves nothing. Same denominator as `remaining`. On 2026-11-16 the plain
+  // figure read 84% while two of seven seats could serve (27%), and lanes read "room" as no wall.
+  if (aggregate.fiveHour) {
+    let servable = 0;
+    for (const a of summaries) {
+      const w = a.tier.weight, f = a.buckets.fiveHour, wk = a.buckets.weeklyShared;
+      if (w == null || f == null || String(f.source).startsWith('backend')) continue;
+      // a week that is spent OR unknown is not counted as room (an unknown week could be spent)
+      const weekUsed = wk == null ? NaN : Number(wk.utilization);
+      if (a.disabled || !Number.isFinite(weekUsed) || weekUsed >= 0.98) continue;
+      servable += w * (1 - Math.max(0, Math.min(1, f.utilization)));
+    }
+    aggregate.fiveHour.servableRemaining = clean(servable / aggregate.fiveHour.capacityWeight);
+  }
   return {
     accounts: summaries,
-    aggregate: Object.fromEntries(BUCKETS.map(key => [key, aggregateBucket(summaries, key)])),
+    aggregate,
     unknownTiers: summaries
       .filter(account => account.type === 'oauth' && account.tier.weight == null)
       .map(account => ({

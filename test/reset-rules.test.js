@@ -274,3 +274,35 @@ test('every landed reset is recorded on the seat (7 days kept, persisted) and co
   await declined.redeemer.redeemByRule(declined.am.accounts[0], 'expiry');
   assert.equal(declined.am.accounts[0].quota.claudeResetSpends, undefined, 'a decline spends nothing');
 });
+
+// ---------- operator --five-hour (Sen 2026-11-16 10:0x)
+test('redeemNamed fiveHour: spends a 5h-only next grant at a live 5-hour wall, never a weekly-clearing one, logs the grant', async () => {
+  const five = [{ id: 'gr-5h', resets_left: 1, clears: FIVE, usable_now: true, paused: false, ends_at: new Date(Date.now() + 90 * DAY).toISOString() }];
+  const ok = rig({ config: {}, status: () => block({ next_grant_id: 'gr-5h', at_limit: true, exhausted: ['five_hour'] }, five), claim: () => ({ result: 'reset', resetsLeft: 0, cleared: FIVE }), usage: { week: 0.17, five: 1 } });
+  const dry = await ok.redeemer.redeemNamed('a', { fiveHour: true, dryRun: true });
+  assert.equal(dry.wouldRedeem, true);
+  assert.equal(ok.calls.claim.length, 0);
+  const r = await ok.redeemer.redeemNamed('a', { fiveHour: true });
+  assert.equal(r.redeemed, true, 'the auto switch is off: the operator decides');
+  assert.deepEqual(ok.calls.claim, [['a@x.org', 'gr-5h']]);
+  assert.equal(r.grantId, 'gr-5h');
+  assert.equal(r.fiveHourBefore, 1);
+  const weekly = rig({ config: {}, status: () => block({ at_limit: true, exhausted: ['five_hour'] }), usage: { week: 0.17, five: 1 } });
+  assert.match((await weekly.redeemer.redeemNamed('a', { fiveHour: true })).reason, /clears the weekly; kept/);
+  const off = rig({ config: {}, status: () => block({ next_grant_id: 'gr-5h' }, five), usage: { week: 0.17, five: 0.5 } });
+  assert.equal((await off.redeemer.redeemNamed('a', { fiveHour: true })).reason, 'not at its 5-hour wall');
+  assert.equal(weekly.calls.claim.length + off.calls.claim.length, 0);
+});
+
+test('servableRemaining counts 5h room only on seats whose week is not spent and that are enabled', async () => {
+  const { buildQuotaSummary } = await import('../src/quota-summary.js');
+  const seatQ = (name, five, week, extra = {}) => ({ name, type: 'oauth', seatTier: 'team_bendep_nonprofit_premium', rateLimitTier: 'default_claude_max_5x',
+    quota: { unified5h: five, unified5hReset: Date.now() + H, unified7d: week, unified7dReset: Date.now() + 3 * DAY }, ...extra });
+  const s = buildQuotaSummary([seatQ('a', 0.1, 0.25), seatQ('b', 0, 1), seatQ('c', 0, 1), seatQ('d', 0, 0.5, { disabled: true })]);
+  const f = s.aggregate.fiveHour;
+  assert.equal(f.capacityWeight, 20);
+  assert.equal(f.remaining, 0.975, 'the plain figure counts the walled seats');
+  assert.equal(f.servableRemaining, 0.225, 'only seat a can serve: 0.9 * 5 / 20');
+  const unknownWeek = buildQuotaSummary([seatQ('a', 0.1, 0.25), { ...seatQ('e', 0, null), quota: { unified5h: 0, unified5hReset: Date.now() + H } }]);
+  assert.equal(unknownWeek.aggregate.fiveHour.servableRemaining, 0.45, 'a seat with no weekly reading is not room: 0.9 * 5 / 10');
+});

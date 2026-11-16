@@ -450,3 +450,20 @@ test('POST /teamclaude/resets/redeem: a present dryRun that is not a boolean (nu
     assert.equal(calls, 0);
   } finally { proxy.close(); }
 });
+
+test('a vanished pending grant fails closed WITHOUT a status read per request after the hold', async () => {
+  let fail = true, listA = true, clock = Date.now();
+  const one = block().grants[0];
+  const { am, redeemer, calls } = harness({ status: () => (listA ? block({ next_grant_id: 'grant-a' }, { id: 'grant-a' }) : { ...block({ next_grant_id: 'grant-b' }), grants: [{ ...one, id: 'grant-b' }] }),
+    claim: () => (fail ? { error: 'socket hang up' } : { result: 'reset', resetsLeft: 0, cleared: ['seven_day'] }) });
+  redeemer.now = () => clock;
+  await redeemer.maybeRedeemForPool(am.accounts);
+  fail = false; listA = false;
+  clock += 31 * 60 * 1000;
+  const reads = calls.status;
+  await redeemer.maybeRedeemForPool(am.accounts);
+  await redeemer.maybeRedeemForPool(am.accounts);
+  await redeemer.maybeRedeemForPool(am.accounts);
+  assert.equal(calls.status - reads, 1, 'one read, then the seat cools down');
+  assert.equal(calls.claim.length, 1);
+});

@@ -155,6 +155,9 @@ const PERSISTED_QUOTA_FIELDS = [
   // pool (claude-resets.js): a bare timestamp, so a restart minutes after a
   // claim that may have landed does not spend a sibling's on top of it.
   'claudeResetHoldUntil',
+  // When an automatic reset rule last spent (or reserved, ahead of its claim) on this seat
+  // (reset-rules.js; at most one per seat per 24 h): it must survive a restart.
+  'claudeResetRuleAt',
   // Whether the last Codex reading stated a 5-hour window at all (see
   // _updateCodexQuota). A fact about the subscription's shape rather than a
   // counter, so it holds across a restart: without it a restored Codex row
@@ -652,6 +655,10 @@ export class AccountManager {
     this._on5hExhausted = [];
     /** @type {Array<(ev: { account: any, reset: number }) => void>} */
     this._on5hWindowStarted = [];
+    // A Claude seat's quota was read off a response (onSeatRequest): the banked-reset rules decide
+    // there, with how long the seat had been idle before this request (null = never used before).
+    /** @type {Array<(ev: { account: any, idleMs: number|null }) => void>} */
+    this._onSeatRequest = [];
     // Skip-reason log throttle (per account) and the session a skip is
     // attributed to — diagnostics only, see _logSkipReason.
     /** @type {Map<number, number>} */
@@ -4865,6 +4872,7 @@ export class AccountManager {
     this._observeBurnRate(account, observed);
     this._observeOutsideSpend(account, observed, { familyResets: false });
 
+    const prevUsed = Date.parse(account.usage.lastUsed ?? '');
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
 
@@ -4873,6 +4881,17 @@ export class AccountManager {
     if (trip) {
       console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" ${trip.bucket} at ${(trip.used * 100).toFixed(1)}% usage — will switch on next request`);
     }
+    const idleMs = Number.isFinite(prevUsed) ? Math.max(0, Date.now() - prevUsed) : null;
+    for (const fn of this._onSeatRequest) {
+      try { fn({ account, idleMs }); }
+      catch (err) { console.error(`[TeamClaude] seat-request listener failed: ${/** @type {any} */ (err)?.message || err}`); }
+    }
+  }
+
+  /** @param {(ev: { account: any, idleMs: number|null }) => void} fn @returns {() => void} unsubscribe */
+  onSeatRequest(fn) {
+    this._onSeatRequest.push(fn);
+    return () => { this._onSeatRequest = this._onSeatRequest.filter(f => f !== fn); };
   }
 
   /**

@@ -51,6 +51,8 @@ export const CLAUDE_REDEEM_BUDGET_MS = 15_000;
 // The operator's single-seat spend is not racing a waiting request: room for a token refresh, a
 // status read, the claim and the re-read.
 export const CLAUDE_MANUAL_REDEEM_BUDGET_MS = 45_000;
+// The automatic rules (reset-rules.js): at most one rule spend per seat per this long.
+export const RULE_SPACING_MS = 24 * 60 * 60 * 1000;
 
 /** @param {Record<string, any>} account */
 function headers(account) {
@@ -199,15 +201,23 @@ function weeklyOf(usage) {
   return typeof u === 'number' && Number.isFinite(u) ? u : null;
 }
 
+/** The 5-hour use (0..1) a normalized usage payload measured, or null. @param {any} usage */
+function fiveHourOf(usage) {
+  const u = usage && !usage.error ? usage.fiveHour?.utilization : null;
+  return typeof u === 'number' && Number.isFinite(u) ? u : null;
+}
+
 /** @typedef {{ redeemed: boolean, reason: string, account?: string, result?: string|null, resetsLeft?: number|null, cleared?: string[], maybeSpent?: boolean }} ClaudeRedeemResult */
 
 export class ClaudeResetRedeemer {
   /**
    * @param {any} accountManager
-   * @param {{ config?: Record<string, any>|null, statusFn?: Function, claimFn?: Function, now?: () => number, log?: Function, timeoutMs?: number }} [opts]
+   * @param {{ config?: Record<string, any>|null, statusFn?: Function, claimFn?: Function, now?: () => number, log?: Function, timeoutMs?: number, persist?: () => Promise<unknown> }} [opts]
    */
-  constructor(accountManager, { config = null, statusFn = fetchClaudeResetStatus, claimFn = claimClaudeReset, now = Date.now, log = console.log, timeoutMs = CLAUDE_REDEEM_BUDGET_MS } = {}) {
+  constructor(accountManager, { config = null, statusFn = fetchClaudeResetStatus, claimFn = claimClaudeReset, now = Date.now, log = console.log, timeoutMs = CLAUDE_REDEEM_BUDGET_MS, persist = async () => {} } = {}) {
     this.am = accountManager;
+    // Writes the saved quota state now (a rule's 24 h reservation must be on disk before its claim).
+    this.persist = persist;
     this.config = config;
     this.statusFn = statusFn;
     this.claimFn = claimFn;
@@ -288,7 +298,7 @@ export class ClaudeResetRedeemer {
     let reason = 'no Claude account holds a usable reset';
     for (const account of candidates) {
       if (this.now() >= deadline) { reason = 'ran out of the redeem budget'; break; }
-      const r = await this._redeem(account, deadline);
+      const r = await this._redeem(account, deadline, { auto: true });
       if (r.redeemed) return r;
       reason = r.reason;
       if (this.now() < this.fleetHoldUntil) break;
@@ -349,16 +359,51 @@ export class ClaudeResetRedeemer {
   }
 
   /**
+   * One of the automatic rules (reset-rules.js) chose this seat: spend its next grant if a LIVE read
+   * still agrees. Armed by the same fleet switch as the pool-dry spend; at most one rule spend per seat
+   * per RULE_SPACING_MS (kept on the seat's saved quota, `claudeResetRuleAt`, so a restart does not
+   * lift it); the fleet hold, the in-flight lock and the per-seat cooldown all apply, so a stale
+   * reading costs at most one status read per cooldown.
+   *
+   * @param {Record<string, any>} account
+   * @param {'expiry'|'five-hour'} rule
+   * @param {string} [why]
+   * @param {{ pool5h?: () => number|null }} [opts] the pool's 5-hour remaining, re-read just before a
+   *   'five-hour' claim (the fleet may have recovered during the live status read)
+   * @returns {Promise<ClaudeRedeemResult & { rule?: string, grantId?: string|null, weeklyBefore?: number|null, weeklyAfter?: number|null, fiveHourBefore?: number|null, fiveHourAfter?: number|null }>}
+   */
+  async redeemByRule(account, rule, why = '', { pool5h = () => null } = {}) {
+    const name = safeLine(account?.name, 64);
+    if (this.config?.autoRedeemResets !== true) return { redeemed: false, account: name, reason: 'auto-redeem is switched off' };
+    if (rule !== 'expiry' && rule !== 'five-hour') return { redeemed: false, account: name, reason: 'unknown rule' };
+    if (!this._isClaude(account) || !account.orgUuid || account.disabled || account.autoRedeemReset === false) return { redeemed: false, account: name, reason: 'not a seat the rules may spend on' };
+    if (this.inFlight) return { redeemed: false, account: name, reason: 'another reset attempt is in flight' };
+    const now = this.now();
+    if (now < this.fleetHoldUntil) return { redeemed: false, account: name, reason: 'holding off after a recent Claude reset attempt' };
+    const last = account.quota?.claudeResetRuleAt;
+    if (Number.isFinite(last) && now - last < RULE_SPACING_MS) return { redeemed: false, account: name, reason: 'a rule already spent on this seat in the last 24 h' };
+    const state = this._stateFor(account);
+    if (now < state.cooldownUntil) return { redeemed: false, account: name, reason: 'cooling down after a recent check' };
+    const observe = { weeklyBefore: /** @type {number|null} */ (null), weeklyAfter: /** @type {number|null} */ (null), fiveHourBefore: /** @type {number|null} */ (null), fiveHourAfter: /** @type {number|null} */ (null), grantId: /** @type {string|null} */ (null) };
+    const attempt = this._redeem(account, now + CLAUDE_MANUAL_REDEEM_BUDGET_MS, { why: `rule ${rule}${why ? `: ${why}` : ''}`, rule, observe, auto: true, pool5h })
+      .then(r => ({ ...r, rule, ...observe }))
+      .finally(() => { this.inFlight = null; });
+    this.inFlight = attempt;
+    return attempt;
+  }
+
+  /**
    * @param {Record<string, any>} account
    * @param {number} deadline
-   * @param {{ why?: string, dryRun?: boolean, observe?: { weeklyBefore: number|null, weeklyAfter: number|null }|null }} [opts]
+   * @param {{ why?: string, dryRun?: boolean, rule?: 'expiry'|'five-hour'|null, auto?: boolean, pool5h?: () => number|null, observe?: { weeklyBefore: number|null, weeklyAfter: number|null, fiveHourBefore?: number|null, fiveHourAfter?: number|null, grantId?: string|null }|null }} [opts]
    * @returns {Promise<ClaudeRedeemResult & { wouldRedeem?: boolean }>}
    */
-  async _redeem(account, deadline, { why = 'no Claude account can serve the request', dryRun = false, observe = null } = {}) {
+  async _redeem(account, deadline, { why = 'no Claude account can serve the request', dryRun = false, rule = null, auto = false, pool5h = () => null, observe = null } = {}) {
     const name = safeLine(account.name, 64);
     const state = this._stateFor(account);
     const now = this.now();
     try { await this.am.ensureTokenFresh(account.index); } catch (/** @type {any} */ err) {
+      state.cooldownUntil = now + DECLINED_COOLDOWN_MS; // never a refresh per response
       return { redeemed: false, account: name, reason: `token refresh failed (${safeLine(err?.message || String(err), 80)})` };
     }
     const left = () => Math.max(1, deadline - this.now());
@@ -367,7 +412,7 @@ export class ClaudeResetRedeemer {
       state.cooldownUntil = now + DECLINED_COOLDOWN_MS;
       return { redeemed: false, account: name, reason: `could not read reset status (${read.error})` };
     }
-    if (observe) observe.weeklyBefore = weeklyOf(read.usage);
+    if (observe) { observe.weeklyBefore = weeklyOf(read.usage); observe.fiveHourBefore = fiveHourOf(read.usage); }
     const status = read.reset;
     if (!status || !status.eligible) {
       state.cooldownUntil = now + NOTHING_COOLDOWN_MS;
@@ -378,6 +423,7 @@ export class ClaudeResetRedeemer {
     // answers `already_used` if it landed, spends it now if it did not, or declines (nothing spent).
     const pending = state.requestId && state.grantId ? status.grants.find((/** @type {{ id: string }} */ g) => g.id === state.grantId) : null;
     if (state.requestId && state.grantId && !pending) {
+      state.cooldownUntil = now + UNKNOWN_HOLD_MS; // fail closed without a status read per request
       // Its grant is gone from the list: most likely that claim spent it. Fail closed: never mint a
       // second spend on top of an unresolved one. Kept in memory, so a restart clears it.
       return { redeemed: false, maybeSpent: true, account: name, reason: 'an earlier reset on this seat got no verdict and its grant is no longer listed, so it most likely went through; nothing more is spent until the proxy restarts' };
@@ -387,7 +433,26 @@ export class ClaudeResetRedeemer {
       state.cooldownUntil = now + NOTHING_COOLDOWN_MS;
       return { redeemed: false, account: name, reason: 'holds no usable reset' };
     }
-    {
+    const liveWeekly = weeklyOf(read.usage);
+    if (rule === 'expiry') {
+      // A weekly-clearing reset that would expire before the seat's own week resets: spend it at >= 60 %
+      // weekly (live), never on a seat whose week resets first.
+      // the LIVE week reset, never the cached one: a stale cache could spend a grant the week outlives
+      const liveReset = read.usage?.sevenDay?.resetAt;
+      const weekReset = typeof liveReset === 'number' && Number.isFinite(liveReset) ? liveReset : null;
+      const no = !grant.clears.includes('seven_day') ? 'its next reset does not clear the weekly'
+        : grant.endsAt == null || weekReset == null || !(grant.endsAt < weekReset) ? 'its reset does not expire before the seat\'s week resets'
+          : liveWeekly == null || liveWeekly < 0.6 ? 'weekly use is under 60%' : null;
+      if (no) { state.cooldownUntil = now + DECLINED_COOLDOWN_MS; return { redeemed: false, account: name, reason: no }; }
+    } else if (rule === 'five-hour') {
+      // Only at a live 5-hour wall with weekly room, and never with a reset that would clear the weekly.
+      const no = grant.clears.includes('seven_day') ? 'its next reset clears the weekly; kept for a weekly wall'
+        : !grant.clears.includes('five_hour') ? 'its next reset does not clear the 5-hour window'
+          : !status.exhausted.includes('five_hour') ? 'not at its 5-hour wall'
+            : status.exhausted.some((/** @type {string} */ l) => l.startsWith('seven_day')) || liveWeekly == null || liveWeekly >= 0.7 ? 'its week has no room'
+              : null;
+      if (no) { state.cooldownUntil = now + DECLINED_COOLDOWN_MS; return { redeemed: false, account: name, reason: no }; }
+    } else {
       if (!status.atLimit || !status.exhausted.length) {
         state.cooldownUntil = now + DECLINED_COOLDOWN_MS;
         return { redeemed: false, account: name, reason: 'not at a usage limit' };
@@ -416,8 +481,48 @@ export class ClaudeResetRedeemer {
       return { redeemed: false, wouldRedeem: true, account: name, reason: `would redeem: at ${status.exhausted.join(', ')}, its reset clears ${grant.clears.join(', ')}`, resetsLeft: grant.resetsLeft, cleared: grant.clears };
     }
     if (state.grantId !== grant.id) { state.grantId = grant.id; state.requestId = null; }
+    if (observe) observe.grantId = grant.id;
+    // A rule's 24 h reservation goes on disk BEFORE the irreversible claim: a restart between the claim
+    // and its answer must not allow a second rule spend on this seat within the day. It records the
+    // attempt's deadline, which is never earlier than the claim, so two spends are >= 24 h apart.
+    // The fleet hold goes on disk with it (a crash after the claim must not free a sibling to spend on
+    // top of it); a definite refusal or decline gives both back.
+    const prevRuleAt = account.quota.claudeResetRuleAt;
+    const prevHold = account.quota.claudeResetHoldUntil;
+    if (rule) {
+      account.quota.claudeResetRuleAt = deadline;
+      this._holdFleet(account, now + UNKNOWN_HOLD_MS);
+      try { await this.persist(); } catch {
+        account.quota.claudeResetRuleAt = prevRuleAt;
+        account.quota.claudeResetHoldUntil = prevHold;
+        state.cooldownUntil = now + DECLINED_COOLDOWN_MS;
+        return { redeemed: false, account: name, reason: 'could not save the rule reservation; nothing spent' };
+      }
+    }
+    // Automatic paths re-check, right before the claim, what may have changed while refreshing, reading
+    // and saving; a refusal here gives the reservation back.
+    // The released reservation is written too: a restart must not bring back a day nothing was spent on.
+    const release = async () => {
+      if (!rule) return;
+      account.quota.claudeResetRuleAt = prevRuleAt;
+      account.quota.claudeResetHoldUntil = prevHold;
+      try { await this.persist(); } catch { /* the next periodic save writes it */ }
+    };
+    const refuse = async (/** @type {string} */ reason) => {
+      await release();
+      state.cooldownUntil = now + DECLINED_COOLDOWN_MS;
+      return { redeemed: false, account: name, reason };
+    };
+    if (auto && this.config?.autoRedeemResets !== true) return refuse('auto-redeem is switched off');
+    if (auto && (account.disabled || account.autoRedeemReset === false)) return refuse('the seat was disabled or exempted');
+    if (rule === 'five-hour') {
+      const pool = pool5h();
+      if (pool == null || !(pool < 0.2)) return refuse('the pool\'s 5-hour headroom recovered');
+    }
+    // The reservation covers the claim only while the attempt is inside its deadline.
+    if (rule && this.now() >= deadline) return refuse('ran out of time before the claim');
     state.requestId ||= randomUUID();
-    this.log(`[TeamClaude] Redeeming a banked Claude usage-limit reset on "${name}" — ${why}`);
+    this.log(`[TeamClaude] Redeeming a banked Claude usage-limit reset on "${name}" (grant ${grant.id}) — ${why}`);
     const r = await this.claimFn(account, { grantId: grant.id, requestId: state.requestId }, { timeoutMs: left() });
 
     if (r?.error || !KNOWN_RESULTS.has(r?.result)) {
@@ -426,7 +531,7 @@ export class ClaudeResetRedeemer {
       const why = r?.error || `unreadable answer (${r?.result ?? 'no result'})`;
       state.cooldownUntil = now + UNKNOWN_HOLD_MS;
       this._holdFleet(account, now + UNKNOWN_HOLD_MS);
-      this.log(`[TeamClaude] Claude reset on "${name}" got no verdict (${why}); it may have been spent, so the fleet holds off`);
+      this.log(`[TeamClaude] Claude reset on "${name}" (grant ${grant.id}) got no verdict (${why}); it may have been spent, so the fleet holds off`);
       return { redeemed: false, maybeSpent: true, account: name, reason: `reset request got no verdict (${why}); it may still have gone through` };
     }
     state.requestId = null;
@@ -434,12 +539,13 @@ export class ClaudeResetRedeemer {
     if (r.result === 'reset' || r.result === 'already_used') {
       state.cooldownUntil = now + SUCCESS_HOLD_MS;
       this._holdFleet(account, now + SUCCESS_HOLD_MS);
-      this.log(`[TeamClaude] Redeemed a Claude usage-limit reset on "${name}" — cleared ${(r.cleared || []).join(', ') || 'its limits'}, ${r.resetsLeft ?? '?'} left`);
+      this.log(`[TeamClaude] Redeemed a Claude usage-limit reset on "${name}" (grant ${grant.id}) — cleared ${(r.cleared || []).join(', ') || 'its limits'}, ${r.resetsLeft ?? '?'} left`);
       const after = await this._reapply(account, deadline);
-      if (observe) observe.weeklyAfter = after;
+      if (observe) { observe.weeklyAfter = after.weekly; observe.fiveHourAfter = after.fiveHour; }
       return { redeemed: true, account: name, reason: why, result: r.result, resetsLeft: r.resetsLeft, cleared: r.cleared };
     }
     state.cooldownUntil = r.result === 'cooldown' && r.cooldownUntil ? r.cooldownUntil : now + DECLINED_COOLDOWN_MS;
+    await release(); // upstream declined: nothing spent, the day is not used
     this.log(`[TeamClaude] Claude reset on "${name}" declined upstream (${r.result || 'no result'}${r.reason ? `: ${r.reason}` : ''}); nothing was spent`);
     return { redeemed: false, account: name, reason: `upstream declined (${r.result || 'no result'}${r.reason ? `: ${r.reason}` : ''})`, result: r.result };
   }
@@ -452,14 +558,14 @@ export class ClaudeResetRedeemer {
    *
    * @param {Record<string, any>} account
    * @param {number} deadline
-   * @returns {Promise<number|null>} the weekly use the re-read measured, or null when it failed
+   * @returns {Promise<{ weekly: number|null, fiveHour: number|null }>} what the re-read measured; null when it failed
    */
   async _reapply(account, deadline) {
     try { this.am.clearRateLimited(account.index); } catch { /* not held */ }
     try { this.am.clearUpstreamRejected(account.index); } catch { /* not rejected */ }
     const read = await this.statusFn(account, { timeoutMs: Math.max(1, deadline - this.now()) });
-    if (!read?.usage || read.usage.error) return null;
+    if (!read?.usage || read.usage.error) return { weekly: null, fiveHour: null };
     this.am.applyUsageData(account.index, read.usage);
-    return weeklyOf(read.usage);
+    return { weekly: weeklyOf(read.usage), fiveHour: fiveHourOf(read.usage) };
   }
 }

@@ -327,3 +327,41 @@ test('ResetsProbe: a 401 twice is recorded once (no loop); a failed refresh is i
   assert.equal(reads, 0);
   assert.equal(q.byName.get('a')?.error, 'token refresh failed');
 });
+
+// ---------- 2026-11-16: claude5/claude6 kept an import-time team_standard tier after becoming premium
+test('ResetsProbe re-reads each seat profile on the first probe, then at most daily, and applies it', async () => {
+  let now = NOW;
+  const reads = [], applied = [];
+  const acct = { name: 'a', type: 'oauth', credential: 't', seatTier: 'team_standard' };
+  const p = new ResetsProbe({
+    accounts: () => [acct],
+    fetchStatus: async () => ({ reset: status(), usage: null }),
+    fetchProfile: async (/** @type {any} */ a) => { reads.push(a.name); return { seatTier: 'team_bendep_nonprofit_premium', rateLimitTier: 'default_claude_max_5x' }; },
+    applyProfile: (/** @type {any} */ a, /** @type {any} */ prof) => { applied.push(prof.seatTier); a.seatTier = prof.seatTier; },
+    now: () => now,
+  });
+  await p.probe({ force: true });
+  assert.deepEqual(reads, ['a']);
+  assert.equal(acct.seatTier, 'team_bendep_nonprofit_premium');
+  now += 23 * H; await p.probe({ force: true });
+  assert.equal(reads.length, 1, 'not again within a day');
+  now += 2 * H; await p.probe({ force: true });
+  assert.equal(reads.length, 2, 'again after a day');
+});
+
+test('ResetsProbe: a failing profile read changes nothing, does not fail the reset reading, and waits a day', async () => {
+  let now = NOW; let reads = 0; const applied = [];
+  const p = new ResetsProbe({
+    accounts: () => [{ name: 'a', type: 'oauth', credential: 't' }],
+    fetchStatus: async () => ({ reset: status(), usage: null }),
+    fetchProfile: async () => { reads++; if (reads === 1) return { error: 'HTTP 500' }; throw new Error('boom'); },
+    applyProfile: (_a, prof) => applied.push(prof),
+    now: () => now,
+  });
+  await p.probe({ force: true });
+  assert.equal(p.byName.get('a')?.error, null);
+  now += 25 * H; await p.probe({ force: true });
+  assert.equal(p.byName.get('a')?.error, null);
+  assert.equal(reads, 2);
+  assert.deepEqual(applied, []);
+});

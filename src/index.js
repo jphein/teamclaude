@@ -38,6 +38,7 @@ import { Prober, probeApplicable } from './prober.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
 import { WindowLedger, ResetsProbe, seatRows } from './seat-resets.js';
+import { ruleFor } from './reset-rules.js';
 import { Warmer, warmApplicable } from './warmer.js';
 import { StaggerAnchors } from './warm-stagger.js';
 import { RoutingEvents } from './routing-events.js';
@@ -909,7 +910,7 @@ async function serverCommand() {
   // binds on the next refusal, not the next restart.
   const redeemer = new ResetCreditRedeemer(accountManager, { config });
   // Banked Claude usage-limit resets, armed by the same switch (autoRedeemResets).
-  const claudeRedeemer = new ClaudeResetRedeemer(accountManager, { config });
+  const claudeRedeemer = new ClaudeResetRedeemer(accountManager, { config, persist: () => saveState({ quota: accountManager.exportQuotaState(), clients: clientUsage.exportState(), usageDimensions: dimensionUsage.exportState() }) });
   hooks.redeemClaudeResetForPool = (/** @type {Record<string, any>[]} */ accounts) => claudeRedeemer.maybeRedeemForPool(accounts);
   hooks.redeemCodexResetForPool = (/** @type {Record<string, any>[]} */ accounts) => redeemer.maybeRedeemForPool(accounts);
   hooks.getStatusExtra = () => ({
@@ -976,9 +977,17 @@ async function serverCommand() {
   const resetsProbe = new ResetsProbe({
     accounts: () => accountManager.accounts,
     refresh: (account, force) => accountManager.ensureTokenFresh(account.index, force),
+    fetchProfile: (account) => fetchProfile(account.credential, account.routing ?? null),
+    applyProfile: (account, profile) => {
+      const was = `${account.seatTier ?? '?'}/${account.rateLimitTier ?? '?'}`;
+      accountManager.applyProfileData(account.index, profile);
+      const now = `${account.seatTier ?? '?'}/${account.rateLimitTier ?? '?'}`;
+      if (was !== now) console.log(`[TeamClaude] Tier of "${safeLine(account.name, 64)}" changed: ${safeLine(was, 80)} → ${safeLine(now, 80)} (from its OAuth profile)`);
+    },
     applyUsage: (account, usage) => accountManager.applyUsageData(account.index, usage),
   });
-  const probeResetsQuietly = () => resetsProbe.probe().catch((/** @type {any} */ e) => console.error(`[TeamClaude] Seat resets probe failed: ${e?.message || e}`));
+  let resetRulesAfterProbe = () => {};
+  const probeResetsQuietly = () => resetsProbe.probe().then(() => resetRulesAfterProbe()).catch((/** @type {any} */ e) => console.error(`[TeamClaude] Seat resets probe failed: ${e?.message || e}`));
   setTimeout(probeResetsQuietly, 60_000).unref?.();
   // every 30 min (Sen 2026-11-16, JP's reset strategy item 1): one zero-spend usage read per seat
   setInterval(probeResetsQuietly, 30 * 60_000).unref?.();
@@ -991,6 +1000,32 @@ async function serverCommand() {
     now: Date.now(),
     dryRun,
   });
+  // The automatic banked-reset rules (src/reset-rules.js; JP 2026-11-16 "our automatic reset strategy").
+  // Decided on each Claude response (with how long the seat had been idle) and after each probe; armed
+  // by the same fleet switch as the pool-dry spend. One journal line per rule attempt, with the seat,
+  // the grant and the before/after use.
+  const tryResetRule = (/** @type {any} */ account, /** @type {number|null} */ idleMs) => {
+    if (config.autoRedeemResets !== true || account?.disabled) return;
+    const kept = resetsProbe.byName.get(account.name)?.kept;
+    // the pool summary only matters at a 5-hour wall; skip building it on every other response
+    const pool5hRemaining = (account.quota?.unified5h ?? 0) >= 0.98 ? accountManager.getQuotaSummary()?.aggregate?.fiveHour?.remaining ?? null : null;
+    const pick = ruleFor(account, { now: Date.now(), kept, idleMs, pool5hRemaining });
+    if (!pick) return;
+    claudeRedeemer.redeemByRule(account, pick.rule, pick.reason, { pool5h: () => accountManager.getQuotaSummary()?.aggregate?.fiveHour?.remaining ?? null }).then((r) => {
+      const pct = (/** @type {number|null|undefined} */ v) => (v == null ? '?' : `${Math.round(v * 100)}%`);
+      // the cheap refusals (hold, cooldown, spacing, lock) would log on every response; a live read's
+      // verdict, a spend or a no-verdict always logs
+      const quiet = /^(holding off|cooling down|a rule already spent|another reset attempt|auto-redeem is switched off)/.test(r.reason || '');
+      if (r.redeemed || r.maybeSpent || !quiet) {
+        console.log(`[TeamClaude] Reset rule ${pick.rule} on "${safeLine(account.name, 64)}" (grant ${r.grantId ?? '?'}): ${r.redeemed ? `REDEEMED (${r.result}, ${r.resetsLeft ?? '?'} left)` : r.maybeSpent ? 'NO VERDICT (may be spent)' : 'not redeemed'} — ${r.reason}; weekly ${pct(r.weeklyBefore)} → ${pct(r.weeklyAfter)}, 5h ${pct(r.fiveHourBefore)} → ${pct(r.fiveHourAfter)}`);
+      }
+      if (r.redeemed) probeResetsQuietly();
+    }).catch((/** @type {any} */ e) => console.error(`[TeamClaude] Reset rule failed: ${e?.message || e}`));
+  };
+  accountManager.onSeatRequest(({ account, idleMs }) => tryResetRule(account, idleMs));
+  // After each probe: the 5-hour rule only (idle 0 is never a work-block start, so the expiry rule waits
+  // for a real request).
+  resetRulesAfterProbe = () => { for (const a of accountManager.accounts) tryResetRule(a, 0); };
   hooks.getQuotaExtra = () => ({ warmup: resolveWarmupConfig(config), stagger: stagger?.status() || { enabled: false }, seats: seatView() });
   /** @type {any} */ (hooks).getSeatResets = async (/** @type {{ probe?: boolean, dryRun?: boolean }} */ { probe = false, dryRun = false } = {}) => {
     if (probe) await resetsProbe.probe();

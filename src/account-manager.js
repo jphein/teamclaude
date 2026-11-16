@@ -4913,6 +4913,13 @@ export class AccountManager {
     account.activityOpen = (account.activityOpen || 0) + 1;
   }
 
+  /** Responses still being delivered, across every account (beginActivity → endActivity). */
+  openStreams() {
+    let n = 0;
+    for (const a of this.accounts) n += a.activityOpen || 0;
+    return n;
+  }
+
   /** The request opened by beginActivity() has ended.
    * @param {number} index */
   endActivity(index) {
@@ -6033,6 +6040,9 @@ export class AccountManager {
         routing: describeRouting(a.routing),
         status: a.status,
         inFlight: a.inFlight || 0,
+        // Requests whose response has not fully ENDED (a stream counts until its last byte). inFlight
+        // drops when the headers arrive, so a restart gated on it alone cut live streams (2026-11-16).
+        openStreams: a.activityOpen || 0,
         // What put it in 'error' and what brings it back; null in every other state.
         errorReason: a.status === 'error' && a.errorReason ? { ...a.errorReason } : null,
         // Why the account is out of rotation right now (null = it can serve).

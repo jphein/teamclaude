@@ -4263,6 +4263,14 @@ async function familyFallback(req, res, body, accountManager, upstream, retryCou
 
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
+  // Draining for a restart (src/drain.js): open streams finish, a NEW request is turned away with a
+  // retryable 503 so the client retries against the next process. Only a request's first attempt: a
+  // retry inside a request that was already admitted is part of an open exchange.
+  if (/** @type {any} */ (accountManager).draining && !retryCount && !res.headersSent) {
+    res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': '2', Connection: 'close' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'teamclaude is restarting; retry in a moment' } }));
+    return;
+  }
   // This function is exported, so a caller may hand us a ctx built elsewhere.
   // The 401 path reads ctx.reauthed on every response; default it here rather
   // than trusting every construction site to include it.

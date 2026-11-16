@@ -38,6 +38,7 @@ import { Prober, probeApplicable } from './prober.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
 import { ClaudeResetRedeemer } from './claude-resets.js';
 import { WindowLedger, ResetsProbe, seatRows } from './seat-resets.js';
+import { drain, drainMsFrom } from './drain.js';
 import { ruleFor } from './reset-rules.js';
 import { Warmer, warmApplicable } from './warmer.js';
 import { StaggerAnchors } from './warm-stagger.js';
@@ -1293,14 +1294,21 @@ async function serverCommand() {
     credentialSync.stop();
     eventLoopMonitor.stop();
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
-    await persistQuotaState();
-    // Don't linger waiting on keep-alive / streaming connections: actively
-    // destroy them so server.close() can complete promptly, and hard-exit after a
-    // short grace period in case anything still hangs.
-    setTimeout(() => process.exit(0), 2000).unref?.();
-    tlsServer?.close();
-    server.closeAllConnections?.();
-    server.close(() => process.exit(0));
+    // Drain (src/drain.js): stop listening, let responses already being delivered finish (new
+    // requests get a retryable 503), then close what is left and exit. The deadline and the drain
+    // start BEFORE anything is awaited, so a slow save cannot eat the service manager's TERM-to-KILL
+    // window; the one quota save runs after the drain, inside the hard-exit timer. A second signal
+    // still exits at once (above).
+    const drainMs = drainMsFrom(config);
+    setTimeout(() => process.exit(0), drainMs + 3000).unref?.();
+    await drain({
+      am: accountManager,
+      drainMs,
+      closeListeners: () => { tlsServer?.close(); server.close(); server.closeIdleConnections?.(); },
+      closeAll: () => { /** @type {any} */ (tlsServer)?.closeAllConnections?.(); server.closeAllConnections?.(); },
+    });
+    await persistQuotaState(); // after the drain: includes what the drained streams spent
+    process.exit(0);
   }
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);

@@ -201,6 +201,14 @@ function weeklyOf(usage) {
   return typeof u === 'number' && Number.isFinite(u) ? u : null;
 }
 
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+/** Record a spend on the seat's saved quota, keeping the last 7 days. @param {Record<string, any>} account @param {number} now */
+function noteSpend(account, now) {
+  const kept = (Array.isArray(account.quota.claudeResetSpends) ? account.quota.claudeResetSpends : []).filter((/** @type {unknown} */ t) => typeof t === 'number' && Number.isFinite(t) && now - t < WEEK_MS);
+  kept.push(now);
+  account.quota.claudeResetSpends = kept.slice(-50);
+}
+
 /** The 5-hour use (0..1) a normalized usage payload measured, or null. @param {any} usage */
 function fiveHourOf(usage) {
   const u = usage && !usage.error ? usage.fiveHour?.utilization : null;
@@ -539,6 +547,7 @@ export class ClaudeResetRedeemer {
     if (r.result === 'reset' || r.result === 'already_used') {
       state.cooldownUntil = now + SUCCESS_HOLD_MS;
       this._holdFleet(account, now + SUCCESS_HOLD_MS);
+      noteSpend(account, now); // 'already_used' for our own request id is our earlier claim landing
       this.log(`[TeamClaude] Redeemed a Claude usage-limit reset on "${name}" (grant ${grant.id}) — cleared ${(r.cleared || []).join(', ') || 'its limits'}, ${r.resetsLeft ?? '?'} left`);
       const after = await this._reapply(account, deadline);
       if (observe) { observe.weeklyAfter = after.weekly; observe.fiveHourAfter = after.fiveHour; }

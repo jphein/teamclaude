@@ -6,7 +6,7 @@
 dir=${CHECK_STATE_DIR:-$HOME/.local/state/checks}
 now=${CHECK_NOW:-$(date +%s)}
 # name:max age in minutes (twice the cadence)
-for spec in pool-quota:30 proxy-wrapper:10 forge-keys:2880 fable-use:2880; do
+for spec in pool-quota:30 proxy-wrapper:10 forge-keys:2880 fable-use:2880 resets-banked:2880; do
   name=${spec%%:*} max=${spec##*:}; f="$dir/$name.line"
   if [ ! -s "$f" ]; then echo "CHECK $name warn · no result yet (timer not run or not installed) · owner teamclaude lane"; continue; fi
   age=$(( (now - $(stat -c %Y "$f")) / 60 ))

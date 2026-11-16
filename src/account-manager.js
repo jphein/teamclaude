@@ -158,6 +158,8 @@ const PERSISTED_QUOTA_FIELDS = [
   // When an automatic reset rule last spent (or reserved, ahead of its claim) on this seat
   // (reset-rules.js; at most one per seat per 24 h): it must survive a restart.
   'claudeResetRuleAt',
+  // When banked resets were spent on this seat in the last 7 days (any path), for "spent this week".
+  'claudeResetSpends',
   // Whether the last Codex reading stated a 5-hour window at all (see
   // _updateCodexQuota). A fact about the subscription's shape rather than a
   // counter, so it holds across a restart: without it a restored Codex row

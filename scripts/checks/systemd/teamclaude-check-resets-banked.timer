@@ -1,0 +1,10 @@
+[Unit]
+Description=CHECK resets-banked timer (*-*-* 07:45)
+
+[Timer]
+OnCalendar=*-*-* 07:45
+Persistent=true
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

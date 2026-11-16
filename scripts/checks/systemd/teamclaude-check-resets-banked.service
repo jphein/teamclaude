@@ -1,0 +1,9 @@
+[Unit]
+Description=CHECK resets-banked: banked Claude resets, split weekly-clearing / 5h-only, none expiring unspent (teamclaude docs/CHECKS.md)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/libexec/teamclaude-checks/resets-banked.sh
+TimeoutStartSec=120
+Nice=10

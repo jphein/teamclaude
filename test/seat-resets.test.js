@@ -25,7 +25,7 @@ test('resetSummary counts live resets, the soonest expiry and what they clear, a
     { id: 'cg_03', resetsLeft: 1, clears: ['seven_day'], usableNow: true, paused: false, endsAt: NOW - H },
     { id: 'cg_04', resetsLeft: 0, clears: ['seven_day'], usableNow: true, paused: false, endsAt: null },
   ] }), NOW);
-  assert.deepEqual(s, { eligible: true, ineligibleReason: null, available: 3, applicable: 1, expiresAt: NOW + 5 * 24 * H, weeklyApplicable: 1, weeklyExpiresAt: NOW + 5 * 24 * H, atLimit: false, cooldownUntil: null, clears: ['five_hour', 'seven_day'] });
+  assert.deepEqual(s, { eligible: true, ineligibleReason: null, available: 3, applicable: 1, expiresAt: NOW + 5 * 24 * H, weeklyApplicable: 1, weeklyExpiresAt: NOW + 5 * 24 * H, weeklyBanked: 1, weeklyBankedExpiresAt: NOW + 5 * 24 * H, otherExpiresAt: NOW + 9 * 24 * H, atLimit: false, cooldownUntil: null, clears: ['five_hour', 'seven_day'] });
   assert.doesNotMatch(JSON.stringify(s), /cg_/, 'no grant id in the summary');
 });
 
@@ -364,4 +364,17 @@ test('ResetsProbe: a failing profile read changes nothing, does not fail the res
   assert.equal(p.byName.get('a')?.error, null);
   assert.equal(reads, 2);
   assert.deepEqual(applied, []);
+});
+
+test('resetSummary: weeklyBanked counts weekly-clearing resets not usable yet; otherExpiresAt is the 5h-only soonest', () => {
+  const s = resetSummary(status({ grants: [
+    { id: GRANT, resetsLeft: 1, clears: ['five_hour', 'seven_day'], usableNow: false, paused: false, endsAt: NOW + 3 * 24 * H },
+    { id: 'cg_02', resetsLeft: 2, clears: ['five_hour'], usableNow: true, paused: false, endsAt: NOW + 90 * 24 * H },
+    { id: 'cg_03', resetsLeft: 1, clears: ['five_hour'], usableNow: false, paused: false, endsAt: NOW + 80 * 24 * H },
+  ] }), NOW);
+  assert.equal(s?.weeklyApplicable, 0);
+  assert.equal(s?.weeklyBanked, 1);
+  assert.equal(s?.weeklyBankedExpiresAt, NOW + 3 * 24 * H);
+  assert.equal(s?.otherExpiresAt, NOW + 80 * 24 * H);
+  assert.equal(s?.expiresAt, NOW + 3 * 24 * H);
 });

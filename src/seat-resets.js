@@ -33,7 +33,7 @@ export const PROFILE_REFRESH_MS = 24 * 3600_000;
  * @typedef {{ eligible: boolean, ineligibleReason: string|null, atLimit: boolean, exhausted: string[], nextGrantId: string|null, cooldownUntil: number|null, grants: Grant[] }} ResetStatus
  * @typedef {{ resetsLeft: number, clearsWeekly: boolean, clears: string[], usable: boolean, endsAt: number|null }} KeptGrant
  * @typedef {{ eligible: boolean, ineligibleReason: string|null, atLimit: boolean, cooldownUntil: number|null, grants: KeptGrant[] }} KeptStatus
- * @typedef {{ eligible: boolean, ineligibleReason: string|null, available: number, applicable: number, expiresAt: number|null, weeklyApplicable: number, weeklyExpiresAt: number|null, atLimit: boolean, cooldownUntil: number|null, clears: string[] }} ResetSummary
+ * @typedef {{ eligible: boolean, ineligibleReason: string|null, available: number, applicable: number, expiresAt: number|null, weeklyApplicable: number, weeklyExpiresAt: number|null, weeklyBanked: number, weeklyBankedExpiresAt: number|null, otherExpiresAt: number|null, atLimit: boolean, cooldownUntil: number|null, clears: string[] }} ResetSummary
  * @typedef {{ start: number, weeklyAtStart: number|null, weekResetAt?: number|null, burn?: number|null }} WindowRecord
  */
 
@@ -80,6 +80,12 @@ export function resetSummary(status, now) {
   let expiresAt = null;
   /** @type {number|null} */
   let weeklyExpiresAt = null;
+  // banked whether usable now or not, split by what they clear (the pass line and the CHECK)
+  let weeklyBanked = 0;
+  /** @type {number|null} */
+  let weeklyBankedExpiresAt = null;
+  /** @type {number|null} */
+  let otherExpiresAt = null;
   /** @type {Set<string>} */
   const clears = new Set();
   for (const g of kept.grants) {
@@ -88,6 +94,10 @@ export function resetSummary(status, now) {
     available += g.resetsLeft;
     if (g.endsAt != null && (expiresAt == null || g.endsAt < expiresAt)) expiresAt = g.endsAt;
     for (const c of g.clears) clears.add(c);
+    if (g.clearsWeekly) {
+      weeklyBanked += g.resetsLeft;
+      if (g.endsAt != null && (weeklyBankedExpiresAt == null || g.endsAt < weeklyBankedExpiresAt)) weeklyBankedExpiresAt = g.endsAt;
+    } else if (g.endsAt != null && (otherExpiresAt == null || g.endsAt < otherExpiresAt)) otherExpiresAt = g.endsAt;
     if (!g.usable) continue;
     applicable += g.resetsLeft;
     if (!g.clearsWeekly) continue;
@@ -102,6 +112,9 @@ export function resetSummary(status, now) {
     expiresAt,
     weeklyApplicable,
     weeklyExpiresAt,
+    weeklyBanked,
+    weeklyBankedExpiresAt,
+    otherExpiresAt,
     atLimit: kept.atLimit,
     cooldownUntil: kept.cooldownUntil,
     clears: [...clears].sort(),
@@ -391,9 +404,11 @@ export function seatRows({ accounts, ledger, probe, staggerSeats = [], poolWeekl
       windowsLeft: w.windowsLeft,
       windowsLeftBasis: w.basis,
       resets: summary
-        ? { ...summary, expiresAt: iso(summary.expiresAt), weeklyExpiresAt: iso(summary.weeklyExpiresAt), cooldownUntil: iso(summary.cooldownUntil), seenAt: iso(seen?.okAt) }
+        ? { ...summary, expiresAt: iso(summary.expiresAt), weeklyExpiresAt: iso(summary.weeklyExpiresAt), weeklyBankedExpiresAt: iso(summary.weeklyBankedExpiresAt), otherExpiresAt: iso(summary.otherExpiresAt), cooldownUntil: iso(summary.cooldownUntil), seenAt: iso(seen?.okAt) }
         : null,
       resetsError: seen ? seen.error : 'not probed yet',
+      // banked resets spent on this seat in the last 7 days (any path: pool-dry, rule, operator)
+      resetsSpent7d: (Array.isArray(a.quota?.claudeResetSpends) ? a.quota.claudeResetSpends : []).filter((/** @type {unknown} */ t) => typeof t === 'number' && t <= now && now - t < 7 * 24 * HOUR_MS).length,
       resetsTriedAt: iso(seen?.triedAt),
     };
     if (dryRun) {

@@ -255,3 +255,22 @@ test('the fleet hold is in the pre-claim save: restored after a crash, it stops 
   await no.redeemer.redeemByRule(no.am.accounts[0], 'expiry');
   assert.ok(!(no.am.accounts[0].quota.claudeResetHoldUntil > Date.now()), 'nothing spent: no hold left');
 });
+
+// ---------- spent this week (item 5)
+test('every landed reset is recorded on the seat (7 days kept, persisted) and counted in the seat row', async () => {
+  const { am, redeemer } = rig();
+  am.accounts[0].quota.claudeResetSpends = [Date.now() - 8 * DAY, 'x', Date.now() - DAY];
+  await redeemer.redeemByRule(am.accounts[0], 'expiry');
+  const spends = am.accounts[0].quota.claudeResetSpends;
+  assert.equal(spends.length, 2, 'the 8-day-old and malformed entries dropped, this spend added');
+  const fresh = new AccountManager([oauth('a@x.org'), oauth('b@x.org')], 0.98);
+  fresh.restoreQuotaState(am.exportQuotaState());
+  assert.equal(fresh.accounts[0].quota.claudeResetSpends.length, 2);
+  const { seatRows } = await import('../src/seat-resets.js');
+  const rows = seatRows({ accounts: fresh.accounts, ledger: null, probe: null, now: Date.now() });
+  assert.equal(rows[0].resetsSpent7d, 2);
+  assert.equal(rows[1].resetsSpent7d, 0);
+  const declined = rig({ claim: () => ({ result: 'not_limited', reason: null }) });
+  await declined.redeemer.redeemByRule(declined.am.accounts[0], 'expiry');
+  assert.equal(declined.am.accounts[0].quota.claudeResetSpends, undefined, 'a decline spends nothing');
+});

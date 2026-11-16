@@ -41,3 +41,7 @@ To the best of the maintainer's knowledge, using TeamClaude as intended — the 
 ## Other providers
 
 No equivalent write-up exists yet for OpenAI's or the backend vendors' terms. The intended use is the same — your own accounts, the provider's own client, used as that client allows — and whether that satisfies a given provider's current terms is for you to check with that provider.
+
+## This fork's deployment
+
+What this fork's own deployment does with seat tokens, set against the verbatim terms, is recorded in [POLICY.md](POLICY.md).

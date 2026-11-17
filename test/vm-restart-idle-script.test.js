@@ -144,8 +144,10 @@ async function restartRun(o) {
     .replaceAll('$D', d);
   // the quota server; with o.onRequest it first runs that fixture edit (e.g. a respawn while answering)
   const server = createServer((req, res) => {
-    if (o.onRequest) spawn('sh', ['-c', expand(o.onRequest)]).on('exit', () => {});
-    setTimeout(() => { res.writeHead(o.quota ?? 200); res.end(o.body ?? '{}'); }, o.delayMs ?? 0);
+    // the fixture edit is finished BEFORE the answer is sent (an unawaited edit raced the reply under
+    // a loaded parallel suite: CI 2026-11-16, the respawn landed after the script had re-read the record)
+    const edited = o.onRequest ? new Promise(r => spawn('sh', ['-c', expand(o.onRequest)]).on('exit', r)) : Promise.resolve();
+    edited.then(() => setTimeout(() => { res.writeHead(o.quota ?? 200); res.end(o.body ?? '{}'); }, o.delayMs ?? 0));
   });
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   const port = /** @type {any} */ (server.address()).port;
@@ -171,8 +173,8 @@ async function restartRun(o) {
   } finally {
     server.close();
     server.closeAllConnections?.();
-    spawn('chmod', ['-R', 'u+rwx', d]).on('exit', () => {});
-    await new Promise(r => setTimeout(r, 50));
+    // wait for the chmod itself, not a fixed 50 ms: a slow chmod left a 000 directory for rmSync
+    await new Promise(r => spawn('chmod', ['-R', 'u+rwx', d]).on('exit', r));
     rmSync(d, { recursive: true, force: true });
   }
 }
@@ -281,6 +283,12 @@ test('a respawn while the quota answer is in flight: the answer is not credited 
   assert.match(r.err, /:3456 listeners are \[5151\], not only the new child 6161/);
 });
 
+test('the respawn fixture is complete before the answer, however slow the edit (a loaded suite)', async () => {
+  const r = await restartRun({ restart: 'OLDGONE; NEWCHILD(5151,200); LISTENER(5151)', onRequest: 'sleep 0.6; NEWCHILD(6161,300)', delayMs: 0 });
+  assert.equal(r.code, 3);
+  assert.match(r.err, /not only the new child 6161/);
+});
+
 test("the live VM's answer, the proxy's own 401 authentication_error (trustLoopback false), counts as serving", async () => {
   const r = await restartRun({ restart: 'OLDGONE; NEWCHILD(5151,200); LISTENER(5151)', quota: 401, body: '{"type":"error","error":{"type":"authentication_error","message":"Invalid proxy API key"}}' });
   assert.equal(r.code, 0, r.err);
@@ -350,8 +358,8 @@ async function gateRun(/** @type {{ flagAgeS?: number|null, args?: string[], ok?
       });
     });
   } finally {
-    spawn('chmod', ['-R', 'u+rwx', d]).on('exit', () => {});
-    await new Promise(r => setTimeout(r, 50));
+    // wait for the chmod itself, not a fixed 50 ms: a slow chmod left a 000 directory for rmSync
+    await new Promise(r => spawn('chmod', ['-R', 'u+rwx', d]).on('exit', r));
     rmSync(d, { recursive: true, force: true });
   }
 }

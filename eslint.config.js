@@ -31,4 +31,10 @@ export default [
       'eqeqeq': ['warn', 'smart'],
     },
   },
+  // Vendored CommonJS (src/vendor/realm-sigil, LGPL-3.0, kept verbatim): linted as
+  // what it is, so the same correctness rules apply without restyling it.
+  {
+    files: ['src/vendor/**/*.cjs'],
+    languageOptions: { sourceType: 'commonjs', globals: { require: 'readonly', module: 'writable' } },
+  },
 ];

@@ -29,6 +29,8 @@ const { generateName } = require('./vendor/realm-sigil/index.cjs');
 const NAME = 'teamclaude';
 const DESCRIPTION = 'TeamClaude proxy';
 const REALM = 'fantasy';
+// The fork, not package.json's upstream (KarpelesLab): this fork is what is deployed, and the
+// commits it runs (its PR merges) exist only here, so an upstream commit link would 404.
 const REPO = 'https://github.com/jphein/teamclaude';
 const HEX = /^[0-9a-f]{7,40}$/;
 

@@ -95,7 +95,10 @@ test('resolveSigil: git never sees GIT_DIR, GIT_WORK_TREE or any other GIT_* tha
   Object.assign(process.env, { GIT_DIR: '/elsewhere/.git', GIT_WORK_TREE: '/elsewhere', GIT_INDEX_FILE: '/x', KEEP_ME: '1' });
   const envs = [];
   try { await resolveSigil({ root, exec: async (f, a, o) => { envs.push(o.env); return { stdout: '3d21c19\n' }; } }); }
-  finally { for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'KEEP_ME']) if (!(k in saved)) delete process.env[k]; rmSync(root, { recursive: true }); }
+  finally {
+    for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'KEEP_ME']) { if (k in saved) process.env[k] = saved[k]; else delete process.env[k]; }
+    rmSync(root, { recursive: true });
+  }
   assert.ok(envs.length >= 1);
   for (const e of envs) { assert.ok(!Object.keys(e).some((k) => k.startsWith('GIT_'))); assert.equal(e.KEEP_ME, '1'); }
   assert.deepEqual(Object.keys(gitEnv({ GIT_DIR: 'x', PATH: '/bin' })), ['PATH']);

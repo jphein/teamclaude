@@ -9,8 +9,8 @@ calls `generateName()`.
 To update: copy the two files again from a newer realm-sigil commit, redo the one `require` rename,
 and change the commit above.
 
-**Licence boundary.** teamclaude's `package.json` says MIT; that covers teamclaude's own code, not this
-directory. Everything in `src/vendor/realm-sigil/` is LGPL-3.0-only and ships as editable source in the
+**Licence boundary.** teamclaude's `package.json` declares the package as `MIT AND LGPL-3.0-only`: its own
+code is MIT, and this directory is the LGPL part. Everything in `src/vendor/realm-sigil/` is LGPL-3.0-only and ships as editable source in the
 published package (`files: ["src/"]`), so a recipient can replace or modify it; `src/version-sigil.js` loads
 it by path. Modification notice: 2026-11-17, the `require` rename above (also stated at the top of
 `index.cjs`).

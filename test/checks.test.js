@@ -1528,7 +1528,7 @@ test('forge-models collect: vendor keys go in the configured header only, never 
 });
 
 test('forge-models collect: an endpoint that answers any key, a wrong shape, and a redirect are all refused (r1.3, r1.6)', async () => {
-  const vaultList = [{ type: 1, name: 'assemblyai-api-key', login: { password: 'PW', uris: [] } }];
+  const vaultList = [{ type: 1, name: 'assemblyai-api-key', login: { password: 'PW-SECRET-3', uris: [] } }];
   const mk = (id, path, method) => ({ id, label: id, provider: 'p', modality: ['llm'], policy: 'vendor-direct', vault: 'assemblyai-api-key', instrument: 'x',
     probe: { url: `BASE${path}`, header: 'x-api-key', scheme: '', expect: id === 'obj' ? 'choices' : 'models', ...(method === 'POST' ? { body: { m: 1 } } : {}) } });
   const vendors = (base) => [mk('any', '/vendor-any', 'GET'), mk('shape', '/vendor-shape', 'GET'), mk('obj', '/vendor-obj', 'POST'), mk('redir', '/vendor-redirect', 'GET')]
@@ -1539,11 +1539,11 @@ test('forge-models collect: an endpoint that answers any key, a wrong shape, and
   assert.match(r.out, /obj \(bad answer\)/);
   assert.match(r.out, /redir \(no answer\)/);
   assert.equal(r.stolen.length, 0, 'a redirect carried a credential to another host');
-  assert.doesNotMatch(r.calls, /testkey123|PW/);
+  assert.doesNotMatch(r.calls, /testkey123|PW-SECRET-3/);   // a fake secret no random temp-dir suffix can contain (CI 2026-11-17: tc-checks-8tPW9e matched /PW/)
 });
 
 test('forge-models collect: a control that gets no answer is "no answer", never "accepts a bad key"; a GET control is retried once', async () => {
-  const vaultList = [{ type: 1, name: 'assemblyai-api-key', login: { password: 'PW', uris: [] } }];
+  const vaultList = [{ type: 1, name: 'assemblyai-api-key', login: { password: 'PW-SECRET-3', uris: [] } }];
   const mk = (id, path, post) => ({ id, label: id, provider: 'p', modality: ['llm'], policy: 'vendor-direct', vault: 'assemblyai-api-key', instrument: 'x',
     probe: { url: `BASE${path}`, header: 'x-api-key', scheme: '', expect: 'transcripts', allowEmpty: true, ...(post ? { body: { m: 1 } } : {}) } });
   const one = async (path, post) => fmCollect({ deployments: DEPLOYS, vaultList,

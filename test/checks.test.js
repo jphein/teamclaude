@@ -1319,8 +1319,10 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
       if (q.url.startsWith('/stt')) return s.end(JSON.stringify({ RecognitionStatus: 'Success', DisplayText: 'The forge is lit.' }));
       if (q.url.startsWith('/katana')) return s.end(JSON.stringify({ models: [{ name: 'qwen3.5:9b-q4_K_M' }] }));
       if (q.url.startsWith('/health')) return s.end('{"status":"ok"}');
-      const badKey = JSON.stringify(q.headers).includes('forge-models-invalid-key');
+      const sent = Object.values(q.headers).join(' ');
+      const badKey = !/(^| )(Bearer |Key )?(testkey123|tokentokentokentokentoken0123)( |$)/.test(sent);   // only the real credential is accepted
       if (q.url.startsWith('/vendor-any')) return s.end(JSON.stringify({ models: [{ id: 'm' }] }));   // answers anyone: not an instrument
+      if (q.url.startsWith('/vendor-shape')) { if (/forge-models-invalid-key/.test(sent)) { s.statusCode = 400; return s.end('{}'); } return s.end(JSON.stringify({ models: [{ id: 'm' }] })); }   // checks format only (r2.1)
       if (badKey) { s.statusCode = 401; return s.end('{}'); }
       if (q.url.startsWith('/vendor-401')) { s.statusCode = 401; return s.end('{"error":"Bearer sk-CANARY77 rejected"}'); }
       if (q.url.startsWith('/vendor-obj')) return s.end(JSON.stringify({ choices: {}, transcripts: {} }));
@@ -1351,7 +1353,7 @@ for a; do case "$prev" in --model) m=$a;; esac; prev=$a; done; echo "{\\"is_erro
   const cfg = { ...FM_CFG, speechRegions: regions, local: [{ ...FM_CFG.local[0], health: `${base}/health` }, { ...FM_CFG.local[1], wyoming: wyomingPort ?? FM_CFG.local[1].wyoming }],
     foundryDirect: [...FM_CFG.foundryDirect, ...(deployments.some((x) => x.id === 'gpt-audio-mini') ? [{ deployment: 'gpt-audio-mini', label: 'audio', kind: 'audio' }] : [])],
     foundryExpect: { ...FM_CFG.foundryExpect, 'gpt-audio-mini': 'gpt-audio-mini' },
-    ...(vendors ? { vendors: vendors(base), vendorScan: { patterns: ['assembly ?ai', 'deepgram'], accountedPatterns: {}, accountedNames: {} } } : {}) };
+    ...(vendors ? { vendors: vendors(base), vendorScan: { patterns: ['assemblyai', 'deepgram'], accountedPatterns: {}, accountedNames: {} } } : {}) };
   writeFileSync(join(d, 'cfg.json'), JSON.stringify(cfg));
   const urls = { foundryApi: `${base}/foundry/list`, foundryBase: `${base}/foundry`, nebius: `${base}/nebius`, tts: `${base}/tts`, stt: `${base}/stt`, katana: `${base}/katana`, status: 'http://127.0.0.1:3456/teamclaude/status' };
   const env = { PATH: `${bin}:${process.env.PATH}`, HOME: d, CHECK_FM_HOME: d, CHECK_FM_PLAN: join(d, 'forge'), CHECK_FM_CONFIG: join(d, 'cfg.json'),
@@ -1432,7 +1434,7 @@ const FM_VCFG = { ...FM_CFG,
       probe: { url: 'https://api.assemblyai.com/v2/transcript?limit=1', header: 'authorization', scheme: '', expect: 'transcripts', allowEmpty: true } },
     { id: 'ibm-bob', label: 'IBM Bob', provider: 'IBM', modality: ['llm'], policy: 'vendor-direct', vault: 'IBM Bob API key', probe: null, why: 'no free read-only call is known' },
   ],
-  vendorScan: { patterns: ['assembly ?ai', '\\bbob\\b', 'deepgram', 'claude', 'openai'], accountedPatterns: { '^teamclaude[ -]': 'teamclaude proxy credentials' },
+  vendorScan: { patterns: ['assemblyai', '\\bbob\\b', 'deepgram', 'claude', 'openai'], accountedPatterns: { '^teamclaude[ -]': 'teamclaude proxy credentials' },
     accountedNames: { 'web login, no API key': ['auth.openai.com'] } },
   vendorsWithoutKey: [{ vendor: 'Deepgram', status: 'no key in the vault' }],
 };
@@ -1508,7 +1510,7 @@ test('forge-models collect: vendor keys go in the configured header only, never 
       probe: { url: `${base}/vendor/entra`, header: 'Authorization', scheme: 'Bearer ', expect: 'transcripts', allowEmpty: true, auth: 'entra' } },
   ];
   const r = await fmCollect({ deployments: DEPLOYS, vendors, vaultList });
-  const real = (h) => !JSON.stringify(h).includes('forge-models-invalid-key');
+  const real = (h) => /(^| )(Bearer |Key )?(testkey123|tokentokentokentokentoken0123)$/.test(String(h.authorization ?? h['x-api-key'] ?? ''));
   assert.equal(r.vendorHeaders.filter(real)[0].authorization, 'testkey123');
   assert.equal(r.vendorHeaders.filter((h) => !real(h)).length, 3, 'one invalid-credential control per vendor');
   assert.equal(r.vendorHeaders.filter((h) => h.method === 'POST' && real(h)).length, 1, 'a failed POST is never retried (r1.2)');
@@ -1528,10 +1530,11 @@ test('forge-models collect: an endpoint that answers any key, a wrong shape, and
   const vaultList = [{ type: 1, name: 'assemblyai-api-key', login: { password: 'PW', uris: [] } }];
   const mk = (id, path, method) => ({ id, label: id, provider: 'p', modality: ['llm'], policy: 'vendor-direct', vault: 'assemblyai-api-key', instrument: 'x',
     probe: { url: `BASE${path}`, header: 'x-api-key', scheme: '', expect: id === 'obj' ? 'choices' : 'models', ...(method === 'POST' ? { body: { m: 1 } } : {}) } });
-  const vendors = (base) => [mk('any', '/vendor-any', 'GET'), mk('obj', '/vendor-obj', 'POST'), mk('redir', '/vendor-redirect', 'GET')]
+  const vendors = (base) => [mk('any', '/vendor-any', 'GET'), mk('shape', '/vendor-shape', 'GET'), mk('obj', '/vendor-obj', 'POST'), mk('redir', '/vendor-redirect', 'GET')]
     .map((v) => ({ ...v, probe: { ...v.probe, url: v.probe.url.replace('BASE', base) } }));
   const r = await fmCollect({ deployments: DEPLOYS, vendors, vaultList });
   assert.match(r.out, /any \(accepts a bad key\)/);
+  assert.match(r.out, /shape \(accepts a bad key\)/);   // refusing a malformed key is not authentication (r2.1)
   assert.match(r.out, /obj \(bad answer\)/);
   assert.match(r.out, /redir \(no answer\)/);
   assert.equal(r.stolen.length, 0, 'a redirect carried a credential to another host');
@@ -1559,8 +1562,25 @@ test('forge-models vendors: the shipped forge-direct.json is well formed (r1.1)'
   assert.ok(cfg.vendorsWithoutKey.every((x) => typeof x.vendor === 'string' && typeof x.status === 'string'));
 });
 
-test('forge-models vendors: a vendorScan pattern outside the restricted language fails as config, never hangs', () => {
-  for (const bad of ['(a+)+$', 'x{2,}', '[', '\\d']) {
+test('forge-models vendors: wrongKey keeps the shape and changes the value', async () => {
+  const { wrongKey } = await import(join(C, 'forge-models.mjs'));
+  for (const k of ['testkey123', 'nvapi-AbCdEfGh0123456789zZ', 'a1b2c3d4e5f6a7b8c9d0', 'eyJ0eXAi.payload.sig-_9Zz']) {
+    const w = wrongKey(k);
+    assert.notEqual(w, k); assert.equal(w.length, k.length);
+    assert.equal(w.replace(/[0-9]/g, '0').replace(/[a-z]/g, 'a').replace(/[A-Z]/g, 'A'), k.replace(/[0-9]/g, '0').replace(/[a-z]/g, 'a').replace(/[A-Z]/g, 'A'));
+  }
+  assert.equal(wrongKey('--------'), '--------');   // nothing to shift: the probe then refuses to trust itself
+});
+
+test('forge-models vendors: an allowed pattern cannot be made slow (r2.2), and a quantifier fails as config', { timeout: 60_000 }, () => {
+  const heavy = '(a|a)(a|a)(a|a)(a|a)(a|a)(a|a)$';   // the worst the language allows: bounded, no loop
+  const cfgOk = { ...FM_VCFG, vendorScan: { ...FM_VCFG.vendorScan, patterns: [...FM_VCFG.vendorScan.patterns, heavy] } };
+  const names = Array.from({ length: 300 }, (_, i) => ({ name: 'a'.repeat(196) + String(i).padStart(3, '0') + '!', hosts: [] }));   // 200 characters, a near miss at the end
+  const t0 = Date.now();
+  const ok = fm(fmV({ vaultItems: [...FM_VAULT, ...names] }), {}, cfgOk);
+  assert.ok(Date.now() - t0 < 20_000, `took ${Date.now() - t0} ms`);
+  assert.match(ok.line, /^CHECK forge-models ok/);
+  for (const bad of ['(a+)+$', 'x{2,}', '[', '\\d', 'a?a?a?a?a?a?a?a?a?$', '(?=a)']) {
     const cfg = { ...FM_VCFG, vendorScan: { ...FM_VCFG.vendorScan, patterns: [...FM_VCFG.vendorScan.patterns, bad] } };
     const r = fm(fmV({ vaultItems: [...FM_VAULT, { name: 'a'.repeat(5000) + '!', hosts: [] }] }), {}, cfg);
     assert.match(r.line, /^CHECK forge-models fail · .*config: a vendorScan pattern is not allowed/, bad);

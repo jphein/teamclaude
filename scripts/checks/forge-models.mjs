@@ -60,13 +60,14 @@ export function safeName(s) {
   if (v.split(/[ ._:()\/@,'-]+/).some((w) => w.length >= 16 && /[0-9]/.test(w) && /[A-Za-z]/.test(w))) return '(unrecognized name)';
   return v;
 }
-// (r1.4) vendorScan patterns are a restricted language: no repetition operators (+ * {), so no catastrophic
-// backtracking; each must compile on its own. A bad one makes the whole config "bad", never a hang or a crash.
+// (r1.4, r2.2) vendorScan patterns are a restricted language: literals, classes, anchors and alternation, with NO
+// quantifier at all (+ * { ?), so the matcher has no loop and its work is bounded by name length times pattern
+// size. Each must compile on its own. A bad one makes the whole config "bad", never a hang or a crash.
 export function scanPatterns(list) {
   if (!Array.isArray(list)) return null;
   const out = [];
   for (const p of list) {
-    if (typeof p !== 'string' || !/^[A-Za-z0-9 ._?^$()|\[\]\\-]{1,40}$/.test(p) || /\\[^bB.\-()]/.test(p)) return null;
+    if (typeof p !== 'string' || !/^[A-Za-z0-9 ._^$()|\[\]\\-]{1,40}$/.test(p) || /\\[^bB.\-()]/.test(p)) return null;
     try { out.push(new RegExp(p, 'i')); } catch { return null; }
   }
   return out;
@@ -98,18 +99,27 @@ async function vendorProbe(spec, key) {
   const shaped = Array.isArray(x) && (spec.allowEmpty || x.length > 0);   // every configured shape is an array (r1.3)
   return { ok: shaped, error: shaped ? null : 'bad answer' };
 }
-// (r1.3) the instrument proves itself each night: the same request with an invalid credential must be refused,
-// or a 200 below could come from an endpoint that answers anyone. A refusal happens before any work, so it costs nothing.
-const INVALID = 'forge-models-invalid-key';
-async function refusesBadKey(spec) {
-  const h = { [spec.header]: spec.scheme + INVALID, 'User-Agent': 'forge-models', Accept: 'application/json' };
+// (r1.3, r2.1) the instrument proves itself each night: the same request with a WELL-FORMED WRONG credential (the
+// real one, its last characters shifted within their class) must be refused as unauthenticated (401/403), or a 200
+// below could come from an endpoint that answers any key of the right shape. It goes only where the real key goes,
+// and a refusal happens before any work, so it costs nothing. Measured 2026-11-17: all eight vendors 401/403.
+export function wrongKey(k) {
+  const n = Math.min(8, Math.floor(k.length / 2));
+  const shift = (c) => /[0-9]/.test(c) ? String((+c + 1) % 10) : /[a-z]/.test(c) ? String.fromCharCode((c.charCodeAt(0) - 97 + 1) % 26 + 97)
+    : /[A-Z]/.test(c) ? String.fromCharCode((c.charCodeAt(0) - 65 + 1) % 26 + 65) : c;
+  return k.slice(0, k.length - n) + [...k.slice(k.length - n)].map(shift).join('');
+}
+async function refusesWrongKey(spec, key) {
+  const bad = wrongKey(key);
+  if (bad === key) return false;   // nothing to shift: no control, so no proof
+  const h = { [spec.header]: spec.scheme + bad, 'User-Agent': 'forge-models', Accept: 'application/json' };
   if (spec.body) h['Content-Type'] = 'application/json';
   const r = await get(spec.url, h, 30_000, spec.body ? 'POST' : 'GET', spec.body ? JSON.stringify(spec.body) : undefined);
-  return [400, 401, 403].includes(r.status);
+  return r.status === 401 || r.status === 403;
 }
 // one probe: the control first, then the real key; a GET (free, read only) gets one retry, a POST never (r1.2)
 async function probeVendor(spec, key) {
-  if (!(await refusesBadKey(spec))) return { ok: false, error: 'accepts a bad key' };
+  if (!(await refusesWrongKey(spec, key))) return { ok: false, error: 'accepts a bad key' };
   let res = await vendorProbe(spec, key);
   if (!res.ok && !spec.body) { await sleep(PACE); res = await vendorProbe(spec, key); }
   return res;
@@ -517,7 +527,7 @@ export function judge(cfg, inp, nowMs) {
     .filter(Boolean).map((n) => String(n).trim()));
   const aiList = scanPatterns(scan.patterns || []), accountedRx = scanPatterns(Object.keys(scan.accountedPatterns || {}));
   const badScan = !aiList || !accountedRx;
-  if (badScan) unlisted.push('config: a vendorScan pattern is not allowed (no + * {, at most 40 characters)');
+  if (badScan) unlisted.push('config: a vendorScan pattern is not allowed (no quantifier, at most 40 characters)');
   const aiRx = !badScan && aiList.length ? { test: (t) => aiList.some((r) => r.test(String(t).slice(0, 200))) } : null;
   const vaultMatched = new Map();   // accounted-pattern reason -> count, for the page
   if (vendors.length || aiRx) {

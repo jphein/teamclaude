@@ -1039,7 +1039,8 @@ const fmIn = (over = {}) => {
     gatewayProbes: { 'local/katana-qwen35-9b': { ok: true }, 'foundry/gpt-6.1-sol': { ok: true }, 'foundry/gpt-5.4-pro': { ok: true }, 'nebius/glm-5.3': { ok: true } },
     feed: { katana: { state: 'idle', ts }, 'familiar-piper-cori': { state: 'idle', ts } },
     claudeCatalog: ['claude-opus-5-5', 'claude-fable-5-2'],
-    claudeProbes: { 'claude-opus-5-5': { ok: true, served: ['claude-opus-5-5'] }, 'claude-fable-5-2': { ok: true, served: ['claude-fable-5-2'] } },
+    claudeProbes: { 'claude-opus-5-5': { ok: true, served: ['claude-opus-5-5'], seen: true }, 'claude-fable-5-2': { ok: true, served: ['claude-fable-5-2'], seen: true } },
+    foundryProbes: { 'gpt-image-1.5': { ok: true } },
     foundry: [
       { id: 'gpt-6.1-sol', model: 'gpt-6.1-sol', status: 'succeeded' }, { id: 'gpt-5.4-pro', model: 'gpt-5.4-pro', status: 'succeeded' },
       { id: 'gpt-5.4-pro-1', model: 'gpt-5.4-pro', status: 'succeeded' }, { id: 'gpt-image-1.5', model: 'gpt-image-1.5', status: 'succeeded' },
@@ -1052,13 +1053,12 @@ const fmIn = (over = {}) => {
     katanaTags: ['qwen3.5:9b-q4_K_M'],
     embedHealth: true,
     wake: ['okay_nabu'],
-    seatProof: true,
     ...over,
   };
 };
 function fm(inputs, extra = {}) {
-  const d = fresh();
-  mkdirSync(join(d, 'forge'), { mode: 0o700 });
+  const d = fresh(); chmodSync(d, 0o700);   // a home writable by no one else (publish refuses otherwise)
+  mkdirSync(join(d, 'forge'), { mode: 0o700 }); chmodSync(join(d, 'forge'), 0o700);
   writeFileSync(join(d, 'cfg.json'), JSON.stringify(FM_CFG));
   writeFileSync(join(d, 'in.json'), typeof inputs === 'string' ? inputs : JSON.stringify(inputs));
   const r = run('forge-models.sh', { CHECK_FM_HOME: d, CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW), ...extra });
@@ -1091,7 +1091,7 @@ test('forge-models: a duplicate Foundry deployment of a listed model is covered,
 
 test('forge-models: a listed model that does not answer, or answers as another model, fails', () => {
   const r = fm(fmIn({ gatewayProbes: { ...fmIn().gatewayProbes, 'nebius/glm-5.3': { ok: false, error: 'upstream' } },
-    claudeProbes: { ...fmIn().claudeProbes, 'claude-fable-5-2': { ok: true, served: ['claude-opus-5-5'] } }, embedHealth: false }));
+    claudeProbes: { ...fmIn().claudeProbes, 'claude-fable-5-2': { ok: true, served: ['claude-opus-5-5'], seen: true } }, embedHealth: false }));
   assert.match(r.line, /^CHECK forge-models fail · .*didn't answer: nebius\/glm-5\.3 \(upstream\), claude-fable-5-2 \(served as claude-opus-5-5\), nomic-embed-text-v1\.5 \(no answer\)/);
   assert.equal(r.direct.models.find((m) => m.name === 'claude-fable-5-2').reachable, false);
 });
@@ -1143,10 +1143,30 @@ test('forge-models: a third-party model is blocked by what it serves, whatever t
   assert.match(fm(fmIn({ foundry })).line, /^CHECK forge-models ok · .*blocked on Foundry: 1 Claude, 1 third-party/);
 });
 
-test('forge-models: Claude probes not seen at the seat proxy fail, and the rows say so', () => {
-  const r = fm(fmIn({ seatProof: false }));
-  assert.match(r.line, /^CHECK forge-models fail · .*Claude probes \(not seen at the seat proxy\)/);
-  assert.equal(r.direct.models.find((m) => m.name === 'claude-opus-5-5').error, 'not seen at the seat proxy');
+test('forge-models: a Claude probe not seen at the seat proxy, or with no proof at all, fails; verdict and row agree (r2.2)', () => {
+  for (const seen of [false, null, undefined]) {
+    const r = fm(fmIn({ claudeProbes: { ...fmIn().claudeProbes, 'claude-opus-5-5': { ok: true, served: ['claude-opus-5-5'], seen } } }));
+    assert.match(r.line, /^CHECK forge-models fail · .*claude-opus-5-5 \(not seen at the seat proxy\)/, String(seen));
+    assert.equal(r.direct.models.find((m) => m.name === 'claude-opus-5-5').reachable, false);
+  }
+});
+
+test('forge-models: a media deployment that does not answer its probe fails and is not published reachable (r2.4)', () => {
+  const r = fm(fmIn({ foundryProbes: { 'gpt-image-1.5': { ok: false, error: 'http 429' } } }));
+  assert.match(r.line, /^CHECK forge-models fail · .*foundry:gpt-image-1\.5 \(http 429\)/);
+  assert.equal(r.direct.models.find((m) => m.name === 'gpt-image-1.5').error, 'http 429');
+  assert.match(fm(fmIn({ foundryProbes: {} })).line, /foundry:gpt-image-1\.5 \(not probed\)/);
+});
+
+test('forge-models: a key-shaped provider id never reaches the line or the page (r2.3)', () => {
+  const canary = 'skCANARY0123456789abcdefXYZ';
+  const r = fm(fmIn({ claudeCatalog: ['claude-opus-5-5', 'claude-fable-5-2', `Bearer sk-${canary}`], nebius: ['zai-org/GLM-5.3', canary],
+    foundry: [...fmIn().foundry, { id: `dep-${canary}`, model: `m-${canary}`, status: 'succeeded' }], units: [...fmIn().units, `llama-${canary}`],
+    katanaTags: ['qwen3.5:9b-q4_K_M', `qwen-${canary}`],
+    claudeProbes: { ...fmIn().claudeProbes, 'claude-fable-5-2': { ok: true, served: [canary.toLowerCase()], seen: true } } }));
+  assert.doesNotMatch(r.line, /CANARY|canary/);
+  assert.doesNotMatch(JSON.stringify(r.direct), /CANARY|canary/);
+  assert.match(r.line, /claude:\(unrecognized id\)/);
 });
 
 test('forge-models: a model in the direct list that left the seat catalog is not published reachable', () => {
@@ -1166,14 +1186,14 @@ test('forge-models: a probe error that is not a fixed word never reaches the lin
 
 // r1.4: publication never follows a symlink on the path
 test('forge-models: direct.json is not written through a symlinked parent, and a symlinked target is replaced, not followed', () => {
-  const d = fresh(); const elsewhere = fresh();
+  const d = fresh(); const elsewhere = fresh(); chmodSync(d, 0o700);
   writeFileSync(join(d, 'cfg.json'), JSON.stringify(FM_CFG)); writeFileSync(join(d, 'in.json'), JSON.stringify(fmIn()));
   symlinkSync(elsewhere, join(d, 'forge'));
   const env = { CHECK_FM_HOME: d, CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_NOW_MS: String(FM_NOW) };
   let r = run('forge-models.sh', { ...env, CHECK_FM_OUT: join(d, 'forge', 'direct.json') });
   assert.match(r.line, /direct\.json not written \(EPATH\)/);
   assert.equal(existsSync(join(elsewhere, 'direct.json')), false);
-  const d2 = fresh(); mkdirSync(join(d2, 'forge'), { mode: 0o700 });
+  const d2 = fresh(); chmodSync(d2, 0o700); mkdirSync(join(d2, 'forge'), { mode: 0o700 }); chmodSync(join(d2, 'forge'), 0o700);
   writeFileSync(join(elsewhere, 'victim'), 'keep');
   symlinkSync(join(elsewhere, 'victim'), join(d2, 'forge', 'direct.json'));
   r = run('forge-models.sh', { ...env, CHECK_FM_HOME: d2, CHECK_FM_OUT: join(d2, 'forge', 'direct.json') });
@@ -1185,8 +1205,8 @@ test('forge-models: direct.json is not written through a symlinked parent, and a
 // ---------- forge-models collect(): fake binaries and a local HTTP server (r1.7)
 async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = true, regions = { tts: 'eastus', stt: 'westus' }, gatewayError = null, foundryStatus = 200 } = {}) {
   const d = fresh(); const bin = join(d, 'bin'); const log = join(d, 'calls.log'); const counter = join(d, 'counter');
-  mkdirSync(bin); writeFileSync(log, ''); writeFileSync(counter, '0');
-  mkdirSync(join(d, 'forge', 'hosts'), { recursive: true, mode: 0o700 });
+  chmodSync(d, 0o700); mkdirSync(bin); writeFileSync(log, ''); writeFileSync(counter, '0');
+  mkdirSync(join(d, 'forge', 'hosts'), { recursive: true, mode: 0o700 }); chmodSync(join(d, 'forge'), 0o700);
   mkdirSync(join(d, '.config/teamclaude-client'), { recursive: true });
   const key = 'tc-' + 'a'.repeat(48);
   writeFileSync(join(d, '.config/teamclaude-client/forge-check.settings.json'), JSON.stringify({ env: { HTTPS_PROXY: `http://${key}:${key}@127.0.0.1:3456` } }), { mode: 0o600 });
@@ -1196,6 +1216,8 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
     let b = '';
     q.on('data', (c) => { b += c; });
     q.on('end', () => {
+      if (q.url.startsWith('/foundry/openai/v1/images')) return s.end(JSON.stringify({ data: [{ b64_json: 'x'.repeat(2000) }] }));
+      if (q.url.startsWith('/foundry/openai/deployments/')) return s.end(JSON.stringify({ choices: [{ message: { audio: { data: 'UklGRg' } } }] }));
       if (q.url.startsWith('/foundry')) { s.statusCode = foundryStatus; return s.end(JSON.stringify({ data: deployments })); }
       if (q.url.startsWith('/nebius')) return s.end(JSON.stringify({ data: [{ id: 'zai-org/GLM-5.3' }] }));
       if (q.url.startsWith('/tts')) return s.end(Buffer.alloc(4000, 1));
@@ -1214,13 +1236,15 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
   sh('forge', `case "$1" in route) echo '${JSON.stringify(registry)}';; probe) ${gatewayError ? `echo '{"ok":false,"error":"${gatewayError}"}'` : `echo '{"ok":true}'`};; esac`);
   sh('az', `echo tokentokentokentokentoken0123`);
   sh('bw', `case "$1" in status) echo '{"status":"${bwStatus}"}';; get) echo testkey123;; *) exit 1;; esac`);
-  sh('claude', `${claudeCounts ? `n=$(cat '${counter}'); echo $((n+1)) > '${counter}'` : ':'}; for a; do case "$prev" in --model) m=$a;; esac; prev=$a; done; echo "{\\"is_error\\":false,\\"modelUsage\\":{\\"$m\\":{}}}"`);
+  const bump = claudeCounts === true ? `n=$(cat '${counter}'); echo $((n+1)) > '${counter}'`
+    : claudeCounts === 'twice-then-none' ? `case "$*" in *claude-opus-5-5*) n=$(cat '${counter}'); echo $((n+2)) > '${counter}';; esac` : ':';
+  sh('claude', `${bump}; for a; do case "$prev" in --model) m=$a;; esac; prev=$a; done; echo "{\\"is_error\\":false,\\"modelUsage\\":{\\"$m\\":{}}}"`);
   sh('curl', `case "$*" in *model_selector*) echo '{"model_selector_config":[{"models":[{"id":"claude-opus-5-5"},{"id":"claude-fable-5-2"}]}]}';; *status*) echo "{\\"clients\\":{\\"forge-check\\":{\\"requests\\":$(cat '${counter}')}}}";; *) exit 22;; esac`);
   sh('systemctl', `echo "wyoming-piper.service loaded active running x"`);
   sh('docker', `echo wyoming-openwakeword`);
   const cfg = { ...FM_CFG, speechRegions: regions, local: [{ ...FM_CFG.local[0], health: `${base}/health` }, FM_CFG.local[1]] };
   writeFileSync(join(d, 'cfg.json'), JSON.stringify(cfg));
-  const urls = { foundryApi: `${base}/foundry`, nebius: `${base}/nebius`, tts: `${base}/tts`, stt: `${base}/stt`, katana: `${base}/katana`, status: 'http://127.0.0.1:3456/teamclaude/status' };
+  const urls = { foundryApi: `${base}/foundry/list`, foundryBase: `${base}/foundry`, nebius: `${base}/nebius`, tts: `${base}/tts`, stt: `${base}/stt`, katana: `${base}/katana`, status: 'http://127.0.0.1:3456/teamclaude/status' };
   const env = { PATH: `${bin}:${process.env.PATH}`, HOME: d, CHECK_FM_HOME: d, CHECK_FM_PLAN: join(d, 'forge'), CHECK_FM_CONFIG: join(d, 'cfg.json'),
     CHECK_FM_URLS: JSON.stringify(urls), CHECK_FM_PACE_MS: '0', CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW) };
   const out = await new Promise((res) => execFile('node', [join(C, 'forge-models.mjs')], { env, encoding: 'utf8', timeout: 60_000 }, (e, so) => res(so)));
@@ -1259,7 +1283,7 @@ test('forge-models collect: a locked vault is never asked for a secret, and its 
 
 test('forge-models collect: Claude probes that do not show at the proxy under forge-check fail', async () => {
   const r = await fmCollect({ deployments: DEPLOYS, claudeCounts: false });
-  assert.match(r.out, /^fail\t.*Claude probes \(not seen at the seat proxy\)/);
+  assert.match(r.out, /^fail\t.*claude-opus-5-5 \(not seen at the seat proxy\), claude-fable-5-2 \(not seen at the seat proxy\)/);
 });
 
 test('forge-models collect: a Speech region that is not a hostname label sends no request', async () => {
@@ -1272,4 +1296,19 @@ test('forge-models collect: a gateway error text is reduced to a fixed word', as
   const r = await fmCollect({ deployments: DEPLOYS, gatewayError: 'Bearer sk-CANARY99' });
   assert.doesNotMatch(r.out, /CANARY/);
   assert.match(r.out, /nebius\/glm-5\.3 \(no answer\)/);
+});
+
+
+test('forge-models: a group-writable HOME refuses publication (r2.5)', () => {
+  const d = fresh(); mkdirSync(join(d, 'forge'), { mode: 0o700 }); chmodSync(d, 0o775);
+  writeFileSync(join(d, 'cfg.json'), JSON.stringify(FM_CFG)); writeFileSync(join(d, 'in.json'), JSON.stringify(fmIn()));
+  const r = run('forge-models.sh', { CHECK_FM_HOME: d, CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW) });
+  chmodSync(d, 0o700);
+  assert.match(r.line, /direct\.json not written \(EPATH\)/);
+});
+
+test('forge-models collect: one call counted twice cannot cover another that never reached the proxy (r2.1)', async () => {
+  const r = await fmCollect({ deployments: DEPLOYS, claudeCounts: 'twice-then-none' });
+  assert.match(r.out, /^fail\t.*claude-fable-5-2 \(not seen at the seat proxy\)/);
+  assert.doesNotMatch(r.out, /claude-opus-5-5 \(not seen/);
 });

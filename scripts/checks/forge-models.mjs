@@ -42,6 +42,12 @@ const CLAUDE_RE = /claude|anthropic/i;
 const GATEWAY_ERRORS = new Set(['auth', 'rate_limited', 'not_found', 'bad_request', 'upstream', 'timeout_or_unreachable', 'probe key missing',
   'gateway registry unreadable', 'not registered', 'gateway host unreachable']);
 const REGION = /^[a-z]{2,16}[0-9]?$/;
+// A provider-supplied id reaches the line or the page only when it looks like a model id: plain
+// segments, no run of 20+ letters/digits (a key shape), no credential words (xreview #89 r2.3).
+export function safeId(s) {
+  const v = String(s ?? '');
+  return /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$/.test(v) && !/[A-Za-z0-9+]{20,}/.test(v) && !/(bearer|sk-|key|token|secret|password)/i.test(v) ? v : '(unrecognized id)';
+}
 
 // a child's environment: no proxy, no alternate Claude provider, no API key from the caller's shell
 function scrubbed() {
@@ -102,6 +108,20 @@ export async function collect() {
     const d = r.status === 200 ? json(r.body.toString()) : null;
     if (Array.isArray(d?.data) && d.data.every((x) => typeof x?.id === 'string')) inp.foundry = d.data.map((x) => ({ id: x.id, model: String(x.model || ''), status: String(x.status || '') }));
   }
+  inp.foundryProbes = {};
+  for (const f of CFG.foundryDirect) {   // the direct media deployments answer one small call each (r2.4)
+    const d = (inp.foundry || []).find((x) => x.id === f.deployment);
+    if (!d || d.status !== 'succeeded' || CLAUDE_RE.test(`${d.id} ${d.model}`) || CFG.foundryExpect[d.id] !== d.model) continue;
+    const base = URLS.foundryBase || api.replace(/\/openai\/deployments\?.*$/, '');
+    const h = { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' };
+    const r = f.kind === 'image'
+      ? await get(`${base}/openai/v1/images/generations`, h, 120_000, 'POST', JSON.stringify({ model: f.deployment, prompt: 'a small iron anvil, flat icon', size: '1024x1024', quality: 'low', n: 1 }))
+      : await get(`${base}/openai/deployments/${encodeURIComponent(f.deployment)}/chat/completions?api-version=2025-01-01-preview`, h, 60_000, 'POST',
+        JSON.stringify({ modalities: ['text', 'audio'], audio: { voice: 'alloy', format: 'wav' }, messages: [{ role: 'user', content: 'Say ok.' }], max_completion_tokens: 100 }));
+    const b = r.status === 200 ? json(r.body.toString()) : null;
+    const ok = f.kind === 'image' ? typeof b?.data?.[0]?.b64_json === 'string' && b.data[0].b64_json.length > 1000 : typeof b?.choices?.[0]?.message?.audio?.data === 'string';
+    inp.foundryProbes[f.deployment] = { ok, error: ok ? null : r.status === 200 ? 'bad answer' : `http ${r.status}` };
+  }
   const safeAzure = new Set((inp.foundry || []).filter((d) => d.status === 'succeeded' && !CLAUDE_RE.test(`${d.id} ${d.model}`) && CFG.foundryExpect[d.id] === d.model).map((d) => `azure/${d.id}`));
   // 2. the gateway registry, then one probe per enabled model (a Foundry route only when safe, above)
   const show = run('forge', ['route', 'show', '--json'], { timeout: 60_000 });
@@ -133,23 +153,22 @@ export async function collect() {
   inp.claudeCatalog = pick.status === 0 && Array.isArray(pj?.model_selector_config) ? pj.model_selector_config.flatMap((c) => (Array.isArray(c?.models) ? c.models : []).map((m) => String(m?.id))) : null;
   inp.claudeProbes = {};
   const settings = seatSettings();
-  const before = settings ? seatCount() : null;
-  let sent = 0;
   for (const c of CFG.claude) {
-    if (!settings) { inp.claudeProbes[c.id] = { ok: false, served: [], error: 'seat client key missing' }; continue; }
-    let d = null;
+    if (!settings) { inp.claudeProbes[c.id] = { ok: false, served: [], seen: false, error: 'seat client key missing' }; continue; }
+    let d = null, seen = false;
     for (let i = 0; i < 2 && !(d && !d.is_error); i++) {   // one retry, as for the gateway
       if (i) await sleep(PACE * 3);
+      // each invocation must itself show at the proxy under forge-check (r1.1/r2.1): a counter that
+      // does not move across THIS call means this call went somewhere else
+      const before = seatCount();
       d = json(run('claude', ['-p', '--settings', settings, '--setting-sources', '', '--strict-mcp-config', '--disable-slash-commands', '--no-session-persistence',
         '--model', c.id, '--system-prompt', 'Answer with one word.', '--tools', '', '--output-format', 'json', 'Say ok.'], { timeout: 120_000, cwd: HOME }).stdout);
-      sent++;
+      const after = seatCount();
+      seen = before !== null && after !== null && after > before;
     }
     const served = Object.keys(d?.modelUsage || {}).filter((k) => /^[a-z0-9.-]{1,60}$/.test(k));
-    inp.claudeProbes[c.id] = { ok: !!d && !d.is_error, served, error: d ? (d.is_error ? 'error' : null) : 'no answer' };
+    inp.claudeProbes[c.id] = { ok: !!d && !d.is_error, served, seen, error: d ? (d.is_error ? 'error' : null) : 'no answer' };
   }
-  const after = settings ? seatCount() : null;
-  // every probe must show at the proxy under forge-check: else they went somewhere else (r1.1)
-  inp.seatProof = settings ? (before !== null && after !== null && after - before >= sent) : null;
   // 5. Nebius and Azure Speech, from the vault only when it is already unlocked
   const unlocked = vaultUnlocked();
   inp.nebius = null;
@@ -242,17 +261,18 @@ export function judge(cfg, inp, nowMs) {
   const inCatalog = (id) => !!inp.claudeCatalog?.includes(id);
   if (!inp.claudeCatalog) unread.push('seat model catalog');
   else {
-    for (const id of new Set(inp.claudeCatalog)) if (!cl.has(id)) unlisted.push(`claude:${id}`);
+    for (const id of new Set(inp.claudeCatalog)) if (!cl.has(id)) unlisted.push(`claude:${safeId(id)}`);
     for (const id of cl) if (!inCatalog(id)) unreachable.push(`${id} (left the seat catalog)`);
   }
-  const claudeOk = (id) => { const p = inp.claudeProbes?.[id]; return !!p?.ok && p.served.includes(id) && inp.seatProof === true && (!inp.claudeCatalog || inCatalog(id)); };
+  // affirmative proof only (r2.2): a probe counts when it answered, as itself, and was seen at the proxy
+  const claudeOk = (id) => { const p = inp.claudeProbes?.[id]; return !!p?.ok && p.served.includes(id) && p.seen === true && (!inp.claudeCatalog || inCatalog(id)); };
   for (const c of cfg.claude) {
     const p = inp.claudeProbes?.[c.id];
     if (!p) unreachable.push(`${c.id} (not probed)`);
     else if (!p.ok) unreachable.push(`${c.id} (${p.error === 'seat client key missing' ? p.error : 'error'})`);
-    else if (!p.served.includes(c.id)) unreachable.push(`${c.id} (served as ${p.served.join('+') || 'nothing'})`);
+    else if (!p.served.includes(c.id)) unreachable.push(`${c.id} (served as ${p.served.map(safeId).join('+') || 'nothing'})`);
+    else if (p.seen !== true) unreachable.push(`${c.id} (not seen at the seat proxy)`);
   }
-  if (cfg.claude.length && inp.seatProof === false) unreachable.push('Claude probes (not seen at the seat proxy)');
   // Foundry: coverage by the model each deployment actually serves (r1.6)
   const fd = new Map((inp.foundry || []).map((d) => [d.id, d]));
   const direct = new Set(cfg.foundryDirect.map((d) => d.deployment));
@@ -265,21 +285,22 @@ export function judge(cfg, inp, nowMs) {
       if (CLAUDE_RE.test(`${d.id} ${d.model}`)) { if (!mine.includes(d.id)) blocked.foundry_claude++; continue; }
       if (thirdParty.has(d.model)) { if (!mine.includes(d.id)) blocked.foundry_third_party++; continue; }
       if (mine.includes(d.id)) continue;   // judged below
-      if (!listedModels.has(d.model)) unlisted.push(`foundry:${d.id} (${d.model.replace(/[^A-Za-z0-9._-]/g, '?').slice(0, 40)})`);
+      if (!listedModels.has(d.model)) unlisted.push(`foundry:${safeId(d.id)} (${safeId(d.model)})`);
     }
     for (const id of mine) {
       const d = fd.get(id);
       if (!d || d.status !== 'succeeded') { unreachable.push(`foundry:${id} (deployment ${d ? (d.status === 'failed' ? 'failed' : 'not ready') : 'gone'})`); continue; }
-      if (d.model !== cfg.foundryExpect[id] || CLAUDE_RE.test(d.model)) drift.push(`foundry:${id} now serves ${d.model.replace(/[^A-Za-z0-9._-]/g, '?').slice(0, 40)}`);
+      if (d.model !== cfg.foundryExpect[id] || CLAUDE_RE.test(d.model)) drift.push(`foundry:${id} now serves ${safeId(d.model)}`);
+      else if (direct.has(id) && !inp.foundryProbes?.[id]?.ok) unreachable.push(`foundry:${id} (${/^(http [0-9]{1,3}|bad answer)$/.test(inp.foundryProbes?.[id]?.error || '') ? inp.foundryProbes[id].error : 'not probed'})`);
     }
   }
   if (!inp.nebius) unread.push('Nebius catalog (vault locked?)');
-  else for (const id of new Set(inp.nebius)) if (!upstreams.has(`nebius/${id}`)) unlisted.push(`nebius:${id.replace(/[^A-Za-z0-9._/-]/g, '?').slice(0, 60)}`);
+  else for (const id of new Set(inp.nebius)) if (!upstreams.has(`nebius/${id}`)) unlisted.push(`nebius:${safeId(id)}`);
   if (!inp.speech) unread.push('Azure Speech (vault locked?)');
   else for (const s of cfg.speech) if (!inp.speech[s.id]?.ok) unreachable.push(`${s.id} (${/^(http [0-9]{1,3}|no audio to transcribe|bad answer)$/.test(inp.speech[s.id]?.error || '') ? inp.speech[s.id].error : 'no answer'})`);
   if (!inp.units) unread.push('running units');
-  else for (const u of new Set(inp.units)) if (MODEL_UNIT.test(u) && !NOT_A_MODEL.test(u) && !(u in cfg.localUnits)) unlisted.push(`unit:${u.replace(/[^A-Za-z0-9@._-]/g, '?').slice(0, 60)}`);
-  if (inp.katanaTags) { for (const t of inp.katanaTags) if (!(t in cfg.katanaTags)) unlisted.push(`katana:${t.replace(/[^A-Za-z0-9._:-]/g, '?').slice(0, 60)}`); }
+  else for (const u of new Set(inp.units)) if (MODEL_UNIT.test(u) && !NOT_A_MODEL.test(u) && !(u in cfg.localUnits)) unlisted.push(`unit:${safeId(u)}`);
+  if (inp.katanaTags) { for (const t of inp.katanaTags) if (!(t in cfg.katanaTags)) unlisted.push(`katana:${safeId(t)}`); }
   else if (!asleep.includes('katana')) unread.push('katana tags');
   const localOk = { embedding: inp.embedHealth === true, wake: Array.isArray(inp.wake) && inp.wake.length > 0 };
   for (const l of cfg.local) if (!localOk[l.kind]) unreachable.push(`${l.id} (no answer)`);
@@ -301,15 +322,17 @@ export function judge(cfg, inp, nowMs) {
   const row = (o, ok, error, instrument) => ({ ...o, reachable: !!ok, checked: at, instrument, error: ok ? null : error });
   const claudeErr = (id) => { const p = inp.claudeProbes?.[id];
     return !p ? 'not probed' : p.error === 'seat client key missing' ? p.error : !p.ok ? 'error' : !p.served.includes(id) ? 'served as another model'
-      : inp.seatProof !== true ? 'not seen at the seat proxy' : inp.claudeCatalog && !inCatalog(id) ? 'left the seat catalog' : 'error'; };
+      : p.seen !== true ? 'not seen at the seat proxy' : inp.claudeCatalog && !inCatalog(id) ? 'left the seat catalog' : 'error'; };
   const rows = [
     ...cfg.claude.map((c) => row({ name: c.id, label: c.label, route: 'teamclaude', kind: 'llm', group: c.group, tier: 'seat', policy: 'claude-teamclaude-only' }, claudeOk(c.id), claudeErr(c.id), 'claude -p through the seats')),
     ...cfg.speech.map((s) => row({ name: s.id, label: s.label, route: 'azure-speech', kind: s.kind, tier: 'credit', policy: s.policy }, inp.speech?.[s.id]?.ok,
       !inp.speech ? 'not read' : /^(http [0-9]{1,3}|no audio to transcribe|bad answer)$/.test(inp.speech[s.id]?.error || '') ? inp.speech[s.id].error : 'no answer',
       s.kind === 'tts' ? 'one sentence synthesized' : 'the synthesized sentence transcribed')),
-    ...cfg.foundryDirect.map((f) => { const d = fd.get(f.deployment); const ok = d?.status === 'succeeded' && d.model === cfg.foundryExpect[f.deployment] && !CLAUDE_RE.test(d.model);
-      return row({ name: f.deployment, label: f.label, route: 'foundry-direct', kind: f.kind, tier: 'credit', policy: 'foundry-first-party' }, ok,
-        !inp.foundry ? 'not read' : !d ? 'deployment gone' : d.status !== 'succeeded' ? 'deployment not ready' : 'deployment serves another model', 'deployment state'); }),
+    ...cfg.foundryDirect.map((f) => { const d = fd.get(f.deployment); const fp = inp.foundryProbes?.[f.deployment];
+      const okDep = d?.status === 'succeeded' && d.model === cfg.foundryExpect[f.deployment] && !CLAUDE_RE.test(d.model);
+      return row({ name: f.deployment, label: f.label, route: 'foundry-direct', kind: f.kind, tier: 'credit', policy: 'foundry-first-party' }, okDep && fp?.ok === true,
+        !inp.foundry ? 'not read' : !d ? 'deployment gone' : d.status !== 'succeeded' ? 'deployment not ready' : !okDep ? 'deployment serves another model'
+          : /^(http [0-9]{1,3}|bad answer)$/.test(fp?.error || '') ? fp.error : 'not probed', f.kind === 'image' ? 'one low-quality image' : 'one short spoken answer'); }),
     ...cfg.local.map((l) => row({ name: l.id, label: l.label, route: 'local', kind: l.kind, host: l.host, tier: 'local', policy: 'local' }, localOk[l.kind], 'no answer', l.health ? 'health endpoint' : 'wyoming describe')),
   ];
   return { state, fact, unlisted, unreachable, drift, unread, asleep, blocked,
@@ -319,7 +342,10 @@ export function judge(cfg, inp, nowMs) {
 // Publish into the plan's data dir (r1.4): every directory from HOME down is a real directory owned by
 // this user and not group/world-writable (no symlink anywhere on the path), the same directory before
 // and after the write; the file is created exclusively (O_EXCL never follows) and renamed over the
-// target (rename replaces a symlink, never its target).
+// target (rename replaces a symlink, never its target). HOME is held to the same rule (r2.5).
+// Threat model: every directory checked is this user's and writable by no one else, so only this
+// uid could swap one between the check and the rename, and that uid already owns the file outright;
+// Node has no openat(), so a descriptor-anchored publish is not available here.
 export function publish(doc, out, home = HOME) {
   const dir = dirname(out);
   if (!dir.startsWith(home + sep)) throw Object.assign(new Error('outside home'), { code: 'EPATH' });
@@ -328,7 +354,7 @@ export function publish(doc, out, home = HOME) {
   const uid = process.getuid();
   const ids = chain.map((p) => {
     const st = lstatSync(p);
-    if (st.isSymbolicLink() || !st.isDirectory() || st.uid !== uid || (p !== home && (st.mode & 0o022))) throw Object.assign(new Error('unsafe path'), { code: 'EPATH' });
+    if (st.isSymbolicLink() || !st.isDirectory() || st.uid !== uid || (st.mode & 0o022)) throw Object.assign(new Error('unsafe path'), { code: 'EPATH' });
     return `${st.dev}:${st.ino}`;
   });
   const tmp = join(dir, `.direct.${process.pid}.tmp`);

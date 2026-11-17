@@ -1210,14 +1210,14 @@ test('forge-models: direct.json is not written through a symlinked parent, and a
 
 // a real 32×32 RGB PNG, built here (signature, IHDR, IDAT, IEND, each with its CRC); options build CRC-correct
 // malformed ones for the negatives
-async function fmPng({ w = 32, h = 32, color = 2, extra = null, iend = Buffer.alloc(0) } = {}) {
+async function fmPng({ w = 32, h = 32, color = 2, extra = null, iend = Buffer.alloc(0), plte = [] } = {}) {
   const { deflateSync, crc32 } = await import('node:zlib');
   const chunk = (type, data) => { const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
     const td = Buffer.concat([Buffer.from(type, 'latin1'), data]); const c = Buffer.alloc(4); c.writeUInt32BE(crc32(td)); return Buffer.concat([len, td, c]); };
   const ch = { 2: 3, 3: 1 }[color];
   const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = color;
   const raw = Buffer.alloc(h * (1 + w * ch), 0x40); for (let y = 0; y < h; y++) raw[y * (1 + w * ch)] = 0;
-  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', ihdr), ...(extra ? [chunk(extra, Buffer.alloc(4))] : []),
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', ihdr), ...(extra ? [chunk(extra, Buffer.alloc(4))] : []), ...plte.map((n) => chunk('PLTE', Buffer.alloc(n, 9))),
     chunk('IDAT', deflateSync(raw)), chunk('IEND', iend)]);
 }
 
@@ -1225,6 +1225,7 @@ test('forge-models: isImage decodes a real PNG and refuses signature-only or bro
   const { isImage } = await import(join(C, 'forge-models.mjs'));
   const good = await fmPng();
   assert.equal(isImage(good), true);
+  assert.equal(isImage(await fmPng({ plte: [48] })), true);   // a valid optional palette (16 entries)
   const flip = (i) => { const b = Buffer.from(good); b[i] ^= 0xff; return b; };
   const bad = [
     Buffer.concat([good.subarray(0, 8), Buffer.from([0, 0, 0, 13]), Buffer.from('IHDR', 'latin1'), Buffer.alloc(2000, 5)]),   // the round-6 fixture
@@ -1237,6 +1238,9 @@ test('forge-models: isImage decodes a real PNG and refuses signature-only or bro
     await fmPng({ color: 3 }),                                // indexed, CRC-correct, no PLTE (r8.2)
     await fmPng({ iend: Buffer.from('x') }),                  // non-empty IEND (r8.2)
     await fmPng({ extra: 'ZZZZ' }),                           // an unknown critical chunk (r8.2)
+    await fmPng({ plte: [4] }),                               // PLTE not a multiple of 3 (r9.2)
+    await fmPng({ plte: [48, 48] }),                          // two PLTEs (r9.2)
+    await fmPng({ plte: [771] }),                             // more than 256 entries (r9.2)
   ];
   for (const [i, b] of bad.entries()) assert.equal(isImage(b), false, `case ${i}`);
 });
@@ -1393,13 +1397,24 @@ test('forge-models: a world-writable HOME refuses publication (r2.5)', () => {
   // through a fake getent (r8.1): private → written; another account sharing the gid → refused
   const bin = join(d, 'bin'); mkdirSync(bin);
   const me = process.env.USER || 'u', gid = process.getgid();
-  const fakeGetent = (others) => { writeFileSync(join(bin, 'getent'), `#!/bin/sh\ncase "$1" in group) echo "${me}:x:${gid}:";; passwd) echo "${me}:x:${process.getuid()}:${gid}::/h:/bin/sh"${others ? `; echo "intruder:x:4242:${gid}::/h:/bin/sh"` : ''};; esac\n`); chmodSync(join(bin, 'getent'), 0o755); };
-  const env3 = { PATH: `${bin}:${process.env.PATH}`, CHECK_FM_HOME: d, CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW) };
+  const fakeGetent = (others, dupGroup = false) => { writeFileSync(join(bin, 'getent'), `#!/bin/sh\ncase "$1" in group) echo "${me}:x:${gid}:"${dupGroup ? `; echo "shared:x:${gid}:intruder"` : ''};; passwd) echo "${me}:x:${process.getuid()}:${gid}::/h:/bin/sh"${others ? `; echo "intruder:x:4242:${gid}::/h:/bin/sh"` : ''};; esac\n`); chmodSync(join(bin, 'getent'), 0o755); };
+  writeFileSync(join(d, 'nss-local'), 'passwd: files systemd\ngroup: files [SUCCESS=merge] systemd\n');
+  writeFileSync(join(d, 'nss-sss'), 'passwd: files sss\ngroup: files sss\n');
+  const env3 = { CHECK_FM_NSSWITCH: join(d, 'nss-local'), PATH: `${bin}:${process.env.PATH}`, CHECK_FM_HOME: d, CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW) };
   fakeGetent(false); chmodSync(d, 0o770);
   const r3 = run('forge-models.sh', env3);
   fakeGetent(true);
   const r4 = run('forge-models.sh', env3);
+  fakeGetent(false);
+  const r5 = run('forge-models.sh', { ...env3, CHECK_FM_NSSWITCH: join(d, 'nss-sss') });   // r9.1: SSSD may hide accounts
+  writeFileSync(join(bin, 'getent'), '#!/bin/sh\nexit 0\n'); chmodSync(join(bin, 'getent'), 0o755);
+  const r6 = run('forge-models.sh', env3);                                                 // r9.1: an empty listing proves nothing
+  fakeGetent(false, true);
+  const r7 = run('forge-models.sh', env3);                                                 // a second group line with the same gid
   chmodSync(d, 0o700);
+  assert.match(r5.line, /direct\.json not written \(EPATH\)/);
+  assert.match(r6.line, /direct\.json not written \(EPATH\)/);
+  assert.match(r7.line, /direct\.json not written \(EPATH\)/);
   if (userInfo().username === me) assert.doesNotMatch(r3.line, /not written/);
   assert.match(r4.line, /^CHECK forge-models warn · .*direct\.json not written \(EPATH\)/);
   assert.match(r.line, /^CHECK forge-models warn · .*direct\.json not written \(EPATH\)/);   // never ok while the page goes stale (r3.3)

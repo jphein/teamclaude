@@ -226,7 +226,7 @@ export async function collect() {
 export function isImage(b) {
   try {
     if (!Buffer.isBuffer(b) || b.length < 57 || !b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return false;
-    let off = 8, ihdr = null, idat = [], ended = false, idatDone = false;
+    let off = 8, ihdr = null, idat = [], ended = false, idatDone = false, plte = false;
     while (off + 12 <= b.length) {
       const len = b.readUInt32BE(off), type = b.toString('latin1', off + 4, off + 8), end = off + 12 + len;
       if (len > b.length || end > b.length) return false;
@@ -241,7 +241,10 @@ export function isImage(b) {
         if (idatDone) return false;   // IDAT chunks are consecutive
         idat.push(d);
       } else if (type === 'IEND') { ended = len === 0 && end === b.length; break; }
-      else if (type === 'PLTE') { if (idat.length) return false; }   // optional for truecolour, before the data
+      else if (type === 'PLTE') {   // optional for truecolour: once, before the data, 1–256 RGB entries (r9.2)
+        if (idat.length || plte || len % 3 !== 0 || len < 3 || len > 768) return false;
+        plte = true;
+      }
       else if (critical) return false;   // an unknown critical chunk: a decoder must refuse it (r8.2)
       if (type !== 'IDAT' && idat.length) idatDone = true;
       off = end;
@@ -442,13 +445,23 @@ export function judge(cfg, inp, nowMs) {
 function privateGroup() {
   try {
     const gid = process.getgid(), user = userInfo().username;   // from the passwd entry, not the environment
-    const g = run('getent', ['group', String(gid)], { timeout: 10_000 });
+    // enumeration proves exclusivity only when every account is local (r9.1): NSS passwd and group
+    // must come from files (and systemd's own users) alone; LDAP/SSSD/NIS may hide accounts from it
+    const nss = readFileSync(process.env.CHECK_FM_NSSWITCH || '/etc/nsswitch.conf', 'utf8');
+    for (const db of ['passwd', 'group']) {
+      const srcs = (nss.match(new RegExp(`^${db}:\\s*(.*)$`, 'm'))?.[1] || '').replace(/\[[^\]]*\]/g, ' ').trim().split(/\s+/).filter(Boolean);
+      if (!srcs.length || srcs.some((x) => x !== 'files' && x !== 'systemd')) return null;
+    }
+    const g = run('getent', ['group'], { timeout: 30_000 });
     const pw = run('getent', ['passwd'], { timeout: 30_000 });
     if (g.status !== 0 || pw.status !== 0) return null;
-    const [name, , , members = ''] = g.stdout.trim().split(':');
-    if (name !== user || !(members === '' || members === user)) return null;
-    const sharing = pw.stdout.split('\n').filter(Boolean).map((l) => l.split(':')).filter((f) => f[3] === String(gid) && f[0] !== user);
-    return sharing.length ? null : gid;
+    // EVERY group entry with this gid (a duplicate gid line is a second group): each must be this
+    // user's own, with no member but this user
+    const same = g.stdout.split('\n').filter(Boolean).map((l) => l.split(':')).filter((f) => f[2] === String(gid));
+    if (!same.length || same.some(([name, , , members = '']) => name !== user || !(members === '' || members === user))) return null;
+    const rows = pw.stdout.split('\n').filter(Boolean).map((l) => l.split(':'));
+    if (!rows.some((f) => f[0] === user)) return null;   // a listing without this user is not the full list
+    return rows.some((f) => f[3] === String(gid) && f[0] !== user) ? null : gid;
   } catch { return null; }
 }
 

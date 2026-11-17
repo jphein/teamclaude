@@ -1544,16 +1544,23 @@ test('forge-models collect: an endpoint that answers any key, a wrong shape, and
 
 test('forge-models collect: a control that gets no answer is "no answer", never "accepts a bad key"; a GET control is retried once', async () => {
   const vaultList = [{ type: 1, name: 'assemblyai-api-key', login: { password: 'PW', uris: [] } }];
-  const mk = (id, path) => ({ id, label: id, provider: 'p', modality: ['llm'], policy: 'vendor-direct', vault: 'assemblyai-api-key', instrument: 'x',
-    probe: { url: `BASE${path}`, header: 'x-api-key', scheme: '', expect: 'transcripts', allowEmpty: true } });
-  const one = async (path) => fmCollect({ deployments: DEPLOYS, vaultList,
-    vendors: (base) => [mk('v', path)].map((v) => ({ ...v, probe: { ...v.probe, url: v.probe.url.replace('BASE', base) } })) });
+  const mk = (id, path, post) => ({ id, label: id, provider: 'p', modality: ['llm'], policy: 'vendor-direct', vault: 'assemblyai-api-key', instrument: 'x',
+    probe: { url: `BASE${path}`, header: 'x-api-key', scheme: '', expect: 'transcripts', allowEmpty: true, ...(post ? { body: { m: 1 } } : {}) } });
+  const one = async (path, post) => fmCollect({ deployments: DEPLOYS, vaultList,
+    vendors: (base) => [mk('v', path, post)].map((v) => ({ ...v, probe: { ...v.probe, url: v.probe.url.replace('BASE', base) } })) });
+  const real = (h) => h['x-api-key'] === 'testkey123';
+  const count = (r) => [r.vendorHeaders.filter((h) => !real(h)).length, r.vendorHeaders.filter(real).length];
   const dead = await one('/vendor-drop');
   assert.match(dead.out, /v \(no answer\)/);
   assert.doesNotMatch(dead.out, /accepts a bad key/);
+  assert.deepEqual(count(dead), [2, 0], 'a dead GET control: two wrong-key tries (one retry, no more), the real key never sent');
   const flaky = await one('/vendor-drop-once');
   assert.doesNotMatch(flaky.out, /v \((no answer|accepts a bad key)\)/);
   assert.equal(flaky.direct.models.find((m) => m.name === 'v').reachable, true);
+  assert.deepEqual(count(flaky), [2, 1], 'a recovered GET control: the retry, then one real probe');
+  const deadPost = await one('/vendor-drop', true);
+  assert.match(deadPost.out, /v \(no answer\)/);
+  assert.deepEqual(count(deadPost), [1, 0], 'a POST control is never retried (r1.2)');
 });
 
 test('forge-models vendors: the shipped forge-direct.json is well formed (r1.1)', async () => {

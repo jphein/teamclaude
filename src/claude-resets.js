@@ -505,7 +505,7 @@ export class ClaudeResetRedeemer {
       return { redeemed: false, account: name, reason: 'upstream reports a reset cooldown' };
     }
     if (dryRun) {
-      return { redeemed: false, wouldRedeem: true, account: name, reason: `would redeem: at ${status.exhausted.join(', ')}, its reset clears ${grant.clears.join(', ')}`, resetsLeft: grant.resetsLeft, cleared: grant.clears };
+      return { redeemed: false, wouldRedeem: true, account: name, reason: `would redeem: at ${status.exhausted.length ? status.exhausted.join(', ') : `its 5-hour threshold (5h ${liveFive == null ? '?' : `${Math.round(liveFive * 100)}%`}; upstream reports no limit yet)`}, its reset clears ${grant.clears.join(', ')}`, resetsLeft: grant.resetsLeft, cleared: grant.clears };
     }
     if (state.grantId !== grant.id) { state.grantId = grant.id; state.requestId = null; }
     if (observe) observe.grantId = grant.id;

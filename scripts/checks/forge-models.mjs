@@ -58,7 +58,7 @@ function scrubbed() {
   for (const [k, v] of Object.entries(process.env)) {
     if (/^(https?_proxy|all_proxy|no_proxy)$/i.test(k)) continue;
     if (/^(ANTHROPIC_|CLAUDE_|AWS_|AZURE_|VERTEX_|CLOUD_ML_|GOOGLE_)/.test(k)) continue;
-    if (/^(NODE_EXTRA_CA_CERTS|NODE_OPTIONS|SSL_CERT_FILE|SSL_CERT_DIR)$/.test(k)) continue;
+    if (/^(NODE_|SSL_CERT_)/.test(k)) continue;   // CA trust, NODE_TLS_REJECT_UNAUTHORIZED, --require hooks (r1.1)
     e[k] = v;
   }
   return e;
@@ -92,10 +92,15 @@ function seatSettings() {
     return /^http:\/\/(tc-[0-9a-f]{48}):\1@127\.0\.0\.1:3456$/.test(p) ? f : null;
   } catch { return null; }
 }
-// the MITM CA the seat proxy presents: Claude Code trusts it only through NODE_EXTRA_CA_CERTS
+// the MITM CA the seat proxy presents: Claude Code trusts it only through NODE_EXTRA_CA_CERTS. It
+// becomes a trust root for the child, so only a file this account owns and nobody else can replace (r1.2)
 const SEAT_CA = join(HOME, '.config/teamclaude-ca.pem');
 function seatCa() {
-  try { const st = statSync(SEAT_CA); return st.isFile() && st.size > 0 ? SEAT_CA : null; } catch { return null; }
+  const mine = (st) => st.uid === process.getuid() && (st.mode & 0o022) === 0;
+  try {
+    const d = lstatSync(dirname(SEAT_CA)), f = lstatSync(SEAT_CA);
+    return d.isDirectory() && mine(d) && f.isFile() && mine(f) && f.size > 0 ? SEAT_CA : null;
+  } catch { return null; }
 }
 const SEAT_SETUP = new Set(['seat client key missing', 'seat CA missing']);
 function seatCount() {   // forge-check's request counter at the proxy (null when unreadable)

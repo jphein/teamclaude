@@ -1289,7 +1289,14 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
   mkdirSync(join(d, '.config/teamclaude-client'), { recursive: true });
   const key = 'tc-' + 'a'.repeat(48);
   writeFileSync(join(d, '.config/teamclaude-client/forge-check.settings.json'), JSON.stringify({ env: { HTTPS_PROXY: `http://${key}:${key}@127.0.0.1:3456` } }), { mode: 0o600 });
-  if (ca) writeFileSync(join(d, '.config/teamclaude-ca.pem'), '-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n');
+  chmodSync(join(d, '.config'), 0o700);
+  const caPath = join(d, '.config/teamclaude-ca.pem'), pem = '-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n';
+  if (ca === true) writeFileSync(caPath, pem, { mode: 0o644 });
+  else if (ca === 'empty') writeFileSync(caPath, '', { mode: 0o644 });
+  else if (ca === 'dir') mkdirSync(caPath);
+  else if (ca === 'group-writable') { writeFileSync(caPath, pem); chmodSync(caPath, 0o664); }
+  else if (ca === 'symlink') { writeFileSync(join(d, 'other.pem'), pem); symlinkSync(join(d, 'other.pem'), caPath); }
+  else if (ca === 'open-dir') { writeFileSync(caPath, pem, { mode: 0o644 }); chmodSync(join(d, '.config'), 0o777); }
   const hits = [];
   const png = await fmPng();
   const srv = createServer((q, s) => {
@@ -1323,7 +1330,7 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
   const bump = claudeCounts === true ? `n=$(cat '${counter}'); echo $((n+1)) > '${counter}'`
     : claudeCounts === 'twice-then-none' ? `case "$*" in *claude-opus-5-5*) n=$(cat '${counter}'); echo $((n+2)) > '${counter}';; esac` : ':';
   // like the real one under a systemd unit: without the proxy's CA it cannot fetch the org settings
-  sh('claude', `${bump}; echo "claude-env ca=\${NODE_EXTRA_CA_CERTS:-none} session=\${CLAUDE_CODE_SESSION_ID:-none}" >> '${log}'
+  sh('claude', `${bump}; echo "claude-env ca=\${NODE_EXTRA_CA_CERTS:-none} session=\${CLAUDE_CODE_SESSION_ID:-none} leaked=\${CLAUDE_EFFORT:-}\${NODE_OPTIONS:-}\${NODE_TLS_REJECT_UNAUTHORIZED:-}\${SSL_CERT_FILE:-}\${SSL_CERT_DIR:-}." >> '${log}'
 [ "\$NODE_EXTRA_CA_CERTS" = '${join(d, '.config/teamclaude-ca.pem')}' ] && [ -s "\$NODE_EXTRA_CA_CERTS" ] || { echo '{"is_error":true,"result":"could not connect"}'; exit 1; }
 for a; do case "$prev" in --model) m=$a;; esac; prev=$a; done; echo "{\\"is_error\\":false,\\"modelUsage\\":{\\"$m\\":{}}}"`);
   sh('curl', `case "$*" in *model_selector*) echo '{"model_selector_config":[{"models":[{"id":"claude-opus-5-5"},{"id":"claude-fable-5-2"}]}]}';; *status*) echo "{\\"clients\\":{\\"forge-check\\":{\\"requests\\":$(cat '${counter}')}}}";; *) exit 22;; esac`);
@@ -1382,16 +1389,21 @@ test('forge-models collect: a Speech region that is not a hostname label sends n
 });
 
 test('forge-models collect: Claude probes carry the seat CA and none of the calling session (2026-11-17 timer run)', async () => {
-  const r = await fmCollect({ deployments: DEPLOYS, extraEnv: { NODE_EXTRA_CA_CERTS: '/etc/elsewhere.pem', CLAUDE_CODE_SESSION_ID: 'caller-session' } });
-  assert.match(r.calls, /claude-env ca=\S*\/\.config\/teamclaude-ca\.pem session=none/);
+  // these reach the check's own node too, so the --require target must exist (it is empty)
+  const hook = join(fresh(), 'noop.cjs'); writeFileSync(hook, '');
+  const r = await fmCollect({ deployments: DEPLOYS, extraEnv: { NODE_EXTRA_CA_CERTS: '/etc/elsewhere.pem', CLAUDE_CODE_SESSION_ID: 'caller-session',
+    CLAUDE_EFFORT: 'x', NODE_OPTIONS: `--require=${hook}`, NODE_TLS_REJECT_UNAUTHORIZED: '0', SSL_CERT_FILE: '/x.pem', SSL_CERT_DIR: '/x' } });
+  assert.match(r.calls, /claude-env ca=\S*\/\.config\/teamclaude-ca\.pem session=none leaked=\./);
   assert.doesNotMatch(r.calls, /caller-session|elsewhere\.pem/);
   assert.doesNotMatch(r.out, /claude-opus-5-5 \(error\)/);
 });
 
-test('forge-models collect: a missing seat CA is named, and no Claude probe is sent', async () => {
-  const r = await fmCollect({ deployments: DEPLOYS, ca: false });
-  assert.doesNotMatch(r.calls, /claude -p/);
-  assert.match(r.out, /^fail\t.*claude-opus-5-5 \(seat CA missing\)/);
+test('forge-models collect: a seat CA that is missing or replaceable is named, and no Claude probe is sent (r1.2)', async () => {
+  for (const ca of [false, 'empty', 'dir', 'group-writable', 'symlink', 'open-dir']) {
+    const r = await fmCollect({ deployments: DEPLOYS, ca });
+    assert.doesNotMatch(r.calls, /claude -p/, `ca=${ca}`);
+    assert.match(r.out, /^fail\t.*claude-opus-5-5 \(seat CA missing\)/, `ca=${ca}`);
+  }
 });
 
 test('forge-models collect: a gateway error text is reduced to a fixed word', async () => {

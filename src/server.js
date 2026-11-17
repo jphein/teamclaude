@@ -15,6 +15,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { ensureCerts, createConnectHandler, mitmHosts, proxyAuthorizationAuth, describeCa } from './mitm.js';
+import { resolveSigil } from './version-sigil.js';
 import { patchAccountUuid } from './account-uuid-rewrite.js';
 import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { sanitizeCacheControl, cacheControlSubfieldsToStrip } from './cache-control-sanitize.js';
@@ -697,6 +698,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     };
   }
 
+  // The realm-sigil version document, resolved once now: the checkout's HEAD as
+  // the server starts, so a later `git pull` without a restart cannot change it.
+  const sigilDoc = (/** @type {any} */ (hooks).resolveSigil || resolveSigil)().catch(() => null);
+
   const requestHandler = async (req, res) => {
     try {
       // The control plane answers to its new name as well (issue #72): a URL
@@ -705,6 +710,21 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // proxy's own prefix is touched; nothing forwarded upstream starts with it.
       const legacyUrl = legacyControlUrl(req.url);
       if (legacyUrl) req.url = legacyUrl;
+
+      // GET /api/version — the realm-sigil version document (CHECK sigil-coverage,
+      // realmwatch #493), served BEFORE the auth gate. It discloses, on purpose,
+      // the product and the checkout's commit (see version-sigil.js for the
+      // contract), nothing about the accounts, the host or the process. Exact
+      // path, no query, GET only; this listener's URL is origin-form here (an
+      // absolute-form URL never equals the literal), and MITM traffic is served by
+      // createProxyRequestListener, which has no such route.
+      if (req.method === 'GET' && req.url === '/api/version') {
+        const doc = await sigilDoc;
+        if (!doc) { json(res, 503, { error: 'version unavailable' }); return; }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+        res.end(JSON.stringify(doc));
+        return;
+      }
 
       // Dashboard page — served BEFORE the auth gate on purpose. The page is a
       // static asset containing no data: everything it shows comes from

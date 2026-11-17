@@ -34,7 +34,7 @@
     "rate-limiting",
     "cli"
   ],
-  "license": "MIT",
+  "license": "MIT AND LGPL-3.0-only",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/KarpelesLab/teamclaude.git"

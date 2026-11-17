@@ -346,3 +346,13 @@ test('the rule trigger reads the SERVABLE pool figure and the seat\'s 5h thresho
   assert.match(body, /ruleFor\(account, \{[^}]*fiveHourWall/);
   assert.match(body, /pool5h: servable5h/);
 });
+
+test('a dry run at the proxy\'s 5h threshold (upstream not yet exhausted) names the threshold, never an empty limit list', async () => {
+  const five = [{ id: 'gr-5h', resets_left: 1, clears: FIVE, usable_now: true, paused: false, ends_at: new Date(Date.now() + 90 * DAY).toISOString() }];
+  const t = rig({ status: () => block({ next_grant_id: 'gr-5h' }, five), usage: { week: 0.56, five: 0.97 } });
+  t.am.thresholdFor = () => 0.97;
+  const r = await t.redeemer.redeemNamed('a@x.org', { dryRun: true, fiveHour: true });
+  assert.equal(r.wouldRedeem, true, r.reason);
+  assert.equal(r.reason, 'would redeem: at its 5-hour threshold (5h 97%; upstream reports no limit yet), its reset clears five_hour, seven_day_overage_included');
+  assert.equal(t.calls.claim.length, 0);
+});

@@ -110,17 +110,24 @@ export function wrongKey(k) {
     : /[A-Z]/.test(c) ? String.fromCharCode((c.charCodeAt(0) - 65 + 1) % 26 + 65) : c;
   return k.slice(0, k.length - n) + [...k.slice(k.length - n)].map(shift).join('');
 }
-async function refusesWrongKey(spec, key) {
+// 'refused' (the instrument is proven), 'no answer' (nothing came back: a reset or timeout proves nothing either
+// way, 2026-11-17 11:59 Azure reset TLS mid-run and the row read "accepts a bad key"), or 'accepted' (any status
+// but 401/403, a 400 for a malformed key included: format checking is not authentication, r2.1)
+async function wrongKeyVerdict(spec, key) {
   const bad = wrongKey(key);
-  if (bad === key) return false;   // nothing to shift: no control, so no proof
+  if (bad === key) return 'accepted';   // nothing to shift: no control, so no proof
   const h = { [spec.header]: spec.scheme + bad, 'User-Agent': 'forge-models', Accept: 'application/json' };
   if (spec.body) h['Content-Type'] = 'application/json';
-  const r = await get(spec.url, h, 30_000, spec.body ? 'POST' : 'GET', spec.body ? JSON.stringify(spec.body) : undefined);
-  return r.status === 401 || r.status === 403;
+  const send = () => get(spec.url, h, 30_000, spec.body ? 'POST' : 'GET', spec.body ? JSON.stringify(spec.body) : undefined);
+  let r = await send();
+  if (r.status === 0 && !spec.body) { await sleep(PACE); r = await send(); }   // a GET control gets the probe's one retry; a POST never
+  return r.status === 401 || r.status === 403 ? 'refused' : r.status === 0 ? 'no answer' : 'accepted';
 }
 // one probe: the control first, then the real key; a GET (free, read only) gets one retry, a POST never (r1.2)
 async function probeVendor(spec, key) {
-  if (!(await refusesWrongKey(spec, key))) return { ok: false, error: 'accepts a bad key' };
+  const control = await wrongKeyVerdict(spec, key);
+  if (control === 'no answer') return { ok: false, error: 'no answer' };
+  if (control !== 'refused') return { ok: false, error: 'accepts a bad key' };
   let res = await vendorProbe(spec, key);
   if (!res.ok && !spec.body) { await sleep(PACE); res = await vendorProbe(spec, key); }
   return res;

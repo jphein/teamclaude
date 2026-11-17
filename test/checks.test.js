@@ -1297,7 +1297,7 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
   else if (ca === 'group-writable') { writeFileSync(caPath, pem); chmodSync(caPath, 0o664); }
   else if (ca === 'symlink') { writeFileSync(join(d, 'other.pem'), pem); symlinkSync(join(d, 'other.pem'), caPath); }
   else if (ca === 'open-dir') { writeFileSync(caPath, pem, { mode: 0o644 }); chmodSync(join(d, '.config'), 0o777); }
-  const hits = [], vendorHeaders = [], stolen = [];
+  const hits = [], vendorHeaders = [], stolen = [], vendorDrops = { n: 0 };
   const png = await fmPng();
   const thief = createServer((q, s) => { stolen.push(q.headers); s.end('{"models":[{"id":"x"}]}'); });
   await new Promise((r) => thief.listen(0, '127.0.0.1', r));
@@ -1323,6 +1323,7 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
       const badKey = !/(^| )(Bearer |Key )?(testkey123|tokentokentokentokentoken0123)( |$)/.test(sent);   // only the real credential is accepted
       if (q.url.startsWith('/vendor-any')) return s.end(JSON.stringify({ models: [{ id: 'm' }] }));   // answers anyone: not an instrument
       if (q.url.startsWith('/vendor-shape')) { if (/forge-models-invalid-key/.test(sent)) { s.statusCode = 400; return s.end('{}'); } return s.end(JSON.stringify({ models: [{ id: 'm' }] })); }   // checks format only (r2.1)
+      if (q.url.startsWith('/vendor-drop')) { if (badKey && vendorDrops.n++ < (q.url.startsWith('/vendor-drop-once') ? 1 : 1e9)) return s.destroy(); }   // a reset, not an answer
       if (badKey) { s.statusCode = 401; return s.end('{}'); }
       if (q.url.startsWith('/vendor-401')) { s.statusCode = 401; return s.end('{"error":"Bearer sk-CANARY77 rejected"}'); }
       if (q.url.startsWith('/vendor-obj')) return s.end(JSON.stringify({ choices: {}, transcripts: {} }));
@@ -1527,7 +1528,7 @@ test('forge-models collect: vendor keys go in the configured header only, never 
 });
 
 test('forge-models collect: an endpoint that answers any key, a wrong shape, and a redirect are all refused (r1.3, r1.6)', async () => {
-  const vaultList = [{ type: 1, name: 'assemblyai-api-key', login: { password: 'PW', uris: [] } }];
+  const vaultList = [{ type: 1, name: 'assemblyai-api-key', login: { password: 'PW-SECRET-3', uris: [] } }];
   const mk = (id, path, method) => ({ id, label: id, provider: 'p', modality: ['llm'], policy: 'vendor-direct', vault: 'assemblyai-api-key', instrument: 'x',
     probe: { url: `BASE${path}`, header: 'x-api-key', scheme: '', expect: id === 'obj' ? 'choices' : 'models', ...(method === 'POST' ? { body: { m: 1 } } : {}) } });
   const vendors = (base) => [mk('any', '/vendor-any', 'GET'), mk('shape', '/vendor-shape', 'GET'), mk('obj', '/vendor-obj', 'POST'), mk('redir', '/vendor-redirect', 'GET')]
@@ -1538,7 +1539,28 @@ test('forge-models collect: an endpoint that answers any key, a wrong shape, and
   assert.match(r.out, /obj \(bad answer\)/);
   assert.match(r.out, /redir \(no answer\)/);
   assert.equal(r.stolen.length, 0, 'a redirect carried a credential to another host');
-  assert.doesNotMatch(r.calls, /testkey123|PW/);
+  assert.doesNotMatch(r.calls, /testkey123|PW-SECRET-3/);   // a fake secret no random temp-dir suffix can contain (CI 2026-11-17: tc-checks-8tPW9e matched /PW/)
+});
+
+test('forge-models collect: a control that gets no answer is "no answer", never "accepts a bad key"; a GET control is retried once', async () => {
+  const vaultList = [{ type: 1, name: 'assemblyai-api-key', login: { password: 'PW-SECRET-3', uris: [] } }];
+  const mk = (id, path, post) => ({ id, label: id, provider: 'p', modality: ['llm'], policy: 'vendor-direct', vault: 'assemblyai-api-key', instrument: 'x',
+    probe: { url: `BASE${path}`, header: 'x-api-key', scheme: '', expect: 'transcripts', allowEmpty: true, ...(post ? { body: { m: 1 } } : {}) } });
+  const one = async (path, post) => fmCollect({ deployments: DEPLOYS, vaultList,
+    vendors: (base) => [mk('v', path, post)].map((v) => ({ ...v, probe: { ...v.probe, url: v.probe.url.replace('BASE', base) } })) });
+  const real = (h) => h['x-api-key'] === 'testkey123';
+  const count = (r) => [r.vendorHeaders.filter((h) => !real(h)).length, r.vendorHeaders.filter(real).length];
+  const dead = await one('/vendor-drop');
+  assert.match(dead.out, /v \(no answer\)/);
+  assert.doesNotMatch(dead.out, /accepts a bad key/);
+  assert.deepEqual(count(dead), [2, 0], 'a dead GET control: two wrong-key tries (one retry, no more), the real key never sent');
+  const flaky = await one('/vendor-drop-once');
+  assert.doesNotMatch(flaky.out, /v \((no answer|accepts a bad key)\)/);
+  assert.equal(flaky.direct.models.find((m) => m.name === 'v').reachable, true);
+  assert.deepEqual(count(flaky), [2, 1], 'a recovered GET control: the retry, then one real probe');
+  const deadPost = await one('/vendor-drop', true);
+  assert.match(deadPost.out, /v \(no answer\)/);
+  assert.deepEqual(count(deadPost), [1, 0], 'a POST control is never retried (r1.2)');
 });
 
 test('forge-models vendors: the shipped forge-direct.json is well formed (r1.1)', async () => {

@@ -7,7 +7,7 @@ import { spawnSync, execFile, spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, chmodSync, mkdirSync, rmSync, utimesSync, copyFileSync, existsSync, symlinkSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join, dirname } from 'node:path';
-import { tmpdir, hostname } from 'node:os';
+import { tmpdir, hostname, userInfo } from 'node:os';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
@@ -1208,14 +1208,17 @@ test('forge-models: direct.json is not written through a symlinked parent, and a
   assert.equal(JSON.parse(readFileSync(join(d2, 'forge', 'direct.json'), 'utf8')).schema, 'forge.direct/v1');
 });
 
-// a real 32×32 RGB PNG, built here (signature, IHDR, IDAT, IEND, each with its CRC)
-async function fmPng({ w = 32, h = 32 } = {}) {
+// a real 32×32 RGB PNG, built here (signature, IHDR, IDAT, IEND, each with its CRC); options build CRC-correct
+// malformed ones for the negatives
+async function fmPng({ w = 32, h = 32, color = 2, extra = null, iend = Buffer.alloc(0) } = {}) {
   const { deflateSync, crc32 } = await import('node:zlib');
   const chunk = (type, data) => { const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
     const td = Buffer.concat([Buffer.from(type, 'latin1'), data]); const c = Buffer.alloc(4); c.writeUInt32BE(crc32(td)); return Buffer.concat([len, td, c]); };
-  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 2;
-  const raw = Buffer.alloc(h * (1 + w * 3), 0x40); for (let y = 0; y < h; y++) raw[y * (1 + w * 3)] = 0;
-  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', ihdr), chunk('IDAT', deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
+  const ch = { 2: 3, 3: 1 }[color];
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = color;
+  const raw = Buffer.alloc(h * (1 + w * ch), 0x40); for (let y = 0; y < h; y++) raw[y * (1 + w * ch)] = 0;
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', ihdr), ...(extra ? [chunk(extra, Buffer.alloc(4))] : []),
+    chunk('IDAT', deflateSync(raw)), chunk('IEND', iend)]);
 }
 
 test('forge-models: isImage decodes a real PNG and refuses signature-only or broken ones (r7.1)', async () => {
@@ -1231,6 +1234,9 @@ test('forge-models: isImage decodes a real PNG and refuses signature-only or bro
     Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.alloc(2000, 1), Buffer.from([0xff, 0xd9])]),   // a JPEG-shaped blob
     Buffer.concat([Buffer.from('RIFF\0\0\0\0WEBP', 'latin1'), Buffer.alloc(2000, 1)]),                   // a WebP-shaped blob
     await fmPng({ w: 4, h: 4 }),                              // too small to be an answer
+    await fmPng({ color: 3 }),                                // indexed, CRC-correct, no PLTE (r8.2)
+    await fmPng({ iend: Buffer.from('x') }),                  // non-empty IEND (r8.2)
+    await fmPng({ extra: 'ZZZZ' }),                           // an unknown critical chunk (r8.2)
   ];
   for (const [i, b] of bad.entries()) assert.equal(isImage(b), false, `case ${i}`);
 });
@@ -1253,6 +1259,9 @@ test('forge-models: playableWav accepts a real PCM WAV and refuses broken ones (
   assert.equal(playableWav(streamed), true);
   const halfStream = fmWav(); halfStream.writeUInt32LE(0xffffffff, 40);   // data streamed but RIFF sized: inconsistent
   assert.equal(playableWav(halfStream), false);
+  // r8.3: a finite, misaligned data size inside a streamed container (the extra byte makes it fit, so misalignment is the only fault)
+  const oddInStream = Buffer.concat([fmWav(), Buffer.from([0])]); oddInStream.writeUInt32LE(0xffffffff, 4); oddInStream.writeUInt32LE(6401, 40);
+  assert.equal(playableWav(oddInStream), false);
   const bad = [
     Buffer.concat([Buffer.from('RIFF\0\0\0\0WAVE', 'latin1'), Buffer.alloc(3000, 1)]),   // the round-3 fixture: no size, no chunks
     fmWav({ seconds: 0.01 }),                                                               // too short to be an answer
@@ -1381,8 +1390,18 @@ test('forge-models: a world-writable HOME refuses publication (r2.5)', () => {
   chmodSync(d, 0o770);
   const r2 = run('forge-models.sh', { CHECK_FM_HOME: d, CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW) });
   chmodSync(d, 0o700);
-  const own = readFileSync('/etc/group', 'utf8').split('\n').find((l) => l.split(':')[2] === String(process.getgid())) || '';
-  if (own.split(':')[0] === process.env.USER && ['', process.env.USER].includes(own.split(':')[3])) assert.doesNotMatch(r2.line, /not written/);
+  // through a fake getent (r8.1): private → written; another account sharing the gid → refused
+  const bin = join(d, 'bin'); mkdirSync(bin);
+  const me = process.env.USER || 'u', gid = process.getgid();
+  const fakeGetent = (others) => { writeFileSync(join(bin, 'getent'), `#!/bin/sh\ncase "$1" in group) echo "${me}:x:${gid}:";; passwd) echo "${me}:x:${process.getuid()}:${gid}::/h:/bin/sh"${others ? `; echo "intruder:x:4242:${gid}::/h:/bin/sh"` : ''};; esac\n`); chmodSync(join(bin, 'getent'), 0o755); };
+  const env3 = { PATH: `${bin}:${process.env.PATH}`, CHECK_FM_HOME: d, CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW) };
+  fakeGetent(false); chmodSync(d, 0o770);
+  const r3 = run('forge-models.sh', env3);
+  fakeGetent(true);
+  const r4 = run('forge-models.sh', env3);
+  chmodSync(d, 0o700);
+  if (userInfo().username === me) assert.doesNotMatch(r3.line, /not written/);
+  assert.match(r4.line, /^CHECK forge-models warn · .*direct\.json not written \(EPATH\)/);
   assert.match(r.line, /^CHECK forge-models warn · .*direct\.json not written \(EPATH\)/);   // never ok while the page goes stale (r3.3)
 });
 

@@ -219,31 +219,39 @@ export async function collect() {
   inp.wake = await describe(CFG.local.find((l) => l.wyoming)?.wyoming);
   return inp;
 }
-// An image (r6.2/r7.1): gpt-image answers PNG, so only a PNG that decodes counts: the signature, every chunk
-// inside the file with a correct CRC, a valid IHDR first (16–8192 px, a legal depth/colour pair, no
-// compression or filter variants), IDAT data that inflates to exactly height × (1 + row bytes), IEND last.
+// An image (r6.2/r7.1/r8.2): gpt-image answers a truecolour PNG, so only one that decodes counts: the
+// signature, every chunk inside the file with a correct CRC, IHDR first (16–8192 px, RGB/RGBA at 8 or 16
+// bits, no compression/filter/interlace variants), no unknown critical chunk, PLTE (optional) before
+// consecutive IDATs that inflate to exactly height × (1 + row bytes), an empty IEND last.
 export function isImage(b) {
   try {
     if (!Buffer.isBuffer(b) || b.length < 57 || !b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return false;
-    let off = 8, ihdr = null, idat = [], ended = false;
+    let off = 8, ihdr = null, idat = [], ended = false, idatDone = false;
     while (off + 12 <= b.length) {
       const len = b.readUInt32BE(off), type = b.toString('latin1', off + 4, off + 8), end = off + 12 + len;
       if (len > b.length || end > b.length) return false;
       if (crc32(b.subarray(off + 4, off + 8 + len)) !== b.readUInt32BE(off + 8 + len)) return false;
       const d = b.subarray(off + 8, off + 8 + len);
       if (!ihdr && type !== 'IHDR') return false;
+      const critical = type.charCodeAt(0) >= 65 && type.charCodeAt(0) <= 90;
       if (type === 'IHDR') {
         if (ihdr || len !== 13) return false;
         ihdr = { w: d.readUInt32BE(0), h: d.readUInt32BE(4), depth: d[8], color: d[9], comp: d[10], filter: d[11], lace: d[12] };
-      } else if (type === 'IDAT') idat.push(d);
-      else if (type === 'IEND') { ended = end === b.length; break; }
+      } else if (type === 'IDAT') {
+        if (idatDone) return false;   // IDAT chunks are consecutive
+        idat.push(d);
+      } else if (type === 'IEND') { ended = len === 0 && end === b.length; break; }
+      else if (type === 'PLTE') { if (idat.length) return false; }   // optional for truecolour, before the data
+      else if (critical) return false;   // an unknown critical chunk: a decoder must refuse it (r8.2)
+      if (type !== 'IDAT' && idat.length) idatDone = true;
       off = end;
     }
     if (!ihdr || !ended || !idat.length) return false;
     const { w, h, depth, color, comp, filter, lace } = ihdr;
-    const legal = { 0: [1, 2, 4, 8, 16], 2: [8, 16], 3: [1, 2, 4, 8], 4: [8, 16], 6: [8, 16] };
+    // gpt-image answers truecolour (RGB or RGBA); indexed and grey PNGs are not its answer (r8.2)
+    const legal = { 2: [8, 16], 6: [8, 16] };
     if (w < 16 || h < 16 || w > 8192 || h > 8192 || !legal[color]?.includes(depth) || comp !== 0 || filter !== 0 || lace !== 0) return false;
-    const channels = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[color];
+    const channels = { 2: 3, 6: 4 }[color];
     const raw = inflateSync(Buffer.concat(idat), { maxOutputLength: 256 << 20 });
     const row = Math.ceil((w * channels * depth) / 8);
     if (raw.length !== h * (1 + row)) return false;
@@ -267,7 +275,8 @@ export function playableWav(b) {
   while (off + 8 <= end) {
     const id = b.toString('latin1', off, off + 4), body = off + 8;
     let size = b.readUInt32LE(off + 4);
-    if (id === 'data' && size === STREAM && riff === STREAM) size = end - body;   // streamed: the rest of the file
+    const streamedData = id === 'data' && size === STREAM && riff === STREAM;
+    if (streamedData) size = end - body;   // streamed: the rest of the file
     if (body + size > end) return false;
     if (id === 'fmt ') {
       if (size < 16) return false;
@@ -277,7 +286,7 @@ export function playableWav(b) {
       if (!fmt || fmt.tag !== 1 || fmt.ch < 1 || fmt.ch > 2 || fmt.rate < 8000 || fmt.rate > 48000 || ![8, 16, 24].includes(fmt.bits)) return false;
       // PCM consistency (r5.2): a block is one sample per channel, and the byte rate follows from it
       if (fmt.align !== fmt.ch * (fmt.bits / 8) || fmt.byteRate !== fmt.rate * fmt.align) return false;
-      return (riff === STREAM || size % fmt.align === 0) && size >= fmt.byteRate / 10;   // a stream may end mid-block
+      return (streamedData || size % fmt.align === 0) && size >= fmt.byteRate / 10;   // only a streamed data chunk may end mid-block (r8.3)
     }
     off = body + size + (size & 1);
   }
@@ -428,13 +437,18 @@ export function judge(cfg, inp, nowMs) {
 // Threat model: every directory checked is this user's and writable by no one else, so only this
 // uid could swap one between the check and the rename, and that uid already owns the file outright;
 // Node has no openat(), so a descriptor-anchored publish is not available here.
-// this user's primary group when it is a private one (named for the user, no listed members); else null
+// this user's primary group when it is provably private, else null (fail closed, r8.1): resolved through NSS
+// (getent), the group lists no member but this user, and no other account has it as its primary group.
 function privateGroup() {
   try {
     const gid = process.getgid(), user = userInfo().username;   // from the passwd entry, not the environment
-    const line = readFileSync('/etc/group', 'utf8').split('\n').find((l) => l.split(':')[2] === String(gid));
-    const [name, , , members = ''] = (line || '').split(':');
-    return line && name === user && (members === '' || members === user) ? gid : null;
+    const g = run('getent', ['group', String(gid)], { timeout: 10_000 });
+    const pw = run('getent', ['passwd'], { timeout: 30_000 });
+    if (g.status !== 0 || pw.status !== 0) return null;
+    const [name, , , members = ''] = g.stdout.trim().split(':');
+    if (name !== user || !(members === '' || members === user)) return null;
+    const sharing = pw.stdout.split('\n').filter(Boolean).map((l) => l.split(':')).filter((f) => f[3] === String(gid) && f[0] !== user);
+    return sharing.length ? null : gid;
   } catch { return null; }
 }
 

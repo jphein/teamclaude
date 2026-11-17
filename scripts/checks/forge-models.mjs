@@ -51,11 +51,27 @@ export function safeId(s) {
 }
 
 // a vault item name for the line and the page: names are written by people, so only plain ones pass
+// (r1.5) Not a guarantee against a secret typed into a name, but a credential's usual shapes are refused: a long
+// run, a known key prefix, or a 16+ character word mixing letters and digits.
 export function safeName(s) {
   const v = String(s ?? '').trim();
-  return /^[A-Za-z0-9 ._:()\/@,'-]{1,90}$/.test(v) && !/[A-Za-z0-9+]{24,}/.test(v) ? v : '(unrecognized name)';
+  if (!/^[A-Za-z0-9 ._:()\/@,'-]{1,90}$/.test(v) || /[A-Za-z0-9+]{24,}/.test(v)) return '(unrecognized name)';
+  if (/(^|[^A-Za-z0-9])(sk|pk|rk|nvapi|gsk|hf|r8|fal|xai|ghp|gho|ghs|glpat|xox[abpr]|AIza)[-_]?[A-Za-z0-9]{8,}/i.test(v)) return '(unrecognized name)';
+  if (v.split(/[ ._:()\/@,'-]+/).some((w) => w.length >= 16 && /[0-9]/.test(w) && /[A-Za-z]/.test(w))) return '(unrecognized name)';
+  return v;
 }
-const VENDOR_ERRORS = /^(http [0-9]{1,3}|bad answer|no answer|key not read|bad probe spec|vault locked|no entra token)$/;
+// (r1.4) vendorScan patterns are a restricted language: no repetition operators (+ * {), so no catastrophic
+// backtracking; each must compile on its own. A bad one makes the whole config "bad", never a hang or a crash.
+export function scanPatterns(list) {
+  if (!Array.isArray(list)) return null;
+  const out = [];
+  for (const p of list) {
+    if (typeof p !== 'string' || !/^[A-Za-z0-9 ._?^$()|\[\]\\-]{1,40}$/.test(p) || /\\[^bB.\-()]/.test(p)) return null;
+    try { out.push(new RegExp(p, 'i')); } catch { return null; }
+  }
+  return out;
+}
+const VENDOR_ERRORS = /^(http [0-9]{1,3}|bad answer|no answer|key not read|bad probe spec|vault locked|no entra token|accepts a bad key)$/;
 // a vendor probe from the repo's config: https only, a plain header name, a known scheme, a fixed shape to expect
 export function vendorSpec(p) {
   let u;
@@ -79,8 +95,24 @@ async function vendorProbe(spec, key) {
   if (r.status !== 200) return { ok: false, error: `http ${r.status}` };
   const d = json(r.body.toString());
   const x = spec.expect === 'array' ? d : d?.[spec.expect];
-  const shaped = Array.isArray(x) ? (spec.allowEmpty || x.length > 0) : spec.expect !== 'array' && x !== null && typeof x === 'object';
+  const shaped = Array.isArray(x) && (spec.allowEmpty || x.length > 0);   // every configured shape is an array (r1.3)
   return { ok: shaped, error: shaped ? null : 'bad answer' };
+}
+// (r1.3) the instrument proves itself each night: the same request with an invalid credential must be refused,
+// or a 200 below could come from an endpoint that answers anyone. A refusal happens before any work, so it costs nothing.
+const INVALID = 'forge-models-invalid-key';
+async function refusesBadKey(spec) {
+  const h = { [spec.header]: spec.scheme + INVALID, 'User-Agent': 'forge-models', Accept: 'application/json' };
+  if (spec.body) h['Content-Type'] = 'application/json';
+  const r = await get(spec.url, h, 30_000, spec.body ? 'POST' : 'GET', spec.body ? JSON.stringify(spec.body) : undefined);
+  return [400, 401, 403].includes(r.status);
+}
+// one probe: the control first, then the real key; a GET (free, read only) gets one retry, a POST never (r1.2)
+async function probeVendor(spec, key) {
+  if (!(await refusesBadKey(spec))) return { ok: false, error: 'accepts a bad key' };
+  let res = await vendorProbe(spec, key);
+  if (!res.ok && !spec.body) { await sleep(PACE); res = await vendorProbe(spec, key); }
+  return res;
 }
 const hostOf = (uri) => { try { return new URL(/^[a-z]+:\/\//i.test(uri) ? uri : `https://${uri}`).hostname.toLowerCase(); } catch { return ''; } };
 
@@ -276,17 +308,13 @@ export async function collect() {
     if (!spec) { inp.vendorProbes[v.id] = { ok: false, error: 'bad probe spec' }; continue; }
     if (spec.auth === 'entra') {
       const t = entra();
-      let res = t ? null : { ok: false, error: 'no entra token' };
-      for (let i = 0; t && i < 2 && !res?.ok; i++) { if (i) await sleep(PACE); res = await vendorProbe(spec, t); }
-      inp.vendorProbes[v.id] = res;
+      inp.vendorProbes[v.id] = t ? await probeVendor(spec, t) : { ok: false, error: 'no entra token' };
       continue;
     }
     if (!unlocked) { inp.vendorProbes[v.id] = { ok: false, error: 'vault locked' }; continue; }
     const k = vault(v.vault);
     if (!k) { inp.vendorProbes[v.id] = { ok: false, error: 'key not read' }; continue; }
-    let res = null;
-    for (let i = 0; i < 2 && !res?.ok; i++) { if (i) await sleep(PACE); res = await vendorProbe(spec, k); }   // one retry, as elsewhere
-    inp.vendorProbes[v.id] = res;
+    inp.vendorProbes[v.id] = await probeVendor(spec, k);
   }
   // 6. local: every scope must be read, or the unit list is unread (r1.5)
   const scopes = [run('systemctl', ['--user', 'list-units', '--type=service', '--state=running', '--no-legend', '--plain'], { timeout: 30_000 }),
@@ -487,14 +515,16 @@ export function judge(cfg, inp, nowMs) {
   const vendors = cfg.vendors || [], scan = cfg.vendorScan || {};
   const accountedNames = new Set([...vendors.map((v) => v.vault).filter(Boolean), cfg.vault?.nebius, cfg.vault?.speech, ...Object.values(scan.accountedNames || {}).flat()]
     .filter(Boolean).map((n) => String(n).trim()));
-  const accountedRx = Object.keys(scan.accountedPatterns || {}).map((p) => new RegExp(p, 'i'));
-  const aiRx = (scan.patterns || []).length ? new RegExp(scan.patterns.join('|'), 'i') : null;
+  const aiList = scanPatterns(scan.patterns || []), accountedRx = scanPatterns(Object.keys(scan.accountedPatterns || {}));
+  const badScan = !aiList || !accountedRx;
+  if (badScan) unlisted.push('config: a vendorScan pattern is not allowed (no + * {, at most 40 characters)');
+  const aiRx = !badScan && aiList.length ? { test: (t) => aiList.some((r) => r.test(String(t).slice(0, 200))) } : null;
   const vaultMatched = new Map();   // accounted-pattern reason -> count, for the page
   if (vendors.length || aiRx) {
     if (!inp.vaultItems) unread.push('vault item list (vault locked?)');
     else if (aiRx) for (const name of new Set(inp.vaultItems.filter((i) => aiRx.test(i.name) || i.hosts.some((h) => aiRx.test(h))).map((i) => i.name))) {
       if (accountedNames.has(name)) continue;
-      const hit = Object.keys(scan.accountedPatterns || {}).find((p, j) => accountedRx[j].test(name));
+      const hit = Object.keys(scan.accountedPatterns || {}).find((p, j) => accountedRx[j].test(name.slice(0, 200)));
       if (hit) { const why = scan.accountedPatterns[hit]; vaultMatched.set(why, (vaultMatched.get(why) || 0) + 1); continue; }
       unlisted.push(`vault:${safeName(name)}`);
     }

@@ -42,7 +42,7 @@ Each night it reads what is listed and what is reachable, and probes every liste
 | Nebius | `GET /v1/models` with the vault item "Nebius Token Factory API key (palace)" | through the gateway |
 | Azure Speech | (fixed list) | One sentence synthesized in each TTS voice, then the Dragon HD audio transcribed. Key: the vault item "Azure Speech westus (speech-to-cli)". |
 | Local | running user and system units and docker containers whose names look like a model server; katana's ollama tags | the host feed's state (fresh within 15 min); the embedder's `/health`; openWakeWord's Wyoming `describe` |
-| AI vendors (keys in the vault) | the vault's item **names**: every item holding a password whose name or URI host matches `vendorScan.patterns` (AssemblyAI, NVIDIA, Gemini, fal, Deepgram, ElevenLabs and about 60 more) | one free authenticated call per `vendors` row, with that row's key in its configured header: a read-only list (AssemblyAI transcripts, Gemini models, fal models, Speech voices, Foundry deployments) or two output tokens (Featherless, NVIDIA). Each endpoint was shown to refuse a bogus key before it was trusted as an instrument. One retry. |
+| AI vendors (keys in the vault) | the vault's item **names**: every item holding a password whose name or URI host matches `vendorScan.patterns` (AssemblyAI, NVIDIA, Gemini, fal, Deepgram, ElevenLabs and about 60 more) | one free authenticated call per `vendors` row, with that row's key in its configured header: a read-only list (AssemblyAI transcripts, Gemini models, fal models, Speech voices, Foundry deployments) or two output tokens (Featherless, NVIDIA). Before each probe the same request goes out with an invalid credential and must be refused (400/401/403, free); an endpoint that answers anyone fails as `accepts a bad key`. The answer must have the configured array. A GET gets one retry; a POST never (no second charge). Redirects are refused, so a key never follows one to another host. |
 
 **The vault is read only when it is already unlocked.** It never prompts. A locked vault means that source is "not read" (warn), never a popup at 04:50. `bw` can take about 30 s, so the read is allowed 90 s. Both vault items now have this check as one more reader.
 
@@ -51,6 +51,8 @@ Each night it reads what is listed and what is reachable, and probes every liste
 - The search space is the pattern list. A vendor whose name and URI match none of the patterns is not seen; add its name to `patterns` when you add its key.
 - A row with `"probe": null` (IBM Bob: no free read-only call) is listed with `reachable: null` and its reason, and never counts as dead.
 - `vendorsWithoutKey` lists the vendors asked about that have no key (Deepgram, ElevenLabs, Groq, …) so the page answers "is X missing?" too.
+- A Foundry row may use the az login's Entra token instead of a vault key (inner-auth-resource, whose vault key is stale); the token goes only to `*.cognitiveservices.azure.com`, as a bearer.
+- `vendorScan` patterns are a restricted language (no `+`, `*` or `{`, at most 40 characters), so a pattern cannot hang the check; one outside it fails as config.
 - Only item names leave the vault listing; passwords are dropped as the list is read, and a name that looks like a secret prints as `(unrecognized name)`.
 
 **Policy built in:**

@@ -1297,8 +1297,11 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
   else if (ca === 'group-writable') { writeFileSync(caPath, pem); chmodSync(caPath, 0o664); }
   else if (ca === 'symlink') { writeFileSync(join(d, 'other.pem'), pem); symlinkSync(join(d, 'other.pem'), caPath); }
   else if (ca === 'open-dir') { writeFileSync(caPath, pem, { mode: 0o644 }); chmodSync(join(d, '.config'), 0o777); }
-  const hits = [], vendorHeaders = [];
+  const hits = [], vendorHeaders = [], stolen = [];
   const png = await fmPng();
+  const thief = createServer((q, s) => { stolen.push(q.headers); s.end('{"models":[{"id":"x"}]}'); });
+  await new Promise((r) => thief.listen(0, '127.0.0.1', r));
+  const redirectTo = `http://127.0.0.1:${thief.address().port}`;
   const srv = createServer((q, s) => {
     hits.push(q.url);
     if (q.url.startsWith('/vendor')) vendorHeaders.push({ ...q.headers, method: q.method });
@@ -1316,7 +1319,12 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
       if (q.url.startsWith('/stt')) return s.end(JSON.stringify({ RecognitionStatus: 'Success', DisplayText: 'The forge is lit.' }));
       if (q.url.startsWith('/katana')) return s.end(JSON.stringify({ models: [{ name: 'qwen3.5:9b-q4_K_M' }] }));
       if (q.url.startsWith('/health')) return s.end('{"status":"ok"}');
+      const badKey = JSON.stringify(q.headers).includes('forge-models-invalid-key');
+      if (q.url.startsWith('/vendor-any')) return s.end(JSON.stringify({ models: [{ id: 'm' }] }));   // answers anyone: not an instrument
+      if (badKey) { s.statusCode = 401; return s.end('{}'); }
       if (q.url.startsWith('/vendor-401')) { s.statusCode = 401; return s.end('{"error":"Bearer sk-CANARY77 rejected"}'); }
+      if (q.url.startsWith('/vendor-obj')) return s.end(JSON.stringify({ choices: {}, transcripts: {} }));
+      if (q.url.startsWith('/vendor-redirect')) { s.statusCode = 302; s.setHeader('Location', `${redirectTo}/stolen`); return s.end(); }
       if (q.url.startsWith('/vendor')) return s.end(JSON.stringify({ transcripts: [], choices: [{ message: { content: 'ok' } }] }));
       s.statusCode = 404; s.end();
     });
@@ -1349,8 +1357,8 @@ for a; do case "$prev" in --model) m=$a;; esac; prev=$a; done; echo "{\\"is_erro
   const env = { PATH: `${bin}:${process.env.PATH}`, HOME: d, CHECK_FM_HOME: d, CHECK_FM_PLAN: join(d, 'forge'), CHECK_FM_CONFIG: join(d, 'cfg.json'),
     CHECK_FM_URLS: JSON.stringify(urls), CHECK_FM_PACE_MS: '0', CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW), ...extraEnv };
   const out = await new Promise((res) => execFile('node', [join(C, 'forge-models.mjs')], { env, encoding: 'utf8', timeout: 60_000 }, (e, so) => res(so)));
-  srv.close();
-  return { out, calls: readFileSync(log, 'utf8'), hits, vendorHeaders, direct: existsSync(join(d, 'forge', 'direct.json')) ? JSON.parse(readFileSync(join(d, 'forge', 'direct.json'), 'utf8')) : null };
+  srv.close(); thief.close();
+  return { out, calls: readFileSync(log, 'utf8'), hits, vendorHeaders, stolen, direct: existsSync(join(d, 'forge', 'direct.json')) ? JSON.parse(readFileSync(join(d, 'forge', 'direct.json'), 'utf8')) : null };
 }
 const DEPLOYS = [{ id: 'gpt-6.1-sol', model: 'gpt-6.1-sol', status: 'succeeded' }, { id: 'gpt-image-1.5', model: 'gpt-image-1.5', status: 'succeeded' }];
 
@@ -1464,10 +1472,11 @@ test('forge-models vendors: a locked vault warns (not read), it does not fail ev
   assert.match(r.line, /^CHECK forge-models warn · .*not read: vault item list \(vault locked\?\), vendor keys \(vault locked\?\)/);
 });
 
-test('forge-models vendors: a vault name that looks like a secret is never printed', () => {
-  const r = fm(fmV({ vaultItems: [...FM_VAULT, { name: 'openai sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', hosts: [] }] }), {}, FM_VCFG);
+test('forge-models vendors: a vault name shaped like a credential is not printed (long, prefixed, short, or split by punctuation)', () => {
+  const canaries = ['openai sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 'openai sk-abcdefghijklmnopqrstuv', 'openai key abcd1234efgh5678ijkl', 'openai nvapi-q9w8e7r6t5'];
+  const r = fm(fmV({ vaultItems: [...FM_VAULT, ...canaries.map((name) => ({ name, hosts: [] }))] }), {}, FM_VCFG);
   assert.match(r.line, /vault:\(unrecognized name\)/);
-  assert.doesNotMatch(r.line + JSON.stringify(r.direct), /AAAAAAAAAAAAAAAAAAAAAAAA/);
+  for (const c of canaries) assert.ok(!(r.line + JSON.stringify(r.direct)).includes(c.split(' ').pop()), c);
 });
 
 test('forge-models vendors: vendorSpec takes https only (no credentials in the URL), a plain header, a known scheme and shape', async () => {
@@ -1499,8 +1508,11 @@ test('forge-models collect: vendor keys go in the configured header only, never 
       probe: { url: `${base}/vendor/entra`, header: 'Authorization', scheme: 'Bearer ', expect: 'transcripts', allowEmpty: true, auth: 'entra' } },
   ];
   const r = await fmCollect({ deployments: DEPLOYS, vendors, vaultList });
-  assert.equal(r.vendorHeaders[0].authorization, 'testkey123');
-  assert.equal(r.vendorHeaders.find((h) => h.method === 'POST').authorization, 'Bearer testkey123');
+  const real = (h) => !JSON.stringify(h).includes('forge-models-invalid-key');
+  assert.equal(r.vendorHeaders.filter(real)[0].authorization, 'testkey123');
+  assert.equal(r.vendorHeaders.filter((h) => !real(h)).length, 3, 'one invalid-credential control per vendor');
+  assert.equal(r.vendorHeaders.filter((h) => h.method === 'POST' && real(h)).length, 1, 'a failed POST is never retried (r1.2)');
+  assert.equal(r.vendorHeaders.find((h) => h.method === 'POST' && real(h)).authorization, 'Bearer testkey123');
   assert.equal(r.vendorHeaders.filter((h) => h.authorization === 'Bearer tokentokentokentokentoken0123').length, 1);   // the Entra row, and only it
   const fd = r.direct.models.find((m) => m.name === 'fd');
   assert.deepEqual([fd.reachable, fd.auth, fd.vault], [true, 'entra', undefined]);
@@ -1510,6 +1522,49 @@ test('forge-models collect: vendor keys go in the configured header only, never 
   assert.doesNotMatch(r.out, /CANARY|unlisted: .*vault:/);
   assert.doesNotMatch(JSON.stringify(r.direct), /PW-SECRET|testkey123/);
   assert.equal(r.direct.models[0].reachable, true);
+});
+
+test('forge-models collect: an endpoint that answers any key, a wrong shape, and a redirect are all refused (r1.3, r1.6)', async () => {
+  const vaultList = [{ type: 1, name: 'assemblyai-api-key', login: { password: 'PW', uris: [] } }];
+  const mk = (id, path, method) => ({ id, label: id, provider: 'p', modality: ['llm'], policy: 'vendor-direct', vault: 'assemblyai-api-key', instrument: 'x',
+    probe: { url: `BASE${path}`, header: 'x-api-key', scheme: '', expect: id === 'obj' ? 'choices' : 'models', ...(method === 'POST' ? { body: { m: 1 } } : {}) } });
+  const vendors = (base) => [mk('any', '/vendor-any', 'GET'), mk('obj', '/vendor-obj', 'POST'), mk('redir', '/vendor-redirect', 'GET')]
+    .map((v) => ({ ...v, probe: { ...v.probe, url: v.probe.url.replace('BASE', base) } }));
+  const r = await fmCollect({ deployments: DEPLOYS, vendors, vaultList });
+  assert.match(r.out, /any \(accepts a bad key\)/);
+  assert.match(r.out, /obj \(bad answer\)/);
+  assert.match(r.out, /redir \(no answer\)/);
+  assert.equal(r.stolen.length, 0, 'a redirect carried a credential to another host');
+  assert.doesNotMatch(r.calls, /testkey123|PW/);
+});
+
+test('forge-models vendors: the shipped forge-direct.json is well formed (r1.1)', async () => {
+  const { vendorSpec, scanPatterns } = await import(join(C, 'forge-models.mjs'));
+  const cfg = JSON.parse(readFileSync(join(C, 'forge-direct.json'), 'utf8'));
+  assert.equal(cfg.vendors[0].id, 'assemblyai', 'AssemblyAI first (JP 07:43)');
+  assert.equal(new Set(cfg.vendors.map((v) => v.id)).size, cfg.vendors.length);
+  const modal = new Set(['stt', 'tts', 'llm', 'embeddings', 'vision', 'image', 'video']);
+  const accounted = new Set(Object.values(cfg.vendorScan.accountedNames).flat());
+  for (const v of cfg.vendors) {
+    assert.ok(/^[a-z0-9-]{1,40}$/.test(v.id) && v.label && v.provider && v.policy, v.id);
+    assert.ok(Array.isArray(v.modality) && v.modality.length && v.modality.every((m) => modal.has(m)), `${v.id} modality`);
+    if (v.probe === null) { assert.ok(v.why && v.vault, `${v.id}: an unprobed row says why`); continue; }
+    const spec = vendorSpec(v.probe);
+    assert.ok(spec, `${v.id}: probe spec`);
+    assert.ok(spec.auth === 'entra' ? !v.vault : !!v.vault, `${v.id}: a key row names its vault item, an Entra row none`);
+    if (v.vault) assert.ok(!accounted.has(v.vault), `${v.id}: listed and accounted at once`);
+    if (v.probe.body) assert.ok(v.probe.body.max_tokens <= 2, `${v.id}: an inference probe stays tiny`);
+  }
+  assert.ok(scanPatterns(cfg.vendorScan.patterns) && scanPatterns(Object.keys(cfg.vendorScan.accountedPatterns)));
+  assert.ok(cfg.vendorsWithoutKey.every((x) => typeof x.vendor === 'string' && typeof x.status === 'string'));
+});
+
+test('forge-models vendors: a vendorScan pattern outside the restricted language fails as config, never hangs', () => {
+  for (const bad of ['(a+)+$', 'x{2,}', '[', '\\d']) {
+    const cfg = { ...FM_VCFG, vendorScan: { ...FM_VCFG.vendorScan, patterns: [...FM_VCFG.vendorScan.patterns, bad] } };
+    const r = fm(fmV({ vaultItems: [...FM_VAULT, { name: 'a'.repeat(5000) + '!', hosts: [] }] }), {}, cfg);
+    assert.match(r.line, /^CHECK forge-models fail · .*config: a vendorScan pattern is not allowed/, bad);
+  }
 });
 
 test('forge-models: a world-writable HOME refuses publication (r2.5)', () => {

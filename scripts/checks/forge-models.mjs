@@ -23,8 +23,9 @@
 import { readFileSync, writeFileSync, renameSync, existsSync, lstatSync, statSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { connect } from 'node:net';
+import { inflateSync, crc32 } from 'node:zlib';
 import { join, dirname, sep } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -218,13 +219,37 @@ export async function collect() {
   inp.wake = await describe(CFG.local.find((l) => l.wyoming)?.wyoming);
   return inp;
 }
-// An image file (r6.2): a PNG, JPEG or WebP signature and some size, not any 1000 bytes.
+// An image (r6.2/r7.1): gpt-image answers PNG, so only a PNG that decodes counts: the signature, every chunk
+// inside the file with a correct CRC, a valid IHDR first (16–8192 px, a legal depth/colour pair, no
+// compression or filter variants), IDAT data that inflates to exactly height × (1 + row bytes), IEND last.
 export function isImage(b) {
-  if (!Buffer.isBuffer(b) || b.length < 1000) return false;
-  const png = b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) && b.toString('latin1', 12, 16) === 'IHDR';
-  const jpeg = b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff && b[b.length - 2] === 0xff && b[b.length - 1] === 0xd9;
-  const webp = b.toString('latin1', 0, 4) === 'RIFF' && b.toString('latin1', 8, 12) === 'WEBP';
-  return png || jpeg || webp;
+  try {
+    if (!Buffer.isBuffer(b) || b.length < 57 || !b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return false;
+    let off = 8, ihdr = null, idat = [], ended = false;
+    while (off + 12 <= b.length) {
+      const len = b.readUInt32BE(off), type = b.toString('latin1', off + 4, off + 8), end = off + 12 + len;
+      if (len > b.length || end > b.length) return false;
+      if (crc32(b.subarray(off + 4, off + 8 + len)) !== b.readUInt32BE(off + 8 + len)) return false;
+      const d = b.subarray(off + 8, off + 8 + len);
+      if (!ihdr && type !== 'IHDR') return false;
+      if (type === 'IHDR') {
+        if (ihdr || len !== 13) return false;
+        ihdr = { w: d.readUInt32BE(0), h: d.readUInt32BE(4), depth: d[8], color: d[9], comp: d[10], filter: d[11], lace: d[12] };
+      } else if (type === 'IDAT') idat.push(d);
+      else if (type === 'IEND') { ended = end === b.length; break; }
+      off = end;
+    }
+    if (!ihdr || !ended || !idat.length) return false;
+    const { w, h, depth, color, comp, filter, lace } = ihdr;
+    const legal = { 0: [1, 2, 4, 8, 16], 2: [8, 16], 3: [1, 2, 4, 8], 4: [8, 16], 6: [8, 16] };
+    if (w < 16 || h < 16 || w > 8192 || h > 8192 || !legal[color]?.includes(depth) || comp !== 0 || filter !== 0 || lace !== 0) return false;
+    const channels = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[color];
+    const raw = inflateSync(Buffer.concat(idat), { maxOutputLength: 256 << 20 });
+    const row = Math.ceil((w * channels * depth) / 8);
+    if (raw.length !== h * (1 + row)) return false;
+    for (let y = 0; y < h; y++) if (raw[y * (1 + row)] > 4) return false;   // each row's filter type is 0–4
+    return true;
+  } catch { return false; }
 }
 
 // A WAV that a player would play (r4.1/r5): RIFF/WAVE whose declared size fits the buffer, a consistent PCM
@@ -233,11 +258,16 @@ export function isImage(b) {
 export function playableWav(b) {
   if (!Buffer.isBuffer(b) || b.length < 44 || b.toString('latin1', 0, 4) !== 'RIFF' || b.toString('latin1', 8, 12) !== 'WAVE') return false;
   const riff = b.readUInt32LE(4);
-  if (riff < 36 || riff + 8 > b.length) return false;
-  const end = riff + 8;   // chunks live inside the declared RIFF container, not the buffer (r5.1)
+  // A streaming writer (gpt-audio-mini, measured 2026-11-17) declares the RIFF and data sizes as
+  // 0xFFFFFFFF, "unknown": then the container is the file. Any other size must fit (r5.1).
+  const STREAM = 0xffffffff;
+  if (riff !== STREAM && (riff < 36 || riff + 8 > b.length)) return false;
+  const end = riff === STREAM ? b.length : riff + 8;   // chunks live inside the declared RIFF container
   let fmt = null, off = 12;
   while (off + 8 <= end) {
-    const id = b.toString('latin1', off, off + 4), size = b.readUInt32LE(off + 4), body = off + 8;
+    const id = b.toString('latin1', off, off + 4), body = off + 8;
+    let size = b.readUInt32LE(off + 4);
+    if (id === 'data' && size === STREAM && riff === STREAM) size = end - body;   // streamed: the rest of the file
     if (body + size > end) return false;
     if (id === 'fmt ') {
       if (size < 16) return false;
@@ -247,7 +277,7 @@ export function playableWav(b) {
       if (!fmt || fmt.tag !== 1 || fmt.ch < 1 || fmt.ch > 2 || fmt.rate < 8000 || fmt.rate > 48000 || ![8, 16, 24].includes(fmt.bits)) return false;
       // PCM consistency (r5.2): a block is one sample per channel, and the byte rate follows from it
       if (fmt.align !== fmt.ch * (fmt.bits / 8) || fmt.byteRate !== fmt.rate * fmt.align) return false;
-      return size % fmt.align === 0 && size >= fmt.byteRate / 10;
+      return (riff === STREAM || size % fmt.align === 0) && size >= fmt.byteRate / 10;   // a stream may end mid-block
     }
     off = body + size + (size & 1);
   }
@@ -273,8 +303,14 @@ function describe(port) {   // Wyoming describe → the wake word names, or null
       const nl = buf.indexOf('\n'); if (nl < 0) return;
       const hdr = json(buf.slice(0, nl)); const need = hdr?.data_length || 0;
       if (buf.length - nl - 1 < need) return;
-      const data = need ? json(buf.slice(nl + 1, nl + 1 + need)) : hdr?.data;
-      settle(Array.isArray(data?.wake) ? data.wake.flatMap((p) => (p.models || []).map((m) => String(m.name))) : null);
+      // every nested entry is checked, and nothing here can throw out of the socket callback (r7.2)
+      try {
+        const data = need ? json(buf.slice(nl + 1, nl + 1 + need)) : hdr?.data;
+        const wake = data?.wake;
+        const ok = Array.isArray(wake) && wake.every((p) => p && typeof p === 'object' && Array.isArray(p.models)
+          && p.models.every((m) => m && typeof m === 'object' && typeof m.name === 'string'));
+        settle(ok ? wake.flatMap((p) => p.models.map((m) => m.name)) : null);
+      } catch { settle(null); }
     });
   });
 }
@@ -392,15 +428,29 @@ export function judge(cfg, inp, nowMs) {
 // Threat model: every directory checked is this user's and writable by no one else, so only this
 // uid could swap one between the check and the rename, and that uid already owns the file outright;
 // Node has no openat(), so a descriptor-anchored publish is not available here.
+// this user's primary group when it is a private one (named for the user, no listed members); else null
+function privateGroup() {
+  try {
+    const gid = process.getgid(), user = userInfo().username;   // from the passwd entry, not the environment
+    const line = readFileSync('/etc/group', 'utf8').split('\n').find((l) => l.split(':')[2] === String(gid));
+    const [name, , , members = ''] = (line || '').split(':');
+    return line && name === user && (members === '' || members === user) ? gid : null;
+  } catch { return null; }
+}
+
 export function publish(doc, out, home = HOME) {
   const dir = dirname(out);
   if (!dir.startsWith(home + sep)) throw Object.assign(new Error('outside home'), { code: 'EPATH' });
   const chain = [];
   for (let p = dir; p.length >= home.length; p = dirname(p)) { chain.push(p); if (p === home) break; }
   const uid = process.getuid();
+  const solo = privateGroup();
   const ids = chain.map((p) => {
     const st = lstatSync(p);
-    if (st.isSymbolicLink() || !st.isDirectory() || st.uid !== uid || (st.mode & 0o022)) throw Object.assign(new Error('unsafe path'), { code: 'EPATH' });
+    // group write is allowed only for this user's own private group (no other members): Ubuntu's
+    // user-private-group umask makes ~/srv 775, and nobody else is in that group (r2.5 kept for others)
+    const groupOk = !(st.mode & 0o020) || (solo !== null && st.gid === solo);
+    if (st.isSymbolicLink() || !st.isDirectory() || st.uid !== uid || (st.mode & 0o002) || !groupOk) throw Object.assign(new Error('unsafe path'), { code: 'EPATH' });
     return `${st.dev}:${st.ino}`;
   });
   const tmp = join(dir, `.direct.${process.pid}.tmp`);

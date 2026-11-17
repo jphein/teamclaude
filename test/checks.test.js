@@ -1208,10 +1208,32 @@ test('forge-models: direct.json is not written through a symlinked parent, and a
   assert.equal(JSON.parse(readFileSync(join(d2, 'forge', 'direct.json'), 'utf8')).schema, 'forge.direct/v1');
 });
 
-// a PNG-signed body of some size (isImage checks the signature and IHDR, not the pixels)
-function fmPng() {
-  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]), Buffer.from('IHDR', 'latin1'), Buffer.alloc(2000, 5)]);
+// a real 32×32 RGB PNG, built here (signature, IHDR, IDAT, IEND, each with its CRC)
+async function fmPng({ w = 32, h = 32 } = {}) {
+  const { deflateSync, crc32 } = await import('node:zlib');
+  const chunk = (type, data) => { const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const td = Buffer.concat([Buffer.from(type, 'latin1'), data]); const c = Buffer.alloc(4); c.writeUInt32BE(crc32(td)); return Buffer.concat([len, td, c]); };
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 2;
+  const raw = Buffer.alloc(h * (1 + w * 3), 0x40); for (let y = 0; y < h; y++) raw[y * (1 + w * 3)] = 0;
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', ihdr), chunk('IDAT', deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
 }
+
+test('forge-models: isImage decodes a real PNG and refuses signature-only or broken ones (r7.1)', async () => {
+  const { isImage } = await import(join(C, 'forge-models.mjs'));
+  const good = await fmPng();
+  assert.equal(isImage(good), true);
+  const flip = (i) => { const b = Buffer.from(good); b[i] ^= 0xff; return b; };
+  const bad = [
+    Buffer.concat([good.subarray(0, 8), Buffer.from([0, 0, 0, 13]), Buffer.from('IHDR', 'latin1'), Buffer.alloc(2000, 5)]),   // the round-6 fixture
+    good.subarray(0, good.length - 12),                       // no IEND
+    flip(20),                                                 // IHDR damaged: CRC fails
+    flip(good.length - 20),                                   // IDAT damaged
+    Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.alloc(2000, 1), Buffer.from([0xff, 0xd9])]),   // a JPEG-shaped blob
+    Buffer.concat([Buffer.from('RIFF\0\0\0\0WEBP', 'latin1'), Buffer.alloc(2000, 1)]),                   // a WebP-shaped blob
+    await fmPng({ w: 4, h: 4 }),                              // too small to be an answer
+  ];
+  for (const [i, b] of bad.entries()) assert.equal(isImage(b), false, `case ${i}`);
+});
 
 // a real 16 kHz mono 16-bit PCM WAV of 0.2 s
 function fmWav({ rate = 16000, seconds = 0.2 } = {}) {
@@ -1226,6 +1248,11 @@ function fmWav({ rate = 16000, seconds = 0.2 } = {}) {
 test('forge-models: playableWav accepts a real PCM WAV and refuses broken ones (r4.1)', async () => {
   const { playableWav } = await import(join(C, 'forge-models.mjs'));
   assert.equal(playableWav(fmWav()), true);
+  // a streamed WAV as gpt-audio-mini sends it: RIFF and data sizes 0xFFFFFFFF, 24 kHz mono 16-bit
+  const streamed = fmWav({ rate: 24000 }); streamed.writeUInt32LE(0xffffffff, 4); streamed.writeUInt32LE(0xffffffff, 40);
+  assert.equal(playableWav(streamed), true);
+  const halfStream = fmWav(); halfStream.writeUInt32LE(0xffffffff, 40);   // data streamed but RIFF sized: inconsistent
+  assert.equal(playableWav(halfStream), false);
   const bad = [
     Buffer.concat([Buffer.from('RIFF\0\0\0\0WAVE', 'latin1'), Buffer.alloc(3000, 1)]),   // the round-3 fixture: no size, no chunks
     fmWav({ seconds: 0.01 }),                                                               // too short to be an answer
@@ -1250,12 +1277,13 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
   const key = 'tc-' + 'a'.repeat(48);
   writeFileSync(join(d, '.config/teamclaude-client/forge-check.settings.json'), JSON.stringify({ env: { HTTPS_PROXY: `http://${key}:${key}@127.0.0.1:3456` } }), { mode: 0o600 });
   const hits = [];
+  const png = await fmPng();
   const srv = createServer((q, s) => {
     hits.push(q.url);
     let b = '';
     q.on('data', (c) => { b += c; });
     q.on('end', () => {
-      if (q.url.startsWith('/foundry/openai/v1/images')) return s.end(image ?? JSON.stringify({ data: [{ b64_json: fmPng().toString('base64') }] }));
+      if (q.url.startsWith('/foundry/openai/v1/images')) return s.end(image ?? JSON.stringify({ data: [{ b64_json: png.toString('base64') }] }));
       if (q.url.startsWith('/foundry/openai/deployments/')) {
         const wav = fmWav().toString('base64');
         return s.end(audio ?? JSON.stringify({ choices: [{ message: { audio: { data: wav } } }] }));
@@ -1343,11 +1371,18 @@ test('forge-models collect: a gateway error text is reduced to a fixed word', as
 });
 
 
-test('forge-models: a group-writable HOME refuses publication (r2.5)', () => {
-  const d = fresh(); mkdirSync(join(d, 'forge'), { mode: 0o700 }); chmodSync(d, 0o775);
+test('forge-models: a world-writable HOME refuses publication (r2.5)', () => {
+  const d = fresh(); mkdirSync(join(d, 'forge'), { mode: 0o700 }); chmodSync(d, 0o777);
   writeFileSync(join(d, 'cfg.json'), JSON.stringify(FM_CFG)); writeFileSync(join(d, 'in.json'), JSON.stringify(fmIn()));
   const r = run('forge-models.sh', { CHECK_FM_HOME: d, CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW) });
   chmodSync(d, 0o700);
+  // group write by this user's own private group (Ubuntu's 775 ~/srv) is allowed; the test host's
+  // group is private when /etc/group lists it for this user with no members
+  chmodSync(d, 0o770);
+  const r2 = run('forge-models.sh', { CHECK_FM_HOME: d, CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW) });
+  chmodSync(d, 0o700);
+  const own = readFileSync('/etc/group', 'utf8').split('\n').find((l) => l.split(':')[2] === String(process.getgid())) || '';
+  if (own.split(':')[0] === process.env.USER && ['', process.env.USER].includes(own.split(':')[3])) assert.doesNotMatch(r2.line, /not written/);
   assert.match(r.line, /^CHECK forge-models warn · .*direct\.json not written \(EPATH\)/);   // never ok while the page goes stale (r3.3)
 });
 
@@ -1406,4 +1441,17 @@ test('forge-models collect: a 200 that is not an image, or a TTS 200 that is not
   assert.match(img.out, /^fail\t.*foundry:gpt-image-1\.5 \(bad answer\)/);
   const tts = await fmCollect({ deployments: DEPLOYS, tts: Buffer.from('<html>' + 'x'.repeat(2000) + '</html>') });
   assert.match(tts.out, /^fail\t.*en-US-Ava:DragonHDLatestNeural \(bad answer\)/);
+});
+
+
+test('forge-models collect: malformed Wyoming wake data is no answer, never a crash (r7.2)', { timeout: 150_000 }, async () => {
+  const { createServer: tcp } = await import('node:net');
+  for (const data of [{ wake: [{ models: {} }] }, { wake: [null] }, { wake: [{ models: [null] }] }, { wake: [{ models: [{ name: 5 }] }] }]) {
+    const body = JSON.stringify(data);
+    const srv = tcp((c) => { c.on('error', () => {}); c.write(JSON.stringify({ type: 'info', data_length: body.length }) + '\n' + body); });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const r = await fmCollect({ deployments: DEPLOYS, wyomingPort: srv.address().port });
+    srv.close();
+    assert.match(r.out ?? '', /^fail\t.*openwakeword \(no answer\)/, JSON.stringify(data));
+  }
 });

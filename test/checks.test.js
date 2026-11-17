@@ -1227,6 +1227,9 @@ test('forge-models: playableWav accepts a real PCM WAV and refuses broken ones (
     (() => { const b = fmWav(); b.writeUInt16LE(3, 20); return b; })(),                    // not PCM
     (() => { const b = fmWav(); b.writeUInt32LE(9_999_999, 40); return b; })(),            // data larger than the file
     (() => { const b = fmWav(); b.write('junk', 12, 'latin1'); return b; })(),             // no fmt chunk
+    (() => { const b = fmWav(); b.writeUInt32LE(36, 4); return b; })(),                   // RIFF ends before the audio (r5.1)
+    (() => { const b = fmWav(); b.writeUInt32LE(0, 28); return b; })(),                    // byte rate 0 (r5.2)
+    (() => { const b = fmWav(); b.writeUInt16LE(0, 32); return b; })(),                    // block align 0 (r5.2)
     Buffer.alloc(0),
   ];
   for (const [i, b] of bad.entries()) assert.equal(playableWav(b), false, `case ${i}`);
@@ -1361,7 +1364,9 @@ test('forge-models collect: an empty or non-WAV audio answer, or a bad image ans
 });
 
 
-test('forge-models collect: a Wyoming peer that closes early or sends half an answer does not hang the check (r4.2)', async () => {
+// bounded twice (r5.3): fmCollect's child is killed after 60 s (its output is then not a verdict, so the
+// match fails), and the runner itself stops this test after 150 s
+test('forge-models collect: a Wyoming peer that closes early or sends half an answer does not hang the check (r4.2)', { timeout: 150_000 }, async () => {
   for (const mode of ['eof', 'truncated']) {
     const { createServer: tcp } = await import('node:net');
     const srv = tcp((c) => { if (mode === 'truncated') c.write('{"type": "info", "data_length": 500}\n{"wa'); c.end(); });
@@ -1369,6 +1374,7 @@ test('forge-models collect: a Wyoming peer that closes early or sends half an an
     const t0 = Date.now();
     const r = await fmCollect({ deployments: DEPLOYS, wyomingPort: srv.address().port });
     srv.close();
+    assert.equal(typeof r.out, 'string', `${mode}: the collector was killed at its deadline`);
     assert.ok(Date.now() - t0 < 30_000, mode);
     assert.match(r.out, /^fail\t.*openwakeword \(no answer\)/, mode);
   }

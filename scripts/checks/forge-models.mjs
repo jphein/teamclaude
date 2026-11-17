@@ -217,25 +217,27 @@ export async function collect() {
   inp.wake = await describe(CFG.local.find((l) => l.wyoming)?.wyoming);
   return inp;
 }
-// A WAV that a player would play (r4.1): RIFF/WAVE whose size fits, a PCM `fmt ` chunk (1–2 channels,
-// 8–48 kHz, 8/16/24-bit) and a `data` chunk of at least 0.1 s that fits in the file.
+// A WAV that a player would play (r4.1/r5): RIFF/WAVE whose declared size fits the buffer, a consistent PCM
+// `fmt ` chunk (1–2 channels, 8–48 kHz, 8/16/24-bit) and a whole-block `data` chunk of at least 0.1 s, all
+// inside the declared container.
 export function playableWav(b) {
   if (!Buffer.isBuffer(b) || b.length < 44 || b.toString('latin1', 0, 4) !== 'RIFF' || b.toString('latin1', 8, 12) !== 'WAVE') return false;
   const riff = b.readUInt32LE(4);
   if (riff < 36 || riff + 8 > b.length) return false;
+  const end = riff + 8;   // chunks live inside the declared RIFF container, not the buffer (r5.1)
   let fmt = null, off = 12;
-  while (off + 8 <= b.length) {
+  while (off + 8 <= end) {
     const id = b.toString('latin1', off, off + 4), size = b.readUInt32LE(off + 4), body = off + 8;
-    if (body + size > b.length && id !== 'data') return false;
+    if (body + size > end) return false;
     if (id === 'fmt ') {
       if (size < 16) return false;
-      fmt = { tag: b.readUInt16LE(body), ch: b.readUInt16LE(body + 2), rate: b.readUInt32LE(body + 4), bits: b.readUInt16LE(body + 14) };
+      fmt = { tag: b.readUInt16LE(body), ch: b.readUInt16LE(body + 2), rate: b.readUInt32LE(body + 4), byteRate: b.readUInt32LE(body + 8),
+        align: b.readUInt16LE(body + 12), bits: b.readUInt16LE(body + 14) };
     } else if (id === 'data') {
       if (!fmt || fmt.tag !== 1 || fmt.ch < 1 || fmt.ch > 2 || fmt.rate < 8000 || fmt.rate > 48000 || ![8, 16, 24].includes(fmt.bits)) return false;
-      const bytesPerSec = fmt.rate * fmt.ch * (fmt.bits / 8);
-      // a streaming writer may put 0xFFFFFFFF here; then the audio is what the file holds
-      const have = size === 0xffffffff ? b.length - body : Math.min(size, b.length - body);
-      return size !== 0 && (size === 0xffffffff || body + size <= b.length) && have >= bytesPerSec / 10;
+      // PCM consistency (r5.2): a block is one sample per channel, and the byte rate follows from it
+      if (fmt.align !== fmt.ch * (fmt.bits / 8) || fmt.byteRate !== fmt.rate * fmt.align) return false;
+      return size % fmt.align === 0 && size >= fmt.byteRate / 10;
     }
     off = body + size + (size & 1);
   }

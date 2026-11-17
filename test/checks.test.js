@@ -1297,7 +1297,7 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
   else if (ca === 'group-writable') { writeFileSync(caPath, pem); chmodSync(caPath, 0o664); }
   else if (ca === 'symlink') { writeFileSync(join(d, 'other.pem'), pem); symlinkSync(join(d, 'other.pem'), caPath); }
   else if (ca === 'open-dir') { writeFileSync(caPath, pem, { mode: 0o644 }); chmodSync(join(d, '.config'), 0o777); }
-  const hits = [], vendorHeaders = [], stolen = [];
+  const hits = [], vendorHeaders = [], stolen = [], vendorDrops = { n: 0 };
   const png = await fmPng();
   const thief = createServer((q, s) => { stolen.push(q.headers); s.end('{"models":[{"id":"x"}]}'); });
   await new Promise((r) => thief.listen(0, '127.0.0.1', r));
@@ -1323,6 +1323,7 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
       const badKey = !/(^| )(Bearer |Key )?(testkey123|tokentokentokentokentoken0123)( |$)/.test(sent);   // only the real credential is accepted
       if (q.url.startsWith('/vendor-any')) return s.end(JSON.stringify({ models: [{ id: 'm' }] }));   // answers anyone: not an instrument
       if (q.url.startsWith('/vendor-shape')) { if (/forge-models-invalid-key/.test(sent)) { s.statusCode = 400; return s.end('{}'); } return s.end(JSON.stringify({ models: [{ id: 'm' }] })); }   // checks format only (r2.1)
+      if (q.url.startsWith('/vendor-drop')) { if (badKey && vendorDrops.n++ < (q.url.startsWith('/vendor-drop-once') ? 1 : 1e9)) return s.destroy(); }   // a reset, not an answer
       if (badKey) { s.statusCode = 401; return s.end('{}'); }
       if (q.url.startsWith('/vendor-401')) { s.statusCode = 401; return s.end('{"error":"Bearer sk-CANARY77 rejected"}'); }
       if (q.url.startsWith('/vendor-obj')) return s.end(JSON.stringify({ choices: {}, transcripts: {} }));
@@ -1539,6 +1540,20 @@ test('forge-models collect: an endpoint that answers any key, a wrong shape, and
   assert.match(r.out, /redir \(no answer\)/);
   assert.equal(r.stolen.length, 0, 'a redirect carried a credential to another host');
   assert.doesNotMatch(r.calls, /testkey123|PW/);
+});
+
+test('forge-models collect: a control that gets no answer is "no answer", never "accepts a bad key"; a GET control is retried once', async () => {
+  const vaultList = [{ type: 1, name: 'assemblyai-api-key', login: { password: 'PW', uris: [] } }];
+  const mk = (id, path) => ({ id, label: id, provider: 'p', modality: ['llm'], policy: 'vendor-direct', vault: 'assemblyai-api-key', instrument: 'x',
+    probe: { url: `BASE${path}`, header: 'x-api-key', scheme: '', expect: 'transcripts', allowEmpty: true } });
+  const one = async (path) => fmCollect({ deployments: DEPLOYS, vaultList,
+    vendors: (base) => [mk('v', path)].map((v) => ({ ...v, probe: { ...v.probe, url: v.probe.url.replace('BASE', base) } })) });
+  const dead = await one('/vendor-drop');
+  assert.match(dead.out, /v \(no answer\)/);
+  assert.doesNotMatch(dead.out, /accepts a bad key/);
+  const flaky = await one('/vendor-drop-once');
+  assert.doesNotMatch(flaky.out, /v \((no answer|accepts a bad key)\)/);
+  assert.equal(flaky.direct.models.find((m) => m.name === 'v').reachable, true);
 });
 
 test('forge-models vendors: the shipped forge-direct.json is well formed (r1.1)', async () => {

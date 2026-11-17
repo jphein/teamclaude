@@ -26,6 +26,41 @@ How a run exits: always 0, whatever it found. A check reports, it never gates; `
 | `forge-keys` | `teamclaude-check-forge-keys.timer` | daily 07:20 | The forge gateway's (LiteLLM, ubox0) virtual keys: spend outside a key's allowlist, keys unused for 30 days, spend by unknown keys, and refused calls by inactive keys | teamclaude lane; gateway owned by palace-nemotron | The 2026-11-14 Ember key rotation. A key fragment leaked, and the only way to tell whether anyone tried the old key was a manual SQL read. |
 | `fable-use` | `teamclaude-check-fable-use.timer` | daily 07:40 | `GET 127.0.0.1:3456/teamclaude/quota`: each seat's Fable weekly bucket (`buckets.weeklyFable`), its used % and when it resets | teamclaude lane | On 2026-11-16 every seat's Fable week stood at 0 % used. The proxy rations Fable to the `fable.allow` client keys (JP, 2026-10-11), so a whole week's Fable allowance can expire unused with nobody seeing it. This check is the mechanism for JP's "use down all credits" rule on this pool (Sen, 2026-11-16 08:0x). |
 | `resets-banked` | `teamclaude-check-resets-banked.timer` | daily 07:45 | `GET 127.0.0.1:3456/teamclaude/quota` → `seats[].resets`: banked Claude usage-limit resets split weekly-clearing / 5h-only with each soonest expiry, and `resetsSpent7d` | teamclaude lane | On 2026-11-16 every seat's reset count read empty to the fleet lead (the field it looked at did not exist) and 5 of 7 seats' readings were 3–8 h stale behind 401s. A reset that expires unspent is lost, and the automatic reset strategy (JP, 2026-11-16 08:26) needs the count to be trusted. |
+| `forge-models` | `teamclaude-check-forge-models.timer` | daily 04:50 | Every model the fleet can reach is listed on the plan's Hearth › Forge, and every listed one answers a live probe. Listed = the gateway registry (`forge route show`), the host feed's stems, and `scripts/checks/forge-direct.json` (Claude seats, Azure Speech, Foundry media, other local). Reachable = each provider's own catalog. Writes the direct rows to the plan's `data/forge/direct.json` | teamclaude lane; gateway owned by palace-nemotron; page owned by the plan lane | On 2026-11-17 at 05:03 JP said "Make sure the forge has comprehensive of all available models I notice some missing". The page listed 14 rows, 2 of them dead, out of 64 reachable models. Nothing compared the page with what the providers serve. |
+
+### forge-models
+
+Each night it reads what is listed and what is reachable, and probes every listed model.
+
+**What it reads, by source:**
+
+| Source | Reachable (the catalog) | Answers (the probe) |
+|---|---|---|
+| Gateway (LiteLLM on ubox0) | `forge route show --json`: enabled models with `mode` and `upstream` | `forge probe <m> --who forge-models` on the model's own endpoint (chat, `/v1/embeddings` or `/v1/responses`). Probes run 3.5 s apart, because the forge-probe key allows 20 a minute. A failure gets one retry after 10 s. |
+| Claude seats | the Claude Code model picker (`/api/model_selector/code` through the proxy) | `claude -p` with this check's own client key `forge-check` (vault item "teamclaude client key forge-check", on `fable.allow`), a one-line system prompt and no tools: about 530 input tokens each. `modelUsage` must name the model asked for; a rewrite to another model counts as did not answer. |
+| Foundry | the resource's deployments (data plane `/openai/deployments`) with an Entra token from the cached `az` login. No API key is read. | Gateway-routed models are probed through the gateway. For `gpt-audio-mini` and `gpt-image-1.5` the probe is the deployment state, because a nightly image would cost money. |
+| Nebius | `GET /v1/models` with the vault item "Nebius Token Factory API key (palace)" | through the gateway |
+| Azure Speech | (fixed list) | One sentence synthesized in each TTS voice, then the Dragon HD audio transcribed. Key: the vault item "Azure Speech westus (speech-to-cli)". |
+| Local | running user and system units and docker containers whose names look like a model server; katana's ollama tags | the host feed's state (fresh within 15 min); the embedder's `/health`; openWakeWord's Wyoming `describe` |
+
+**The vault is read only when it is already unlocked.** It never prompts. A locked vault means that source is "not read" (warn), never a popup at 04:50. `bw` can take about 30 s, so the read is allowed 90 s. Both vault items now have this check as one more reader.
+
+**Policy built in:**
+- Foundry deployments of Claude (Marketplace billing) and of third-party models (FLUX) are counted as "blocked", never listed.
+- A deployment whose state is failed (sora-2) serves nothing and is ignored.
+- A duplicate deployment of a listed model (gpt-5.4-pro-1) is covered by that model.
+- **Drift fails.** If a registered or direct Foundry deployment now serves another model, or any Claude model, the check fails. The gateway's allowlist goes by deployment name, so this is the detection behind it (forge-gateway PR 23, xreview r1.4).
+
+**States:**
+- **fail:** a reachable model is unlisted; a listed one did not answer, or left the seat catalog; deployment drift.
+- **warn:** a source could not be read (each is named); a desktop host is asleep. Katana's failed probe is then not counted as dead.
+- **ok:** every listed model answered, and nothing reachable is unlisted.
+
+**When it fails on an unlisted model:**
+- A gateway-capable cloud model goes in forge-gateway's `registry/models.yaml` plus the code allowlist (`azureModes` or `nebiusModes`), through that repo's gate.
+- Anything else is a row in `scripts/checks/forge-direct.json` here.
+
+**The page:** `data/forge/direct.json` (`forge.direct/v1`, 0640, temp file then rename) carries each direct row with its result from last night. The plan lane renders it on Hearth › Forge.
 
 ### pool-quota
 

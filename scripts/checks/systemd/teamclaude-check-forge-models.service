@@ -1,0 +1,12 @@
+[Unit]
+Description=CHECK forge-models: the Forge lists every reachable model and every listed one answers (teamclaude docs/CHECKS.md)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/libexec/teamclaude-checks/forge-models.sh
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# 37 gateway probes (3.5 s apart, one retry each), 15 Claude probes, Azure Speech and the catalogs:
+# about 5 min measured on 2026-11-17, up to ~15 min with retries.
+TimeoutStartSec=1800
+Nice=10

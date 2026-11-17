@@ -7,7 +7,7 @@ import { spawnSync, execFile, spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, chmodSync, mkdirSync, rmSync, utimesSync, copyFileSync, existsSync, symlinkSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join, dirname } from 'node:path';
-import { tmpdir, hostname } from 'node:os';
+import { tmpdir, hostname, userInfo } from 'node:os';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
@@ -506,7 +506,7 @@ test('lib: an unknown status becomes fail (still exit 0); the line file is writt
 });
 
 test('units: every check has a service and a timer; services run the installed copy', () => {
-  for (const name of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use', 'resets-banked']) {
+  for (const name of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use', 'resets-banked', 'forge-models']) {
     const svc = readFileSync(join(C, 'systemd', `teamclaude-check-${name}.service`), 'utf8');
     assert.match(svc, new RegExp(`^ExecStart=%h/\\.local/libexec/teamclaude-checks/${name}\\.sh$`, 'm'));
     assert.match(readFileSync(join(C, 'systemd', `teamclaude-check-${name}.timer`), 'utf8'), /^Persistent=true$/m);
@@ -525,8 +525,8 @@ function repoAt(files) {
 }
 const payload = (omit = []) => {
   const files = {};
-  for (const f of ['lib.sh', 'pool-quota.sh', 'proxy-probe.sh', 'proxy-wrapper.sh', 'forge-keys.sh', 'fable-use.sh', 'resets-banked.sh', 'summary.sh', 'install.sh']) if (!omit.includes(f)) files[`scripts/checks/${f}`] = readFileSync(join(C, f), 'utf8');
-  for (const n of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use', 'resets-banked']) for (const ext of ['service', 'timer']) files[`scripts/checks/systemd/teamclaude-check-${n}.${ext}`] = readFileSync(join(C, 'systemd', `teamclaude-check-${n}.${ext}`), 'utf8');
+  for (const f of ['lib.sh', 'pool-quota.sh', 'proxy-probe.sh', 'proxy-wrapper.sh', 'forge-keys.sh', 'fable-use.sh', 'resets-banked.sh', 'summary.sh', 'install.sh', 'forge-models.sh', 'forge-models.mjs', 'forge-direct.json']) if (!omit.includes(f)) files[`scripts/checks/${f}`] = readFileSync(join(C, f), 'utf8');
+  for (const n of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use', 'resets-banked', 'forge-models']) for (const ext of ['service', 'timer']) files[`scripts/checks/systemd/teamclaude-check-${n}.${ext}`] = readFileSync(join(C, 'systemd', `teamclaude-check-${n}.${ext}`), 'utf8');
   files['scripts/claude-wrapper.sh'] = NEW_WRAPPER;
   return files;
 };
@@ -540,7 +540,7 @@ test('install: a complete merged commit is published and its timers enabled', ()
   assert.equal(r.status, 0, r.stderr);
   assert.equal(readFileSync(join(h, '.local/libexec/teamclaude-checks/claude-wrapper.sh'), 'utf8'), NEW_WRAPPER);
   assert.ok(existsSync(join(h, '.config/systemd/user/teamclaude-check-forge-keys.timer')));
-  assert.match(readFileSync(join(h, 'systemctl.log'), 'utf8'), /^--user enable --now teamclaude-check-pool-quota\.timer teamclaude-check-proxy-wrapper\.timer teamclaude-check-forge-keys\.timer teamclaude-check-fable-use\.timer teamclaude-check-resets-banked\.timer$/m);
+  assert.match(readFileSync(join(h, 'systemctl.log'), 'utf8'), /^--user enable --now teamclaude-check-pool-quota\.timer teamclaude-check-proxy-wrapper\.timer teamclaude-check-forge-keys\.timer teamclaude-check-fable-use\.timer teamclaude-check-resets-banked\.timer teamclaude-check-forge-models\.timer$/m);
 });
 
 test('install: a commit missing a file publishes nothing over the existing install', () => {
@@ -572,7 +572,7 @@ test('install: a commit missing one unit publishes nothing', () => {
   const files = payload(); delete files['scripts/checks/systemd/teamclaude-check-forge-keys.service'];
   const r = install(repoAt(files), h);
   assert.equal(r.status, 4);
-  assert.match(r.stderr, /not exactly the ten check units; nothing installed/);
+  assert.match(r.stderr, /not exactly the check units; nothing installed/);
   assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false);
 });
 
@@ -627,7 +627,7 @@ test('install: an extra unit file refuses the install; only the three named time
   const files = payload(); files['scripts/checks/systemd/unexpected.timer'] = '[Timer]\nOnCalendar=*:*\n'; files['scripts/checks/systemd/unexpected.service'] = '[Service]\nExecStart=/bin/true\n';
   const r = install(repoAt(files), h);
   assert.equal(r.status, 4);
-  assert.match(r.stderr, /not exactly the ten check units/);
+  assert.match(r.stderr, /not exactly the check units/);
   assert.equal(existsSync(join(h, '.config/systemd/user/unexpected.timer')), false);
   assert.equal(existsSync(join(h, 'systemctl.log')), false);
 });
@@ -699,7 +699,7 @@ test('install: an unexpected failure after the stop (daemon-reload) still starts
   const r = installWith(repoAt(payload()), h, RUNNING(h) + `\ncase "$2" in daemon-reload) if [ ! -e '${once}' ]; then : > '${once}'; exit 1; fi ;; esac`);
   assert.notEqual(r.status, 0);
   const log = readFileSync(join(h, 'systemctl.log'), 'utf8').trim().split('\n');
-  assert.equal(log[log.length - 1], '--user start teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer teamclaude-check-resets-banked.timer', log.join(' | '));
+  assert.equal(log[log.length - 1], '--user start teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer teamclaude-check-resets-banked.timer teamclaude-check-forge-models.timer', log.join(' | '));
 });
 
 test('install: a second install while one holds the lock is refused', async () => {
@@ -798,7 +798,7 @@ test('install: a partial enable --now failure leaves no timer running that was n
   const enable = log.findIndex((l) => l.startsWith('--user enable --now '));
   assert.ok(enable >= 0, log.join(' | '));
   // stop all three timers first, then (after the wait) restore the files and reload; none was running before
-  assert.equal(log[enable + 1], '--user stop teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer teamclaude-check-resets-banked.timer', log.join(' | '));
+  assert.equal(log[enable + 1], '--user stop teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer teamclaude-check-resets-banked.timer teamclaude-check-forge-models.timer', log.join(' | '));
   assert.ok(log.slice(enable + 2).includes('--user daemon-reload'), log.join(' | '));
   assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false, 'a first install that failed must not leave its files');
   assert.equal(log.slice(enable + 1).some((l) => l.startsWith('--user start ')), false);
@@ -1010,4 +1010,482 @@ test('install: a second signal during the rollback does not cut it short', () =>
   assert.ok(existsSync(once), 'the second signal was never sent');
   assert.equal(readFileSync(a, 'utf8'), beforeA);
   assert.equal(readFileSync(b, 'utf8'), beforeB, 'the rollback stopped after the second signal');
+});
+
+// ---------- forge-models (fixture inputs; JP 2026-11-17 05:03 "comprehensive of all available models")
+const FM_NOW = Date.parse('2026-11-17T12:50:00Z');
+const FM_CFG = {
+  claude: [{ id: 'claude-opus-5-5', label: 'Opus 5.5', group: 'main' }, { id: 'claude-fable-5-2', label: 'Fable 5.2', group: 'main' }],
+  speech: [{ id: 'en-US-Ava:DragonHDLatestNeural', label: 'Ava, Dragon HD', kind: 'tts', policy: 'recorded-voice' }, { id: 'azure-stt-en-US', label: 'STT', kind: 'asr', policy: 'first-party' }],
+  speechRegions: { tts: 'eastus', stt: 'westus' },
+  foundryDirect: [{ deployment: 'gpt-image-1.5', label: 'gpt-image-1.5', kind: 'image' }],
+  foundryExpect: { 'gpt-6.1-sol': 'gpt-6.1-sol', 'gpt-5.4-pro': 'gpt-5.4-pro', 'gpt-5.4-pro-1': 'gpt-5.4-pro', 'gpt-image-1.5': 'gpt-image-1.5' },
+  foundryBlockedModels: { 'third-party': ['FLUX-1.1-pro'] },
+  local: [{ id: 'nomic-embed-text-v1.5', label: 'nomic', kind: 'embedding', host: 'familiar', health: 'http://127.0.0.1:1/' }, { id: 'openwakeword', label: 'oww', kind: 'wake', host: 'familiar', wyoming: 1 }],
+  feedStems: { katana: 'local/katana-qwen35-9b', 'familiar-piper-cori': null },
+  localUnits: { 'wyoming-piper': 'familiar-piper-cori', 'ollama-embed': 'nomic-embed-text-v1.5', 'wyoming-openwakeword': 'openwakeword' },
+  katanaTags: { 'qwen3.5:9b-q4_K_M': 'katana' },
+  vault: { nebius: 'x', speech: 'y' },
+};
+const fmIn = (over = {}) => {
+  const ts = new Date(FM_NOW - 60_000).toISOString();
+  return {
+    registry: [
+      { name: 'local/katana-qwen35-9b', provider: 'local', enabled: true, mode: 'chat', upstream: '' },
+      { name: 'foundry/gpt-6.1-sol', provider: 'azure', enabled: true, mode: 'chat', upstream: 'azure/gpt-6.1-sol' },
+      { name: 'foundry/gpt-5.4-pro', provider: 'azure', enabled: true, mode: 'responses', upstream: 'azure/gpt-5.4-pro' },
+      { name: 'nebius/glm-5.3', provider: 'nebius', enabled: true, mode: 'chat', upstream: 'nebius/zai-org/GLM-5.3' },
+    ],
+    gatewayProbes: { 'local/katana-qwen35-9b': { ok: true }, 'foundry/gpt-6.1-sol': { ok: true }, 'foundry/gpt-5.4-pro': { ok: true }, 'nebius/glm-5.3': { ok: true } },
+    feed: { katana: { state: 'idle', ts }, 'familiar-piper-cori': { state: 'idle', ts } },
+    claudeCatalog: ['claude-opus-5-5', 'claude-fable-5-2'],
+    claudeProbes: { 'claude-opus-5-5': { ok: true, served: ['claude-opus-5-5'], seen: true }, 'claude-fable-5-2': { ok: true, served: ['claude-fable-5-2'], seen: true } },
+    foundryProbes: { 'gpt-image-1.5': { ok: true } },
+    foundry: [
+      { id: 'gpt-6.1-sol', model: 'gpt-6.1-sol', status: 'succeeded' }, { id: 'gpt-5.4-pro', model: 'gpt-5.4-pro', status: 'succeeded' },
+      { id: 'gpt-5.4-pro-1', model: 'gpt-5.4-pro', status: 'succeeded' }, { id: 'gpt-image-1.5', model: 'gpt-image-1.5', status: 'succeeded' },
+      { id: 'claude-opus-5-5', model: 'claude-opus-5-5', status: 'succeeded' }, { id: 'FLUX-1.1-pro', model: 'FLUX-1.1-pro', status: 'succeeded' },
+      { id: 'sora-2', model: 'sora-2', status: 'failed' },
+    ],
+    nebius: ['zai-org/GLM-5.3'],
+    speech: { 'en-US-Ava:DragonHDLatestNeural': { ok: true }, 'azure-stt-en-US': { ok: true } },
+    units: ['wyoming-piper', 'ollama-embed', 'wyoming-openwakeword', 'teamclaude-check-pool-quota', 'realm-forge-feed', 'sshd'],
+    katanaTags: ['qwen3.5:9b-q4_K_M'],
+    embedHealth: true,
+    wake: ['okay_nabu'],
+    ...over,
+  };
+};
+function fm(inputs, extra = {}) {
+  const d = fresh(); chmodSync(d, 0o700);   // a home writable by no one else (publish refuses otherwise)
+  mkdirSync(join(d, 'forge'), { mode: 0o700 }); chmodSync(join(d, 'forge'), 0o700);
+  writeFileSync(join(d, 'cfg.json'), JSON.stringify(FM_CFG));
+  writeFileSync(join(d, 'in.json'), typeof inputs === 'string' ? inputs : JSON.stringify(inputs));
+  const r = run('forge-models.sh', { CHECK_FM_HOME: d, CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW), ...extra });
+  const out = join(d, 'forge', 'direct.json');
+  return { ...r, direct: existsSync(out) ? JSON.parse(readFileSync(out, 'utf8')) : null };
+}
+
+test('forge-models: everything listed and answering is ok; blocked Foundry deployments are counted, a failed one ignored', () => {
+  const r = fm(fmIn());
+  assert.match(r.line, LINE);
+  assert.match(r.line, /^CHECK forge-models ok · 12 listed \(4 gateway, 1 host-feed voices, 7 direct\); every listed model answered; blocked on Foundry: 1 Claude, 1 third-party, at /);
+  assert.equal(r.direct.schema, 'forge.direct/v1');
+  assert.deepEqual(r.direct.models.map((m) => [m.name, m.route, m.reachable]), [
+    ['claude-opus-5-5', 'teamclaude', true], ['claude-fable-5-2', 'teamclaude', true], ['en-US-Ava:DragonHDLatestNeural', 'azure-speech', true],
+    ['azure-stt-en-US', 'azure-speech', true], ['gpt-image-1.5', 'foundry-direct', true], ['nomic-embed-text-v1.5', 'local', true], ['openwakeword', 'local', true]]);
+  assert.deepEqual(r.direct.blocked, { foundry_claude: 1, foundry_third_party: 1 });
+});
+
+test('forge-models: a reachable model that is not listed fails, named by source', () => {
+  const i = fmIn({ claudeCatalog: ['claude-opus-5-5', 'claude-fable-5-2', 'claude-opus-6'], nebius: ['zai-org/GLM-5.3', 'zai-org/GLM-6'],
+    foundry: [...fmIn().foundry, { id: 'gpt-7', model: 'gpt-7', status: 'succeeded' }], units: [...fmIn().units, 'whisper-large'], katanaTags: ['qwen3.5:9b-q4_K_M', 'llama4:8b'] });
+  const r = fm(i);
+  assert.match(r.line, /^CHECK forge-models fail · .*reachable but unlisted: claude:claude-opus-6, foundry:gpt-7 \(gpt-7\), nebius:zai-org\/GLM-6, unit:whisper-large, katana:llama4:8b/);
+});
+
+test('forge-models: a duplicate Foundry deployment of a listed model is covered, not unlisted', () => {
+  const r = fm(fmIn());
+  assert.doesNotMatch(r.line, /gpt-5\.4-pro-1/);
+});
+
+test('forge-models: a listed model that does not answer, or answers as another model, fails', () => {
+  const r = fm(fmIn({ gatewayProbes: { ...fmIn().gatewayProbes, 'nebius/glm-5.3': { ok: false, error: 'upstream' } },
+    claudeProbes: { ...fmIn().claudeProbes, 'claude-fable-5-2': { ok: true, served: ['claude-opus-5-5'], seen: true } }, embedHealth: false }));
+  assert.match(r.line, /^CHECK forge-models fail · .*didn't answer: nebius\/glm-5\.3 \(upstream\), claude-fable-5-2 \(served as claude-opus-5-5\), nomic-embed-text-v1\.5 \(no answer\)/);
+  assert.equal(r.direct.models.find((m) => m.name === 'claude-fable-5-2').reachable, false);
+});
+
+test('forge-models: a model that left the seat catalog fails', () => {
+  const r = fm(fmIn({ claudeCatalog: ['claude-opus-5-5'] }));
+  assert.match(r.line, /^CHECK forge-models fail · .*didn't answer: claude-fable-5-2 \(left the seat catalog\)/);
+});
+
+test('forge-models: a registered or direct Foundry deployment that now serves another model is drift (fail)', () => {
+  const foundry = fmIn().foundry.map((d) => (d.id === 'gpt-6.1-sol' ? { ...d, model: 'claude-sonnet-5-5' } : d.id === 'gpt-image-1.5' ? { ...d, model: 'FLUX-2' } : d));
+  const r = fm(fmIn({ foundry }));
+  assert.match(r.line, /^CHECK forge-models fail · .*deployment drift: foundry:gpt-6\.1-sol now serves claude-sonnet-5-5, foundry:gpt-image-1\.5 now serves FLUX-2/);
+});
+
+test('forge-models: katana asleep warns and its failed gateway probe is not counted dead', () => {
+  const r = fm(fmIn({ feed: { ...fmIn().feed, katana: { state: 'asleep', ts: new Date(FM_NOW - 60_000).toISOString() } },
+    gatewayProbes: { ...fmIn().gatewayProbes, 'local/katana-qwen35-9b': { ok: false, error: 'timeout_or_unreachable' } }, katanaTags: null }));
+  assert.match(r.line, /^CHECK forge-models warn · .*none of the models probed failed; asleep: katana;/);
+});
+
+test('forge-models: an unreadable source (vault locked, az, stale feed) warns and is named, never ok', () => {
+  const r = fm(fmIn({ nebius: null, speech: null, foundry: null, feed: { katana: { state: 'idle', ts: '2026-11-16T00:00:00Z' }, 'familiar-piper-cori': null } }));
+  assert.match(r.line, /^CHECK forge-models warn · .*not read: host feed katana, host feed familiar-piper-cori, Foundry deployments, Nebius catalog \(vault locked\?\), Azure Speech \(vault locked\?\)/);
+  assert.equal(r.direct.models.find((m) => m.name === 'azure-stt-en-US').error, 'not read');
+});
+
+test('forge-models: unreadable inputs or a crash is a fail line (exit 0)', () => {
+  const r = fm('{not json');
+  assert.equal(r.status, 0);
+  assert.match(r.line, /^CHECK forge-models fail · check crashed reading its sources \(SyntaxError\), at /);
+});
+
+
+// xreview #89 r1.5/r1.6: no ok with a missing probe or an unread source; coverage by the observed model
+test('forge-models: a missing Claude probe fails; katana tags unread (katana awake) warns', () => {
+  assert.match(fm(fmIn({ claudeProbes: {} })).line, /^CHECK forge-models fail · .*didn't answer: claude-opus-5-5 \(not probed\), claude-fable-5-2 \(not probed\)/);
+  const r = fm(fmIn({ katanaTags: null }));
+  assert.match(r.line, /^CHECK forge-models warn · .*none of the models probed failed; not read: katana tags/);
+});
+
+test('forge-models: a duplicate deployment that serves another model is unlisted, not covered', () => {
+  const foundry = fmIn().foundry.map((d) => (d.id === 'gpt-5.4-pro-1' ? { ...d, model: 'gpt-7' } : d));
+  assert.match(fm(fmIn({ foundry })).line, /reachable but unlisted: foundry:gpt-5\.4-pro-1 \(gpt-7\)/);
+});
+
+test('forge-models: a third-party model is blocked by what it serves, whatever the deployment is called', () => {
+  const foundry = [...fmIn().foundry.filter((d) => d.id !== 'FLUX-1.1-pro'), { id: 'my-images', model: 'FLUX-1.1-pro', status: 'succeeded' }];
+  assert.match(fm(fmIn({ foundry })).line, /^CHECK forge-models ok · .*blocked on Foundry: 1 Claude, 1 third-party/);
+});
+
+test('forge-models: a Claude probe not seen at the seat proxy, or with no proof at all, fails; verdict and row agree (r2.2)', () => {
+  for (const seen of [false, null, undefined]) {
+    const r = fm(fmIn({ claudeProbes: { ...fmIn().claudeProbes, 'claude-opus-5-5': { ok: true, served: ['claude-opus-5-5'], seen } } }));
+    assert.match(r.line, /^CHECK forge-models fail · .*claude-opus-5-5 \(not seen at the seat proxy\)/, String(seen));
+    assert.equal(r.direct.models.find((m) => m.name === 'claude-opus-5-5').reachable, false);
+  }
+});
+
+test('forge-models: a media deployment that does not answer its probe fails and is not published reachable (r2.4)', () => {
+  const r = fm(fmIn({ foundryProbes: { 'gpt-image-1.5': { ok: false, error: 'http 429' } } }));
+  assert.match(r.line, /^CHECK forge-models fail · .*foundry:gpt-image-1\.5 \(http 429\)/);
+  assert.equal(r.direct.models.find((m) => m.name === 'gpt-image-1.5').error, 'http 429');
+  assert.match(fm(fmIn({ foundryProbes: {} })).line, /foundry:gpt-image-1\.5 \(not probed\)/);
+});
+
+test('forge-models: a key-shaped provider id never reaches the line or the page (r2.3)', () => {
+  const canary = 'skCANARY0123456789abcdefXYZ';
+  const r = fm(fmIn({ claudeCatalog: ['claude-opus-5-5', 'claude-fable-5-2', `Bearer sk-${canary}`], nebius: ['zai-org/GLM-5.3', canary],
+    foundry: [...fmIn().foundry, { id: `dep-${canary}`, model: `m-${canary}`, status: 'succeeded' }], units: [...fmIn().units, `llama-${canary}`],
+    katanaTags: ['qwen3.5:9b-q4_K_M', `qwen-${canary}`],
+    claudeProbes: { ...fmIn().claudeProbes, 'claude-fable-5-2': { ok: true, served: [canary.toLowerCase()], seen: true } } }));
+  assert.doesNotMatch(r.line, /CANARY|canary/);
+  assert.doesNotMatch(JSON.stringify(r.direct), /CANARY|canary/);
+  assert.match(r.line, /claude:\(unrecognized id\)/);
+  // r3.1: a registry name and an Azure upstream, failing and drifting
+  const reg = [...fmIn().registry, { name: `sk-${canary}`, provider: 'nebius', enabled: true, mode: 'chat', upstream: 'nebius/x' },
+    { name: 'foundry/x', provider: 'azure', enabled: true, mode: 'chat', upstream: `azure/${canary}` }];
+  const r2 = fm(fmIn({ registry: reg, foundry: [...fmIn().foundry, { id: canary, model: 'claude-x', status: 'succeeded' }] }));
+  assert.doesNotMatch(r2.line, /CANARY|canary/);
+  assert.match(r2.line, /\(unrecognized id\) \(not probed\)/);
+});
+
+test('forge-models: a model in the direct list that left the seat catalog is not published reachable', () => {
+  const r = fm(fmIn({ claudeCatalog: ['claude-opus-5-5'] }));
+  assert.equal(r.direct.models.find((m) => m.name === 'claude-fable-5-2').reachable, false);
+});
+
+test('forge-models: a probe error that is not a fixed word never reaches the line or the page', () => {
+  const canary = 'sk-CANARY0123456789abcdef';
+  const r = fm(fmIn({ gatewayProbes: { ...fmIn().gatewayProbes, 'nebius/glm-5.3': { ok: false, error: `Bearer ${canary}` } },
+    claudeProbes: { ...fmIn().claudeProbes, 'claude-opus-5-5': { ok: false, served: [], error: canary } },
+    speech: { 'en-US-Ava:DragonHDLatestNeural': { ok: false, error: canary }, 'azure-stt-en-US': { ok: true } } }));
+  assert.doesNotMatch(r.line, /CANARY/);
+  assert.doesNotMatch(JSON.stringify(r.direct), /CANARY/);
+  assert.match(r.line, /nebius\/glm-5\.3 \(no answer\)/);
+});
+
+// r1.4: publication never follows a symlink on the path
+test('forge-models: direct.json is not written through a symlinked parent, and a symlinked target is replaced, not followed', () => {
+  const d = fresh(); const elsewhere = fresh(); chmodSync(d, 0o700);
+  writeFileSync(join(d, 'cfg.json'), JSON.stringify(FM_CFG)); writeFileSync(join(d, 'in.json'), JSON.stringify(fmIn()));
+  symlinkSync(elsewhere, join(d, 'forge'));
+  const env = { CHECK_FM_HOME: d, CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_NOW_MS: String(FM_NOW) };
+  let r = run('forge-models.sh', { ...env, CHECK_FM_OUT: join(d, 'forge', 'direct.json') });
+  assert.match(r.line, /direct\.json not written \(EPATH\)/);
+  assert.equal(existsSync(join(elsewhere, 'direct.json')), false);
+  const d2 = fresh(); chmodSync(d2, 0o700); mkdirSync(join(d2, 'forge'), { mode: 0o700 }); chmodSync(join(d2, 'forge'), 0o700);
+  writeFileSync(join(elsewhere, 'victim'), 'keep');
+  symlinkSync(join(elsewhere, 'victim'), join(d2, 'forge', 'direct.json'));
+  r = run('forge-models.sh', { ...env, CHECK_FM_HOME: d2, CHECK_FM_OUT: join(d2, 'forge', 'direct.json') });
+  assert.doesNotMatch(r.line, /not written/);
+  assert.equal(readFileSync(join(elsewhere, 'victim'), 'utf8'), 'keep');
+  assert.equal(JSON.parse(readFileSync(join(d2, 'forge', 'direct.json'), 'utf8')).schema, 'forge.direct/v1');
+});
+
+// a real 32×32 RGB PNG, built here (signature, IHDR, IDAT, IEND, each with its CRC); options build CRC-correct
+// malformed ones for the negatives
+async function fmPng({ w = 32, h = 32, color = 2, extra = null, iend = Buffer.alloc(0), plte = [] } = {}) {
+  const { deflateSync, crc32 } = await import('node:zlib');
+  const chunk = (type, data) => { const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+    const td = Buffer.concat([Buffer.from(type, 'latin1'), data]); const c = Buffer.alloc(4); c.writeUInt32BE(crc32(td)); return Buffer.concat([len, td, c]); };
+  const ch = { 2: 3, 3: 1 }[color];
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = color;
+  const raw = Buffer.alloc(h * (1 + w * ch), 0x40); for (let y = 0; y < h; y++) raw[y * (1 + w * ch)] = 0;
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', ihdr), ...(extra ? [chunk(extra, Buffer.alloc(4))] : []), ...plte.map((n) => chunk('PLTE', Buffer.alloc(n, 9))),
+    chunk('IDAT', deflateSync(raw)), chunk('IEND', iend)]);
+}
+
+test('forge-models: isImage decodes a real PNG and refuses signature-only or broken ones (r7.1)', async () => {
+  const { isImage } = await import(join(C, 'forge-models.mjs'));
+  const good = await fmPng();
+  assert.equal(isImage(good), true);
+  assert.equal(isImage(await fmPng({ plte: [48] })), true);   // a valid optional palette (16 entries)
+  const flip = (i) => { const b = Buffer.from(good); b[i] ^= 0xff; return b; };
+  const bad = [
+    Buffer.concat([good.subarray(0, 8), Buffer.from([0, 0, 0, 13]), Buffer.from('IHDR', 'latin1'), Buffer.alloc(2000, 5)]),   // the round-6 fixture
+    good.subarray(0, good.length - 12),                       // no IEND
+    flip(20),                                                 // IHDR damaged: CRC fails
+    flip(good.length - 20),                                   // IDAT damaged
+    Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.alloc(2000, 1), Buffer.from([0xff, 0xd9])]),   // a JPEG-shaped blob
+    Buffer.concat([Buffer.from('RIFF\0\0\0\0WEBP', 'latin1'), Buffer.alloc(2000, 1)]),                   // a WebP-shaped blob
+    await fmPng({ w: 4, h: 4 }),                              // too small to be an answer
+    await fmPng({ color: 3 }),                                // indexed, CRC-correct, no PLTE (r8.2)
+    await fmPng({ iend: Buffer.from('x') }),                  // non-empty IEND (r8.2)
+    await fmPng({ extra: 'ZZZZ' }),                           // an unknown critical chunk (r8.2)
+    await fmPng({ plte: [4] }),                               // PLTE not a multiple of 3 (r9.2)
+    await fmPng({ plte: [48, 48] }),                          // two PLTEs (r9.2)
+    await fmPng({ plte: [771] }),                             // more than 256 entries (r9.2)
+  ];
+  for (const [i, b] of bad.entries()) assert.equal(isImage(b), false, `case ${i}`);
+});
+
+// a real 16 kHz mono 16-bit PCM WAV of 0.2 s
+function fmWav({ rate = 16000, seconds = 0.2 } = {}) {
+  const data = Buffer.alloc(Math.round(rate * seconds) * 2, 3);
+  const h = Buffer.alloc(44);
+  h.write('RIFF', 0, 'latin1'); h.writeUInt32LE(36 + data.length, 4); h.write('WAVE', 8, 'latin1');
+  h.write('fmt ', 12, 'latin1'); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22); h.writeUInt32LE(rate, 24);
+  h.writeUInt32LE(rate * 2, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34); h.write('data', 36, 'latin1'); h.writeUInt32LE(data.length, 40);
+  return Buffer.concat([h, data]);
+}
+
+test('forge-models: playableWav accepts a real PCM WAV and refuses broken ones (r4.1)', async () => {
+  const { playableWav } = await import(join(C, 'forge-models.mjs'));
+  assert.equal(playableWav(fmWav()), true);
+  // a streamed WAV as gpt-audio-mini sends it: RIFF and data sizes 0xFFFFFFFF, 24 kHz mono 16-bit
+  const streamed = fmWav({ rate: 24000 }); streamed.writeUInt32LE(0xffffffff, 4); streamed.writeUInt32LE(0xffffffff, 40);
+  assert.equal(playableWav(streamed), true);
+  const halfStream = fmWav(); halfStream.writeUInt32LE(0xffffffff, 40);   // data streamed but RIFF sized: inconsistent
+  assert.equal(playableWav(halfStream), false);
+  // r8.3: a finite, misaligned data size inside a streamed container (the extra byte makes it fit, so misalignment is the only fault)
+  const oddInStream = Buffer.concat([fmWav(), Buffer.from([0])]); oddInStream.writeUInt32LE(0xffffffff, 4); oddInStream.writeUInt32LE(6401, 40);
+  assert.equal(playableWav(oddInStream), false);
+  const bad = [
+    Buffer.concat([Buffer.from('RIFF\0\0\0\0WAVE', 'latin1'), Buffer.alloc(3000, 1)]),   // the round-3 fixture: no size, no chunks
+    fmWav({ seconds: 0.01 }),                                                               // too short to be an answer
+    (() => { const b = fmWav(); b.writeUInt16LE(3, 20); return b; })(),                    // not PCM
+    (() => { const b = fmWav(); b.writeUInt32LE(9_999_999, 40); return b; })(),            // data larger than the file
+    (() => { const b = fmWav(); b.write('junk', 12, 'latin1'); return b; })(),             // no fmt chunk
+    (() => { const b = fmWav(); b.writeUInt32LE(36, 4); return b; })(),                   // RIFF ends before the audio (r5.1)
+    (() => { const b = fmWav(); b.writeUInt32LE(0, 28); return b; })(),                    // byte rate 0 (r5.2)
+    (() => { const b = fmWav(); b.writeUInt16LE(0, 32); return b; })(),                    // block align 0 (r5.2)
+    (() => { const b = fmWav(); b.writeUInt32LE(b.readUInt32LE(40) - 1, 40); return b; })(), // a partial block (r6)
+    Buffer.alloc(0),
+  ];
+  for (const [i, b] of bad.entries()) assert.equal(playableWav(b), false, `case ${i}`);
+});
+
+// ---------- forge-models collect(): fake binaries and a local HTTP server (r1.7)
+async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = true, regions = { tts: 'eastus', stt: 'westus' }, gatewayError = null, foundryStatus = 200, audio = null, image = null, wyomingPort = null, tts = null } = {}) {
+  const d = fresh(); const bin = join(d, 'bin'); const log = join(d, 'calls.log'); const counter = join(d, 'counter');
+  chmodSync(d, 0o700); mkdirSync(bin); writeFileSync(log, ''); writeFileSync(counter, '0');
+  mkdirSync(join(d, 'forge', 'hosts'), { recursive: true, mode: 0o700 }); chmodSync(join(d, 'forge'), 0o700);
+  mkdirSync(join(d, '.config/teamclaude-client'), { recursive: true });
+  const key = 'tc-' + 'a'.repeat(48);
+  writeFileSync(join(d, '.config/teamclaude-client/forge-check.settings.json'), JSON.stringify({ env: { HTTPS_PROXY: `http://${key}:${key}@127.0.0.1:3456` } }), { mode: 0o600 });
+  const hits = [];
+  const png = await fmPng();
+  const srv = createServer((q, s) => {
+    hits.push(q.url);
+    let b = '';
+    q.on('data', (c) => { b += c; });
+    q.on('end', () => {
+      if (q.url.startsWith('/foundry/openai/v1/images')) return s.end(image ?? JSON.stringify({ data: [{ b64_json: png.toString('base64') }] }));
+      if (q.url.startsWith('/foundry/openai/deployments/')) {
+        const wav = fmWav().toString('base64');
+        return s.end(audio ?? JSON.stringify({ choices: [{ message: { audio: { data: wav } } }] }));
+      }
+      if (q.url.startsWith('/foundry')) { s.statusCode = foundryStatus; return s.end(JSON.stringify({ data: deployments })); }
+      if (q.url.startsWith('/nebius')) return s.end(JSON.stringify({ data: [{ id: 'zai-org/GLM-5.3' }] }));
+      if (q.url.startsWith('/tts')) return s.end(tts ?? fmWav());
+      if (q.url.startsWith('/stt')) return s.end(JSON.stringify({ RecognitionStatus: 'Success', DisplayText: 'The forge is lit.' }));
+      if (q.url.startsWith('/katana')) return s.end(JSON.stringify({ models: [{ name: 'qwen3.5:9b-q4_K_M' }] }));
+      if (q.url.startsWith('/health')) return s.end('{"status":"ok"}');
+      s.statusCode = 404; s.end();
+    });
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  const sh = (name, body) => { writeFileSync(join(bin, name), `#!/bin/sh\necho "${name} $*" >> '${log}'\n${body}\n`); chmodSync(join(bin, name), 0o755); };
+  const registry = { ok: true, models: [
+    { name: 'foundry/gpt-6.1-sol', provider: 'azure', enabled: true, upstream: 'azure/gpt-6.1-sol' },
+    { name: 'nebius/glm-5.3', provider: 'nebius', enabled: true, upstream: 'nebius/zai-org/GLM-5.3' } ] };
+  sh('forge', `case "$1" in route) echo '${JSON.stringify(registry)}';; probe) ${gatewayError ? `echo '{"ok":false,"error":"${gatewayError}"}'` : `echo '{"ok":true}'`};; esac`);
+  sh('az', `echo tokentokentokentokentoken0123`);
+  sh('bw', `case "$1" in status) echo '{"status":"${bwStatus}"}';; get) echo testkey123;; *) exit 1;; esac`);
+  const bump = claudeCounts === true ? `n=$(cat '${counter}'); echo $((n+1)) > '${counter}'`
+    : claudeCounts === 'twice-then-none' ? `case "$*" in *claude-opus-5-5*) n=$(cat '${counter}'); echo $((n+2)) > '${counter}';; esac` : ':';
+  sh('claude', `${bump}; for a; do case "$prev" in --model) m=$a;; esac; prev=$a; done; echo "{\\"is_error\\":false,\\"modelUsage\\":{\\"$m\\":{}}}"`);
+  sh('curl', `case "$*" in *model_selector*) echo '{"model_selector_config":[{"models":[{"id":"claude-opus-5-5"},{"id":"claude-fable-5-2"}]}]}';; *status*) echo "{\\"clients\\":{\\"forge-check\\":{\\"requests\\":$(cat '${counter}')}}}";; *) exit 22;; esac`);
+  sh('systemctl', `echo "wyoming-piper.service loaded active running x"`);
+  sh('docker', `echo wyoming-openwakeword`);
+  const cfg = { ...FM_CFG, speechRegions: regions, local: [{ ...FM_CFG.local[0], health: `${base}/health` }, { ...FM_CFG.local[1], wyoming: wyomingPort ?? FM_CFG.local[1].wyoming }],
+    foundryDirect: [...FM_CFG.foundryDirect, ...(deployments.some((x) => x.id === 'gpt-audio-mini') ? [{ deployment: 'gpt-audio-mini', label: 'audio', kind: 'audio' }] : [])],
+    foundryExpect: { ...FM_CFG.foundryExpect, 'gpt-audio-mini': 'gpt-audio-mini' } };
+  writeFileSync(join(d, 'cfg.json'), JSON.stringify(cfg));
+  const urls = { foundryApi: `${base}/foundry/list`, foundryBase: `${base}/foundry`, nebius: `${base}/nebius`, tts: `${base}/tts`, stt: `${base}/stt`, katana: `${base}/katana`, status: 'http://127.0.0.1:3456/teamclaude/status' };
+  const env = { PATH: `${bin}:${process.env.PATH}`, HOME: d, CHECK_FM_HOME: d, CHECK_FM_PLAN: join(d, 'forge'), CHECK_FM_CONFIG: join(d, 'cfg.json'),
+    CHECK_FM_URLS: JSON.stringify(urls), CHECK_FM_PACE_MS: '0', CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW) };
+  const out = await new Promise((res) => execFile('node', [join(C, 'forge-models.mjs')], { env, encoding: 'utf8', timeout: 60_000 }, (e, so) => res(so)));
+  srv.close();
+  return { out, calls: readFileSync(log, 'utf8'), hits };
+}
+const DEPLOYS = [{ id: 'gpt-6.1-sol', model: 'gpt-6.1-sol', status: 'succeeded' }, { id: 'gpt-image-1.5', model: 'gpt-image-1.5', status: 'succeeded' }];
+
+test('forge-models collect: a Foundry deployment that drifted to Claude is never probed, and fails as drift', async () => {
+  const r = await fmCollect({ deployments: [{ id: 'gpt-6.1-sol', model: 'claude-opus-5-5', status: 'succeeded' }, DEPLOYS[1]] });
+  assert.doesNotMatch(r.calls, /forge probe foundry\/gpt-6\.1-sol/);
+  assert.match(r.calls, /forge probe nebius\/glm-5\.3/);
+  assert.match(r.out, /^fail\t.*deployment drift: foundry:gpt-6\.1-sol now serves claude-opus-5-5/);
+});
+
+test('forge-models collect: Foundry deployments unread means no Foundry route is probed', async () => {
+  const r = await fmCollect({ deployments: DEPLOYS, foundryStatus: 500 });
+  assert.doesNotMatch(r.calls, /forge probe foundry\//);
+  assert.match(r.out, /not read: .*Foundry deployments/);
+});
+
+test('forge-models collect: a healthy run probes every route and Claude model through the seat proxy', async () => {
+  const r = await fmCollect({ deployments: DEPLOYS });
+  assert.match(r.calls, /forge probe foundry\/gpt-6\.1-sol/);
+  assert.match(r.calls, /claude -p --settings .*forge-check\.settings\.json .*--model claude-opus-5-5/);
+  assert.match(r.calls, /bw get password x --nointeraction/);
+  assert.doesNotMatch(r.out, /not seen at the seat proxy/);
+});
+
+test('forge-models collect: a locked vault is never asked for a secret, and its sources are "not read"', async () => {
+  const r = await fmCollect({ deployments: DEPLOYS, bwStatus: 'locked' });
+  assert.match(r.calls, /bw status --nointeraction/);
+  assert.doesNotMatch(r.calls, /bw (get|unlock|login)/);
+  assert.match(r.out, /not read: .*Nebius catalog \(vault locked\?\), Azure Speech \(vault locked\?\)/);
+});
+
+test('forge-models collect: Claude probes that do not show at the proxy under forge-check fail', async () => {
+  const r = await fmCollect({ deployments: DEPLOYS, claudeCounts: false });
+  assert.match(r.out, /^fail\t.*claude-opus-5-5 \(not seen at the seat proxy\), claude-fable-5-2 \(not seen at the seat proxy\)/);
+});
+
+test('forge-models collect: a Speech region that is not a hostname label sends no request', async () => {
+  const r = await fmCollect({ deployments: DEPLOYS, regions: { tts: 'evil.example/x', stt: 'westus' } });
+  assert.equal(r.hits.some((h) => h.startsWith('/tts') || h.startsWith('/stt')), false);
+  assert.match(r.out, /not read: .*Azure Speech/);
+});
+
+test('forge-models collect: a gateway error text is reduced to a fixed word', async () => {
+  const r = await fmCollect({ deployments: DEPLOYS, gatewayError: 'Bearer sk-CANARY99' });
+  assert.doesNotMatch(r.out, /CANARY/);
+  assert.match(r.out, /nebius\/glm-5\.3 \(no answer\)/);
+});
+
+
+test('forge-models: a world-writable HOME refuses publication (r2.5)', () => {
+  const d = fresh(); mkdirSync(join(d, 'forge'), { mode: 0o700 }); chmodSync(d, 0o777);
+  writeFileSync(join(d, 'cfg.json'), JSON.stringify(FM_CFG)); writeFileSync(join(d, 'in.json'), JSON.stringify(fmIn()));
+  const r = run('forge-models.sh', { CHECK_FM_HOME: d, CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW) });
+  chmodSync(d, 0o700);
+  // group write by this user's own private group (Ubuntu's 775 ~/srv) is allowed; the test host's
+  // group is private when /etc/group lists it for this user with no members
+  chmodSync(d, 0o770);
+  const r2 = run('forge-models.sh', { CHECK_FM_HOME: d, CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW) });
+  chmodSync(d, 0o700);
+  // through a fake getent (r8.1): private → written; another account sharing the gid → refused
+  const bin = join(d, 'bin'); mkdirSync(bin);
+  const me = process.env.USER || 'u', gid = process.getgid();
+  const fakeGetent = (others, dupGroup = false) => { writeFileSync(join(bin, 'getent'), `#!/bin/sh\ncase "$1" in group) echo "${me}:x:${gid}:"${dupGroup ? `; echo "shared:x:${gid}:intruder"` : ''};; passwd) echo "${me}:x:${process.getuid()}:${gid}::/h:/bin/sh"${others ? `; echo "intruder:x:4242:${gid}::/h:/bin/sh"` : ''};; esac\n`); chmodSync(join(bin, 'getent'), 0o755); };
+  writeFileSync(join(d, 'nss-local'), 'passwd: files systemd\ngroup: files [SUCCESS=merge] systemd\n');
+  writeFileSync(join(d, 'nss-sss'), 'passwd: files sss\ngroup: files sss\n');
+  const env3 = { CHECK_FM_NSSWITCH: join(d, 'nss-local'), PATH: `${bin}:${process.env.PATH}`, CHECK_FM_HOME: d, CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW) };
+  fakeGetent(false); chmodSync(d, 0o770);
+  const r3 = run('forge-models.sh', env3);
+  fakeGetent(true);
+  const r4 = run('forge-models.sh', env3);
+  fakeGetent(false);
+  const r5 = run('forge-models.sh', { ...env3, CHECK_FM_NSSWITCH: join(d, 'nss-sss') });   // r9.1: SSSD may hide accounts
+  writeFileSync(join(bin, 'getent'), '#!/bin/sh\nexit 0\n'); chmodSync(join(bin, 'getent'), 0o755);
+  const r6 = run('forge-models.sh', env3);                                                 // r9.1: an empty listing proves nothing
+  fakeGetent(false, true);
+  const r7 = run('forge-models.sh', env3);                                                 // a second group line with the same gid
+  chmodSync(d, 0o700);
+  assert.match(r5.line, /direct\.json not written \(EPATH\)/);
+  assert.match(r6.line, /direct\.json not written \(EPATH\)/);
+  assert.match(r7.line, /direct\.json not written \(EPATH\)/);
+  if (userInfo().username === me) assert.doesNotMatch(r3.line, /not written/);
+  assert.match(r4.line, /^CHECK forge-models warn · .*direct\.json not written \(EPATH\)/);
+  assert.match(r.line, /^CHECK forge-models warn · .*direct\.json not written \(EPATH\)/);   // never ok while the page goes stale (r3.3)
+});
+
+test('forge-models collect: one call counted twice cannot cover another that never reached the proxy (r2.1)', async () => {
+  const r = await fmCollect({ deployments: DEPLOYS, claudeCounts: 'twice-then-none' });
+  assert.match(r.out, /^fail\t.*claude-fable-5-2 \(not seen at the seat proxy\)/);
+  assert.doesNotMatch(r.out, /claude-opus-5-5 \(not seen/);
+});
+
+
+test('forge-models collect: an empty or non-WAV audio answer, or a bad image answer, is not a reachable model (r3.2)', async () => {
+  const ok = await fmCollect({ deployments: [...DEPLOYS, { id: 'gpt-audio-mini', model: 'gpt-audio-mini', status: 'succeeded' }] });
+  assert.doesNotMatch(ok.out, /foundry:gpt-(audio-mini|image-1\.5) \(/);
+  for (const audio of [JSON.stringify({ choices: [{ message: { audio: { data: '' } } }] }), JSON.stringify({ choices: [{ message: { audio: { data: Buffer.alloc(3000).toString('base64') } } }] }), 'not json']) {
+    const r = await fmCollect({ deployments: [...DEPLOYS, { id: 'gpt-audio-mini', model: 'gpt-audio-mini', status: 'succeeded' }], audio });
+    assert.match(r.out, /^fail\t.*foundry:gpt-audio-mini \(bad answer\)/);
+  }
+  const r = await fmCollect({ deployments: [...DEPLOYS, { id: 'gpt-audio-mini', model: 'gpt-audio-mini', status: 'succeeded' }], image: JSON.stringify({ data: [{ b64_json: '' }] }) });
+  assert.match(r.out, /^fail\t.*foundry:gpt-image-1\.5 \(bad answer\)/);
+});
+
+
+// bounded twice (r5.3): fmCollect's child is killed after 60 s (its output is then not a verdict, so the
+// match fails), and the runner itself stops this test after 150 s
+test('forge-models collect: a Wyoming peer that closes early or sends half an answer does not hang the check (r4.2)', { timeout: 150_000 }, async () => {
+  for (const mode of ['eof', 'truncated']) {
+    const { createServer: tcp } = await import('node:net');
+    const srv = tcp((c) => { if (mode === 'truncated') c.write('{"type": "info", "data_length": 500}\n{"wa'); c.end(); });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const t0 = Date.now();
+    const r = await fmCollect({ deployments: DEPLOYS, wyomingPort: srv.address().port });
+    srv.close();
+    assert.equal(typeof r.out, 'string', `${mode}: the collector was killed at its deadline`);
+    assert.ok(Date.now() - t0 < 30_000, mode);
+    assert.match(r.out, /^fail\t.*openwakeword \(no answer\)/, mode);
+  }
+});
+
+
+test('forge-models collect: a Wyoming peer that trickles bytes forever is cut off by an absolute deadline (r6.1)', { timeout: 150_000 }, async () => {
+  const { createServer: tcp } = await import('node:net');
+  const conns = [];
+  const srv = tcp((c) => { conns.push(c); const iv = setInterval(() => c.write('{'), 1000); c.on('close', () => clearInterval(iv)); c.on('error', () => {}); });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const t0 = Date.now();
+  const r = await fmCollect({ deployments: DEPLOYS, wyomingPort: srv.address().port });
+  for (const c of conns) c.destroy();
+  srv.close();
+  assert.equal(typeof r.out, 'string');
+  assert.ok(Date.now() - t0 < 40_000, `took ${Date.now() - t0} ms`);
+  assert.match(r.out, /^fail\t.*openwakeword \(no answer\)/);
+});
+
+test('forge-models collect: a 200 that is not an image, or a TTS 200 that is not the WAV asked for, is a bad answer (r6.2)', async () => {
+  const img = await fmCollect({ deployments: DEPLOYS, image: JSON.stringify({ data: [{ b64_json: Buffer.alloc(3000).toString('base64') }] }) });
+  assert.match(img.out, /^fail\t.*foundry:gpt-image-1\.5 \(bad answer\)/);
+  const tts = await fmCollect({ deployments: DEPLOYS, tts: Buffer.from('<html>' + 'x'.repeat(2000) + '</html>') });
+  assert.match(tts.out, /^fail\t.*en-US-Ava:DragonHDLatestNeural \(bad answer\)/);
+});
+
+
+test('forge-models collect: malformed Wyoming wake data is no answer, never a crash (r7.2)', { timeout: 150_000 }, async () => {
+  const { createServer: tcp } = await import('node:net');
+  for (const data of [{ wake: [{ models: {} }] }, { wake: [null] }, { wake: [{ models: [null] }] }, { wake: [{ models: [{ name: 5 }] }] }]) {
+    const body = JSON.stringify(data);
+    const srv = tcp((c) => { c.on('error', () => {}); c.write(JSON.stringify({ type: 'info', data_length: body.length }) + '\n' + body); });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const r = await fmCollect({ deployments: DEPLOYS, wyomingPort: srv.address().port });
+    srv.close();
+    assert.match(r.out ?? '', /^fail\t.*openwakeword \(no answer\)/, JSON.stringify(data));
+  }
 });

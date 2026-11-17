@@ -122,7 +122,7 @@ export async function collect() {
     // a real answer, not just the shape (r3.2): an image of some size; a WAV that decodes, with audio in it
     const audio = f.kind === 'image' ? null : Buffer.from(String(b?.choices?.[0]?.message?.audio?.data || ''), 'base64');
     const ok = f.kind === 'image' ? typeof b?.data?.[0]?.b64_json === 'string' && Buffer.from(b.data[0].b64_json, 'base64').length > 1000
-      : audio.length > 1000 && audio.subarray(0, 4).toString('latin1') === 'RIFF' && audio.subarray(8, 12).toString('latin1') === 'WAVE';
+      : playableWav(audio);
     inp.foundryProbes[f.deployment] = { ok, error: ok ? null : r.status === 200 ? 'bad answer' : `http ${r.status}` };
   }
   const safeAzure = new Set((inp.foundry || []).filter((d) => d.status === 'succeeded' && !CLAUDE_RE.test(`${d.id} ${d.model}`) && CFG.foundryExpect[d.id] === d.model).map((d) => `azure/${d.id}`));
@@ -217,21 +217,49 @@ export async function collect() {
   inp.wake = await describe(CFG.local.find((l) => l.wyoming)?.wyoming);
   return inp;
 }
+// A WAV that a player would play (r4.1): RIFF/WAVE whose size fits, a PCM `fmt ` chunk (1–2 channels,
+// 8–48 kHz, 8/16/24-bit) and a `data` chunk of at least 0.1 s that fits in the file.
+export function playableWav(b) {
+  if (!Buffer.isBuffer(b) || b.length < 44 || b.toString('latin1', 0, 4) !== 'RIFF' || b.toString('latin1', 8, 12) !== 'WAVE') return false;
+  const riff = b.readUInt32LE(4);
+  if (riff < 36 || riff + 8 > b.length) return false;
+  let fmt = null, off = 12;
+  while (off + 8 <= b.length) {
+    const id = b.toString('latin1', off, off + 4), size = b.readUInt32LE(off + 4), body = off + 8;
+    if (body + size > b.length && id !== 'data') return false;
+    if (id === 'fmt ') {
+      if (size < 16) return false;
+      fmt = { tag: b.readUInt16LE(body), ch: b.readUInt16LE(body + 2), rate: b.readUInt32LE(body + 4), bits: b.readUInt16LE(body + 14) };
+    } else if (id === 'data') {
+      if (!fmt || fmt.tag !== 1 || fmt.ch < 1 || fmt.ch > 2 || fmt.rate < 8000 || fmt.rate > 48000 || ![8, 16, 24].includes(fmt.bits)) return false;
+      const bytesPerSec = fmt.rate * fmt.ch * (fmt.bits / 8);
+      // a streaming writer may put 0xFFFFFFFF here; then the audio is what the file holds
+      const have = size === 0xffffffff ? b.length - body : Math.min(size, b.length - body);
+      return size !== 0 && (size === 0xffffffff || body + size <= b.length) && have >= bytesPerSec / 10;
+    }
+    off = body + size + (size & 1);
+  }
+  return false;
+}
+
 function describe(port) {   // Wyoming describe → the wake word names, or null
   return new Promise((res) => {
     if (!port) return res(null);
+    let done = false;
+    const settle = (v) => { if (!done) { done = true; s.destroy(); res(v); } };
     const s = connect({ host: '127.0.0.1', port }, () => s.write('{"type": "describe"}\n'));
     let buf = '';
-    s.setTimeout(5000, () => { s.destroy(); res(null); });
-    s.on('error', () => res(null));
+    s.setTimeout(5000, () => settle(null));
+    s.on('error', () => settle(null));
+    s.on('end', () => settle(null));     // an early EOF or a truncated answer is no answer (r4.2)
+    s.on('close', () => settle(null));
     s.on('data', (d) => {
       buf += d;
       const nl = buf.indexOf('\n'); if (nl < 0) return;
       const hdr = json(buf.slice(0, nl)); const need = hdr?.data_length || 0;
       if (buf.length - nl - 1 < need) return;
       const data = need ? json(buf.slice(nl + 1, nl + 1 + need)) : hdr?.data;
-      s.destroy();
-      res(Array.isArray(data?.wake) ? data.wake.flatMap((p) => (p.models || []).map((m) => String(m.name))) : null);
+      settle(Array.isArray(data?.wake) ? data.wake.flatMap((p) => (p.models || []).map((m) => String(m.name))) : null);
     });
   });
 }

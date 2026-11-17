@@ -1208,8 +1208,32 @@ test('forge-models: direct.json is not written through a symlinked parent, and a
   assert.equal(JSON.parse(readFileSync(join(d2, 'forge', 'direct.json'), 'utf8')).schema, 'forge.direct/v1');
 });
 
+// a real 16 kHz mono 16-bit PCM WAV of 0.2 s
+function fmWav({ rate = 16000, seconds = 0.2 } = {}) {
+  const data = Buffer.alloc(Math.round(rate * seconds) * 2, 3);
+  const h = Buffer.alloc(44);
+  h.write('RIFF', 0, 'latin1'); h.writeUInt32LE(36 + data.length, 4); h.write('WAVE', 8, 'latin1');
+  h.write('fmt ', 12, 'latin1'); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22); h.writeUInt32LE(rate, 24);
+  h.writeUInt32LE(rate * 2, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34); h.write('data', 36, 'latin1'); h.writeUInt32LE(data.length, 40);
+  return Buffer.concat([h, data]);
+}
+
+test('forge-models: playableWav accepts a real PCM WAV and refuses broken ones (r4.1)', async () => {
+  const { playableWav } = await import(join(C, 'forge-models.mjs'));
+  assert.equal(playableWav(fmWav()), true);
+  const bad = [
+    Buffer.concat([Buffer.from('RIFF\0\0\0\0WAVE', 'latin1'), Buffer.alloc(3000, 1)]),   // the round-3 fixture: no size, no chunks
+    fmWav({ seconds: 0.01 }),                                                               // too short to be an answer
+    (() => { const b = fmWav(); b.writeUInt16LE(3, 20); return b; })(),                    // not PCM
+    (() => { const b = fmWav(); b.writeUInt32LE(9_999_999, 40); return b; })(),            // data larger than the file
+    (() => { const b = fmWav(); b.write('junk', 12, 'latin1'); return b; })(),             // no fmt chunk
+    Buffer.alloc(0),
+  ];
+  for (const [i, b] of bad.entries()) assert.equal(playableWav(b), false, `case ${i}`);
+});
+
 // ---------- forge-models collect(): fake binaries and a local HTTP server (r1.7)
-async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = true, regions = { tts: 'eastus', stt: 'westus' }, gatewayError = null, foundryStatus = 200, audio = null, image = null } = {}) {
+async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = true, regions = { tts: 'eastus', stt: 'westus' }, gatewayError = null, foundryStatus = 200, audio = null, image = null, wyomingPort = null } = {}) {
   const d = fresh(); const bin = join(d, 'bin'); const log = join(d, 'calls.log'); const counter = join(d, 'counter');
   chmodSync(d, 0o700); mkdirSync(bin); writeFileSync(log, ''); writeFileSync(counter, '0');
   mkdirSync(join(d, 'forge', 'hosts'), { recursive: true, mode: 0o700 }); chmodSync(join(d, 'forge'), 0o700);
@@ -1224,7 +1248,7 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
     q.on('end', () => {
       if (q.url.startsWith('/foundry/openai/v1/images')) return s.end(image ?? JSON.stringify({ data: [{ b64_json: Buffer.alloc(3000, 7).toString('base64') }] }));
       if (q.url.startsWith('/foundry/openai/deployments/')) {
-        const wav = Buffer.concat([Buffer.from('RIFF\0\0\0\0WAVE', 'latin1'), Buffer.alloc(3000, 1)]).toString('base64');
+        const wav = fmWav().toString('base64');
         return s.end(audio ?? JSON.stringify({ choices: [{ message: { audio: { data: wav } } }] }));
       }
       if (q.url.startsWith('/foundry')) { s.statusCode = foundryStatus; return s.end(JSON.stringify({ data: deployments })); }
@@ -1251,7 +1275,7 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
   sh('curl', `case "$*" in *model_selector*) echo '{"model_selector_config":[{"models":[{"id":"claude-opus-5-5"},{"id":"claude-fable-5-2"}]}]}';; *status*) echo "{\\"clients\\":{\\"forge-check\\":{\\"requests\\":$(cat '${counter}')}}}";; *) exit 22;; esac`);
   sh('systemctl', `echo "wyoming-piper.service loaded active running x"`);
   sh('docker', `echo wyoming-openwakeword`);
-  const cfg = { ...FM_CFG, speechRegions: regions, local: [{ ...FM_CFG.local[0], health: `${base}/health` }, FM_CFG.local[1]],
+  const cfg = { ...FM_CFG, speechRegions: regions, local: [{ ...FM_CFG.local[0], health: `${base}/health` }, { ...FM_CFG.local[1], wyoming: wyomingPort ?? FM_CFG.local[1].wyoming }],
     foundryDirect: [...FM_CFG.foundryDirect, ...(deployments.some((x) => x.id === 'gpt-audio-mini') ? [{ deployment: 'gpt-audio-mini', label: 'audio', kind: 'audio' }] : [])],
     foundryExpect: { ...FM_CFG.foundryExpect, 'gpt-audio-mini': 'gpt-audio-mini' } };
   writeFileSync(join(d, 'cfg.json'), JSON.stringify(cfg));
@@ -1334,4 +1358,18 @@ test('forge-models collect: an empty or non-WAV audio answer, or a bad image ans
   }
   const r = await fmCollect({ deployments: [...DEPLOYS, { id: 'gpt-audio-mini', model: 'gpt-audio-mini', status: 'succeeded' }], image: JSON.stringify({ data: [{ b64_json: '' }] }) });
   assert.match(r.out, /^fail\t.*foundry:gpt-image-1\.5 \(bad answer\)/);
+});
+
+
+test('forge-models collect: a Wyoming peer that closes early or sends half an answer does not hang the check (r4.2)', async () => {
+  for (const mode of ['eof', 'truncated']) {
+    const { createServer: tcp } = await import('node:net');
+    const srv = tcp((c) => { if (mode === 'truncated') c.write('{"type": "info", "data_length": 500}\n{"wa'); c.end(); });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const t0 = Date.now();
+    const r = await fmCollect({ deployments: DEPLOYS, wyomingPort: srv.address().port });
+    srv.close();
+    assert.ok(Date.now() - t0 < 30_000, mode);
+    assert.match(r.out, /^fail\t.*openwakeword \(no answer\)/, mode);
+  }
 });

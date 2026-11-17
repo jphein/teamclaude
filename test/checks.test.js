@@ -1020,7 +1020,7 @@ const FM_CFG = {
   speechRegions: { tts: 'eastus', stt: 'westus' },
   foundryDirect: [{ deployment: 'gpt-image-1.5', label: 'gpt-image-1.5', kind: 'image' }],
   foundryExpect: { 'gpt-6.1-sol': 'gpt-6.1-sol', 'gpt-5.4-pro': 'gpt-5.4-pro', 'gpt-5.4-pro-1': 'gpt-5.4-pro', 'gpt-image-1.5': 'gpt-image-1.5' },
-  foundryBlocked: { 'FLUX-1.1-pro': 'third-party' },
+  foundryBlockedModels: { 'third-party': ['FLUX-1.1-pro'] },
   local: [{ id: 'nomic-embed-text-v1.5', label: 'nomic', kind: 'embedding', host: 'familiar', health: 'http://127.0.0.1:1/' }, { id: 'openwakeword', label: 'oww', kind: 'wake', host: 'familiar', wyoming: 1 }],
   feedStems: { katana: 'local/katana-qwen35-9b', 'familiar-piper-cori': null },
   localUnits: { 'wyoming-piper': 'familiar-piper-cori', 'ollama-embed': 'nomic-embed-text-v1.5', 'wyoming-openwakeword': 'openwakeword' },
@@ -1052,14 +1052,16 @@ const fmIn = (over = {}) => {
     katanaTags: ['qwen3.5:9b-q4_K_M'],
     embedHealth: true,
     wake: ['okay_nabu'],
+    seatProof: true,
     ...over,
   };
 };
 function fm(inputs, extra = {}) {
   const d = fresh();
+  mkdirSync(join(d, 'forge'), { mode: 0o700 });
   writeFileSync(join(d, 'cfg.json'), JSON.stringify(FM_CFG));
   writeFileSync(join(d, 'in.json'), typeof inputs === 'string' ? inputs : JSON.stringify(inputs));
-  const r = run('forge-models.sh', { CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW), ...extra });
+  const r = run('forge-models.sh', { CHECK_FM_HOME: d, CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW), ...extra });
   const out = join(d, 'forge', 'direct.json');
   return { ...r, direct: existsSync(out) ? JSON.parse(readFileSync(out, 'utf8')) : null };
 }
@@ -1108,7 +1110,7 @@ test('forge-models: a registered or direct Foundry deployment that now serves an
 test('forge-models: katana asleep warns and its failed gateway probe is not counted dead', () => {
   const r = fm(fmIn({ feed: { ...fmIn().feed, katana: { state: 'asleep', ts: new Date(FM_NOW - 60_000).toISOString() } },
     gatewayProbes: { ...fmIn().gatewayProbes, 'local/katana-qwen35-9b': { ok: false, error: 'timeout_or_unreachable' } }, katanaTags: null }));
-  assert.match(r.line, /^CHECK forge-models warn · .*every listed model answered; asleep: katana;/);
+  assert.match(r.line, /^CHECK forge-models warn · .*none of the models probed failed; asleep: katana;/);
 });
 
 test('forge-models: an unreadable source (vault locked, az, stale feed) warns and is named, never ok', () => {
@@ -1121,4 +1123,153 @@ test('forge-models: unreadable inputs or a crash is a fail line (exit 0)', () =>
   const r = fm('{not json');
   assert.equal(r.status, 0);
   assert.match(r.line, /^CHECK forge-models fail · check crashed reading its sources \(SyntaxError\), at /);
+});
+
+
+// xreview #89 r1.5/r1.6: no ok with a missing probe or an unread source; coverage by the observed model
+test('forge-models: a missing Claude probe fails; katana tags unread (katana awake) warns', () => {
+  assert.match(fm(fmIn({ claudeProbes: {} })).line, /^CHECK forge-models fail · .*didn't answer: claude-opus-5-5 \(not probed\), claude-fable-5-2 \(not probed\)/);
+  const r = fm(fmIn({ katanaTags: null }));
+  assert.match(r.line, /^CHECK forge-models warn · .*none of the models probed failed; not read: katana tags/);
+});
+
+test('forge-models: a duplicate deployment that serves another model is unlisted, not covered', () => {
+  const foundry = fmIn().foundry.map((d) => (d.id === 'gpt-5.4-pro-1' ? { ...d, model: 'gpt-7' } : d));
+  assert.match(fm(fmIn({ foundry })).line, /reachable but unlisted: foundry:gpt-5\.4-pro-1 \(gpt-7\)/);
+});
+
+test('forge-models: a third-party model is blocked by what it serves, whatever the deployment is called', () => {
+  const foundry = [...fmIn().foundry.filter((d) => d.id !== 'FLUX-1.1-pro'), { id: 'my-images', model: 'FLUX-1.1-pro', status: 'succeeded' }];
+  assert.match(fm(fmIn({ foundry })).line, /^CHECK forge-models ok · .*blocked on Foundry: 1 Claude, 1 third-party/);
+});
+
+test('forge-models: Claude probes not seen at the seat proxy fail, and the rows say so', () => {
+  const r = fm(fmIn({ seatProof: false }));
+  assert.match(r.line, /^CHECK forge-models fail · .*Claude probes \(not seen at the seat proxy\)/);
+  assert.equal(r.direct.models.find((m) => m.name === 'claude-opus-5-5').error, 'not seen at the seat proxy');
+});
+
+test('forge-models: a model in the direct list that left the seat catalog is not published reachable', () => {
+  const r = fm(fmIn({ claudeCatalog: ['claude-opus-5-5'] }));
+  assert.equal(r.direct.models.find((m) => m.name === 'claude-fable-5-2').reachable, false);
+});
+
+test('forge-models: a probe error that is not a fixed word never reaches the line or the page', () => {
+  const canary = 'sk-CANARY0123456789abcdef';
+  const r = fm(fmIn({ gatewayProbes: { ...fmIn().gatewayProbes, 'nebius/glm-5.3': { ok: false, error: `Bearer ${canary}` } },
+    claudeProbes: { ...fmIn().claudeProbes, 'claude-opus-5-5': { ok: false, served: [], error: canary } },
+    speech: { 'en-US-Ava:DragonHDLatestNeural': { ok: false, error: canary }, 'azure-stt-en-US': { ok: true } } }));
+  assert.doesNotMatch(r.line, /CANARY/);
+  assert.doesNotMatch(JSON.stringify(r.direct), /CANARY/);
+  assert.match(r.line, /nebius\/glm-5\.3 \(no answer\)/);
+});
+
+// r1.4: publication never follows a symlink on the path
+test('forge-models: direct.json is not written through a symlinked parent, and a symlinked target is replaced, not followed', () => {
+  const d = fresh(); const elsewhere = fresh();
+  writeFileSync(join(d, 'cfg.json'), JSON.stringify(FM_CFG)); writeFileSync(join(d, 'in.json'), JSON.stringify(fmIn()));
+  symlinkSync(elsewhere, join(d, 'forge'));
+  const env = { CHECK_FM_HOME: d, CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_NOW_MS: String(FM_NOW) };
+  let r = run('forge-models.sh', { ...env, CHECK_FM_OUT: join(d, 'forge', 'direct.json') });
+  assert.match(r.line, /direct\.json not written \(EPATH\)/);
+  assert.equal(existsSync(join(elsewhere, 'direct.json')), false);
+  const d2 = fresh(); mkdirSync(join(d2, 'forge'), { mode: 0o700 });
+  writeFileSync(join(elsewhere, 'victim'), 'keep');
+  symlinkSync(join(elsewhere, 'victim'), join(d2, 'forge', 'direct.json'));
+  r = run('forge-models.sh', { ...env, CHECK_FM_HOME: d2, CHECK_FM_OUT: join(d2, 'forge', 'direct.json') });
+  assert.doesNotMatch(r.line, /not written/);
+  assert.equal(readFileSync(join(elsewhere, 'victim'), 'utf8'), 'keep');
+  assert.equal(JSON.parse(readFileSync(join(d2, 'forge', 'direct.json'), 'utf8')).schema, 'forge.direct/v1');
+});
+
+// ---------- forge-models collect(): fake binaries and a local HTTP server (r1.7)
+async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = true, regions = { tts: 'eastus', stt: 'westus' }, gatewayError = null, foundryStatus = 200 } = {}) {
+  const d = fresh(); const bin = join(d, 'bin'); const log = join(d, 'calls.log'); const counter = join(d, 'counter');
+  mkdirSync(bin); writeFileSync(log, ''); writeFileSync(counter, '0');
+  mkdirSync(join(d, 'forge', 'hosts'), { recursive: true, mode: 0o700 });
+  mkdirSync(join(d, '.config/teamclaude-client'), { recursive: true });
+  const key = 'tc-' + 'a'.repeat(48);
+  writeFileSync(join(d, '.config/teamclaude-client/forge-check.settings.json'), JSON.stringify({ env: { HTTPS_PROXY: `http://${key}:${key}@127.0.0.1:3456` } }), { mode: 0o600 });
+  const hits = [];
+  const srv = createServer((q, s) => {
+    hits.push(q.url);
+    let b = '';
+    q.on('data', (c) => { b += c; });
+    q.on('end', () => {
+      if (q.url.startsWith('/foundry')) { s.statusCode = foundryStatus; return s.end(JSON.stringify({ data: deployments })); }
+      if (q.url.startsWith('/nebius')) return s.end(JSON.stringify({ data: [{ id: 'zai-org/GLM-5.3' }] }));
+      if (q.url.startsWith('/tts')) return s.end(Buffer.alloc(4000, 1));
+      if (q.url.startsWith('/stt')) return s.end(JSON.stringify({ RecognitionStatus: 'Success', DisplayText: 'The forge is lit.' }));
+      if (q.url.startsWith('/katana')) return s.end(JSON.stringify({ models: [{ name: 'qwen3.5:9b-q4_K_M' }] }));
+      if (q.url.startsWith('/health')) return s.end('{"status":"ok"}');
+      s.statusCode = 404; s.end();
+    });
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  const sh = (name, body) => { writeFileSync(join(bin, name), `#!/bin/sh\necho "${name} $*" >> '${log}'\n${body}\n`); chmodSync(join(bin, name), 0o755); };
+  const registry = { ok: true, models: [
+    { name: 'foundry/gpt-6.1-sol', provider: 'azure', enabled: true, upstream: 'azure/gpt-6.1-sol' },
+    { name: 'nebius/glm-5.3', provider: 'nebius', enabled: true, upstream: 'nebius/zai-org/GLM-5.3' } ] };
+  sh('forge', `case "$1" in route) echo '${JSON.stringify(registry)}';; probe) ${gatewayError ? `echo '{"ok":false,"error":"${gatewayError}"}'` : `echo '{"ok":true}'`};; esac`);
+  sh('az', `echo tokentokentokentokentoken0123`);
+  sh('bw', `case "$1" in status) echo '{"status":"${bwStatus}"}';; get) echo testkey123;; *) exit 1;; esac`);
+  sh('claude', `${claudeCounts ? `n=$(cat '${counter}'); echo $((n+1)) > '${counter}'` : ':'}; for a; do case "$prev" in --model) m=$a;; esac; prev=$a; done; echo "{\\"is_error\\":false,\\"modelUsage\\":{\\"$m\\":{}}}"`);
+  sh('curl', `case "$*" in *model_selector*) echo '{"model_selector_config":[{"models":[{"id":"claude-opus-5-5"},{"id":"claude-fable-5-2"}]}]}';; *status*) echo "{\\"clients\\":{\\"forge-check\\":{\\"requests\\":$(cat '${counter}')}}}";; *) exit 22;; esac`);
+  sh('systemctl', `echo "wyoming-piper.service loaded active running x"`);
+  sh('docker', `echo wyoming-openwakeword`);
+  const cfg = { ...FM_CFG, speechRegions: regions, local: [{ ...FM_CFG.local[0], health: `${base}/health` }, FM_CFG.local[1]] };
+  writeFileSync(join(d, 'cfg.json'), JSON.stringify(cfg));
+  const urls = { foundryApi: `${base}/foundry`, nebius: `${base}/nebius`, tts: `${base}/tts`, stt: `${base}/stt`, katana: `${base}/katana`, status: 'http://127.0.0.1:3456/teamclaude/status' };
+  const env = { PATH: `${bin}:${process.env.PATH}`, HOME: d, CHECK_FM_HOME: d, CHECK_FM_PLAN: join(d, 'forge'), CHECK_FM_CONFIG: join(d, 'cfg.json'),
+    CHECK_FM_URLS: JSON.stringify(urls), CHECK_FM_PACE_MS: '0', CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW) };
+  const out = await new Promise((res) => execFile('node', [join(C, 'forge-models.mjs')], { env, encoding: 'utf8', timeout: 60_000 }, (e, so) => res(so)));
+  srv.close();
+  return { out, calls: readFileSync(log, 'utf8'), hits };
+}
+const DEPLOYS = [{ id: 'gpt-6.1-sol', model: 'gpt-6.1-sol', status: 'succeeded' }, { id: 'gpt-image-1.5', model: 'gpt-image-1.5', status: 'succeeded' }];
+
+test('forge-models collect: a Foundry deployment that drifted to Claude is never probed, and fails as drift', async () => {
+  const r = await fmCollect({ deployments: [{ id: 'gpt-6.1-sol', model: 'claude-opus-5-5', status: 'succeeded' }, DEPLOYS[1]] });
+  assert.doesNotMatch(r.calls, /forge probe foundry\/gpt-6\.1-sol/);
+  assert.match(r.calls, /forge probe nebius\/glm-5\.3/);
+  assert.match(r.out, /^fail\t.*deployment drift: foundry:gpt-6\.1-sol now serves claude-opus-5-5/);
+});
+
+test('forge-models collect: Foundry deployments unread means no Foundry route is probed', async () => {
+  const r = await fmCollect({ deployments: DEPLOYS, foundryStatus: 500 });
+  assert.doesNotMatch(r.calls, /forge probe foundry\//);
+  assert.match(r.out, /not read: .*Foundry deployments/);
+});
+
+test('forge-models collect: a healthy run probes every route and Claude model through the seat proxy', async () => {
+  const r = await fmCollect({ deployments: DEPLOYS });
+  assert.match(r.calls, /forge probe foundry\/gpt-6\.1-sol/);
+  assert.match(r.calls, /claude -p --settings .*forge-check\.settings\.json .*--model claude-opus-5-5/);
+  assert.match(r.calls, /bw get password x --nointeraction/);
+  assert.doesNotMatch(r.out, /not seen at the seat proxy/);
+});
+
+test('forge-models collect: a locked vault is never asked for a secret, and its sources are "not read"', async () => {
+  const r = await fmCollect({ deployments: DEPLOYS, bwStatus: 'locked' });
+  assert.match(r.calls, /bw status --nointeraction/);
+  assert.doesNotMatch(r.calls, /bw (get|unlock|login)/);
+  assert.match(r.out, /not read: .*Nebius catalog \(vault locked\?\), Azure Speech \(vault locked\?\)/);
+});
+
+test('forge-models collect: Claude probes that do not show at the proxy under forge-check fail', async () => {
+  const r = await fmCollect({ deployments: DEPLOYS, claudeCounts: false });
+  assert.match(r.out, /^fail\t.*Claude probes \(not seen at the seat proxy\)/);
+});
+
+test('forge-models collect: a Speech region that is not a hostname label sends no request', async () => {
+  const r = await fmCollect({ deployments: DEPLOYS, regions: { tts: 'evil.example/x', stt: 'westus' } });
+  assert.equal(r.hits.some((h) => h.startsWith('/tts') || h.startsWith('/stt')), false);
+  assert.match(r.out, /not read: .*Azure Speech/);
+});
+
+test('forge-models collect: a gateway error text is reduced to a fixed word', async () => {
+  const r = await fmCollect({ deployments: DEPLOYS, gatewayError: 'Bearer sk-CANARY99' });
+  assert.doesNotMatch(r.out, /CANARY/);
+  assert.match(r.out, /nebius\/glm-5\.3 \(no answer\)/);
 });

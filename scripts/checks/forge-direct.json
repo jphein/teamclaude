@@ -1,52 +1,182 @@
 {
   "_about": "CHECK forge-models (docs/CHECKS.md): what the Forge must list besides the gateway registry, and how each provider's catalog maps to a listed row. Inventory 2026-11-17 05:0x, every row probed live (JP 05:03 via Sen: 'Make sure the forge has comprehensive of all available models').",
   "claude": [
-    {"id": "claude-opus-5-5", "label": "Opus 5.5", "group": "main"},
-    {"id": "claude-fable-5-2", "label": "Fable 5.2", "group": "main"},
-    {"id": "claude-sonnet-5-5", "label": "Sonnet 5.5", "group": "main"},
-    {"id": "claude-haiku-5-5", "label": "Haiku 5.5", "group": "main"},
-    {"id": "claude-mythos-5-2", "label": "Mythos 5.2", "group": "overflow"},
-    {"id": "claude-mythos-5-1", "label": "Mythos 5.1", "group": "overflow"},
-    {"id": "claude-fable-5-1", "label": "Fable 5.1", "group": "overflow"},
-    {"id": "claude-fable-5", "label": "Fable 5", "group": "overflow"},
-    {"id": "claude-opus-5", "label": "Opus 5", "group": "overflow"},
-    {"id": "claude-opus-4-8", "label": "Opus 4.8", "group": "overflow"},
-    {"id": "claude-opus-4-7", "label": "Opus 4.7", "group": "overflow"},
-    {"id": "claude-opus-4-6", "label": "Opus 4.6", "group": "overflow"},
-    {"id": "claude-sonnet-5", "label": "Sonnet 5", "group": "overflow"},
-    {"id": "claude-sonnet-4-6", "label": "Sonnet 4.6", "group": "overflow"},
-    {"id": "claude-haiku-4-5-20251001", "label": "Haiku 4.5", "group": "overflow"}
+    {
+      "id": "claude-opus-5-5",
+      "label": "Opus 5.5",
+      "group": "main"
+    },
+    {
+      "id": "claude-fable-5-2",
+      "label": "Fable 5.2",
+      "group": "main"
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "label": "Sonnet 5.5",
+      "group": "main"
+    },
+    {
+      "id": "claude-haiku-5-5",
+      "label": "Haiku 5.5",
+      "group": "main"
+    },
+    {
+      "id": "claude-mythos-5-2",
+      "label": "Mythos 5.2",
+      "group": "overflow"
+    },
+    {
+      "id": "claude-mythos-5-1",
+      "label": "Mythos 5.1",
+      "group": "overflow"
+    },
+    {
+      "id": "claude-fable-5-1",
+      "label": "Fable 5.1",
+      "group": "overflow"
+    },
+    {
+      "id": "claude-fable-5",
+      "label": "Fable 5",
+      "group": "overflow"
+    },
+    {
+      "id": "claude-opus-5",
+      "label": "Opus 5",
+      "group": "overflow"
+    },
+    {
+      "id": "claude-opus-4-8",
+      "label": "Opus 4.8",
+      "group": "overflow"
+    },
+    {
+      "id": "claude-opus-4-7",
+      "label": "Opus 4.7",
+      "group": "overflow"
+    },
+    {
+      "id": "claude-opus-4-6",
+      "label": "Opus 4.6",
+      "group": "overflow"
+    },
+    {
+      "id": "claude-sonnet-5",
+      "label": "Sonnet 5",
+      "group": "overflow"
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "label": "Sonnet 4.6",
+      "group": "overflow"
+    },
+    {
+      "id": "claude-haiku-4-5-20251001",
+      "label": "Haiku 4.5",
+      "group": "overflow"
+    }
   ],
   "speech": [
-    {"id": "en-US-Ava:DragonHDLatestNeural", "label": "Ava, Dragon HD", "kind": "tts", "policy": "recorded-voice"},
-    {"id": "en-US-AvaNeural", "label": "Ava, neural (fast)", "kind": "tts", "policy": "first-party"},
-    {"id": "azure-stt-en-US", "label": "Azure speech to text (en-US)", "kind": "asr", "policy": "first-party"}
+    {
+      "id": "en-US-Ava:DragonHDLatestNeural",
+      "label": "Ava, Dragon HD",
+      "kind": "tts",
+      "policy": "recorded-voice"
+    },
+    {
+      "id": "en-US-AvaNeural",
+      "label": "Ava, neural (fast)",
+      "kind": "tts",
+      "policy": "first-party"
+    },
+    {
+      "id": "azure-stt-en-US",
+      "label": "Azure speech to text (en-US)",
+      "kind": "asr",
+      "policy": "first-party"
+    }
   ],
-  "speechRegions": {"tts": "eastus", "stt": "westus"},
+  "speechRegions": {
+    "tts": "eastus",
+    "stt": "westus"
+  },
   "foundryDirect": [
-    {"deployment": "gpt-audio-mini", "label": "gpt-audio-mini (speech in and out)", "kind": "audio"},
-    {"deployment": "gpt-image-1.5", "label": "gpt-image-1.5", "kind": "image"}
+    {
+      "deployment": "gpt-audio-mini",
+      "label": "gpt-audio-mini (speech in and out)",
+      "kind": "audio"
+    },
+    {
+      "deployment": "gpt-image-1.5",
+      "label": "gpt-image-1.5",
+      "kind": "image"
+    }
   ],
   "foundryExpect": {
-    "gpt-6.1-sol": "gpt-6.1-sol", "gpt-5.5-1": "gpt-5.5", "gpt-5.4-pro": "gpt-5.4-pro", "gpt-5.4-pro-1": "gpt-5.4-pro",
-    "gpt-5.4-mini-1": "gpt-5.4-mini", "gpt-5.4-nano-1": "gpt-5.4-nano", "gpt-5.3-chat": "gpt-chat-latest",
-    "gpt-5.3-codex": "gpt-5.3-codex", "gpt-5.3-codex-1": "gpt-5.3-codex", "o1": "o1", "o4-mini": "o4-mini",
-    "text-embedding-3-small": "text-embedding-3-small", "gpt-audio-mini": "gpt-audio-mini", "gpt-image-1.5": "gpt-image-1.5"
+    "gpt-6.1-sol": "gpt-6.1-sol",
+    "gpt-5.5-1": "gpt-5.5",
+    "gpt-5.4-pro": "gpt-5.4-pro",
+    "gpt-5.4-pro-1": "gpt-5.4-pro",
+    "gpt-5.4-mini-1": "gpt-5.4-mini",
+    "gpt-5.4-nano-1": "gpt-5.4-nano",
+    "gpt-5.3-chat": "gpt-chat-latest",
+    "gpt-5.3-codex": "gpt-5.3-codex",
+    "gpt-5.3-codex-1": "gpt-5.3-codex",
+    "o1": "o1",
+    "o4-mini": "o4-mini",
+    "text-embedding-3-small": "text-embedding-3-small",
+    "gpt-audio-mini": "gpt-audio-mini",
+    "gpt-image-1.5": "gpt-image-1.5"
   },
-  "foundryBlocked": {"FLUX-1.1-pro": "third-party (Black Forest Labs)", "FLUX.1-Kontext-pro": "third-party (Black Forest Labs)"},
   "local": [
-    {"id": "nomic-embed-text-v1.5", "label": "nomic-embed-text v1.5 (embeddings)", "kind": "embedding", "host": "familiar", "health": "http://127.0.0.1:11435/health"},
-    {"id": "openwakeword", "label": "openWakeWord", "kind": "wake", "host": "familiar", "wyoming": 10400}
+    {
+      "id": "nomic-embed-text-v1.5",
+      "label": "nomic-embed-text v1.5 (embeddings)",
+      "kind": "embedding",
+      "host": "familiar",
+      "health": "http://127.0.0.1:11435/health"
+    },
+    {
+      "id": "openwakeword",
+      "label": "openWakeWord",
+      "kind": "wake",
+      "host": "familiar",
+      "wyoming": 10400
+    }
   ],
   "feedStems": {
-    "familiar-b60": "local/b60-qwen36-coder", "familiar-donkey": "local/donkey-4b", "katana": "local/katana-qwen35-9b",
-    "familiar-piper-cori": null, "familiar-piper-burrito": null, "familiar-piper-jp": null, "familiar-parakeet": null, "familiar-scribe": null
+    "familiar-b60": "local/b60-qwen36-coder",
+    "familiar-donkey": "local/donkey-4b",
+    "katana": "local/katana-qwen35-9b",
+    "familiar-piper-cori": null,
+    "familiar-piper-burrito": null,
+    "familiar-piper-jp": null,
+    "familiar-parakeet": null,
+    "familiar-scribe": null
   },
   "localUnits": {
-    "qwen3-coder": "familiar-b60", "donkey-llm": "familiar-donkey", "wyoming-piper": "familiar-piper-cori",
-    "wyoming-piper-burrito": "familiar-piper-burrito", "wyoming-piper-jp": "familiar-piper-jp", "wyoming-onnx-asr": "familiar-parakeet",
-    "scribe": "familiar-scribe", "ollama-embed": "nomic-embed-text-v1.5", "wyoming-openwakeword": "openwakeword"
+    "qwen3-coder": "familiar-b60",
+    "donkey-llm": "familiar-donkey",
+    "wyoming-piper": "familiar-piper-cori",
+    "wyoming-piper-burrito": "familiar-piper-burrito",
+    "wyoming-piper-jp": "familiar-piper-jp",
+    "wyoming-onnx-asr": "familiar-parakeet",
+    "scribe": "familiar-scribe",
+    "ollama-embed": "nomic-embed-text-v1.5",
+    "wyoming-openwakeword": "openwakeword"
   },
-  "katanaTags": {"qwen3.5:9b-q4_K_M": "katana"},
-  "vault": {"nebius": "Nebius Token Factory API key (palace)", "speech": "Azure Speech westus (speech-to-cli)"}
+  "katanaTags": {
+    "qwen3.5:9b-q4_K_M": "katana"
+  },
+  "vault": {
+    "nebius": "Nebius Token Factory API key (palace)",
+    "speech": "Azure Speech westus (speech-to-cli)"
+  },
+  "foundryBlockedModels": {
+    "third-party (Black Forest Labs)": [
+      "FLUX-1.1-pro",
+      "FLUX.1-Kontext-pro"
+    ]
+  }
 }

@@ -123,6 +123,10 @@ for b in "${want_units[@]}"; do
     || { echo "install.sh: $b missing at $sha; nothing installed" >&2; exit 4; }
 done
 for f in "$stage"/lib/*.sh; do bash -n "$f" || { echo "install.sh: $(basename "$f") does not parse; nothing installed" >&2; exit 4; }; done
+# forge-models probes Claude only with its own client key (xreview #89 r1.7): without the file it
+# fails its Claude rows by name ("seat client key missing"), never falls back to a default login
+[ -f "$HOME/.config/teamclaude-client/forge-check.settings.json" ] \
+  || echo "install.sh: note: ~/.config/teamclaude-client/forge-check.settings.json is missing; forge-models will fail its Claude rows until it exists (vault item 'teamclaude client key forge-check')" >&2
 node --check "$stage/lib/forge-models.mjs" 2>/dev/null || { echo "install.sh: forge-models.mjs does not parse; nothing installed" >&2; exit 4; }
 node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$stage/lib/forge-direct.json" 2>/dev/null \
   || { echo "install.sh: forge-direct.json is not JSON; nothing installed" >&2; exit 4; }

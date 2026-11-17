@@ -61,8 +61,9 @@ export function safeName(s) {
   return v;
 }
 // (r1.4, r2.2) vendorScan patterns are a restricted language: literals, classes, anchors and alternation, with NO
-// quantifier at all (+ * { ?), so the matcher has no loop and its work is bounded by name length times pattern
-// size. Each must compile on its own. A bad one makes the whole config "bad", never a hang or a crash.
+// quantifier at all (+ * { ?), so the matcher has no loop: alternation can still multiply paths, but only up to a
+// fixed bound set by the 40-character cap, per position of a 200-character name. Each must compile on its own; a bad
+// one makes the whole config "bad", never a hang or a crash.
 export function scanPatterns(list) {
   if (!Array.isArray(list)) return null;
   const out = [];

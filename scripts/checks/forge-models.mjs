@@ -50,12 +50,15 @@ export function safeId(s) {
   return /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$/.test(v) && !/[A-Za-z0-9+]{20,}/.test(v) && !/(bearer|sk-|key|token|secret|password)/i.test(v) ? v : '(unrecognized id)';
 }
 
-// a child's environment: no proxy, no alternate Claude provider, no API key from the caller's shell
+// a child's environment: no proxy, no alternate Claude provider, no API key from the caller's shell,
+// and nothing a calling Claude session or interactive shell lends it (CLAUDE_*, the CA trust), so a
+// run by hand sees what the timer sees (2026-11-17: a hand run passed on the shell's CA, the timer failed)
 function scrubbed() {
   const e = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (/^(https?_proxy|all_proxy|no_proxy)$/i.test(k)) continue;
-    if (/^(ANTHROPIC_|CLAUDE_CODE_USE_|AWS_|AZURE_|VERTEX_|CLOUD_ML_|GOOGLE_)/.test(k)) continue;
+    if (/^(ANTHROPIC_|CLAUDE_|AWS_|AZURE_|VERTEX_|CLOUD_ML_|GOOGLE_)/.test(k)) continue;
+    if (/^(NODE_EXTRA_CA_CERTS|NODE_OPTIONS|SSL_CERT_FILE|SSL_CERT_DIR)$/.test(k)) continue;
     e[k] = v;
   }
   return e;
@@ -89,6 +92,12 @@ function seatSettings() {
     return /^http:\/\/(tc-[0-9a-f]{48}):\1@127\.0\.0\.1:3456$/.test(p) ? f : null;
   } catch { return null; }
 }
+// the MITM CA the seat proxy presents: Claude Code trusts it only through NODE_EXTRA_CA_CERTS
+const SEAT_CA = join(HOME, '.config/teamclaude-ca.pem');
+function seatCa() {
+  try { const st = statSync(SEAT_CA); return st.isFile() && st.size > 0 ? SEAT_CA : null; } catch { return null; }
+}
+const SEAT_SETUP = new Set(['seat client key missing', 'seat CA missing']);
 function seatCount() {   // forge-check's request counter at the proxy (null when unreadable)
   const r = run('curl', ['-q', '-s', '-f', '--noproxy', '*', '--max-time', '15', URLS.status], { timeout: 30_000 });
   const n = json(r.stdout)?.clients?.['forge-check']?.requests;
@@ -156,9 +165,9 @@ export async function collect() {
   const pj = json(pick.stdout);
   inp.claudeCatalog = pick.status === 0 && Array.isArray(pj?.model_selector_config) ? pj.model_selector_config.flatMap((c) => (Array.isArray(c?.models) ? c.models : []).map((m) => String(m?.id))) : null;
   inp.claudeProbes = {};
-  const settings = seatSettings();
+  const settings = seatSettings(), ca = seatCa();
   for (const c of CFG.claude) {
-    if (!settings) { inp.claudeProbes[c.id] = { ok: false, served: [], seen: false, error: 'seat client key missing' }; continue; }
+    if (!settings || !ca) { inp.claudeProbes[c.id] = { ok: false, served: [], seen: false, error: settings ? 'seat CA missing' : 'seat client key missing' }; continue; }
     let d = null, seen = false;
     for (let i = 0; i < 2 && !(d && !d.is_error); i++) {   // one retry, as for the gateway
       if (i) await sleep(PACE * 3);
@@ -166,7 +175,7 @@ export async function collect() {
       // does not move across THIS call means this call went somewhere else
       const before = seatCount();
       d = json(run('claude', ['-p', '--settings', settings, '--setting-sources', '', '--strict-mcp-config', '--disable-slash-commands', '--no-session-persistence',
-        '--model', c.id, '--system-prompt', 'Answer with one word.', '--tools', '', '--output-format', 'json', 'Say ok.'], { timeout: 120_000, cwd: HOME }).stdout);
+        '--model', c.id, '--system-prompt', 'Answer with one word.', '--tools', '', '--output-format', 'json', 'Say ok.'], { timeout: 120_000, cwd: HOME, env: { ...scrubbed(), NODE_EXTRA_CA_CERTS: ca } }).stdout);
       const after = seatCount();
       seen = before !== null && after !== null && after > before;
     }
@@ -363,7 +372,7 @@ export function judge(cfg, inp, nowMs) {
   for (const c of cfg.claude) {
     const p = inp.claudeProbes?.[c.id];
     if (!p) unreachable.push(`${c.id} (not probed)`);
-    else if (!p.ok) unreachable.push(`${c.id} (${p.error === 'seat client key missing' ? p.error : 'error'})`);
+    else if (!p.ok) unreachable.push(`${c.id} (${SEAT_SETUP.has(p.error) ? p.error : 'error'})`);
     else if (!p.served.includes(c.id)) unreachable.push(`${c.id} (served as ${p.served.map(safeId).join('+') || 'nothing'})`);
     else if (p.seen !== true) unreachable.push(`${c.id} (not seen at the seat proxy)`);
   }
@@ -415,7 +424,7 @@ export function judge(cfg, inp, nowMs) {
   const at = new Date(nowMs).toISOString();
   const row = (o, ok, error, instrument) => ({ ...o, reachable: !!ok, checked: at, instrument, error: ok ? null : error });
   const claudeErr = (id) => { const p = inp.claudeProbes?.[id];
-    return !p ? 'not probed' : p.error === 'seat client key missing' ? p.error : !p.ok ? 'error' : !p.served.includes(id) ? 'served as another model'
+    return !p ? 'not probed' : SEAT_SETUP.has(p.error) ? p.error : !p.ok ? 'error' : !p.served.includes(id) ? 'served as another model'
       : p.seen !== true ? 'not seen at the seat proxy' : inp.claudeCatalog && !inCatalog(id) ? 'left the seat catalog' : 'error'; };
   const rows = [
     ...cfg.claude.map((c) => row({ name: c.id, label: c.label, route: 'teamclaude', kind: 'llm', group: c.group, tier: 'seat', policy: 'claude-teamclaude-only' }, claudeOk(c.id), claudeErr(c.id), 'claude -p through the seats')),

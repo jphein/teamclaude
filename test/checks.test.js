@@ -1056,10 +1056,10 @@ const fmIn = (over = {}) => {
     ...over,
   };
 };
-function fm(inputs, extra = {}) {
+function fm(inputs, extra = {}, cfg = FM_CFG) {
   const d = fresh(); chmodSync(d, 0o700);   // a home writable by no one else (publish refuses otherwise)
   mkdirSync(join(d, 'forge'), { mode: 0o700 }); chmodSync(join(d, 'forge'), 0o700);
-  writeFileSync(join(d, 'cfg.json'), JSON.stringify(FM_CFG));
+  writeFileSync(join(d, 'cfg.json'), JSON.stringify(cfg));
   writeFileSync(join(d, 'in.json'), typeof inputs === 'string' ? inputs : JSON.stringify(inputs));
   const r = run('forge-models.sh', { CHECK_FM_HOME: d, CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW), ...extra });
   const out = join(d, 'forge', 'direct.json');
@@ -1282,7 +1282,7 @@ test('forge-models: playableWav accepts a real PCM WAV and refuses broken ones (
 });
 
 // ---------- forge-models collect(): fake binaries and a local HTTP server (r1.7)
-async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = true, regions = { tts: 'eastus', stt: 'westus' }, gatewayError = null, foundryStatus = 200, audio = null, image = null, wyomingPort = null, tts = null, ca = true, extraEnv = {} } = {}) {
+async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = true, regions = { tts: 'eastus', stt: 'westus' }, gatewayError = null, foundryStatus = 200, audio = null, image = null, wyomingPort = null, tts = null, ca = true, extraEnv = {}, vendors = null, vaultList = null } = {}) {
   const d = fresh(); const bin = join(d, 'bin'); const log = join(d, 'calls.log'); const counter = join(d, 'counter');
   chmodSync(d, 0o700); mkdirSync(bin); writeFileSync(log, ''); writeFileSync(counter, '0');
   mkdirSync(join(d, 'forge', 'hosts'), { recursive: true, mode: 0o700 }); chmodSync(join(d, 'forge'), 0o700);
@@ -1297,10 +1297,11 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
   else if (ca === 'group-writable') { writeFileSync(caPath, pem); chmodSync(caPath, 0o664); }
   else if (ca === 'symlink') { writeFileSync(join(d, 'other.pem'), pem); symlinkSync(join(d, 'other.pem'), caPath); }
   else if (ca === 'open-dir') { writeFileSync(caPath, pem, { mode: 0o644 }); chmodSync(join(d, '.config'), 0o777); }
-  const hits = [];
+  const hits = [], vendorHeaders = [];
   const png = await fmPng();
   const srv = createServer((q, s) => {
     hits.push(q.url);
+    if (q.url.startsWith('/vendor')) vendorHeaders.push({ ...q.headers, method: q.method });
     let b = '';
     q.on('data', (c) => { b += c; });
     q.on('end', () => {
@@ -1315,6 +1316,8 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
       if (q.url.startsWith('/stt')) return s.end(JSON.stringify({ RecognitionStatus: 'Success', DisplayText: 'The forge is lit.' }));
       if (q.url.startsWith('/katana')) return s.end(JSON.stringify({ models: [{ name: 'qwen3.5:9b-q4_K_M' }] }));
       if (q.url.startsWith('/health')) return s.end('{"status":"ok"}');
+      if (q.url.startsWith('/vendor-401')) { s.statusCode = 401; return s.end('{"error":"Bearer sk-CANARY77 rejected"}'); }
+      if (q.url.startsWith('/vendor')) return s.end(JSON.stringify({ transcripts: [], choices: [{ message: { content: 'ok' } }] }));
       s.statusCode = 404; s.end();
     });
   });
@@ -1326,7 +1329,8 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
     { name: 'nebius/glm-5.3', provider: 'nebius', enabled: true, upstream: 'nebius/zai-org/GLM-5.3' } ] };
   sh('forge', `case "$1" in route) echo '${JSON.stringify(registry)}';; probe) ${gatewayError ? `echo '{"ok":false,"error":"${gatewayError}"}'` : `echo '{"ok":true}'`};; esac`);
   sh('az', `echo tokentokentokentokentoken0123`);
-  sh('bw', `case "$1" in status) echo '{"status":"${bwStatus}"}';; get) echo testkey123;; *) exit 1;; esac`);
+  if (vaultList) writeFileSync(join(d, 'vault.json'), JSON.stringify(vaultList));
+  sh('bw', `case "$1" in status) echo '{"status":"${bwStatus}"}';; get) echo testkey123;; list) ${vaultList ? `cat '${join(d, 'vault.json')}'` : 'exit 1'};; *) exit 1;; esac`);
   const bump = claudeCounts === true ? `n=$(cat '${counter}'); echo $((n+1)) > '${counter}'`
     : claudeCounts === 'twice-then-none' ? `case "$*" in *claude-opus-5-5*) n=$(cat '${counter}'); echo $((n+2)) > '${counter}';; esac` : ':';
   // like the real one under a systemd unit: without the proxy's CA it cannot fetch the org settings
@@ -1338,14 +1342,15 @@ for a; do case "$prev" in --model) m=$a;; esac; prev=$a; done; echo "{\\"is_erro
   sh('docker', `echo wyoming-openwakeword`);
   const cfg = { ...FM_CFG, speechRegions: regions, local: [{ ...FM_CFG.local[0], health: `${base}/health` }, { ...FM_CFG.local[1], wyoming: wyomingPort ?? FM_CFG.local[1].wyoming }],
     foundryDirect: [...FM_CFG.foundryDirect, ...(deployments.some((x) => x.id === 'gpt-audio-mini') ? [{ deployment: 'gpt-audio-mini', label: 'audio', kind: 'audio' }] : [])],
-    foundryExpect: { ...FM_CFG.foundryExpect, 'gpt-audio-mini': 'gpt-audio-mini' } };
+    foundryExpect: { ...FM_CFG.foundryExpect, 'gpt-audio-mini': 'gpt-audio-mini' },
+    ...(vendors ? { vendors: vendors(base), vendorScan: { patterns: ['assembly ?ai', 'deepgram'], accountedPatterns: {}, accountedNames: {} } } : {}) };
   writeFileSync(join(d, 'cfg.json'), JSON.stringify(cfg));
   const urls = { foundryApi: `${base}/foundry/list`, foundryBase: `${base}/foundry`, nebius: `${base}/nebius`, tts: `${base}/tts`, stt: `${base}/stt`, katana: `${base}/katana`, status: 'http://127.0.0.1:3456/teamclaude/status' };
   const env = { PATH: `${bin}:${process.env.PATH}`, HOME: d, CHECK_FM_HOME: d, CHECK_FM_PLAN: join(d, 'forge'), CHECK_FM_CONFIG: join(d, 'cfg.json'),
     CHECK_FM_URLS: JSON.stringify(urls), CHECK_FM_PACE_MS: '0', CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW), ...extraEnv };
   const out = await new Promise((res) => execFile('node', [join(C, 'forge-models.mjs')], { env, encoding: 'utf8', timeout: 60_000 }, (e, so) => res(so)));
   srv.close();
-  return { out, calls: readFileSync(log, 'utf8'), hits };
+  return { out, calls: readFileSync(log, 'utf8'), hits, vendorHeaders, direct: existsSync(join(d, 'forge', 'direct.json')) ? JSON.parse(readFileSync(join(d, 'forge', 'direct.json'), 'utf8')) : null };
 }
 const DEPLOYS = [{ id: 'gpt-6.1-sol', model: 'gpt-6.1-sol', status: 'succeeded' }, { id: 'gpt-image-1.5', model: 'gpt-image-1.5', status: 'succeeded' }];
 
@@ -1412,6 +1417,100 @@ test('forge-models collect: a gateway error text is reduced to a fixed word', as
   assert.match(r.out, /nebius\/glm-5\.3 \(no answer\)/);
 });
 
+// ---------- forge-models AI vendors (JP 07:43 via Sen, plan-chat 2414: "The forge is missing assembly ai?")
+const FM_VCFG = { ...FM_CFG,
+  vendors: [
+    { id: 'assemblyai', label: 'AssemblyAI', provider: 'AssemblyAI', modality: ['stt'], tier: 'credit', policy: 'vendor-direct', vault: 'assemblyai-api-key', instrument: 'list transcripts',
+      probe: { url: 'https://api.assemblyai.com/v2/transcript?limit=1', header: 'authorization', scheme: '', expect: 'transcripts', allowEmpty: true } },
+    { id: 'ibm-bob', label: 'IBM Bob', provider: 'IBM', modality: ['llm'], policy: 'vendor-direct', vault: 'IBM Bob API key', probe: null, why: 'no free read-only call is known' },
+  ],
+  vendorScan: { patterns: ['assembly ?ai', '\\bbob\\b', 'deepgram', 'claude', 'openai'], accountedPatterns: { '^teamclaude[ -]': 'teamclaude proxy credentials' },
+    accountedNames: { 'web login, no API key': ['auth.openai.com'] } },
+  vendorsWithoutKey: [{ vendor: 'Deepgram', status: 'no key in the vault' }],
+};
+const FM_VAULT = [{ name: 'assemblyai-api-key', hosts: ['www.assemblyai.com'] }, { name: 'IBM Bob API key', hosts: [] }, { name: 'teamclaude client key ha', hosts: [] },
+  { name: 'auth.openai.com', hosts: ['auth.openai.com'] }, { name: 'resend.com api key', hosts: ['resend.com'] }];
+const fmV = (over = {}) => fmIn({ vaultItems: FM_VAULT, vendorProbes: { assemblyai: { ok: true } }, ...over });
+
+test('forge-models vendors: every AI vault item accounted for and every vendor key answering is ok; AssemblyAI is the first row', () => {
+  const r = fm(fmV(), {}, FM_VCFG);
+  assert.match(r.line, /^CHECK forge-models ok · 12 listed \(4 gateway, 1 host-feed voices, 7 direct\); 2 vendor keys \(1 probed\); every listed model answered/);
+  const [a, b] = r.direct.models;
+  assert.deepEqual([a.name, a.route, a.reachable, a.vault, a.modality, a.policy], ['assemblyai', 'vendor', true, 'assemblyai-api-key', ['stt'], 'vendor-direct']);
+  assert.deepEqual([b.name, b.reachable, b.instrument], ['ibm-bob', null, 'none']);
+  assert.match(b.error, /^not probed: no free read-only call/);
+  assert.deepEqual(r.direct.vendorsWithoutKey, [{ vendor: 'Deepgram', status: 'no key in the vault' }]);
+  assert.deepEqual(r.direct.vaultAccounted, [{ why: 'web login, no API key', names: ['auth.openai.com'] }, { why: 'teamclaude proxy credentials', count: 1 }]);
+});
+
+test('forge-models vendors: an AI key in the vault that the Forge does not list fails, matched by name or by host', () => {
+  const r = fm(fmV({ vaultItems: [...FM_VAULT, { name: 'deepgram api key', hosts: [] }, { name: 'speech thing', hosts: ['console.deepgram.com'] }] }), {}, FM_VCFG);
+  assert.match(r.line, /^CHECK forge-models fail · .*reachable but unlisted: vault:deepgram api key, vault:speech thing/);
+  // the same item before the vendor row existed: AssemblyAI unlisted is exactly JP's 07:43 question
+  const cfg = { ...FM_VCFG, vendors: FM_VCFG.vendors.slice(1) };
+  assert.match(fm(fmV(), {}, cfg).line, /reachable but unlisted: vault:assemblyai-api-key/);
+});
+
+test('forge-models vendors: a key that does not answer fails with a fixed word; a vendor error text never reaches the line', () => {
+  assert.match(fm(fmV({ vendorProbes: { assemblyai: { ok: false, error: 'http 401' } } }), {}, FM_VCFG).line, /^CHECK forge-models fail · .*didn't answer: assemblyai \(http 401\)/);
+  const r = fm(fmV({ vendorProbes: { assemblyai: { ok: false, error: 'Bearer sk-CANARY55' } } }), {}, FM_VCFG);
+  assert.doesNotMatch(r.line + JSON.stringify(r.direct), /CANARY/);
+  assert.match(r.line, /assemblyai \(no answer\)/);
+  assert.match(fm(fmV({ vendorProbes: {} }), {}, FM_VCFG).line, /assemblyai \(not probed\)/);
+});
+
+test('forge-models vendors: a locked vault warns (not read), it does not fail every vendor', () => {
+  const r = fm(fmV({ vaultItems: null, vendorProbes: { assemblyai: { ok: false, error: 'vault locked' } } }), {}, FM_VCFG);
+  assert.match(r.line, /^CHECK forge-models warn · .*not read: vault item list \(vault locked\?\), vendor keys \(vault locked\?\)/);
+});
+
+test('forge-models vendors: a vault name that looks like a secret is never printed', () => {
+  const r = fm(fmV({ vaultItems: [...FM_VAULT, { name: 'openai sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', hosts: [] }] }), {}, FM_VCFG);
+  assert.match(r.line, /vault:\(unrecognized name\)/);
+  assert.doesNotMatch(r.line + JSON.stringify(r.direct), /AAAAAAAAAAAAAAAAAAAAAAAA/);
+});
+
+test('forge-models vendors: vendorSpec takes https only (no credentials in the URL), a plain header, a known scheme and shape', async () => {
+  const { vendorSpec } = await import(join(C, 'forge-models.mjs'));
+  const ok = { url: 'https://api.example.com/v1/models', header: 'Authorization', scheme: 'Bearer ', expect: 'data' };
+  assert.ok(vendorSpec(ok));
+  for (const bad of [{ url: 'http://api.example.com/x' }, { url: 'https://u:p@api.example.com/x' }, { url: 'file:///etc/passwd' }, { header: 'X\r\nInjected: 1' },
+    { header: '' }, { scheme: 'Basic ' }, { expect: 'a.b' }, { expect: '' }, { body: 'raw' }, { url: 'not a url' }])
+    assert.equal(vendorSpec({ ...ok, ...bad }), null, JSON.stringify(bad));
+  // the az login's Entra token: a Cognitive Services host only, as a bearer
+  const en = { url: 'https://inner-auth-resource.cognitiveservices.azure.com/openai/deployments', header: 'Authorization', scheme: 'Bearer ', expect: 'data', auth: 'entra' };
+  assert.equal(vendorSpec(en)?.auth, 'entra');
+  for (const bad of [{ url: 'https://api.example.com/x' }, { url: 'https://cognitiveservices.azure.com.evil.example/x' }, { header: 'api-key', scheme: '' }, { scheme: 'Key ' }, { auth: 'other' }])
+    assert.equal(vendorSpec({ ...en, ...bad }), null, JSON.stringify(bad));
+});
+
+test('forge-models collect: vendor keys go in the configured header only, never argv; the vault list keeps names, not passwords', async () => {
+  const vaultList = [
+    { type: 1, name: 'assemblyai-api-key', login: { password: 'PW-SECRET-1', uris: [{ uri: 'https://www.assemblyai.com/app' }] } },
+    { type: 1, name: 'deepgram login', login: { password: '', uris: [] } },   // no password: not a key
+    { type: 2, name: 'deepgram note', notes: 'x' },
+  ];
+  const vendors = (base) => [
+    { id: 'assemblyai', label: 'AssemblyAI', provider: 'AssemblyAI', modality: ['stt'], policy: 'vendor-direct', vault: 'assemblyai-api-key', instrument: 'x',
+      probe: { url: `${base}/vendor/transcript`, header: 'authorization', scheme: '', expect: 'transcripts', allowEmpty: true } },
+    { id: 'nv', label: 'NV', provider: 'NVIDIA', modality: ['llm'], policy: 'vendor-direct', vault: 'assemblyai-api-key', instrument: 'x',
+      probe: { url: `${base}/vendor-401`, header: 'Authorization', scheme: 'Bearer ', expect: 'choices', body: { model: 'm', max_tokens: 2 } } },
+    { id: 'fd', label: 'FD', provider: 'Azure AI Foundry', modality: ['llm'], policy: 'foundry-first-party', instrument: 'x',
+      probe: { url: `${base}/vendor/entra`, header: 'Authorization', scheme: 'Bearer ', expect: 'transcripts', allowEmpty: true, auth: 'entra' } },
+  ];
+  const r = await fmCollect({ deployments: DEPLOYS, vendors, vaultList });
+  assert.equal(r.vendorHeaders[0].authorization, 'testkey123');
+  assert.equal(r.vendorHeaders.find((h) => h.method === 'POST').authorization, 'Bearer testkey123');
+  assert.equal(r.vendorHeaders.filter((h) => h.authorization === 'Bearer tokentokentokentokentoken0123').length, 1);   // the Entra row, and only it
+  const fd = r.direct.models.find((m) => m.name === 'fd');
+  assert.deepEqual([fd.reachable, fd.auth, fd.vault], [true, 'entra', undefined]);
+  assert.doesNotMatch(r.calls, /testkey123|PW-SECRET/);
+  assert.match(r.calls, /bw list items --nointeraction/);
+  assert.match(r.out, /nv \(http 401\)/);
+  assert.doesNotMatch(r.out, /CANARY|unlisted: .*vault:/);
+  assert.doesNotMatch(JSON.stringify(r.direct), /PW-SECRET|testkey123/);
+  assert.equal(r.direct.models[0].reachable, true);
+});
 
 test('forge-models: a world-writable HOME refuses publication (r2.5)', () => {
   const d = fresh(); mkdirSync(join(d, 'forge'), { mode: 0o700 }); chmodSync(d, 0o777);

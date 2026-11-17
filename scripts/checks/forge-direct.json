@@ -1,5 +1,5 @@
 {
-  "_about": "CHECK forge-models (docs/CHECKS.md): what the Forge must list besides the gateway registry, and how each provider's catalog maps to a listed row. Inventory 2026-11-17 05:0x, every row probed live (JP 05:03 via Sen: 'Make sure the forge has comprehensive of all available models').",
+  "_about": "CHECK forge-models (docs/CHECKS.md): what the Forge must list besides the gateway registry, and how each provider's catalog maps to a listed row. Inventory 2026-11-17 05:0x, every row probed live (JP 05:03 via Sen: 'Make sure the forge has comprehensive of all available models'). Vendors: JP 07:43 via Sen (plan-chat 2414): 'The forge is missing assembly ai?' -- every AI vendor the vault holds a key for, probed with one free authenticated call; the vault scan fails on an AI-vendor item that is neither listed nor accounted for.",
   "claude": [
     {
       "id": "claude-opus-5-5",
@@ -178,5 +178,383 @@
       "FLUX-1.1-pro",
       "FLUX.1-Kontext-pro"
     ]
-  }
+  },
+  "vendors": [
+    {
+      "id": "assemblyai",
+      "label": "AssemblyAI",
+      "provider": "AssemblyAI",
+      "modality": [
+        "stt"
+      ],
+      "tier": "credit ($150 hackathon credits)",
+      "policy": "vendor-direct",
+      "vault": "assemblyai-api-key",
+      "instrument": "list transcripts (read only)",
+      "probe": {
+        "url": "https://api.assemblyai.com/v2/transcript?limit=1",
+        "header": "authorization",
+        "scheme": "",
+        "expect": "transcripts",
+        "allowEmpty": true
+      }
+    },
+    {
+      "id": "google-ai",
+      "label": "Google AI (Gemini API)",
+      "provider": "Google",
+      "modality": [
+        "llm",
+        "vision",
+        "embeddings",
+        "tts"
+      ],
+      "tier": "AI Studio key",
+      "policy": "vendor-direct",
+      "vault": "aistudio.google.com jp@jphein.com API gemini key",
+      "instrument": "list models (read only)",
+      "probe": {
+        "url": "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1",
+        "header": "x-goog-api-key",
+        "scheme": "",
+        "expect": "models"
+      }
+    },
+    {
+      "id": "fal",
+      "label": "fal.ai",
+      "provider": "fal",
+      "modality": [
+        "image",
+        "video"
+      ],
+      "tier": "credit (MegaJam perk)",
+      "policy": "vendor-direct",
+      "vault": "fal api key dreamspace",
+      "instrument": "list models with the key (a bad key is refused)",
+      "probe": {
+        "url": "https://api.fal.ai/v1/models?limit=1",
+        "header": "Authorization",
+        "scheme": "Key ",
+        "expect": "models"
+      }
+    },
+    {
+      "id": "featherless",
+      "label": "Featherless",
+      "provider": "Featherless",
+      "modality": [
+        "llm"
+      ],
+      "tier": "credit (FORGE26 perk)",
+      "policy": "vendor-direct",
+      "vault": "featherless api key palace",
+      "instrument": "two output tokens from Qwen2.5-0.5B (about $0.0000005)",
+      "probe": {
+        "url": "https://api.featherless.ai/v1/chat/completions",
+        "header": "Authorization",
+        "scheme": "Bearer ",
+        "expect": "choices",
+        "body": {
+          "model": "Qwen/Qwen2.5-0.5B-Instruct",
+          "max_tokens": 2,
+          "messages": [
+            {
+              "role": "user",
+              "content": "Say ok."
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "nvidia-build-palace",
+      "label": "NVIDIA Build (palace-nemotron key)",
+      "provider": "NVIDIA",
+      "modality": [
+        "llm",
+        "vision",
+        "embeddings"
+      ],
+      "tier": "free credits",
+      "policy": "vendor-direct",
+      "vault": "NVIDIA API key (palace-nemotron)",
+      "instrument": "two output tokens from nemotron-3.5-bolt-e4b",
+      "probe": {
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "header": "Authorization",
+        "scheme": "Bearer ",
+        "expect": "choices",
+        "body": {
+          "model": "nvidia/nemotron-3.5-bolt-e4b",
+          "max_tokens": 2,
+          "messages": [
+            {
+              "role": "user",
+              "content": "Say ok."
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "nvidia-build-nightshift",
+      "label": "NVIDIA Build (nightshift key)",
+      "provider": "NVIDIA",
+      "modality": [
+        "llm",
+        "vision",
+        "embeddings"
+      ],
+      "tier": "free credits",
+      "policy": "vendor-direct",
+      "vault": "nvidia build api key (nightshift-palace-nemotron-2)",
+      "instrument": "two output tokens from nemotron-3.5-bolt-e4b",
+      "probe": {
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "header": "Authorization",
+        "scheme": "Bearer ",
+        "expect": "choices",
+        "body": {
+          "model": "nvidia/nemotron-3.5-bolt-e4b",
+          "max_tokens": 2,
+          "messages": [
+            {
+              "role": "user",
+              "content": "Say ok."
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "azure-speech-westus2",
+      "label": "Azure Speech westus2 (oracle)",
+      "provider": "Azure Speech",
+      "modality": [
+        "tts",
+        "stt"
+      ],
+      "tier": "credit (Sponsorship)",
+      "policy": "first-party",
+      "vault": "Azure Speech westus2 (oracle, clawcode-resource)",
+      "instrument": "list voices (read only)",
+      "probe": {
+        "url": "https://westus2.tts.speech.microsoft.com/cognitiveservices/voices/list",
+        "header": "Ocp-Apim-Subscription-Key",
+        "scheme": "",
+        "expect": "array"
+      }
+    },
+    {
+      "id": "foundry-inner-auth",
+      "label": "Foundry inner-auth-resource: o3-deep-research",
+      "provider": "Azure AI Foundry",
+      "modality": [
+        "llm"
+      ],
+      "tier": "credit (Sponsorship)",
+      "policy": "foundry-first-party",
+      "instrument": "deployments read with the az login's Entra token; no inference: deep research runs minutes",
+      "note": "Also deploys DeepSeek-V3.2 (third-party, blocked: Foundry is first-party only).",
+      "probe": {
+        "url": "https://inner-auth-resource.cognitiveservices.azure.com/openai/deployments?api-version=2022-12-01",
+        "header": "Authorization",
+        "scheme": "Bearer ",
+        "expect": "data",
+        "allowEmpty": true,
+        "auth": "entra"
+      }
+    },
+    {
+      "id": "ibm-bob",
+      "label": "IBM Bob",
+      "provider": "IBM",
+      "modality": [
+        "llm"
+      ],
+      "tier": "trial (50 Bobcoins/month)",
+      "policy": "vendor-direct",
+      "vault": "IBM Bob API key (katana-agents fax-console v2)",
+      "instrument": "none",
+      "probe": null,
+      "why": "no free read-only call is known; its consumer is Bob Shell on katana"
+    }
+  ],
+  "vendorScan": {
+    "_about": "Vault items (with a password) whose name or URI host matches a pattern must be a vendor row, the Nebius/Speech keys above, or accounted for here.",
+    "patterns": [
+      "assembly ?ai",
+      "deepgram",
+      "eleven ?labs",
+      "openai",
+      "anthropic",
+      "claude",
+      "\\bgroq\\b",
+      "\\btogether\\b",
+      "fireworks",
+      "replicate",
+      "hugging ?face",
+      "\\bhf\\b",
+      "mistral",
+      "nebius",
+      "token ?factory",
+      "nvidia",
+      "nemotron",
+      "gemini",
+      "google ai",
+      "aistudio",
+      "cohere",
+      "perplexity",
+      "\\bfal\\b",
+      "featherless",
+      "\\bbob\\b",
+      "watsonx",
+      "azure ai",
+      "azure speech",
+      "azure_openai",
+      "foundry",
+      "cognitive",
+      "\\bx\\.?ai\\b",
+      "\\bgrok\\b",
+      "deepseek",
+      "openrouter",
+      "voyage",
+      "\\bjina\\b",
+      "cerebras",
+      "sambanova",
+      "\\bai21\\b",
+      "stability",
+      "cartesia",
+      "speechmatics",
+      "gladia",
+      "rev\\.ai",
+      "\\bmurf\\b",
+      "speechify",
+      "resemble",
+      "typecast",
+      "coqui",
+      "runway",
+      "pictory",
+      "otter\\.ai",
+      "litellm",
+      "llama",
+      "ollama",
+      "dreamup",
+      "immersity",
+      "dissident",
+      "mycroft",
+      "\\bband\\.ai\\b",
+      "lablab",
+      "skilljar"
+    ],
+    "accountedPatterns": {
+      "^teamclaude[ -]": "teamclaude proxy credentials (Claude goes through teamclaude only)",
+      "^(DEAD|RETIRED|BACKUP)\\b": "retired key",
+      "\\(DEAD key": "retired key"
+    },
+    "accountedNames": {
+      "web login, no API key": [
+        "anthropic.skilljar.com",
+        "app.coqui.ai",
+        "app.pictory.ai",
+        "app.resemble.ai",
+        "app.runwayml.com",
+        "app.typecast.ai",
+        "auth.dreamup.ai",
+        "auth.immersity.ai",
+        "auth.openai.com",
+        "auth0.openai.com",
+        "chat.mycroft.ai",
+        "home.dissident.ai",
+        "home.mycroft.ai",
+        "mycroft ai",
+        "sso.mycroft.ai",
+        "featherless.ai",
+        "huggingface.co",
+        "login.nvgs.nvidia.com",
+        "murf.ai",
+        "Nvidia.com",
+        "onboarding.speechify.com",
+        "otter.ai",
+        "speechify.com"
+      ],
+      "Foundry resource key; the check reads Foundry with Entra, never this key": [
+        "Azure AI Foundry - Claude"
+      ],
+      "the gateway's own credentials (forge-gateway)": [
+        "forge-gateway litellm master key",
+        "litellm key ha-ember-2",
+        "litellm postgres password (ubox0)"
+      ],
+      "local server key (b60, listed through the gateway)": [
+        "llama-server b60 api key"
+      ],
+      "dead: 401 on every Azure AI resource (2026-11-17); its Vercel project was deleted": [
+        "vercel artcardsv5 AZURE_OPENAI_API_KEY"
+      ],
+      "not an AI key": [
+        "Replicate Mysql",
+        "vultr hackathon gift code (lablab Agent Rush, 2026-11)",
+        "win10 VM local admin claude (katana KVM)"
+      ],
+      "stale: matches neither current resource key (rotated); this resource is read with Entra (2026-11-17)": [
+        "Azure AI Foundry - inner-auth-resource (westus)"
+      ]
+    }
+  },
+  "vendorsWithoutKey": [
+    {
+      "vendor": "Deepgram",
+      "status": "no key in the vault"
+    },
+    {
+      "vendor": "ElevenLabs",
+      "status": "no key in the vault"
+    },
+    {
+      "vendor": "OpenAI API",
+      "status": "web login only; OpenAI models are served through Foundry"
+    },
+    {
+      "vendor": "Anthropic API (direct)",
+      "status": "no key; Claude goes through teamclaude only"
+    },
+    {
+      "vendor": "Groq",
+      "status": "no key in the vault"
+    },
+    {
+      "vendor": "Together",
+      "status": "no key in the vault"
+    },
+    {
+      "vendor": "Fireworks",
+      "status": "no key in the vault"
+    },
+    {
+      "vendor": "Replicate",
+      "status": "no key in the vault"
+    },
+    {
+      "vendor": "Hugging Face",
+      "status": "web login only, no token"
+    },
+    {
+      "vendor": "Mistral",
+      "status": "no key in the vault"
+    },
+    {
+      "vendor": "Cohere",
+      "status": "no key in the vault"
+    },
+    {
+      "vendor": "Perplexity",
+      "status": "no key in the vault"
+    },
+    {
+      "vendor": "Cloudflare AI Gateway (techempower ai gateway)",
+      "status": "endpoint URLs only, no key stored"
+    }
+  ]
 }

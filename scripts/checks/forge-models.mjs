@@ -50,6 +50,40 @@ export function safeId(s) {
   return /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$/.test(v) && !/[A-Za-z0-9+]{20,}/.test(v) && !/(bearer|sk-|key|token|secret|password)/i.test(v) ? v : '(unrecognized id)';
 }
 
+// a vault item name for the line and the page: names are written by people, so only plain ones pass
+export function safeName(s) {
+  const v = String(s ?? '').trim();
+  return /^[A-Za-z0-9 ._:()\/@,'-]{1,90}$/.test(v) && !/[A-Za-z0-9+]{24,}/.test(v) ? v : '(unrecognized name)';
+}
+const VENDOR_ERRORS = /^(http [0-9]{1,3}|bad answer|no answer|key not read|bad probe spec|vault locked|no entra token)$/;
+// a vendor probe from the repo's config: https only, a plain header name, a known scheme, a fixed shape to expect
+export function vendorSpec(p) {
+  let u;
+  try { u = new URL(p?.url); } catch { return null; }
+  const testHttp = !!process.env.CHECK_FM_URLS && u.protocol === 'http:' && u.hostname === '127.0.0.1';   // the tests' local server only
+  if ((u.protocol !== 'https:' && !testHttp) || u.username || u.password) return null;
+  if (!/^[A-Za-z][A-Za-z0-9-]{0,39}$/.test(p.header || '') || !['', 'Bearer ', 'Key '].includes(p.scheme ?? '')) return null;
+  if (!/^(array|[a-z_]{1,20})$/.test(p.expect || '')) return null;
+  if (p.body !== undefined && (typeof p.body !== 'object' || p.body === null)) return null;
+  // an Entra token reaches every Cognitive Services resource of the login, so it goes to one of those only, as a bearer
+  const auth = p.auth ?? 'vault';
+  if (!['vault', 'entra'].includes(auth)) return null;
+  if (auth === 'entra' && (!(u.hostname.endsWith('.cognitiveservices.azure.com') || testHttp) || p.header !== 'Authorization' || p.scheme !== 'Bearer ')) return null;
+  return { url: u.href, header: p.header, scheme: p.scheme ?? '', expect: p.expect, allowEmpty: p.allowEmpty === true, body: p.body, auth };
+}
+async function vendorProbe(spec, key) {
+  const h = { [spec.header]: spec.scheme + key, 'User-Agent': 'forge-models', Accept: 'application/json' };
+  if (spec.body) h['Content-Type'] = 'application/json';
+  const r = await get(spec.url, h, 30_000, spec.body ? 'POST' : 'GET', spec.body ? JSON.stringify(spec.body) : undefined);
+  if (r.status === 0) return { ok: false, error: 'no answer' };
+  if (r.status !== 200) return { ok: false, error: `http ${r.status}` };
+  const d = json(r.body.toString());
+  const x = spec.expect === 'array' ? d : d?.[spec.expect];
+  const shaped = Array.isArray(x) ? (spec.allowEmpty || x.length > 0) : spec.expect !== 'array' && x !== null && typeof x === 'object';
+  return { ok: shaped, error: shaped ? null : 'bad answer' };
+}
+const hostOf = (uri) => { try { return new URL(/^[a-z]+:\/\//i.test(uri) ? uri : `https://${uri}`).hostname.toLowerCase(); } catch { return ''; } };
+
 // a child's environment: no proxy, no alternate Claude provider, no API key from the caller's shell,
 // and nothing a calling Claude session or interactive shell lends it (CLAUDE_*, the CA trust), so a
 // run by hand sees what the timer sees (2026-11-17: a hand run passed on the shell's CA, the timer failed)
@@ -217,6 +251,42 @@ export async function collect() {
       const d = r.status === 200 ? json(r.body.toString()) : null;
       inp.speech[s.id] = { ok: d?.RecognitionStatus === 'Success' && /forge/i.test(String(d?.DisplayText || '')), error: r.status === 200 ? (d ? null : 'bad answer') : `http ${r.status}` };
     }
+  }
+  // 7. AI vendors (JP 07:43, plan-chat 2414: "The forge is missing assembly ai?"): the vault's item NAMES
+  // (only items holding a password; nothing else is kept), then one free authenticated call per vendor key
+  inp.vaultItems = null;
+  if (unlocked) {
+    const r = run('bw', ['list', 'items', '--nointeraction'], { timeout: 120_000, maxBuffer: 64 << 20, env: { ...scrubbed(), BW_NOINTERACTION: 'true' } });
+    const all = r.status === 0 ? json(r.stdout) : null;
+    if (Array.isArray(all)) inp.vaultItems = all.filter((i) => i?.type === 1 && typeof i?.login?.password === 'string' && i.login.password.length > 0)
+      .map((i) => ({ name: String(i.name ?? '').trim(), hosts: (Array.isArray(i.login.uris) ? i.login.uris : []).map((u) => hostOf(String(u?.uri ?? ''))).filter(Boolean) }));
+  }
+  inp.vendorProbes = {};
+  let entraTok = tok && /^[A-Za-z0-9._-]{20,8192}$/.test(tok) ? tok : undefined;
+  const entra = () => {
+    if (entraTok === undefined) {
+      const t = run('az', ['account', 'get-access-token', '--resource', 'https://cognitiveservices.azure.com', '--query', 'accessToken', '-o', 'tsv'], { timeout: 60_000 }).stdout?.trim() || '';
+      entraTok = /^[A-Za-z0-9._-]{20,8192}$/.test(t) ? t : null;
+    }
+    return entraTok;
+  };
+  for (const v of CFG.vendors || []) {
+    if (!v.probe) continue;
+    const spec = vendorSpec(v.probe);
+    if (!spec) { inp.vendorProbes[v.id] = { ok: false, error: 'bad probe spec' }; continue; }
+    if (spec.auth === 'entra') {
+      const t = entra();
+      let res = t ? null : { ok: false, error: 'no entra token' };
+      for (let i = 0; t && i < 2 && !res?.ok; i++) { if (i) await sleep(PACE); res = await vendorProbe(spec, t); }
+      inp.vendorProbes[v.id] = res;
+      continue;
+    }
+    if (!unlocked) { inp.vendorProbes[v.id] = { ok: false, error: 'vault locked' }; continue; }
+    const k = vault(v.vault);
+    if (!k) { inp.vendorProbes[v.id] = { ok: false, error: 'key not read' }; continue; }
+    let res = null;
+    for (let i = 0; i < 2 && !res?.ok; i++) { if (i) await sleep(PACE); res = await vendorProbe(spec, k); }   // one retry, as elsewhere
+    inp.vendorProbes[v.id] = res;
   }
   // 6. local: every scope must be read, or the unit list is unread (r1.5)
   const scopes = [run('systemctl', ['--user', 'list-units', '--type=service', '--state=running', '--no-legend', '--plain'], { timeout: 30_000 }),
@@ -413,11 +483,35 @@ export function judge(cfg, inp, nowMs) {
   const localOk = { embedding: inp.embedHealth === true, wake: Array.isArray(inp.wake) && inp.wake.length > 0 };
   for (const l of cfg.local) if (!localOk[l.kind]) unreachable.push(`${l.id} (no answer)`);
 
+  // AI vendors: every vault item an AI-vendor pattern matches is listed or accounted for, and every listed key answers
+  const vendors = cfg.vendors || [], scan = cfg.vendorScan || {};
+  const accountedNames = new Set([...vendors.map((v) => v.vault).filter(Boolean), cfg.vault?.nebius, cfg.vault?.speech, ...Object.values(scan.accountedNames || {}).flat()]
+    .filter(Boolean).map((n) => String(n).trim()));
+  const accountedRx = Object.keys(scan.accountedPatterns || {}).map((p) => new RegExp(p, 'i'));
+  const aiRx = (scan.patterns || []).length ? new RegExp(scan.patterns.join('|'), 'i') : null;
+  const vaultMatched = new Map();   // accounted-pattern reason -> count, for the page
+  if (vendors.length || aiRx) {
+    if (!inp.vaultItems) unread.push('vault item list (vault locked?)');
+    else if (aiRx) for (const name of new Set(inp.vaultItems.filter((i) => aiRx.test(i.name) || i.hosts.some((h) => aiRx.test(h))).map((i) => i.name))) {
+      if (accountedNames.has(name)) continue;
+      const hit = Object.keys(scan.accountedPatterns || {}).find((p, j) => accountedRx[j].test(name));
+      if (hit) { const why = scan.accountedPatterns[hit]; vaultMatched.set(why, (vaultMatched.get(why) || 0) + 1); continue; }
+      unlisted.push(`vault:${safeName(name)}`);
+    }
+  }
+  const vendorErr = (v) => { const p = inp.vendorProbes?.[v.id]; return !p ? 'not probed' : VENDOR_ERRORS.test(p.error || '') ? p.error : 'no answer'; };
+  for (const v of vendors) {
+    if (!v.probe || inp.vendorProbes?.[v.id]?.ok) continue;
+    if (inp.vendorProbes?.[v.id]?.error === 'vault locked') { if (!unread.includes('vendor keys (vault locked?)')) unread.push('vendor keys (vault locked?)'); continue; }
+    unreachable.push(`${safeId(v.id)} (${vendorErr(v)})`);
+  }
+
   const nGateway = enabled.length, nFeed = Object.values(cfg.feedStems).filter((g) => !g).length;
   const nDirect = cfg.claude.length + cfg.speech.length + cfg.foundryDirect.length + cfg.local.length;
   const state = unlisted.length || unreachable.length || drift.length ? 'fail' : unread.length || asleep.length ? 'warn' : 'ok';
   const few = (a) => a.slice(0, 6).join(', ') + (a.length > 6 ? ` +${a.length - 6} more` : '');
   let fact = `${nGateway + nFeed + nDirect} listed (${nGateway} gateway, ${nFeed} host-feed voices, ${nDirect} direct)`;
+  if (vendors.length) fact += `; ${vendors.length} vendor keys (${vendors.filter((v) => v.probe).length} probed)`;
   fact += unreachable.length ? `; didn't answer: ${few(unreachable)}` : unread.length || asleep.length ? '; none of the models probed failed' : '; every listed model answered';
   if (unlisted.length) fact += `; reachable but unlisted: ${few(unlisted)}`;
   if (drift.length) fact += `; deployment drift: ${few(drift)}`;
@@ -431,7 +525,14 @@ export function judge(cfg, inp, nowMs) {
   const claudeErr = (id) => { const p = inp.claudeProbes?.[id];
     return !p ? 'not probed' : SEAT_SETUP.has(p.error) ? p.error : !p.ok ? 'error' : !p.served.includes(id) ? 'served as another model'
       : p.seen !== true ? 'not seen at the seat proxy' : inp.claudeCatalog && !inCatalog(id) ? 'left the seat catalog' : 'error'; };
+  const vendorRows = vendors.map((v) => {
+    const o = { name: v.id, label: v.label, route: 'vendor', provider: v.provider, kind: v.modality?.[0], modality: v.modality, tier: v.tier, policy: v.policy,
+      ...(v.vault ? { vault: safeName(v.vault) } : { auth: v.probe?.auth || 'none' }), ...(v.note ? { note: v.note } : {}) };
+    return v.probe ? row(o, inp.vendorProbes?.[v.id]?.ok, vendorErr(v), v.instrument)
+      : { ...o, reachable: null, checked: at, instrument: 'none', error: `not probed: ${v.why || 'no free call known'}` };
+  });
   const rows = [
+    ...vendorRows,
     ...cfg.claude.map((c) => row({ name: c.id, label: c.label, route: 'teamclaude', kind: 'llm', group: c.group, tier: 'seat', policy: 'claude-teamclaude-only' }, claudeOk(c.id), claudeErr(c.id), 'claude -p through the seats')),
     ...cfg.speech.map((s) => row({ name: s.id, label: s.label, route: 'azure-speech', kind: s.kind, tier: 'credit', policy: s.policy }, inp.speech?.[s.id]?.ok,
       !inp.speech ? 'not read' : /^(http [0-9]{1,3}|no audio to transcribe|bad answer)$/.test(inp.speech[s.id]?.error || '') ? inp.speech[s.id].error : 'no answer',
@@ -444,7 +545,10 @@ export function judge(cfg, inp, nowMs) {
     ...cfg.local.map((l) => row({ name: l.id, label: l.label, route: 'local', kind: l.kind, host: l.host, tier: 'local', policy: 'local' }, localOk[l.kind], 'no answer', l.health ? 'health endpoint' : 'wyoming describe')),
   ];
   return { state, fact, unlisted, unreachable, drift, unread, asleep, blocked,
-    direct: { schema: 'forge.direct/v1', ts: at, poller: 'teamclaude-check-forge-models', models: rows, blocked } };
+    direct: { schema: 'forge.direct/v1', ts: at, poller: 'teamclaude-check-forge-models', models: rows, blocked,
+      ...(vendors.length || aiRx ? { vendorsWithoutKey: (cfg.vendorsWithoutKey || []).map((x) => ({ vendor: safeName(x.vendor), status: String(x.status ?? '').slice(0, 120) })),
+        vaultAccounted: [...Object.entries(scan.accountedNames || {}).map(([why, names]) => ({ why, names: names.map(safeName) })),
+          ...[...vaultMatched].map(([why, count]) => ({ why, count }))] } : {}) } };
 }
 
 // Publish into the plan's data dir (r1.4): every directory from HOME down is a real directory owned by

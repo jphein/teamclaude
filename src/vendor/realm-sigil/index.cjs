@@ -1,3 +1,6 @@
+// Vendored from jphein/realm-sigil js/index.js at 4693abb, under the GNU LGPL v3 (COPYING.LESSER,
+// COPYING beside this file). MODIFIED 2026-11-17 by teamclaude: require('./realms') renamed to
+// require('./realms.cjs') for this package's ES-module layout; nothing else changed.
 /**
  * realm-sigil: Deterministic magical version name generation.
  *

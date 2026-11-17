@@ -2,14 +2,19 @@
 // realmwatch #493: every web project carries realm-sigil). CHECK sigil-coverage
 // reads `version` ("<Name> · <hash>") and `hash` from it.
 //
-// Served before the key gate, so it carries only what identifies the build:
-// no host, pid, uptime, OS or runtime (the full realm-sigil shape has them, and
-// this endpoint answers anyone who can reach the proxy).
+// Security contract: served before the key gate, to anyone who can reach the
+// proxy, so it discloses on purpose exactly two things: that this is TeamClaude,
+// and which commit of it. That lets a caller fingerprint the version (and names
+// a local commit that may not be pushed); it carries no account, credential,
+// host, pid, OS, runtime or uptime (the full realm-sigil shape has those, and
+// they are left out).
 //
-// The hash is resolved ONCE, when the server is created: the document names
-// the code that is running, and a `git pull` without a restart must not change
-// it. Without a checkout (an npm or Nix install) there is no hash to name, and
-// the document says so (`hash: null`) rather than inventing one.
+// What `hash` means: the package checkout's HEAD as seen when the server was
+// created, and `dirty` says whether tracked files differed from it then. It is
+// resolved once, so a later `git pull` without a restart does not change what
+// the document says; it is not a build stamp, and files changed between the
+// process loading and this read are not detected. Without a checkout (an npm or
+// Nix install) the hash is null, never invented.
 
 import { createRequire } from 'node:module';
 import { execFile } from 'node:child_process';
@@ -30,23 +35,40 @@ const HEX = /^[0-9a-f]{7,40}$/;
 const packageRoot = () => resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 /**
- * The version document for the code at `root`.
+ * git's environment without anything that picks a repository other than the
+ * one at `cwd` (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, GIT_COMMON_DIR, …).
+ * @param {NodeJS.ProcessEnv} env
+ */
+export function gitEnv(env = process.env) {
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const [k, v] of Object.entries(env)) if (!/^GIT_/.test(k) && v !== undefined) out[k] = v;
+  return out;
+}
+
+/**
+ * The version document for the checkout at `root`.
  *
  * @param {Object} [opts]
  * @param {string} [opts.root]
- * @param {(file: string, args: string[], options: { cwd: string, encoding: 'utf8', timeout: number }) => Promise<{ stdout: string }>} [opts.exec]
- * @returns {Promise<Record<string, string | null>>}
+ * @param {(file: string, args: string[], options: { cwd: string, encoding: 'utf8', timeout: number, env: Record<string, string> }) => Promise<{ stdout: string }>} [opts.exec]
+ * @returns {Promise<Record<string, string | boolean | null>>}
  */
 export async function resolveSigil({ root = packageRoot(), exec = promisify(execFile) } = {}) {
-  let hash = null;
+  let hash = null, dirty = null;
   if (existsSync(join(root, '.git'))) {
+    const opts = { cwd: root, encoding: /** @type {'utf8'} */ ('utf8'), timeout: 2000, env: gitEnv() };
     try {
-      const out = String((await exec('git', ['rev-parse', '--short=7', 'HEAD'], { cwd: root, encoding: 'utf8', timeout: 2000 })).stdout).trim();
+      const out = String((await exec('git', ['rev-parse', '--short=7', 'HEAD'], opts)).stdout).trim();
       if (HEX.test(out)) hash = out;
     } catch { /* a broken checkout or no git binary: no hash */ }
+    if (hash) {
+      try { dirty = String((await exec('git', ['status', '--porcelain', '--untracked-files=no'], opts)).stdout).trim() !== ''; }
+      catch { dirty = true; }   // unknown is not clean
+    }
   }
   const base = { name: NAME, description: DESCRIPTION, realm: REALM, repo: REPO };
   return hash
-    ? { ...base, version: generateName(hash, REALM), hash, commit_url: `${REPO}/commit/${hash}` }
-    : { ...base, version: `${NAME} · unknown`, hash: null, commit_url: null };
+    ? { ...base, version: generateName(hash, REALM), hash, dirty, commit_url: `${REPO}/commit/${hash}` }
+    : { ...base, version: `${NAME} · unknown`, hash: null, dirty: null, commit_url: null };
 }

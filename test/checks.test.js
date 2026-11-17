@@ -1167,6 +1167,12 @@ test('forge-models: a key-shaped provider id never reaches the line or the page 
   assert.doesNotMatch(r.line, /CANARY|canary/);
   assert.doesNotMatch(JSON.stringify(r.direct), /CANARY|canary/);
   assert.match(r.line, /claude:\(unrecognized id\)/);
+  // r3.1: a registry name and an Azure upstream, failing and drifting
+  const reg = [...fmIn().registry, { name: `sk-${canary}`, provider: 'nebius', enabled: true, mode: 'chat', upstream: 'nebius/x' },
+    { name: 'foundry/x', provider: 'azure', enabled: true, mode: 'chat', upstream: `azure/${canary}` }];
+  const r2 = fm(fmIn({ registry: reg, foundry: [...fmIn().foundry, { id: canary, model: 'claude-x', status: 'succeeded' }] }));
+  assert.doesNotMatch(r2.line, /CANARY|canary/);
+  assert.match(r2.line, /\(unrecognized id\) \(not probed\)/);
 });
 
 test('forge-models: a model in the direct list that left the seat catalog is not published reachable', () => {
@@ -1203,7 +1209,7 @@ test('forge-models: direct.json is not written through a symlinked parent, and a
 });
 
 // ---------- forge-models collect(): fake binaries and a local HTTP server (r1.7)
-async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = true, regions = { tts: 'eastus', stt: 'westus' }, gatewayError = null, foundryStatus = 200 } = {}) {
+async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = true, regions = { tts: 'eastus', stt: 'westus' }, gatewayError = null, foundryStatus = 200, audio = null, image = null } = {}) {
   const d = fresh(); const bin = join(d, 'bin'); const log = join(d, 'calls.log'); const counter = join(d, 'counter');
   chmodSync(d, 0o700); mkdirSync(bin); writeFileSync(log, ''); writeFileSync(counter, '0');
   mkdirSync(join(d, 'forge', 'hosts'), { recursive: true, mode: 0o700 }); chmodSync(join(d, 'forge'), 0o700);
@@ -1216,8 +1222,11 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
     let b = '';
     q.on('data', (c) => { b += c; });
     q.on('end', () => {
-      if (q.url.startsWith('/foundry/openai/v1/images')) return s.end(JSON.stringify({ data: [{ b64_json: 'x'.repeat(2000) }] }));
-      if (q.url.startsWith('/foundry/openai/deployments/')) return s.end(JSON.stringify({ choices: [{ message: { audio: { data: 'UklGRg' } } }] }));
+      if (q.url.startsWith('/foundry/openai/v1/images')) return s.end(image ?? JSON.stringify({ data: [{ b64_json: Buffer.alloc(3000, 7).toString('base64') }] }));
+      if (q.url.startsWith('/foundry/openai/deployments/')) {
+        const wav = Buffer.concat([Buffer.from('RIFF\0\0\0\0WAVE', 'latin1'), Buffer.alloc(3000, 1)]).toString('base64');
+        return s.end(audio ?? JSON.stringify({ choices: [{ message: { audio: { data: wav } } }] }));
+      }
       if (q.url.startsWith('/foundry')) { s.statusCode = foundryStatus; return s.end(JSON.stringify({ data: deployments })); }
       if (q.url.startsWith('/nebius')) return s.end(JSON.stringify({ data: [{ id: 'zai-org/GLM-5.3' }] }));
       if (q.url.startsWith('/tts')) return s.end(Buffer.alloc(4000, 1));
@@ -1242,7 +1251,9 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
   sh('curl', `case "$*" in *model_selector*) echo '{"model_selector_config":[{"models":[{"id":"claude-opus-5-5"},{"id":"claude-fable-5-2"}]}]}';; *status*) echo "{\\"clients\\":{\\"forge-check\\":{\\"requests\\":$(cat '${counter}')}}}";; *) exit 22;; esac`);
   sh('systemctl', `echo "wyoming-piper.service loaded active running x"`);
   sh('docker', `echo wyoming-openwakeword`);
-  const cfg = { ...FM_CFG, speechRegions: regions, local: [{ ...FM_CFG.local[0], health: `${base}/health` }, FM_CFG.local[1]] };
+  const cfg = { ...FM_CFG, speechRegions: regions, local: [{ ...FM_CFG.local[0], health: `${base}/health` }, FM_CFG.local[1]],
+    foundryDirect: [...FM_CFG.foundryDirect, ...(deployments.some((x) => x.id === 'gpt-audio-mini') ? [{ deployment: 'gpt-audio-mini', label: 'audio', kind: 'audio' }] : [])],
+    foundryExpect: { ...FM_CFG.foundryExpect, 'gpt-audio-mini': 'gpt-audio-mini' } };
   writeFileSync(join(d, 'cfg.json'), JSON.stringify(cfg));
   const urls = { foundryApi: `${base}/foundry/list`, foundryBase: `${base}/foundry`, nebius: `${base}/nebius`, tts: `${base}/tts`, stt: `${base}/stt`, katana: `${base}/katana`, status: 'http://127.0.0.1:3456/teamclaude/status' };
   const env = { PATH: `${bin}:${process.env.PATH}`, HOME: d, CHECK_FM_HOME: d, CHECK_FM_PLAN: join(d, 'forge'), CHECK_FM_CONFIG: join(d, 'cfg.json'),
@@ -1304,11 +1315,23 @@ test('forge-models: a group-writable HOME refuses publication (r2.5)', () => {
   writeFileSync(join(d, 'cfg.json'), JSON.stringify(FM_CFG)); writeFileSync(join(d, 'in.json'), JSON.stringify(fmIn()));
   const r = run('forge-models.sh', { CHECK_FM_HOME: d, CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW) });
   chmodSync(d, 0o700);
-  assert.match(r.line, /direct\.json not written \(EPATH\)/);
+  assert.match(r.line, /^CHECK forge-models warn · .*direct\.json not written \(EPATH\)/);   // never ok while the page goes stale (r3.3)
 });
 
 test('forge-models collect: one call counted twice cannot cover another that never reached the proxy (r2.1)', async () => {
   const r = await fmCollect({ deployments: DEPLOYS, claudeCounts: 'twice-then-none' });
   assert.match(r.out, /^fail\t.*claude-fable-5-2 \(not seen at the seat proxy\)/);
   assert.doesNotMatch(r.out, /claude-opus-5-5 \(not seen/);
+});
+
+
+test('forge-models collect: an empty or non-WAV audio answer, or a bad image answer, is not a reachable model (r3.2)', async () => {
+  const ok = await fmCollect({ deployments: [...DEPLOYS, { id: 'gpt-audio-mini', model: 'gpt-audio-mini', status: 'succeeded' }] });
+  assert.doesNotMatch(ok.out, /foundry:gpt-(audio-mini|image-1\.5) \(/);
+  for (const audio of [JSON.stringify({ choices: [{ message: { audio: { data: '' } } }] }), JSON.stringify({ choices: [{ message: { audio: { data: Buffer.alloc(3000).toString('base64') } } }] }), 'not json']) {
+    const r = await fmCollect({ deployments: [...DEPLOYS, { id: 'gpt-audio-mini', model: 'gpt-audio-mini', status: 'succeeded' }], audio });
+    assert.match(r.out, /^fail\t.*foundry:gpt-audio-mini \(bad answer\)/);
+  }
+  const r = await fmCollect({ deployments: [...DEPLOYS, { id: 'gpt-audio-mini', model: 'gpt-audio-mini', status: 'succeeded' }], image: JSON.stringify({ data: [{ b64_json: '' }] }) });
+  assert.match(r.out, /^fail\t.*foundry:gpt-image-1\.5 \(bad answer\)/);
 });

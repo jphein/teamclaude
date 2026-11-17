@@ -119,7 +119,10 @@ export async function collect() {
       : await get(`${base}/openai/deployments/${encodeURIComponent(f.deployment)}/chat/completions?api-version=2025-01-01-preview`, h, 60_000, 'POST',
         JSON.stringify({ modalities: ['text', 'audio'], audio: { voice: 'alloy', format: 'wav' }, messages: [{ role: 'user', content: 'Say ok.' }], max_completion_tokens: 100 }));
     const b = r.status === 200 ? json(r.body.toString()) : null;
-    const ok = f.kind === 'image' ? typeof b?.data?.[0]?.b64_json === 'string' && b.data[0].b64_json.length > 1000 : typeof b?.choices?.[0]?.message?.audio?.data === 'string';
+    // a real answer, not just the shape (r3.2): an image of some size; a WAV that decodes, with audio in it
+    const audio = f.kind === 'image' ? null : Buffer.from(String(b?.choices?.[0]?.message?.audio?.data || ''), 'base64');
+    const ok = f.kind === 'image' ? typeof b?.data?.[0]?.b64_json === 'string' && Buffer.from(b.data[0].b64_json, 'base64').length > 1000
+      : audio.length > 1000 && audio.subarray(0, 4).toString('latin1') === 'RIFF' && audio.subarray(8, 12).toString('latin1') === 'WAVE';
     inp.foundryProbes[f.deployment] = { ok, error: ok ? null : r.status === 200 ? 'bad answer' : `http ${r.status}` };
   }
   const safeAzure = new Set((inp.foundry || []).filter((d) => d.status === 'succeeded' && !CLAUDE_RE.test(`${d.id} ${d.model}`) && CFG.foundryExpect[d.id] === d.model).map((d) => `azure/${d.id}`));
@@ -254,7 +257,7 @@ export function judge(cfg, inp, nowMs) {
     const p = inp.gatewayProbes?.[m.name];
     if (p?.ok) continue;
     if (asleepStems.has(m.name)) continue;   // a desktop asleep: warn above, not unreachable
-    unreachable.push(`${m.name} (${p ? (GATEWAY_ERRORS.has(p.error) || /^not probed: /.test(p.error || '') ? p.error : 'no answer') : 'not probed'})`);
+    unreachable.push(`${safeId(m.name)} (${p ? (GATEWAY_ERRORS.has(p.error) || /^not probed: /.test(p.error || '') ? p.error : 'no answer') : 'not probed'})`);
   }
   // Claude seats: listed and probed, in the catalog, served as itself, and seen at the proxy
   const cl = new Set(cfg.claude.map((c) => c.id));
@@ -289,9 +292,9 @@ export function judge(cfg, inp, nowMs) {
     }
     for (const id of mine) {
       const d = fd.get(id);
-      if (!d || d.status !== 'succeeded') { unreachable.push(`foundry:${id} (deployment ${d ? (d.status === 'failed' ? 'failed' : 'not ready') : 'gone'})`); continue; }
-      if (d.model !== cfg.foundryExpect[id] || CLAUDE_RE.test(d.model)) drift.push(`foundry:${id} now serves ${safeId(d.model)}`);
-      else if (direct.has(id) && !inp.foundryProbes?.[id]?.ok) unreachable.push(`foundry:${id} (${/^(http [0-9]{1,3}|bad answer)$/.test(inp.foundryProbes?.[id]?.error || '') ? inp.foundryProbes[id].error : 'not probed'})`);
+      if (!d || d.status !== 'succeeded') { unreachable.push(`foundry:${safeId(id)} (deployment ${d ? (d.status === 'failed' ? 'failed' : 'not ready') : 'gone'})`); continue; }
+      if (d.model !== cfg.foundryExpect[id] || CLAUDE_RE.test(d.model)) drift.push(`foundry:${safeId(id)} now serves ${safeId(d.model)}`);
+      else if (direct.has(id) && !inp.foundryProbes?.[id]?.ok) unreachable.push(`foundry:${safeId(id)} (${/^(http [0-9]{1,3}|bad answer)$/.test(inp.foundryProbes?.[id]?.error || '') ? inp.foundryProbes[id].error : 'not probed'})`);
     }
   }
   if (!inp.nebius) unread.push('Nebius catalog (vault locked?)');
@@ -372,6 +375,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const v = judge(CFG, inp, now);
   const out = process.env.CHECK_FM_OUT || join(PLAN, 'direct.json');
   let fact = v.fact;
-  try { publish(v.direct, out); } catch (e) { fact += `; direct.json not written (${['EPATH', 'ENOENT', 'EACCES', 'EEXIST'].includes(e?.code) ? e.code : 'error'})`; }
-  process.stdout.write(`${v.state}\t${fact.replace(/[\t\n\r]/g, ' ')}\n`);
+  let state = v.state;
+  // the page goes stale without this file: at least a warn, never ok (r3.3)
+  try { publish(v.direct, out); } catch (e) { fact += `; direct.json not written (${['EPATH', 'ENOENT', 'EACCES', 'EEXIST'].includes(e?.code) ? e.code : 'error'})`; if (state === 'ok') state = 'warn'; }
+  process.stdout.write(`${state}\t${fact.replace(/[\t\n\r]/g, ' ')}\n`);
 }

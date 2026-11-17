@@ -1208,6 +1208,11 @@ test('forge-models: direct.json is not written through a symlinked parent, and a
   assert.equal(JSON.parse(readFileSync(join(d2, 'forge', 'direct.json'), 'utf8')).schema, 'forge.direct/v1');
 });
 
+// a PNG-signed body of some size (isImage checks the signature and IHDR, not the pixels)
+function fmPng() {
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]), Buffer.from('IHDR', 'latin1'), Buffer.alloc(2000, 5)]);
+}
+
 // a real 16 kHz mono 16-bit PCM WAV of 0.2 s
 function fmWav({ rate = 16000, seconds = 0.2 } = {}) {
   const data = Buffer.alloc(Math.round(rate * seconds) * 2, 3);
@@ -1230,13 +1235,14 @@ test('forge-models: playableWav accepts a real PCM WAV and refuses broken ones (
     (() => { const b = fmWav(); b.writeUInt32LE(36, 4); return b; })(),                   // RIFF ends before the audio (r5.1)
     (() => { const b = fmWav(); b.writeUInt32LE(0, 28); return b; })(),                    // byte rate 0 (r5.2)
     (() => { const b = fmWav(); b.writeUInt16LE(0, 32); return b; })(),                    // block align 0 (r5.2)
+    (() => { const b = fmWav(); b.writeUInt32LE(b.readUInt32LE(40) - 1, 40); return b; })(), // a partial block (r6)
     Buffer.alloc(0),
   ];
   for (const [i, b] of bad.entries()) assert.equal(playableWav(b), false, `case ${i}`);
 });
 
 // ---------- forge-models collect(): fake binaries and a local HTTP server (r1.7)
-async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = true, regions = { tts: 'eastus', stt: 'westus' }, gatewayError = null, foundryStatus = 200, audio = null, image = null, wyomingPort = null } = {}) {
+async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = true, regions = { tts: 'eastus', stt: 'westus' }, gatewayError = null, foundryStatus = 200, audio = null, image = null, wyomingPort = null, tts = null } = {}) {
   const d = fresh(); const bin = join(d, 'bin'); const log = join(d, 'calls.log'); const counter = join(d, 'counter');
   chmodSync(d, 0o700); mkdirSync(bin); writeFileSync(log, ''); writeFileSync(counter, '0');
   mkdirSync(join(d, 'forge', 'hosts'), { recursive: true, mode: 0o700 }); chmodSync(join(d, 'forge'), 0o700);
@@ -1249,14 +1255,14 @@ async function fmCollect({ deployments, bwStatus = 'unlocked', claudeCounts = tr
     let b = '';
     q.on('data', (c) => { b += c; });
     q.on('end', () => {
-      if (q.url.startsWith('/foundry/openai/v1/images')) return s.end(image ?? JSON.stringify({ data: [{ b64_json: Buffer.alloc(3000, 7).toString('base64') }] }));
+      if (q.url.startsWith('/foundry/openai/v1/images')) return s.end(image ?? JSON.stringify({ data: [{ b64_json: fmPng().toString('base64') }] }));
       if (q.url.startsWith('/foundry/openai/deployments/')) {
         const wav = fmWav().toString('base64');
         return s.end(audio ?? JSON.stringify({ choices: [{ message: { audio: { data: wav } } }] }));
       }
       if (q.url.startsWith('/foundry')) { s.statusCode = foundryStatus; return s.end(JSON.stringify({ data: deployments })); }
       if (q.url.startsWith('/nebius')) return s.end(JSON.stringify({ data: [{ id: 'zai-org/GLM-5.3' }] }));
-      if (q.url.startsWith('/tts')) return s.end(Buffer.alloc(4000, 1));
+      if (q.url.startsWith('/tts')) return s.end(tts ?? fmWav());
       if (q.url.startsWith('/stt')) return s.end(JSON.stringify({ RecognitionStatus: 'Success', DisplayText: 'The forge is lit.' }));
       if (q.url.startsWith('/katana')) return s.end(JSON.stringify({ models: [{ name: 'qwen3.5:9b-q4_K_M' }] }));
       if (q.url.startsWith('/health')) return s.end('{"status":"ok"}');
@@ -1378,4 +1384,26 @@ test('forge-models collect: a Wyoming peer that closes early or sends half an an
     assert.ok(Date.now() - t0 < 30_000, mode);
     assert.match(r.out, /^fail\t.*openwakeword \(no answer\)/, mode);
   }
+});
+
+
+test('forge-models collect: a Wyoming peer that trickles bytes forever is cut off by an absolute deadline (r6.1)', { timeout: 150_000 }, async () => {
+  const { createServer: tcp } = await import('node:net');
+  const conns = [];
+  const srv = tcp((c) => { conns.push(c); const iv = setInterval(() => c.write('{'), 1000); c.on('close', () => clearInterval(iv)); c.on('error', () => {}); });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const t0 = Date.now();
+  const r = await fmCollect({ deployments: DEPLOYS, wyomingPort: srv.address().port });
+  for (const c of conns) c.destroy();
+  srv.close();
+  assert.equal(typeof r.out, 'string');
+  assert.ok(Date.now() - t0 < 40_000, `took ${Date.now() - t0} ms`);
+  assert.match(r.out, /^fail\t.*openwakeword \(no answer\)/);
+});
+
+test('forge-models collect: a 200 that is not an image, or a TTS 200 that is not the WAV asked for, is a bad answer (r6.2)', async () => {
+  const img = await fmCollect({ deployments: DEPLOYS, image: JSON.stringify({ data: [{ b64_json: Buffer.alloc(3000).toString('base64') }] }) });
+  assert.match(img.out, /^fail\t.*foundry:gpt-image-1\.5 \(bad answer\)/);
+  const tts = await fmCollect({ deployments: DEPLOYS, tts: Buffer.from('<html>' + 'x'.repeat(2000) + '</html>') });
+  assert.match(tts.out, /^fail\t.*en-US-Ava:DragonHDLatestNeural \(bad answer\)/);
 });

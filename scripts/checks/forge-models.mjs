@@ -121,7 +121,7 @@ export async function collect() {
     const b = r.status === 200 ? json(r.body.toString()) : null;
     // a real answer, not just the shape (r3.2): an image of some size; a WAV that decodes, with audio in it
     const audio = f.kind === 'image' ? null : Buffer.from(String(b?.choices?.[0]?.message?.audio?.data || ''), 'base64');
-    const ok = f.kind === 'image' ? typeof b?.data?.[0]?.b64_json === 'string' && Buffer.from(b.data[0].b64_json, 'base64').length > 1000
+    const ok = f.kind === 'image' ? typeof b?.data?.[0]?.b64_json === 'string' && isImage(Buffer.from(b.data[0].b64_json, 'base64'))
       : playableWav(audio);
     inp.foundryProbes[f.deployment] = { ok, error: ok ? null : r.status === 200 ? 'bad answer' : `http ${r.status}` };
   }
@@ -191,7 +191,8 @@ export async function collect() {
       const ssml = `<speak version='1.0' xml:lang='en-US'><voice name='${s.id.replace(/[^A-Za-z0-9:-]/g, '')}'>The forge is lit.</voice></speak>`;
       const r = await get(URLS.tts || `https://${tts}.tts.speech.microsoft.com/cognitiveservices/v1`, { 'Ocp-Apim-Subscription-Key': sk, 'Content-Type': 'application/ssml+xml',
         'X-Microsoft-OutputFormat': 'riff-16khz-16bit-mono-pcm', 'User-Agent': 'forge-models' }, 30_000, 'POST', ssml);
-      inp.speech[s.id] = { ok: r.status === 200 && r.body.length > 1000, error: r.status === 200 ? null : `http ${r.status}` };
+      const okTts = r.status === 200 && playableWav(r.body);   // the PCM WAV that was asked for, not any 200 body (r6.2)
+      inp.speech[s.id] = { ok: okTts, error: okTts ? null : r.status === 200 ? 'bad answer' : `http ${r.status}` };
       if (inp.speech[s.id].ok && !wav) wav = r.body;
     }
     for (const s of CFG.speech.filter((x) => x.kind === 'asr')) {
@@ -217,6 +218,15 @@ export async function collect() {
   inp.wake = await describe(CFG.local.find((l) => l.wyoming)?.wyoming);
   return inp;
 }
+// An image file (r6.2): a PNG, JPEG or WebP signature and some size, not any 1000 bytes.
+export function isImage(b) {
+  if (!Buffer.isBuffer(b) || b.length < 1000) return false;
+  const png = b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) && b.toString('latin1', 12, 16) === 'IHDR';
+  const jpeg = b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff && b[b.length - 2] === 0xff && b[b.length - 1] === 0xd9;
+  const webp = b.toString('latin1', 0, 4) === 'RIFF' && b.toString('latin1', 8, 12) === 'WEBP';
+  return png || jpeg || webp;
+}
+
 // A WAV that a player would play (r4.1/r5): RIFF/WAVE whose declared size fits the buffer, a consistent PCM
 // `fmt ` chunk (1–2 channels, 8–48 kHz, 8/16/24-bit) and a whole-block `data` chunk of at least 0.1 s, all
 // inside the declared container.
@@ -248,7 +258,9 @@ function describe(port) {   // Wyoming describe → the wake word names, or null
   return new Promise((res) => {
     if (!port) return res(null);
     let done = false;
-    const settle = (v) => { if (!done) { done = true; s.destroy(); res(v); } };
+    // an absolute deadline and a size cap (r6.1): a peer trickling bytes resets an idle timeout forever
+    const deadline = setTimeout(() => settle(null), 10_000);
+    const settle = (v) => { if (!done) { done = true; clearTimeout(deadline); s.destroy(); res(v); } };
     const s = connect({ host: '127.0.0.1', port }, () => s.write('{"type": "describe"}\n'));
     let buf = '';
     s.setTimeout(5000, () => settle(null));
@@ -257,6 +269,7 @@ function describe(port) {   // Wyoming describe → the wake word names, or null
     s.on('close', () => settle(null));
     s.on('data', (d) => {
       buf += d;
+      if (buf.length > 256 * 1024) return settle(null);
       const nl = buf.indexOf('\n'); if (nl < 0) return;
       const hdr = json(buf.slice(0, nl)); const need = hdr?.data_length || 0;
       if (buf.length - nl - 1 < need) return;

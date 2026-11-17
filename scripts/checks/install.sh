@@ -5,7 +5,7 @@
 # published (scripts to ~/.local/libexec/teamclaude-checks/, units to ~/.config/systemd/user/), each
 # file moved into place. A commit missing any file publishes nothing. The reviewed claude wrapper
 # goes beside the scripts as the reference proxy-wrapper compares each host's wrapper against.
-# Rollback: systemctl --user disable --now teamclaude-check-{pool-quota,proxy-wrapper,forge-keys,fable-use,resets-banked}.timer
+# Rollback: systemctl --user disable --now teamclaude-check-{pool-quota,proxy-wrapper,forge-keys,fable-use,resets-banked,forge-models}.timer
 set -euo pipefail
 [ $# -eq 1 ] || { echo "usage: scripts/checks/install.sh <commit>" >&2; exit 22; }
 cd "$(dirname "$0")/../.."
@@ -106,23 +106,26 @@ cleanup() {
 }
 stage=$(mktemp -d "$lib/.stage.XXXXXX"); trap cleanup EXIT; trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
 mkdir "$stage/lib" "$stage/units"
-scripts=(lib.sh pool-quota.sh proxy-probe.sh proxy-wrapper.sh forge-keys.sh fable-use.sh resets-banked.sh summary.sh)
+scripts=(lib.sh pool-quota.sh proxy-probe.sh proxy-wrapper.sh forge-keys.sh fable-use.sh resets-banked.sh summary.sh forge-models.sh forge-models.mjs forge-direct.json)
 for f in "${scripts[@]}"; do
   git show "$sha:scripts/checks/$f" > "$stage/lib/$f" || { echo "install.sh: $f missing at $sha; nothing installed" >&2; exit 4; }
 done
 git show "$sha:scripts/claude-wrapper.sh" > "$stage/lib/claude-wrapper.sh" || { echo "install.sh: claude-wrapper.sh missing at $sha; nothing installed" >&2; exit 4; }
-# exactly these ten units, nothing more: an extra file is refused, not installed or enabled
-checks=(pool-quota proxy-wrapper forge-keys fable-use resets-banked)
+# exactly these units (two per check), nothing more: an extra file is refused, not installed or enabled
+checks=(pool-quota proxy-wrapper forge-keys fable-use resets-banked forge-models)
 want_units=(); timers=()
 for n in "${checks[@]}"; do want_units+=("teamclaude-check-$n.service" "teamclaude-check-$n.timer"); timers+=("teamclaude-check-$n.timer"); done
 have_units=$(git ls-tree --name-only "$sha" scripts/checks/systemd/ | xargs -rn1 basename | sort)
 [ "$have_units" = "$(printf '%s\n' "${want_units[@]}" | sort)" ] \
-  || { echo "install.sh: scripts/checks/systemd/ at $sha is not exactly the ten check units; nothing installed" >&2; exit 4; }
+  || { echo "install.sh: scripts/checks/systemd/ at $sha is not exactly the check units; nothing installed" >&2; exit 4; }
 for b in "${want_units[@]}"; do
   git show "$sha:scripts/checks/systemd/$b" > "$stage/units/$b" && [ -s "$stage/units/$b" ] \
     || { echo "install.sh: $b missing at $sha; nothing installed" >&2; exit 4; }
 done
 for f in "$stage"/lib/*.sh; do bash -n "$f" || { echo "install.sh: $(basename "$f") does not parse; nothing installed" >&2; exit 4; }; done
+node --check "$stage/lib/forge-models.mjs" 2>/dev/null || { echo "install.sh: forge-models.mjs does not parse; nothing installed" >&2; exit 4; }
+node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$stage/lib/forge-direct.json" 2>/dev/null \
+  || { echo "install.sh: forge-direct.json is not JSON; nothing installed" >&2; exit 4; }
 # quiesce: stop the timers and wait for a running check to finish, so no check runs while its files
 # are half replaced (a check started mid-publish could load a new lib.sh with an old script)
 for n in "${checks[@]}"; do services+=("teamclaude-check-$n.service"); done

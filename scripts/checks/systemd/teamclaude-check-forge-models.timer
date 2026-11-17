@@ -1,0 +1,10 @@
+[Unit]
+Description=CHECK forge-models timer (*-*-* 04:50)
+
+[Timer]
+OnCalendar=*-*-* 04:50
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

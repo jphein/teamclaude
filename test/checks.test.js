@@ -506,7 +506,7 @@ test('lib: an unknown status becomes fail (still exit 0); the line file is writt
 });
 
 test('units: every check has a service and a timer; services run the installed copy', () => {
-  for (const name of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use', 'resets-banked']) {
+  for (const name of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use', 'resets-banked', 'forge-models']) {
     const svc = readFileSync(join(C, 'systemd', `teamclaude-check-${name}.service`), 'utf8');
     assert.match(svc, new RegExp(`^ExecStart=%h/\\.local/libexec/teamclaude-checks/${name}\\.sh$`, 'm'));
     assert.match(readFileSync(join(C, 'systemd', `teamclaude-check-${name}.timer`), 'utf8'), /^Persistent=true$/m);
@@ -525,8 +525,8 @@ function repoAt(files) {
 }
 const payload = (omit = []) => {
   const files = {};
-  for (const f of ['lib.sh', 'pool-quota.sh', 'proxy-probe.sh', 'proxy-wrapper.sh', 'forge-keys.sh', 'fable-use.sh', 'resets-banked.sh', 'summary.sh', 'install.sh']) if (!omit.includes(f)) files[`scripts/checks/${f}`] = readFileSync(join(C, f), 'utf8');
-  for (const n of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use', 'resets-banked']) for (const ext of ['service', 'timer']) files[`scripts/checks/systemd/teamclaude-check-${n}.${ext}`] = readFileSync(join(C, 'systemd', `teamclaude-check-${n}.${ext}`), 'utf8');
+  for (const f of ['lib.sh', 'pool-quota.sh', 'proxy-probe.sh', 'proxy-wrapper.sh', 'forge-keys.sh', 'fable-use.sh', 'resets-banked.sh', 'summary.sh', 'install.sh', 'forge-models.sh', 'forge-models.mjs', 'forge-direct.json']) if (!omit.includes(f)) files[`scripts/checks/${f}`] = readFileSync(join(C, f), 'utf8');
+  for (const n of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use', 'resets-banked', 'forge-models']) for (const ext of ['service', 'timer']) files[`scripts/checks/systemd/teamclaude-check-${n}.${ext}`] = readFileSync(join(C, 'systemd', `teamclaude-check-${n}.${ext}`), 'utf8');
   files['scripts/claude-wrapper.sh'] = NEW_WRAPPER;
   return files;
 };
@@ -540,7 +540,7 @@ test('install: a complete merged commit is published and its timers enabled', ()
   assert.equal(r.status, 0, r.stderr);
   assert.equal(readFileSync(join(h, '.local/libexec/teamclaude-checks/claude-wrapper.sh'), 'utf8'), NEW_WRAPPER);
   assert.ok(existsSync(join(h, '.config/systemd/user/teamclaude-check-forge-keys.timer')));
-  assert.match(readFileSync(join(h, 'systemctl.log'), 'utf8'), /^--user enable --now teamclaude-check-pool-quota\.timer teamclaude-check-proxy-wrapper\.timer teamclaude-check-forge-keys\.timer teamclaude-check-fable-use\.timer teamclaude-check-resets-banked\.timer$/m);
+  assert.match(readFileSync(join(h, 'systemctl.log'), 'utf8'), /^--user enable --now teamclaude-check-pool-quota\.timer teamclaude-check-proxy-wrapper\.timer teamclaude-check-forge-keys\.timer teamclaude-check-fable-use\.timer teamclaude-check-resets-banked\.timer teamclaude-check-forge-models\.timer$/m);
 });
 
 test('install: a commit missing a file publishes nothing over the existing install', () => {
@@ -572,7 +572,7 @@ test('install: a commit missing one unit publishes nothing', () => {
   const files = payload(); delete files['scripts/checks/systemd/teamclaude-check-forge-keys.service'];
   const r = install(repoAt(files), h);
   assert.equal(r.status, 4);
-  assert.match(r.stderr, /not exactly the ten check units; nothing installed/);
+  assert.match(r.stderr, /not exactly the check units; nothing installed/);
   assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false);
 });
 
@@ -627,7 +627,7 @@ test('install: an extra unit file refuses the install; only the three named time
   const files = payload(); files['scripts/checks/systemd/unexpected.timer'] = '[Timer]\nOnCalendar=*:*\n'; files['scripts/checks/systemd/unexpected.service'] = '[Service]\nExecStart=/bin/true\n';
   const r = install(repoAt(files), h);
   assert.equal(r.status, 4);
-  assert.match(r.stderr, /not exactly the ten check units/);
+  assert.match(r.stderr, /not exactly the check units/);
   assert.equal(existsSync(join(h, '.config/systemd/user/unexpected.timer')), false);
   assert.equal(existsSync(join(h, 'systemctl.log')), false);
 });
@@ -699,7 +699,7 @@ test('install: an unexpected failure after the stop (daemon-reload) still starts
   const r = installWith(repoAt(payload()), h, RUNNING(h) + `\ncase "$2" in daemon-reload) if [ ! -e '${once}' ]; then : > '${once}'; exit 1; fi ;; esac`);
   assert.notEqual(r.status, 0);
   const log = readFileSync(join(h, 'systemctl.log'), 'utf8').trim().split('\n');
-  assert.equal(log[log.length - 1], '--user start teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer teamclaude-check-resets-banked.timer', log.join(' | '));
+  assert.equal(log[log.length - 1], '--user start teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer teamclaude-check-resets-banked.timer teamclaude-check-forge-models.timer', log.join(' | '));
 });
 
 test('install: a second install while one holds the lock is refused', async () => {
@@ -798,7 +798,7 @@ test('install: a partial enable --now failure leaves no timer running that was n
   const enable = log.findIndex((l) => l.startsWith('--user enable --now '));
   assert.ok(enable >= 0, log.join(' | '));
   // stop all three timers first, then (after the wait) restore the files and reload; none was running before
-  assert.equal(log[enable + 1], '--user stop teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer teamclaude-check-resets-banked.timer', log.join(' | '));
+  assert.equal(log[enable + 1], '--user stop teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer teamclaude-check-resets-banked.timer teamclaude-check-forge-models.timer', log.join(' | '));
   assert.ok(log.slice(enable + 2).includes('--user daemon-reload'), log.join(' | '));
   assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false, 'a first install that failed must not leave its files');
   assert.equal(log.slice(enable + 1).some((l) => l.startsWith('--user start ')), false);
@@ -1010,4 +1010,115 @@ test('install: a second signal during the rollback does not cut it short', () =>
   assert.ok(existsSync(once), 'the second signal was never sent');
   assert.equal(readFileSync(a, 'utf8'), beforeA);
   assert.equal(readFileSync(b, 'utf8'), beforeB, 'the rollback stopped after the second signal');
+});
+
+// ---------- forge-models (fixture inputs; JP 2026-11-17 05:03 "comprehensive of all available models")
+const FM_NOW = Date.parse('2026-11-17T12:50:00Z');
+const FM_CFG = {
+  claude: [{ id: 'claude-opus-5-5', label: 'Opus 5.5', group: 'main' }, { id: 'claude-fable-5-2', label: 'Fable 5.2', group: 'main' }],
+  speech: [{ id: 'en-US-Ava:DragonHDLatestNeural', label: 'Ava, Dragon HD', kind: 'tts', policy: 'recorded-voice' }, { id: 'azure-stt-en-US', label: 'STT', kind: 'asr', policy: 'first-party' }],
+  speechRegions: { tts: 'eastus', stt: 'westus' },
+  foundryDirect: [{ deployment: 'gpt-image-1.5', label: 'gpt-image-1.5', kind: 'image' }],
+  foundryExpect: { 'gpt-6.1-sol': 'gpt-6.1-sol', 'gpt-5.4-pro': 'gpt-5.4-pro', 'gpt-5.4-pro-1': 'gpt-5.4-pro', 'gpt-image-1.5': 'gpt-image-1.5' },
+  foundryBlocked: { 'FLUX-1.1-pro': 'third-party' },
+  local: [{ id: 'nomic-embed-text-v1.5', label: 'nomic', kind: 'embedding', host: 'familiar', health: 'http://127.0.0.1:1/' }, { id: 'openwakeword', label: 'oww', kind: 'wake', host: 'familiar', wyoming: 1 }],
+  feedStems: { katana: 'local/katana-qwen35-9b', 'familiar-piper-cori': null },
+  localUnits: { 'wyoming-piper': 'familiar-piper-cori', 'ollama-embed': 'nomic-embed-text-v1.5', 'wyoming-openwakeword': 'openwakeword' },
+  katanaTags: { 'qwen3.5:9b-q4_K_M': 'katana' },
+  vault: { nebius: 'x', speech: 'y' },
+};
+const fmIn = (over = {}) => {
+  const ts = new Date(FM_NOW - 60_000).toISOString();
+  return {
+    registry: [
+      { name: 'local/katana-qwen35-9b', provider: 'local', enabled: true, mode: 'chat', upstream: '' },
+      { name: 'foundry/gpt-6.1-sol', provider: 'azure', enabled: true, mode: 'chat', upstream: 'azure/gpt-6.1-sol' },
+      { name: 'foundry/gpt-5.4-pro', provider: 'azure', enabled: true, mode: 'responses', upstream: 'azure/gpt-5.4-pro' },
+      { name: 'nebius/glm-5.3', provider: 'nebius', enabled: true, mode: 'chat', upstream: 'nebius/zai-org/GLM-5.3' },
+    ],
+    gatewayProbes: { 'local/katana-qwen35-9b': { ok: true }, 'foundry/gpt-6.1-sol': { ok: true }, 'foundry/gpt-5.4-pro': { ok: true }, 'nebius/glm-5.3': { ok: true } },
+    feed: { katana: { state: 'idle', ts }, 'familiar-piper-cori': { state: 'idle', ts } },
+    claudeCatalog: ['claude-opus-5-5', 'claude-fable-5-2'],
+    claudeProbes: { 'claude-opus-5-5': { ok: true, served: ['claude-opus-5-5'] }, 'claude-fable-5-2': { ok: true, served: ['claude-fable-5-2'] } },
+    foundry: [
+      { id: 'gpt-6.1-sol', model: 'gpt-6.1-sol', status: 'succeeded' }, { id: 'gpt-5.4-pro', model: 'gpt-5.4-pro', status: 'succeeded' },
+      { id: 'gpt-5.4-pro-1', model: 'gpt-5.4-pro', status: 'succeeded' }, { id: 'gpt-image-1.5', model: 'gpt-image-1.5', status: 'succeeded' },
+      { id: 'claude-opus-5-5', model: 'claude-opus-5-5', status: 'succeeded' }, { id: 'FLUX-1.1-pro', model: 'FLUX-1.1-pro', status: 'succeeded' },
+      { id: 'sora-2', model: 'sora-2', status: 'failed' },
+    ],
+    nebius: ['zai-org/GLM-5.3'],
+    speech: { 'en-US-Ava:DragonHDLatestNeural': { ok: true }, 'azure-stt-en-US': { ok: true } },
+    units: ['wyoming-piper', 'ollama-embed', 'wyoming-openwakeword', 'teamclaude-check-pool-quota', 'realm-forge-feed', 'sshd'],
+    katanaTags: ['qwen3.5:9b-q4_K_M'],
+    embedHealth: true,
+    wake: ['okay_nabu'],
+    ...over,
+  };
+};
+function fm(inputs, extra = {}) {
+  const d = fresh();
+  writeFileSync(join(d, 'cfg.json'), JSON.stringify(FM_CFG));
+  writeFileSync(join(d, 'in.json'), typeof inputs === 'string' ? inputs : JSON.stringify(inputs));
+  const r = run('forge-models.sh', { CHECK_FM_CONFIG: join(d, 'cfg.json'), CHECK_FM_INPUTS: join(d, 'in.json'), CHECK_FM_OUT: join(d, 'forge', 'direct.json'), CHECK_FM_NOW_MS: String(FM_NOW), ...extra });
+  const out = join(d, 'forge', 'direct.json');
+  return { ...r, direct: existsSync(out) ? JSON.parse(readFileSync(out, 'utf8')) : null };
+}
+
+test('forge-models: everything listed and answering is ok; blocked Foundry deployments are counted, a failed one ignored', () => {
+  const r = fm(fmIn());
+  assert.match(r.line, LINE);
+  assert.match(r.line, /^CHECK forge-models ok · 12 listed \(4 gateway, 1 host-feed voices, 7 direct\); every listed model answered; blocked on Foundry: 1 Claude, 1 third-party, at /);
+  assert.equal(r.direct.schema, 'forge.direct/v1');
+  assert.deepEqual(r.direct.models.map((m) => [m.name, m.route, m.reachable]), [
+    ['claude-opus-5-5', 'teamclaude', true], ['claude-fable-5-2', 'teamclaude', true], ['en-US-Ava:DragonHDLatestNeural', 'azure-speech', true],
+    ['azure-stt-en-US', 'azure-speech', true], ['gpt-image-1.5', 'foundry-direct', true], ['nomic-embed-text-v1.5', 'local', true], ['openwakeword', 'local', true]]);
+  assert.deepEqual(r.direct.blocked, { foundry_claude: 1, foundry_third_party: 1 });
+});
+
+test('forge-models: a reachable model that is not listed fails, named by source', () => {
+  const i = fmIn({ claudeCatalog: ['claude-opus-5-5', 'claude-fable-5-2', 'claude-opus-6'], nebius: ['zai-org/GLM-5.3', 'zai-org/GLM-6'],
+    foundry: [...fmIn().foundry, { id: 'gpt-7', model: 'gpt-7', status: 'succeeded' }], units: [...fmIn().units, 'whisper-large'], katanaTags: ['qwen3.5:9b-q4_K_M', 'llama4:8b'] });
+  const r = fm(i);
+  assert.match(r.line, /^CHECK forge-models fail · .*reachable but unlisted: claude:claude-opus-6, foundry:gpt-7 \(gpt-7\), nebius:zai-org\/GLM-6, unit:whisper-large, katana:llama4:8b/);
+});
+
+test('forge-models: a duplicate Foundry deployment of a listed model is covered, not unlisted', () => {
+  const r = fm(fmIn());
+  assert.doesNotMatch(r.line, /gpt-5\.4-pro-1/);
+});
+
+test('forge-models: a listed model that does not answer, or answers as another model, fails', () => {
+  const r = fm(fmIn({ gatewayProbes: { ...fmIn().gatewayProbes, 'nebius/glm-5.3': { ok: false, error: 'upstream' } },
+    claudeProbes: { ...fmIn().claudeProbes, 'claude-fable-5-2': { ok: true, served: ['claude-opus-5-5'] } }, embedHealth: false }));
+  assert.match(r.line, /^CHECK forge-models fail · .*didn't answer: nebius\/glm-5\.3 \(upstream\), claude-fable-5-2 \(served as claude-opus-5-5\), nomic-embed-text-v1\.5 \(no answer\)/);
+  assert.equal(r.direct.models.find((m) => m.name === 'claude-fable-5-2').reachable, false);
+});
+
+test('forge-models: a model that left the seat catalog fails', () => {
+  const r = fm(fmIn({ claudeCatalog: ['claude-opus-5-5'] }));
+  assert.match(r.line, /^CHECK forge-models fail · .*didn't answer: claude-fable-5-2 \(left the seat catalog\)/);
+});
+
+test('forge-models: a registered or direct Foundry deployment that now serves another model is drift (fail)', () => {
+  const foundry = fmIn().foundry.map((d) => (d.id === 'gpt-6.1-sol' ? { ...d, model: 'claude-sonnet-5-5' } : d.id === 'gpt-image-1.5' ? { ...d, model: 'FLUX-2' } : d));
+  const r = fm(fmIn({ foundry }));
+  assert.match(r.line, /^CHECK forge-models fail · .*deployment drift: foundry:gpt-6\.1-sol now serves claude-sonnet-5-5, foundry:gpt-image-1\.5 now serves FLUX-2/);
+});
+
+test('forge-models: katana asleep warns and its failed gateway probe is not counted dead', () => {
+  const r = fm(fmIn({ feed: { ...fmIn().feed, katana: { state: 'asleep', ts: new Date(FM_NOW - 60_000).toISOString() } },
+    gatewayProbes: { ...fmIn().gatewayProbes, 'local/katana-qwen35-9b': { ok: false, error: 'timeout_or_unreachable' } }, katanaTags: null }));
+  assert.match(r.line, /^CHECK forge-models warn · .*every listed model answered; asleep: katana;/);
+});
+
+test('forge-models: an unreadable source (vault locked, az, stale feed) warns and is named, never ok', () => {
+  const r = fm(fmIn({ nebius: null, speech: null, foundry: null, feed: { katana: { state: 'idle', ts: '2026-11-16T00:00:00Z' }, 'familiar-piper-cori': null } }));
+  assert.match(r.line, /^CHECK forge-models warn · .*not read: host feed katana, host feed familiar-piper-cori, Foundry deployments, Nebius catalog \(vault locked\?\), Azure Speech \(vault locked\?\)/);
+  assert.equal(r.direct.models.find((m) => m.name === 'azure-stt-en-US').error, 'not read');
+});
+
+test('forge-models: unreadable inputs or a crash is a fail line (exit 0)', () => {
+  const r = fm('{not json');
+  assert.equal(r.status, 0);
+  assert.match(r.line, /^CHECK forge-models fail · check crashed reading its sources \(SyntaxError\), at /);
 });

@@ -21,7 +21,7 @@ How a run exits: always 0, whatever it found. A check reports, it never gates; `
 
 | Name | Timer | Cadence | Measures | Owner | The miss behind it |
 |---|---|---|---|---|---|
-| `pool-quota` | `teamclaude-check-pool-quota.timer` | every 15 min (:00/:15/:30/:45) | `GET 127.0.0.1:3456/teamclaude/quota`: the pool's five-hour and weekly-shared remaining, the seats ≥90 % used, seats not active, and stale buckets | teamclaude lane | Lanes found out about an empty pool by hitting it. The quota numbers can also go stale without anyone noticing. |
+| `pool-quota` | `teamclaude-check-pool-quota.timer` | every 15 min (:00/:15/:30/:45) | `GET 127.0.0.1:3456/teamclaude/quota`: which seats can serve now and when each barred seat comes back (5h-full or week-spent), the servable five-hour and the weekly-shared remaining, seats not active, and stale buckets | teamclaude lane | Lanes found out about an empty pool by hitting it. The quota numbers can also go stale without anyone noticing. |
 | `proxy-wrapper` | `teamclaude-check-proxy-wrapper.timer` | every 5 min (:02/:07/…/:57; was 15 min until the 2026-11-15 outage) | On familiar, wakizashi and katana: whether `:3456` answers `/teamclaude/quota`, and whether `claude` fails closed | teamclaude lane | Before #66, the wrapper silently ran claude on the host's own login whenever `:3456` was down. That billed a seat outside the pool (Sen, 2026-11-14 06:4x). |
 | `forge-keys` | `teamclaude-check-forge-keys.timer` | daily 07:20 | The forge gateway's (LiteLLM, ubox0) virtual keys: spend outside a key's allowlist, keys unused for 30 days, spend by unknown keys, and refused calls by inactive keys | teamclaude lane; gateway owned by palace-nemotron | The 2026-11-14 Ember key rotation. A key fragment leaked, and the only way to tell whether anyone tried the old key was a manual SQL read. |
 | `fable-use` | `teamclaude-check-fable-use.timer` | daily 07:40 | `GET 127.0.0.1:3456/teamclaude/quota`: each seat's Fable weekly bucket (`buckets.weeklyFable`), its used % and when it resets | teamclaude lane | On 2026-11-16 every seat's Fable week stood at 0 % used. The proxy rations Fable to the `fable.allow` client keys (JP, 2026-10-11), so a whole week's Fable allowance can expire unused with nobody seeing it. This check is the mechanism for JP's "use down all credits" rule on this pool (Sen, 2026-11-16 08:0x). |
@@ -76,20 +76,29 @@ Each night it reads what is listed and what is reachable, and probes every liste
 
 ### pool-quota
 
+The line is the per-seat picture: which seats can serve now, and when each barred seat comes back. A lane reads it
+before treating a "usage limit" notice as a wall: a notice names one seat, and the proxy moves to the next one.
+(Sen 2026-11-19: the lead's session drew six per-seat notices in 18 h while this line read "5h 45-99% left". That was
+the five-hour capacity of seats whose week was already spent, so it could serve nothing.)
+
+- **Seat states** (seats not disabled and `active`):
+  - **serving**: week under 98 % used and five hours under 97 % (the proxy's servable rule and its 5h switch). Shown with both numbers.
+  - **5h-full**: the week has room but the five hours do not. Shown with the 5h reset.
+  - **week-spent**: the week is 98 % or more used. Shown with the time it serves again: the weekly reset, or the five-hour reset when that is later and the five hours are full too (`?` when either blocking reset is unknown).
+  - Reset times print as `<day> <hh:mm>`, soonest first; seats resetting in the same minute share one entry; a missing or insane time prints `?` and sorts last.
+  - A seat's name is the local part of its address reduced to `[A-Za-z0-9._-]`; an empty one prints `?`.
+  - The serving count is the proxy's own `live_seats` when it reports one. When the seat data disagrees, the line says so: with `live_seats` 0 it lists no seat as serving and says the seat data calls N servable and the cause is unknown here; otherwise it adds "(the proxy's count; the seat data calls N servable)".
+- **fail:**
+  - no seat serves (a real wall); the line names the first seat back;
+  - the endpoint does not answer, or it answers with anything other than exactly one JSON document holding the aggregate numbers.
 - **warn:**
-  - five-hour remaining is under 0.15;
+  - exactly one seat serves;
+  - the servable five-hour headroom (`aggregate.fiveHour.servableRemaining`; the raw figure when the proxy reports none) is under 0.15;
   - weekly-shared remaining is at or under 0.15;
   - a seat bucket's `resetAt` is more than 15 minutes in the past and it still shows usage. The numbers have stopped updating; that is the stale data JP named.
-- **fail:**
-  - weekly-shared remaining is at or under 0.05;
-  - the endpoint does not answer, or it answers with anything other than exactly one JSON document holding the aggregate numbers.
-- **Why these weekly numbers:** they follow the dashboard's 7-day switch threshold (`switchThreshold.unified7d`). JP moved it from 0.90 to 1.00 on 2026-11-15 at 10:03 (log: `Switch threshold (unified7d) set to 100% via SSO as "jp"`), so seats are used to the end of their week. Under the old 0.30 floor the check would read WARN most of every week by construction. If the slider moves again, move these numbers with it.
-- **Informational:**
-  - The weekly reset (`aggregate.weeklyShared.nextResetAt`) is printed as `week resets <day> <mm-dd> <hh:mm>` whenever the proxy reports a sane one.
-  - Seats at or above 90 % used (five-hour or weekly) are named by the local part of their address.
-  - Seats that are not `active` are listed.
-  - None of these causes a warn.
-- **Example:** `CHECK pool-quota warn · 5h 63% left, week 12% left (week at or under 15%), week resets Mon 11-16 17:00, seats ≥90% used: claude3 jp claude2 claude4, at 10:45 · next run in 15 min · owner teamclaude lane`
+- **Why no weekly fail:** seats are used to the end of their week (the 7-day switch threshold is 1.00 since JP's 2026-11-15 10:03 change), so a low weekly pool is normal. What stops lanes is no seat serving, and that is the fail.
+- Seats that are not `active` are listed, and are not counted as serving.
+- **Example:** `CHECK pool-quota warn · serving 1 of 7 seats: claude6 (5h 91%, week 15% used); week-spent, back: claude2 Thu 20:59, claude Fri 12:00, claude5 Fri 23:59, claude4 Mon 16:59, claude3 jp Mon 22:59; 5h servable 1% (raw 83%), week 12% left (one seat serves; 5h servable under 15%; week at or under 15%), at 11:09 · a seat notice is not a wall while a seat serves · next run in 15 min · owner teamclaude lane`
 
 ### proxy-wrapper
 

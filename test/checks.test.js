@@ -90,9 +90,58 @@ test('pool-quota: the servable 5h figure decides the 5h warning when the proxy r
 
 test('pool-quota: the proxy\'s live_seats is the count; without it the seats are counted here', () => {
   let r = pq(quota(0.8, 0.6, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2)], { live_seats: 1 }));
-  assert.match(r.line, /^CHECK pool-quota warn · serving 1 of 2 seats: a .*\(one seat serves\)/);
+  assert.match(r.line, /^CHECK pool-quota warn · serving 1 of 2 seats: a .*, b .* \(the proxy's count; the seat data calls 2 servable\).*\(one seat serves\)/, r.line);
   r = pq(quota(0.8, 0.6, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2)], { live_seats: 'many' }));
   assert.match(r.line, /^CHECK pool-quota ok · serving 2 of 2 seats/);
+  assert.doesNotMatch(r.line, /the proxy's count/, 'no disagreement note when the counts agree');
+});
+
+test('pool-quota: the proxy serving none while the seat data calls seats servable fails and says the cause is unknown', () => {
+  const r = pq(quota(0.8, 0.6, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2), at(seat('c', 0.1, 1), 'weeklyShared', NOW + 3 * PQH)], { live_seats: 0 }));
+  assert.match(r.line, new RegExp(`^CHECK pool-quota fail · serving 0 of 3 seats, first back ${hm(NOW + 3 * PQH)}; the seat data calls 2 servable \\(a \\(5h 10%, week 20% used\\), b .*\\): why the proxy serves none is unknown here; .*\\(no seat serves: a wall`), r.line);
+  assert.doesNotMatch(r.line, /serving 0 of 3 seats: /, 'never lists seats as serving under a count of zero');
+});
+
+test('pool-quota: a week-spent seat whose 5 hours are also full comes back at the later reset; unknown if either is unknown', () => {
+  const wk1 = NOW + 1 * PQH, f2 = NOW + 2 * PQH;
+  let r = pq(quota(0.5, 0.5, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2), at(at(seat('both', 0.99, 0.99), 'weeklyShared', wk1), 'fiveHour', f2)]));
+  assert.match(r.line, new RegExp(`week-spent, back: both ${hm(f2)}; `), r.line);
+  r = pq(quota(0.5, 0.5, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2), at(at(seat('both', 0.99, 0.99), 'weeklyShared', f2), 'fiveHour', wk1)]));
+  assert.match(r.line, new RegExp(`week-spent, back: both ${hm(f2)}; `), 'the week resetting later wins too');
+  r = pq(quota(0.5, 0.5, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2), at(at(seat('both', 0.99, 0.99), 'weeklyShared', wk1), 'fiveHour', null)]));
+  assert.match(r.line, /week-spent, back: both \?; /, r.line);
+  r = pq(quota(0.5, 0.5, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2), at(at(seat('wkonly', 0.5, 0.99), 'weeklyShared', wk1), 'fiveHour', f2)]));
+  assert.match(r.line, new RegExp(`week-spent, back: wkonly ${hm(wk1)}; `), 'a 5h bucket with room does not delay the return');
+  r = pq(quota(0.5, 0.5, [at(at(seat('both', 0.99, 0.99), 'weeklyShared', wk1), 'fiveHour', f2)], { live_seats: 0 }));
+  assert.match(r.line, new RegExp(`serving 0 of 1 seats, first back ${hm(f2)}; `), 'first back uses the same later reset');
+});
+
+test('pool-quota: an empty or domain-only name prints as ? and never shifts the serving entry', () => {
+  const r = pq(quota(0.8, 0.6, [seat('', 0.1, 0.2), seat('@x.org', 0.3, 0.4)]));
+  assert.match(r.line, /serving 2 of 2 seats: \? \(5h 10%, week 20% used\), \? \(5h 30%, week 40% used\); /, r.line);
+});
+
+test('pool-quota: hostile names in the 5h-full and week-spent groups are reduced; unknown times group last', () => {
+  const r = pq(quota(0.5, 0.5, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2),
+    at(seat('\u001b]0;x\u0007f5@x.org', 0.98, 0.2), 'fiveHour', NOW + PQH),
+    at(seat('w\nk@x.org', 0.1, 0.99), 'weeklyShared', null),
+    at(seat('zz', 0.1, 0.99), 'weeklyShared', 'soon'),
+    at(seat('early', 0.1, 0.99), 'weeklyShared', NOW + 2 * PQH)]));
+  assert.doesNotMatch(r.stdout, /[\x00-\x09\x0b-\x1f\x7f]/);
+  assert.equal(r.stdout.trim().split('\n').length, 1);
+  assert.match(r.line, new RegExp(`5h-full, back: \\?\\?0\\?x\\?f5 ${hm(NOW + PQH)}; week-spent, back: early ${hm(NOW + 2 * PQH)}, w\\?k zz \\?; `), r.line);
+});
+
+test('pool-quota: 5 hours at exactly 97 % is full; just under serves', () => {
+  let r = pq(quota(0.5, 0.5, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2), at(seat('edge', 0.97, 0.2), 'fiveHour', NOW + PQH)]));
+  assert.match(r.line, new RegExp(`serving 2 of 3 seats: a .*; 5h-full, back: edge ${hm(NOW + PQH)}; `), r.line);
+  r = pq(quota(0.5, 0.5, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2), seat('edge', 0.969, 0.2)]));
+  assert.match(r.line, /serving 3 of 3 seats: .*edge \(5h 97%, week 20% used\)/, r.line);
+});
+
+test('pool-quota: a low weekly pool with seats serving warns and never fails (the weekly fail is gone)', () => {
+  const r = pq(quota(0.8, 0.04, [seat('a', 0.1, 0.9), seat('b', 0.1, 0.95)]));
+  assert.match(r.line, /^CHECK pool-quota warn · serving 2 of 2 seats: .*week 4% left \(week at or under 15%\)/, r.line);
 });
 
 test('pool-quota: a reset time that is missing or insane prints as ?', () => {

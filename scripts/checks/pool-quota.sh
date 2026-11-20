@@ -27,16 +27,22 @@ else
     || check_emit "$NAME" fail "quota endpoint $url did not answer at $(check_now)" "$NEXT"
 fi
 now_ms=${CHECK_NOW_MS:-$(( $(date +%s) * 1000 ))}
-# One record, \x1f-separated: five, servable, week, live, total, serving, fivefull, spent, stale, inactive, first_back_s.
-# serving: "name 5h% wk%" items joined by ";"; fivefull and spent: "names Day HH:MM" groups, soonest first, joined by
-# ", " (seats whose resets fall in the same minute share one group).
+# One record, \x1f-separated: five, servable, week, live, total, serving, fivefull, spent, stale, inactive, first_back_s,
+# nlocal. serving: "name (5h x%, week y% used)" items joined by ", "; fivefull and spent: "names Day HH:MM" groups,
+# soonest first, joined by ", " (seats whose resets fall in the same minute share one group). nlocal: the seats the
+# seat data calls servable, which can differ from the proxy's own live_seats.
 r=$(jq -r -s --argjson now "$now_ms" '
   # the local part only, reduced to [A-Za-z0-9._-]: a name never carries an escape into the line
-  def who: (.name // "?") | tostring | split("@")[0] | gsub("[^A-Za-z0-9._-]"; "?");
+  def who: (.name // "?") | tostring | (split("@")[0] // "") | gsub("[^A-Za-z0-9._-]"; "?") | if . == "" then "?" else . end;
   def u($b): (.buckets[$b].utilization // null) | if type == "number" then . else null end;
   def at($b): (.buckets[$b].resetAt // null) | if type == "number" and . > 0 and . < 1e14 then (. / 1000 | floor) else null end;
   def p: if . == null then "?" else (. * 100 + 0.5 | floor | tostring) + "%" end;
   def hm: if . == null then "?" else strflocaltime("%a %H:%M") end;
+  # a week-spent seat serves again only when every blocking bucket has reset: its week, and its 5 hours too when those
+  # are full; an unknown blocking reset makes the return unknown
+  def wkback: at("weeklyShared") as $w
+    | if (u("fiveHour") // 0) >= 0.97 then at("fiveHour") as $f | (if $w == null or $f == null then null else ([$w, $f] | max) end)
+      else $w end;
   # [{t, who}] -> "a b Thu 20:59, c Fri 12:00": by time, a group per minute, unknown times last
   def backs: map({k: (if .t == null then 1e12 else (.t / 60 | floor) end), t, who}) | sort_by(.k, .who) | group_by(.k)
              | map("\(map(.who) | join(" ")) \(.[0].t | hm)") | join(", ");
@@ -50,30 +56,32 @@ r=$(jq -r -s --argjson now "$now_ms" '
       | [$act[] | select((u("weeklyShared") // 1) < 0.98 and (u("fiveHour") // 0) < 0.97)] as $srv
       | [$act[] | select((u("weeklyShared") // 1) < 0.98 and (u("fiveHour") // 0) >= 0.97)] as $f5
       | [$act[] | select((u("weeklyShared") // 1) >= 0.98)] as $wk
-      | ([$f5[] | at("fiveHour")] + [$wk[] | at("weeklyShared")] | map(select(. != null)) | min) as $first
+      | ([$f5[] | at("fiveHour")] + [$wk[] | wkback] | map(select(. != null)) | min) as $first
       | [ $a.fiveHour.remaining,
           ($a.fiveHour.servableRemaining | if type == "number" then . else "" end),
           $a.weeklyShared.remaining,
           (.live_seats | if type == "number" then . else ($srv | length) end),
           ($seats | length),
-          ([$srv[] | "\(who) \(u("fiveHour") | p) \(u("weeklyShared") | p)"] | join(";")),
+          ([$srv[] | "\(who) (5h \(u("fiveHour") | p), week \(u("weeklyShared") | p) used)"] | join(", ")),
           ([$f5[] | {t: at("fiveHour"), who: who}] | backs),
-          ([$wk[] | {t: at("weeklyShared"), who: who}] | backs),
+          ([$wk[] | {t: wkback, who: who}] | backs),
           ([$seats[] | . as $s
               | [.buckets[]? | select(type == "object" and (.resetAt | type) == "number"
                                       and .resetAt < ($now - 900000) and (.utilization // 0) > 0)]
               | select(length > 0) | $s | who] | unique | join(" ")),
           ([$seats[] | select(.status != "active") | "\(who)=\(.status | tostring | gsub("[^A-Za-z0-9._-]"; "?"))"] | join(" ")),
-          (if $first == null then "" else ($first | hm) end)
+          (if $first == null then "" else ($first | hm) end),
+          ($srv | length)
         ] | map(tostring) | join("\u001f") end end' <<<"$body" 2>/dev/null) || r=BAD
-# exactly one record of eleven fields, or nothing here can be trusted
-[ "$(printf '%s' "$r" | grep -c '')" = 1 ] && [ "$(printf '%s' "$r" | tr -cd '\037' | wc -c)" = 10 ] || r=BAD
+# exactly one record of twelve fields, or nothing here can be trusted
+[ "$(printf '%s' "$r" | grep -c '')" = 1 ] && [ "$(printf '%s' "$r" | tr -cd '\037' | wc -c)" = 11 ] || r=BAD
 [ "$r" = BAD ] || [ -z "$r" ] && check_emit "$NAME" fail "quota endpoint answered without aggregate numbers at $(check_now)" "$NEXT"
 # \x1f, not a tab: read collapses runs of a whitespace IFS, so an empty field would shift the rest
-IFS=$'\x1f' read -r five servable week live total serving fivefull spent stale inactive first_s <<<"$r"
+IFS=$'\x1f' read -r five servable week live total serving fivefull spent stale inactive first_s nlocal <<<"$r"
 pct() { awk -v x="$1" 'BEGIN { printf "%d%%", x * 100 + 0.5 }'; }
 [[ $live =~ ^[0-9]+$ ]] || live=0
 [[ $total =~ ^[0-9]+$ ]] || total=0
+[[ $nlocal =~ ^[0-9]+$ ]] || nlocal=0
 status=ok; why=()
 if [ "$live" = 0 ]; then status=fail; why+=("no seat serves: a wall")
 elif [ "$live" = 1 ]; then status=warn; why+=("one seat serves"); fi
@@ -82,12 +90,15 @@ awk -v x="$room" 'BEGIN { exit !(x < 0.15) }' && { [ "$status" = fail ] || statu
 awk -v x="$week" 'BEGIN { exit !(x <= 0.15) }' && { [ "$status" = fail ] || status=warn; why+=("week at or under 15%"); }
 [ -n "$stale" ] && { [ "$status" = fail ] || status=warn; why+=("stale buckets: $stale"); }
 
-if [ -n "$serving" ]; then
-  srv=$(tr ';' '\n' <<<"$serving" | awk '{ printf "%s%s (5h %s, week %s used)", (NR > 1 ? ", " : ""), $1, $2, $3 }')
-  fact="serving $live of $total seats: $srv"
+# The proxy's count is the truth about serving; the seat data only explains it. When they disagree, say so.
+if [ "$live" = 0 ]; then
+  fact="serving 0 of $total seats"
+  [ -n "$first_s" ] && fact+=", first back $first_s"
+  [ "$nlocal" -gt 0 ] && fact+="; the seat data calls $nlocal servable ($serving): why the proxy serves none is unknown here"
 else
   fact="serving $live of $total seats"
-  [ -n "$first_s" ] && fact+=", first back $first_s"
+  [ -n "$serving" ] && fact+=": $serving"
+  [ "$nlocal" != "$live" ] && fact+=" (the proxy's count; the seat data calls $nlocal servable)"
 fi
 [ -n "$fivefull" ] && fact+="; 5h-full, back: $fivefull"
 [ -n "$spent" ] && fact+="; week-spent, back: $spent"

@@ -84,9 +84,10 @@ the five-hour capacity of seats whose week was already spent, so it could serve 
 - **Seat states** (seats not disabled and `active`):
   - **serving**: week under 98 % used and five hours under 97 % (the proxy's servable rule and its 5h switch). Shown with both numbers.
   - **5h-full**: the week has room but the five hours do not. Shown with the 5h reset.
-  - **week-spent**: the week is 98 % or more used. Shown with the weekly reset.
-  - Reset times print as `<day> <hh:mm>`, soonest first; seats resetting in the same minute share one entry; a missing or insane time prints `?`.
-  - The serving count is the proxy's own `live_seats` when it reports one.
+  - **week-spent**: the week is 98 % or more used. Shown with the time it serves again: the weekly reset, or the five-hour reset when that is later and the five hours are full too (`?` when either blocking reset is unknown).
+  - Reset times print as `<day> <hh:mm>`, soonest first; seats resetting in the same minute share one entry; a missing or insane time prints `?` and sorts last.
+  - A seat's name is the local part of its address reduced to `[A-Za-z0-9._-]`; an empty one prints `?`.
+  - The serving count is the proxy's own `live_seats` when it reports one. When the seat data disagrees, the line says so: with `live_seats` 0 it lists no seat as serving and says the seat data calls N servable and the cause is unknown here; otherwise it adds "(the proxy's count; the seat data calls N servable)".
 - **fail:**
   - no seat serves (a real wall); the line names the first seat back;
   - the endpoint does not answer, or it answers with anything other than exactly one JSON document holding the aggregate numbers.

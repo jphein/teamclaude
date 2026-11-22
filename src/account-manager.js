@@ -6182,6 +6182,9 @@ export class AccountManager {
   /** Return per-account quota and fleet aggregates for status clients. */
   getQuotaSummary() {
     this.refreshExpiredQuotas();
-    return { ...this.liveSeats(), ...this.nextRefresh(), ...buildQuotaSummary(this.accounts) };
+    // servableRemaining counts with the same predicate as live_seats, so one is 0 exactly when the other is
+    // (for seats with a 5h reading and a known tier)
+    const canServe = (/** @type {any} */ account) => this.unavailableReason(account) == null;
+    return { ...this.liveSeats(), ...this.nextRefresh(), ...buildQuotaSummary(this.accounts, { canServe }) };
   }
 }

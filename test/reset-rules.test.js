@@ -308,6 +308,21 @@ test('servableRemaining counts 5h room only on seats whose week is not spent and
   assert.equal(unknownWeek.aggregate.fiveHour.servableRemaining, 0.45, 'a seat with no weekly reading is not room: 0.9 * 5 / 10');
 });
 
+test('servableRemaining counts no room on a seat the proxy holds back for its status (2026-11-21 claude5 throttled)', async () => {
+  const { buildQuotaSummary } = await import('../src/quota-summary.js');
+  const seatQ = (name, five, week, extra = {}) => ({ name, type: 'oauth', seatTier: 'team_bendep_nonprofit_premium', rateLimitTier: 'default_claude_max_5x',
+    status: 'active', quota: { unified5h: five, unified5hReset: Date.now() + H, unified7d: week, unified7dReset: Date.now() + 3 * DAY }, ...extra });
+  const servable = (...seats) => buildQuotaSummary([seatQ('a', 0.1, 0.25), ...seats]).aggregate.fiveHour.servableRemaining;
+  assert.equal(servable(seatQ('t', 0.2, 0.46, { status: 'throttled', rateLimitedUntil: Date.now() + H })), 0.45,
+    'a running throttle is no room: only a, 0.9 * 5 / 10');
+  assert.equal(servable(seatQ('e', 0.2, 0.46, { status: 'error' })), 0.45, 'an error seat is no room');
+  assert.equal(servable(seatQ('x', 0.2, 0.46, { status: 'exhausted' })), 0.45, 'an exhausted seat is no room');
+  assert.equal(servable(seatQ('t', 0.2, 0.46, { status: 'throttled', rateLimitedUntil: Date.now() - 1000 })), 0.85,
+    'a throttle that has run out is room again, as the proxy routes it: (0.9 + 0.8) * 5 / 10');
+  const s = buildQuotaSummary([seatQ('a', 0.1, 0.25), seatQ('e', 0.2, 0.46, { status: 'error' })]);
+  assert.equal(s.aggregate.fiveHour.remaining, 0.85, 'the plain figure still counts every seat');
+});
+
 // ---------- 2026-11-16 13:08–14:30: every seat stopped at the proxy's 97 % 5h threshold, three seats'
 // weeks were spent, and the five-hour rule never fired: the wall was "98 % cached + upstream exhausted"
 // (never reached by a seat the proxy stops routing to at 97 %), and the pool figure counted the

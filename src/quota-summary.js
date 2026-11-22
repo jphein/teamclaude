@@ -144,14 +144,21 @@ export function buildQuotaSummary(accounts) {
   // The 5h headroom the fleet can actually SERVE: a seat whose week is spent, or that is disabled, has
   // an empty 5h window that serves nothing. Same denominator as `remaining`. On 2026-11-16 the plain
   // figure read 84% while two of seven seats could serve (27%), and lanes read "room" as no wall.
+  // A seat the proxy will not route to for its STATUS serves nothing either, whatever its buckets say: an error
+  // seat, an exhausted one, and a throttled one whose throttle is still running (the same states, read the same
+  // way, as AccountManager.unavailableReason). On 2026-11-21 claude5, throttled 10:15-10:45, counted as room
+  // while every request was refused.
+  const now = Date.now();
+  const barredByStatus = (/** @type {any} */ raw) => raw?.status === 'error' || raw?.status === 'exhausted'
+    || (raw?.status === 'throttled' && Number(raw.rateLimitedUntil) > now);
   if (aggregate.fiveHour) {
     let servable = 0;
-    for (const a of summaries) {
+    for (const [i, a] of summaries.entries()) {
       const w = a.tier.weight, f = a.buckets.fiveHour, wk = a.buckets.weeklyShared;
       if (w == null || f == null || String(f.source).startsWith('backend')) continue;
       // a week that is spent OR unknown is not counted as room (an unknown week could be spent)
       const weekUsed = wk == null ? NaN : Number(wk.utilization);
-      if (a.disabled || !Number.isFinite(weekUsed) || weekUsed >= 0.98) continue;
+      if (a.disabled || barredByStatus(accounts[i]) || !Number.isFinite(weekUsed) || weekUsed >= 0.98) continue;
       servable += w * (1 - Math.max(0, Math.min(1, f.utilization)));
     }
     aggregate.fiveHour.servableRemaining = clean(servable / aggregate.fiveHour.capacityWeight);

@@ -128,8 +128,14 @@ function aggregateBucket(accounts, key) {
   };
 }
 
-/** Build the quota payload shared by the control endpoint and status clients. */
-export function buildQuotaSummary(accounts) {
+/**
+ * Build the quota payload shared by the control endpoint and status clients.
+ * @param {any[]} accounts
+ * @param {{ canServe?: (account: any) => boolean }} [opts] `canServe`: the proxy's own routing predicate
+ *   (AccountManager passes `unavailableReason(account) == null`, the one `live_seats` counts with). Without it
+ *   (a bare summary of stored accounts) only the enabled-and-week-not-spent rule below applies.
+ */
+export function buildQuotaSummary(accounts, { canServe } = {}) {
   const summaries = accounts
     .map(account => ({
       name: account.name,
@@ -144,15 +150,25 @@ export function buildQuotaSummary(accounts) {
   // The 5h headroom the fleet can actually SERVE: a seat whose week is spent, or that is disabled, has
   // an empty 5h window that serves nothing. Same denominator as `remaining`. On 2026-11-16 the plain
   // figure read 84% while two of seven seats could serve (27%), and lanes read "room" as no wall.
+  // With the proxy's predicate, a seat counts exactly when the proxy would route a request to it: the same call
+  // live_seats counts with, so the two cannot drift (2026-11-21: claude5, throttled 10:15-10:45, counted as room
+  // while every request was refused). Its 5h room still needs a known tier weight and a unified 5h reading:
+  // unknown headroom is never counted, so a live seat with neither adds 0 (live_seats > 0, servable 0).
   if (aggregate.fiveHour) {
     let servable = 0;
-    for (const a of summaries) {
-      const w = a.tier.weight, f = a.buckets.fiveHour, wk = a.buckets.weeklyShared;
+    for (const [i, a] of summaries.entries()) {
+      const w = a.tier?.weight, f = a.buckets?.fiveHour, wk = a.buckets?.weeklyShared;
       if (w == null || f == null || String(f.source).startsWith('backend')) continue;
-      // a week that is spent OR unknown is not counted as room (an unknown week could be spent)
-      const weekUsed = wk == null ? NaN : Number(wk.utilization);
-      if (a.disabled || !Number.isFinite(weekUsed) || weekUsed >= 0.98) continue;
-      servable += w * (1 - Math.max(0, Math.min(1, f.utilization)));
+      const used = Number(f.utilization);
+      if (!Number.isFinite(used)) continue;
+      if (canServe) {
+        if (!canServe(accounts[i])) continue;
+      } else {
+        // a week that is spent OR unknown is not counted as room (an unknown week could be spent)
+        const weekUsed = wk == null ? NaN : Number(wk.utilization);
+        if (a.disabled || !Number.isFinite(weekUsed) || weekUsed >= 0.98) continue;
+      }
+      servable += w * (1 - Math.max(0, Math.min(1, used)));
     }
     aggregate.fiveHour.servableRemaining = clean(servable / aggregate.fiveHour.capacityWeight);
   }

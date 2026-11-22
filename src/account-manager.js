@@ -6125,14 +6125,17 @@ export class AccountManager {
    * The two numbers a fleet sweep needs: how many seats can serve a request
    * right now, and when the next barred seat comes back. Snake case because the
    * lead's sweep reads exactly these names (2026-11-07).
+   * @param {Map<any, boolean>} [servesNow] each seat's routing verdict, already taken once (getQuotaSummary
+   *   shares one verdict per seat between live_seats and servableRemaining); asked here when absent
    * @returns {{live_seats: number, next_reset: string|null}}
    */
-  liveSeats() {
+  liveSeats(servesNow) {
     const now = Date.now();
     let live = 0;
     let next = Infinity;
     for (const account of this.accounts) {
-      if (this.unavailableReason(account) == null) { live++; continue; }
+      const serves = servesNow ? servesNow.get(account) === true : this.unavailableReason(account) == null;
+      if (serves) { live++; continue; }
       const back = this._backAt(account, now);
       if (back != null && back < next) next = back;
     }
@@ -6182,6 +6185,13 @@ export class AccountManager {
   /** Return per-account quota and fleet aggregates for status clients. */
   getQuotaSummary() {
     this.refreshExpiredQuotas();
-    return { ...this.liveSeats(), ...this.nextRefresh(), ...buildQuotaSummary(this.accounts) };
+    // One routing verdict per seat, taken once and shared by live_seats and servableRemaining, so the two never
+    // disagree about a seat (a throttle expiring between two asks, say). live_seats is THE wall instrument;
+    // servableRemaining is advisory and one-directional: > 0 implies live_seats > 0, never the reverse, since a
+    // live seat with unknown headroom (no 5h reading, unknown tier) adds 0 (Sen's ruling on #97, 2026-11-21).
+    /** @type {Map<any, boolean>} */
+    const servesNow = new Map(this.accounts.map((a) => [a, this.unavailableReason(a) == null]));
+    const canServe = (/** @type {any} */ account) => servesNow.get(account) === true;
+    return { ...this.liveSeats(servesNow), ...this.nextRefresh(), ...buildQuotaSummary(this.accounts, { canServe }) };
   }
 }

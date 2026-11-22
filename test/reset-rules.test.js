@@ -308,6 +308,86 @@ test('servableRemaining counts 5h room only on seats whose week is not spent and
   assert.equal(unknownWeek.aggregate.fiveHour.servableRemaining, 0.45, 'a seat with no weekly reading is not room: 0.9 * 5 / 10');
 });
 
+test('servableRemaining counts a seat exactly when the passed routing predicate says it serves (the call is proven)', async () => {
+  const { buildQuotaSummary } = await import('../src/quota-summary.js');
+  const seatQ = (name, five, week, extra = {}) => ({ name, type: 'oauth', seatTier: 'team_bendep_nonprofit_premium', rateLimitTier: 'default_claude_max_5x',
+    status: 'active', quota: { unified5h: five, unified5hReset: Date.now() + H, unified7d: week, unified7dReset: Date.now() + 3 * DAY }, ...extra });
+  const asked = [];
+  const canServe = (acct) => { asked.push(acct.name); return acct.name !== 't'; };
+  const seats = [seatQ('a', 0.1, 0.25), seatQ('t', 0.2, 0.46, { status: 'throttled', rateLimitedUntil: Date.now() + H }), seatQ('w', 0.5, 0.99)];
+  const f = buildQuotaSummary(seats, { canServe }).aggregate.fiveHour;
+  assert.deepEqual(asked, ['a', 't', 'w'], 'the predicate is asked about every seat with a 5h reading');
+  assert.equal(f.servableRemaining, 0.466666666667, "the predicate decides, not a copy of its rules: a + w, (0.9 + 0.5) * 5 / 15");
+  assert.equal(buildQuotaSummary(seats, { canServe: () => false }).aggregate.fiveHour.servableRemaining, 0, 'no seat serves: 0');
+  assert.equal(f.remaining, 0.733333333333, 'the plain figure still counts every seat');
+});
+
+test('servableRemaining: missing, null or non-numeric quota never throws and is never counted as room', async () => {
+  const { buildQuotaSummary } = await import('../src/quota-summary.js');
+  const seat = (name, quota) => ({ name, type: 'oauth', rateLimitTier: 'default_claude_max_5x', status: 'active', quota });
+  const good = seat('a', { unified5h: 0.1, unified5hReset: Date.now() + H, unified7d: 0.25, unified7dReset: Date.now() + 3 * DAY });
+  const odd = [seat('none', undefined), seat('null', null), seat('nulls', { unified5h: null, unified7d: null }),
+    seat('text', { unified5h: 'x', unified5hReset: Date.now() + H, unified7d: 0.2, unified7dReset: Date.now() + 3 * DAY }),
+    { name: 'bare', type: 'oauth', rateLimitTier: 'default_claude_max_5x' }];
+  for (const canServe of [undefined, () => true]) {
+    const s = buildQuotaSummary([good, ...odd], canServe ? { canServe } : {});
+    assert.equal(s.aggregate.fiveHour.servableRemaining, 0.9, `only a's known room counts (${canServe ? 'predicate' : 'bare'})`);
+  }
+});
+
+// Sen's ruling on #97 (2026-11-21): live_seats is THE wall instrument; servableRemaining is advisory and
+// one-directional: servableRemaining > 0 implies live_seats > 0, never the reverse.
+function quotaPool(...seats) {
+  const am = new AccountManager(seats.map(([name, , , extra]) => ({ name, type: 'oauth', accessToken: `token-${name}`,
+    rateLimitTier: 'default_claude_max_5x', ...(extra?.tier || {}) })), 0.98);
+  seats.forEach(([, five, week, extra], i) => {
+    if (five !== undefined) Object.assign(am.accounts[i].quota, { unified5h: five, unified5hReset: Date.now() + H });
+    Object.assign(am.accounts[i].quota, { unified7d: week, unified7dReset: Date.now() + 3 * DAY });
+    const { tier, ...rest } = extra || {};
+    Object.assign(am.accounts[i], rest);
+  });
+  return am;
+}
+const liveAndServable = (am) => {
+  const s = am.getQuotaSummary();
+  return { live: s.live_seats, servable: s.aggregate.fiveHour?.servableRemaining ?? 0 };
+};
+
+test('servableRemaining > 0 implies live_seats > 0 (one direction only)', () => {
+  const cases = {
+    'all held back (running throttle, error, week spent, 5h at threshold)': quotaPool(
+      ['t', 0.2, 0.46, { status: 'throttled', rateLimitedUntil: Date.now() + H }],
+      ['e', 0.2, 0.46, { status: 'error' }], ['w', 0, 1], ['f', 0.99, 0.3]),
+    'an expired throttle serves again': quotaPool(['t', 0.2, 0.46, { status: 'throttled', rateLimitedUntil: Date.now() - 1000 }], ['w', 0, 1]),
+    'one active seat among held-back ones': quotaPool(['a', 0.1, 0.25], ['e', 0.2, 0.46, { status: 'error' }], ['w', 0, 1]),
+  };
+  const seen = Object.fromEntries(Object.entries(cases).map(([name, am]) => [name, liveAndServable(am)]));
+  for (const [name, { live, servable }] of Object.entries(seen)) {
+    if (servable > 0) assert.ok(live > 0, `${name}: servableRemaining ${servable} with live_seats ${live}`);
+  }
+  assert.deepEqual(seen['all held back (running throttle, error, week spent, 5h at threshold)'], { live: 0, servable: 0 }, 'the all-held-back pool is a wall on both');
+  assert.ok(seen['an expired throttle serves again'].live > 0 && seen['an expired throttle serves again'].servable > 0);
+  assert.ok(seen['one active seat among held-back ones'].servable > 0);
+});
+
+test('the counterexample is correct: live seats with unknown headroom give live_seats > 0 and servableRemaining 0', () => {
+  const unknown = quotaPool(['heron', 0.1, 0.25, { tier: { rateLimitTier: 'default_heron' } }], ['no5h', undefined, 0.25]);
+  const { live, servable } = liveAndServable(unknown);
+  assert.equal(live, 2, 'both seats are routable: no wall');
+  assert.equal(servable, 0, 'their headroom is unknown, and unknown headroom is never counted');
+});
+
+test('getQuotaSummary asks the routing predicate once per seat and shares the verdict', () => {
+  const am = quotaPool(['a', 0.1, 0.25], ['t', 0.2, 0.46, { status: 'throttled', rateLimitedUntil: Date.now() + H }], ['w', 0, 1]);
+  const asked = new Map();
+  const real = am.unavailableReason.bind(am);
+  am.unavailableReason = (acct, ...rest) => { asked.set(acct.name, (asked.get(acct.name) || 0) + 1); return real(acct, ...rest); };
+  const s = am.getQuotaSummary();
+  assert.deepEqual(Object.fromEntries(asked), { a: 1, t: 1, w: 1 }, 'one verdict per seat for both live_seats and servableRemaining');
+  assert.equal(s.live_seats, 1);
+  assert.equal(s.aggregate.fiveHour.servableRemaining, 0.3, "only a's room: 0.9 * 5 / 15");
+});
+
 // ---------- 2026-11-16 13:08–14:30: every seat stopped at the proxy's 97 % 5h threshold, three seats'
 // weeks were spent, and the five-hour rule never fired: the wall was "98 % cached + upstream exhausted"
 // (never reached by a seat the proxy stops routing to at 97 %), and the pool figure counted the

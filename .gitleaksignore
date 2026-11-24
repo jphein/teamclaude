@@ -1,4 +1,4 @@
-# Throwaway TLS keys committed as test fixtures (see test/fixtures/README.md).
-# They sign nothing anyone trusts; listed so secret scans stop flagging them.
-test/fixtures/pre-ski-listener/leaf.TEST-ONLY-key.pem:private-key:1
-test/fixtures/pre-ski-listener-named/leaf.TEST-ONLY-key.pem:private-key:1
+# gitleaks false positives, by fingerprint (commit:file:rule:line), read on 2026-11-23 by teamclaude-42:
+#   test/upgrade-attribution.test.js WS_KEY is RFC 6455's published sample nonce; src/oauth.js OAUTH_CLIENT_ID is Claude Code's public OAuth client id
+93ed029aca24b86fc7850a8649bee418b7c2b4e4:test/upgrade-attribution.test.js:generic-api-key:19
+fa9e97776272a4f01443860a32db98aab2b29794:src/oauth.js:generic-api-key:64

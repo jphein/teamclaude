@@ -2,23 +2,33 @@
 # CHECK security-scan: exploits or bad code coming in from upstream or from our own processes, for teamclaude and
 # the LiteLLM gateway, daily (JP 2026-11-23 18:3x via Sen, row f3fb83d4: "make sure we are scanning teamclaude and
 # litellm all the time for any exploits or bad code coming in from upstream or our own tainted processes").
-#   leaks     gitleaks over the whole history of teamclaude origin/master and forge-gateway origin/main, minus each
-#             repo's committed .gitleaksignore (fingerprints, no values). Any finding: fail. Values never print.
-#   audit     npm audit of teamclaude's lockfile on origin/master (no runtime deps: dev tools only). critical/high:
-#             fail; moderate: warn; audit could not run: warn.
-#   osv       the LiteLLM version pinned in forge-gateway's compose (`# vX.Y.Z` on the image line) against OSV.
-#             A HIGH/CRITICAL advisory: fail; any other: warn; OSV unreachable: warn.
-#   upstream  KarpelesLab/teamclaude commits not in the fork: the count, and the commits that are NEW since the
-#             baseline this check keeps (each new one is a row: read its diff before any sync). warn on new ones.
-#   PRs       an open PR that changes dependencies (teamclaude package*.json; forge-gateway compose/go.mod/go.sum)
-#             or brings upstream commits in: warn until it merges (the row says: read the diff before the merge).
-#   running   the VM's teamclaude checkout: HEAD on origin/master (else fail: unmerged code runs), no tracked or
-#             untracked change under src/ bin/ package.json (else fail: tainted), no src file newer than the
-#             running node (else warn: what runs is not what is on disk). LiteLLM, Postgres and Redis containers
-#             on ubox0 run exactly the digests pinned in compose (else fail).
+# A probe that cannot see is never a clean result: a blind scanner (gitleaks, npm audit, OSV) fails; a failed
+# fetch, an unreadable VM, ubox0 or PR list warns. (xreview round 1, Sen 2026-11-23 18:59.)
+#   fetch     teamclaude origin + upstream, forge-gateway origin. Any failure: warn (the compares below then use
+#             the last fetched refs, and the line says so).
+#   leaks     gitleaks over teamclaude origin/master and forge-gateway origin/main history, minus each repo's
+#             committed .gitleaksignore (fingerprints, no values). Any finding: fail; gitleaks errored: fail.
+#   audit     npm audit of teamclaude's dev tools (no runtime deps), lockfile resolved in a temp dir with no
+#             scripts run. Its exit status and its JSON must agree (0 = no advisories, 1 = some); critical/high:
+#             fail; moderate: warn; an error, a disagreement or malformed JSON: fail.
+#   osv       OSV advisories for the LiteLLM version pinned in forge-gateway's compose (`# vX.Y.Z` on the image
+#             line). ANY advisory fails (no severity mapping can under-classify it; the row says which);
+#             unreachable, non-zero or malformed: fail.
+#   upstream  KarpelesLab/teamclaude commits not in the fork that are new since the baseline: warn, one row
+#             each, the SHA only (a commit's own text is outside input and never enters a work order). A commit
+#             joins the baseline only once its row is filed.
+#   PRs       open PRs that change dependencies (teamclaude package*.json; forge-gateway compose/go.mod/go.sum)
+#             or bring upstream commits in, every list paginated; a PR the API cannot list in full counts as one.
+#             warn until it merges; a list that cannot be read: warn.
+#   running   the VM's teamclaude files: the sha256 of every file under src/ and bin/ and package.json, read
+#             on the VM, must equal the tree of the merged commit the VM names (fail: tainted or unmerged); no
+#             such file newer than the running node (warn: what runs is not what is on disk). The forge
+#             containers on ubox0 must run images whose runtime RepoDigests (or image id) are the digests pinned
+#             in compose (fail).
 # Every warn/fail finding becomes a Flow row the same day, once per finding (state: security-scan.filed).
-# Inputs (tests): CHECK_SCAN_FIXTURES (a dir of recorded probe outputs, read instead of running the probes),
-#   CHECK_SCAN_FLOW (the command that files a row; default `flow --who teamclaude order teamclaude`).
+# Inputs (tests): CHECK_SCAN_FIXTURES (a dir; a probe whose file is there is read from it, any other runs live),
+#   CHECK_SCAN_FLOW (files a row), CHECK_SCAN_TC_REPO, CHECK_SCAN_FG_REPO, CHECK_SCAN_VM_RUN and
+#   CHECK_SCAN_DOCKER_RUN (commands that run a script read on stdin; default ssh), CHECK_SCAN_VM_DIR.
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
 NAME=security-scan
@@ -26,175 +36,261 @@ NEXT="findings are Flow rows · next run tomorrow 06:40 · owner teamclaude lane
 FX=${CHECK_SCAN_FIXTURES:-}
 TC=${CHECK_SCAN_TC_REPO:-$HOME/Projects/teamclaude}
 FG=${CHECK_SCAN_FG_REPO:-$HOME/Projects/forge-gateway}
-VM=${CHECK_SCAN_VM:-jp@10.0.6.145}
+VM_RUN=${CHECK_SCAN_VM_RUN:-timeout 90 ssh -o BatchMode=yes -o ConnectTimeout=8 jp@10.0.6.145 sh -s --}
+VM_DIR=${CHECK_SCAN_VM_DIR:-teamclaude}
+DOCKER_RUN=${CHECK_SCAN_DOCKER_RUN:-timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=8 ubox0 sh -s --}
 DIR=${CHECK_STATE_DIR:-$HOME/.local/state/checks}
 mkdir -p "$DIR" 2>/dev/null
 tmp=$(mktemp -d) || check_emit "$NAME" fail "cannot make a temp dir at $(check_now)" "$NEXT"
 trap 'rm -rf -- "$tmp"' EXIT
 noproxy() { env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy -u ALL_PROXY "$@"; }
-# a probe's output: the fixture when testing, else the live command
-probe() { local name=$1; shift; if [ -n "$FX" ]; then cat "$FX/$name" 2>/dev/null; else "$@"; fi; }
+# a probe's output: its fixture when one is recorded, else the live command
+probe() { local name=$1; shift; if [ -n "$FX" ] && [ -e "$FX/$name" ]; then cat "$FX/$name"; else "$@"; fi; }
 clean() { tr -c 'A-Za-z0-9._:/#@+=,() \n-' '?' | tr '\n' ' ' | sed 's/ *$//'; }   # nothing odd reaches the line
+rc_of() { sed -n 's/^#RC //p' | tail -1; }    # probes end their output with "#RC <exit status>"
+body_of() { grep -v '^#RC '; }
 
 status=ok; facts=(); finds=()   # finds: "key<TAB>row text"
 bump() { case $1 in fail) status=fail ;; warn) [ "$status" = fail ] || status=warn ;; esac; }
 find_() { finds+=("$1"$'\t'"$2"); }
 
-[ -n "$FX" ] || { git -C "$TC" fetch -q origin 2>/dev/null; git -C "$TC" fetch -q upstream 2>/dev/null; git -C "$FG" fetch -q origin 2>/dev/null; }
+# ---- fetch
+do_fetch() {
+  local spec
+  for spec in "teamclaude $TC origin" "upstream $TC upstream" "forge-gateway $FG origin"; do
+    # shellcheck disable=SC2086
+    set -- $spec
+    noproxy timeout 120 git -C "$2" fetch -q "$3" >/dev/null 2>&1; echo "$1 $?"
+  done
+}
+out=$(probe fetch.txt do_fetch)
+stale=""
+for r in teamclaude upstream forge-gateway; do grep -qx "$r 0" <<<"$out" || stale+="$r "; done
+stale=${stale% }
+[ -n "$stale" ] && { bump warn; facts+=("fetch failed: $stale (compared against the last fetched refs)"); }
 
 # ---- leaks
-leaks() { # repo ref -> gitleaks JSON report (redacted) on stdout
-  local ign="$tmp/ign.$RANDOM"
+leaks() { # repo ref -> the redacted gitleaks JSON report, then "#RC n"
+  local ign="$tmp/ign.$RANDOM" rc
   git -C "$1" show "$2:.gitleaksignore" > "$ign" 2>/dev/null || : > "$ign"
+  rm -f "$tmp/gl.json"
   noproxy timeout 600 ionice -c3 nice -n 15 gitleaks git --redact --no-banner --log-opts="$2" --gitleaks-ignore-path "$ign" \
     --report-format json --report-path "$tmp/gl.json" "$1" >/dev/null 2>&1
-  [ $? -le 1 ] && cat "$tmp/gl.json"
+  rc=$?
+  cat "$tmp/gl.json" 2>/dev/null; echo; echo "#RC $rc"
 }
 for pair in "teamclaude:$TC:origin/master" "forge-gateway:$FG:origin/main"; do
   repo=${pair%%:*}; rest=${pair#*:}; path=${rest%%:*}; ref=${rest#*:}
-  out=$(probe "gitleaks-$repo.json" leaks "$path" "$ref")
-  if ! n=$(jq -er 'length' <<<"$out" 2>/dev/null); then bump warn; facts+=("$repo gitleaks did not run"); continue; fi
+  out=$(probe "gitleaks-$repo.json" leaks "$path" "$ref"); rc=$(rc_of <<<"$out"); body=$(body_of <<<"$out")
+  # gitleaks exits 0 with no leaks and 1 with leaks; anything else, or a report that is not an array, is blind
+  if { [ "$rc" != 0 ] && [ "$rc" != 1 ]; } || ! n=$(jq -er 'if type == "array" then length else error end' <<<"$body" 2>/dev/null) \
+     || { [ "$rc" = 0 ] && [ "$n" -gt 0 ]; } || { [ "$rc" = 1 ] && [ "$n" = 0 ]; }; then
+    bump fail; facts+=("$repo gitleaks could not scan (exit ${rc:-?})"); continue
+  fi
   if [ "$n" -gt 0 ]; then
-    bump fail; facts+=("$repo gitleaks $n: $(jq -r '[.[] | "\(.RuleID) \(.File)"] | unique | join(", ")' <<<"$out" | clean)")
+    bump fail; facts+=("$repo gitleaks $n: $(jq -r '[.[] | "\(.RuleID) \(.File)"] | unique | join(", ")' <<<"$body" | clean)")
     while IFS=$'\t' read -r fp what; do find_ "leak:$repo:$fp" "security-scan: gitleaks found $what in $repo main history: rotate if real, else add its fingerprint to .gitleaksignore"; done \
-      < <(jq -r '.[] | "\(.Fingerprint)\t\(.RuleID) at \(.File):\(.StartLine) (\(.Commit[0:7]))"' <<<"$out" | tr -c 'A-Za-z0-9._:/@()\t\n -' '?')
+      < <(jq -r '.[] | "\(.Fingerprint)\t\(.RuleID) at \(.File):\(.StartLine) (\(.Commit[0:7]))"' <<<"$body" | tr -c 'A-Za-z0-9._:/@()\t\n -' '?')
   else facts+=("$repo gitleaks 0"); fi
 done
 
 # ---- audit (teamclaude dev tools)
-audit() {
-  # master keeps no lockfile: resolve one the way CI's install would (no scripts run, nothing installed)
-  mkdir -p "$tmp/audit" && git -C "$TC" show origin/master:package.json > "$tmp/audit/package.json" \
-    && (cd "$tmp/audit" && noproxy timeout 180 npm install --package-lock-only --ignore-scripts --no-audit --no-fund >/dev/null 2>&1 \
-        && noproxy timeout 120 npm audit --package-lock-only --json 2>/dev/null)
+audit() { # -> npm audit JSON, then "#RC n" ("#RC install-n" when the lockfile could not be resolved)
+  local rc
+  mkdir -p "$tmp/audit"
+  git -C "$TC" show origin/master:package.json > "$tmp/audit/package.json" 2>/dev/null || { echo "#RC show-1"; return; }
+  (cd "$tmp/audit" && noproxy timeout 180 npm install --package-lock-only --ignore-scripts --no-audit --no-fund >/dev/null 2>&1) \
+    || { echo "#RC install-$?"; return; }
+  (cd "$tmp/audit" && noproxy timeout 120 npm audit --package-lock-only --json 2>/dev/null); rc=$?
+  echo; echo "#RC $rc"
 }
-out=$(probe audit.json audit)
-if v=$(jq -er '.metadata.vulnerabilities | "\(.critical // 0) \(.high // 0) \(.moderate // 0)"' <<<"$out" 2>/dev/null); then
-  read -r crit high mod <<<"$v"
-  names=$(jq -r '[.vulnerabilities // {} | to_entries[] | select(.value.severity == "critical" or .value.severity == "high" or .value.severity == "moderate") | "\(.key)(\(.value.severity))"] | join(" ")' <<<"$out" | clean)
+out=$(probe audit.json audit); rc=$(rc_of <<<"$out"); body=$(body_of <<<"$out")
+v=$(jq -er '.metadata.vulnerabilities | [.critical, .high, .moderate, .total] | if all(type == "number") then map(tostring) | join(" ") else error end' <<<"$body" 2>/dev/null)
+read -r crit high mod total <<<"${v:-x x x x}"
+if [ -z "$v" ] || { [ "$rc" != 0 ] && [ "$rc" != 1 ]; } || { [ "$rc" = 0 ] && [ "$total" != 0 ]; } || { [ "$rc" = 1 ] && [ "$total" = 0 ]; }; then
+  bump fail; facts+=("npm audit could not be read (exit ${rc:-?})")
+else
+  names=$(jq -r '[.vulnerabilities // {} | to_entries[] | select(.value.severity == "critical" or .value.severity == "high" or .value.severity == "moderate") | "\(.key)(\(.value.severity))"] | join(" ")' <<<"$body" | clean)
   if [ $((crit + high)) -gt 0 ]; then bump fail; elif [ "$mod" -gt 0 ]; then bump warn; fi
   facts+=("npm audit $crit critical $high high $mod moderate${names:+ ($names)}")
   for p in $names; do find_ "audit:$p" "security-scan: npm audit flags $p in teamclaude's dev tools on master: bump or pin it"; done
-else bump warn; facts+=("npm audit did not run"); fi
+fi
 
 # ---- osv (the LiteLLM version the compose pins)
 compose=$(probe compose.yaml git -C "$FG" show origin/main:deploy/compose.yaml)
 ver=$(grep -E 'image: *ghcr.io/berriai/litellm[^ ]*@sha256:' <<<"$compose" | grep -oE '# *v[0-9]+(\.[0-9]+)+' | head -1 | grep -oE '[0-9]+(\.[0-9]+)+')
-if [ -z "$ver" ]; then bump warn; facts+=("litellm version not found in compose")
+osv() {
+  local rc
+  noproxy curl -q -s -f --max-time 30 -H 'Content-Type: application/json' \
+    -d "{\"package\":{\"name\":\"litellm\",\"ecosystem\":\"PyPI\"},\"version\":\"$1\"}" https://api.osv.dev/v1/query; rc=$?
+  echo; echo "#RC $rc"
+}
+if [ -z "$ver" ]; then bump fail; facts+=("litellm version not found in compose: OSV not asked")
 else
-  out=$(probe osv.json noproxy curl -q -s -f --max-time 30 -H 'Content-Type: application/json' \
-    -d "{\"package\":{\"name\":\"litellm\",\"ecosystem\":\"PyPI\"},\"version\":\"$ver\"}" https://api.osv.dev/v1/query)
-  if ids=$(jq -er '[.vulns // [] | .[] | .id] | join(" ")' <<<"$out" 2>/dev/null); then
-    hi=$(jq -r '[.vulns // [] | .[] | select(((.database_specific.severity // "") | ascii_upcase) as $s | $s == "HIGH" or $s == "CRITICAL") | .id] | join(" ")' <<<"$out")
-    ids=$(clean <<<"$ids"); hi=$(clean <<<"$hi")
-    if [ -n "$hi" ]; then bump fail; elif [ -n "$ids" ]; then bump warn; fi
-    facts+=("litellm $ver OSV ${ids:-0}${hi:+ (high: $hi)}")
-    for id in $ids; do find_ "osv:litellm:$ver:$id" "security-scan: OSV $id affects LiteLLM $ver (forge-gateway pin): read it; bump the pinned digest if it applies"; done
-  else bump warn; facts+=("litellm $ver OSV did not answer"); fi
+  out=$(probe osv.json osv "$ver"); rc=$(rc_of <<<"$out"); body=$(body_of <<<"$out")
+  # OSV answers {} when nothing applies; anything that is not an object with an optional vulns array is unread
+  if [ "$rc" != 0 ] || ! ids=$(jq -er 'if type == "object" and ((.vulns // []) | type) == "array" then [(.vulns // [])[] | .id] | join(" ") else error end' <<<"$body" 2>/dev/null); then
+    bump fail; facts+=("litellm $ver OSV could not be read (exit ${rc:-?})")
+  else
+    ids=$(clean <<<"$ids")
+    if [ -n "$ids" ]; then
+      bump fail
+      sev=$(jq -r '[(.vulns // [])[] | "\(.id)=\(.database_specific.severity // ([.severity[]?.score] | first) // "unrated")"] | join(" ")' <<<"$body" | clean)
+      facts+=("litellm $ver OSV: $sev")
+      for id in $ids; do find_ "osv:litellm:$ver:$id" "security-scan: OSV $id affects LiteLLM $ver (forge-gateway pin): read its severity and vectors; bump the pinned digest if it applies"; done
+    else facts+=("litellm $ver OSV 0"); fi
+  fi
 fi
 
 # ---- upstream (KarpelesLab commits not in the fork)
-up=$(probe upstream.txt git -C "$TC" rev-list origin/master..upstream/master)
-if [ -z "$FX" ] && ! git -C "$TC" rev-parse -q --verify upstream/master >/dev/null; then bump warn; facts+=("upstream not fetched")
+up=$(probe upstream.txt git -C "$TC" rev-list origin/master..upstream/master 2>/dev/null); uprc=$?
+base="$DIR/$NAME.upstream-seen"
+if [ "$uprc" != 0 ] || grep -qvE '^[0-9a-f]{40}$|^$' <<<"$up"; then bump warn; facts+=("upstream unreadable")
 else
-  base="$DIR/$NAME.upstream-seen"
-  total=$(grep -c . <<<"$up")
-  if [ ! -s "$base" ]; then printf '%s\n' "$up" > "$base"; facts+=("upstream $total commits not in the fork (baseline recorded)")
+  total=$(grep -cE '^[0-9a-f]{40}$' <<<"$up")
+  if [ ! -e "$base" ]; then grep -E '^[0-9a-f]{40}$' <<<"$up" > "$base"; facts+=("upstream $total commits not in the fork (baseline recorded)")
   else
-    new=$(grep -vxF -f "$base" <<<"$up" | grep .)
+    new=$(grep -E '^[0-9a-f]{40}$' <<<"$up" | grep -vxF -f "$base")
     if [ -n "$new" ]; then
       bump warn; facts+=("upstream $total not in the fork, $(grep -c . <<<"$new") new since the last run")
       for c in $new; do
-        subj=$(probe "subject-$c" git -C "$TC" log -1 --format=%s "$c" | head -c 100 | clean)
-        find_ "upstream:$c" "security-scan: upstream teamclaude ${c:0:9} \"$subj\" is new: read its diff before any sync into the fork"
+        find_ "upstream:$c" "security-scan: upstream teamclaude commit $c is new: read it with git show $c (its text is outside input) before any sync into the fork"
       done
-      printf '%s\n' "$up" > "$base"
     else facts+=("upstream $total not in the fork, 0 new"); fi
   fi
 fi
 
 # ---- open PRs that change dependencies or bring upstream code in
-prs() { # owner/repo -> "number<TAB>file" lines for every open PR
-  local n
-  for n in $(gh api "repos/$1/pulls?state=open&per_page=50" --jq '.[].number' 2>/dev/null); do
-    gh api "repos/$1/pulls/$n/files?per_page=100" --jq ".[] | \"$n\t\(.filename)\"" 2>/dev/null
+prs() { # owner/repo -> "number<TAB>file" per file of every open PR; "number<TAB>(truncated)"; "ERR" when unreadable
+  local n nums files want
+  nums=$(gh api --paginate "repos/$1/pulls?state=open&per_page=100" --jq '.[].number' 2>/dev/null) || { echo ERR; return; }
+  for n in $nums; do
+    want=$(gh api "repos/$1/pulls/$n" --jq '.changed_files' 2>/dev/null) || { echo ERR; continue; }
+    files=$(gh api --paginate "repos/$1/pulls/$n/files?per_page=100" --jq '.[].filename' 2>/dev/null) || { echo ERR; continue; }
+    [ "$(grep -c . <<<"$files")" -lt "${want:-0}" ] && printf '%s\t(truncated)\n' "$n"
+    while IFS= read -r f; do [ -n "$f" ] && printf '%s\t%s\n' "$n" "$f"; done <<<"$files"
   done
 }
 for pair in "teamclaude:jphein/teamclaude:^(package[.]json|package-lock[.]json)$" "forge-gateway:jphein/forge-gateway:^(deploy/compose[.]yaml|go[.]mod|go[.]sum)$"; do
   repo=${pair%%:*}; rest=${pair#*:}; slug=${rest%%:*}; pat=${rest#*:}
-  hits=$(probe "prs-$repo.txt" prs "$slug" | awk -F'\t' -v p="$pat" '$2 ~ p {print $1}' | sort -un | tr '\n' ' ' | sed 's/ $//')
+  out=$(probe "prs-$repo.txt" prs "$slug")
+  grep -qx ERR <<<"$out" && { bump warn; facts+=("$repo open PRs unreadable"); }
+  hits=$(awk -F'\t' -v p="$pat" '$2 ~ p || $2 == "(truncated)" {print $1}' <<<"$out" | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ' | sed 's/ $//')
   if [ -n "$hits" ]; then
     bump warn; facts+=("$repo dependency PRs open: $(sed 's/[0-9]\+/#&/g' <<<"$hits")")
-    for n in $hits; do find_ "pr:$repo:$n" "security-scan: $slug PR $n changes dependencies: read the upstream diff of each bump before it merges"; done
+    for n in $hits; do find_ "pr:$repo:$n" "security-scan: $slug PR $n changes dependencies (or has more files than the API lists): read the upstream diff of each bump before it merges"; done
   fi
 done
-if [ -n "$FX" ]; then upr=$(cat "$FX/upstream-prs.txt" 2>/dev/null)
-else upr=$(for n in $(gh api "repos/jphein/teamclaude/pulls?state=open&per_page=50" --jq '.[].number' 2>/dev/null); do
-  gh api "repos/jphein/teamclaude/pulls/$n/commits?per_page=250" --jq '.[].sha' 2>/dev/null | while read -r s; do
-    git -C "$TC" merge-base --is-ancestor "$s" upstream/master 2>/dev/null && { echo "$n"; break; }; done; done); fi
-for n in $(sort -un <<<"$upr"); do
+upstream_prs() { # PR numbers whose commits include an upstream commit (or cannot all be listed); "ERR" when unreadable
+  local n nums shas want
+  nums=$(gh api --paginate "repos/jphein/teamclaude/pulls?state=open&per_page=100" --jq '.[].number' 2>/dev/null) || { echo ERR; return; }
+  for n in $nums; do
+    want=$(gh api "repos/jphein/teamclaude/pulls/$n" --jq '.commits' 2>/dev/null) || { echo ERR; continue; }
+    shas=$(gh api --paginate "repos/jphein/teamclaude/pulls/$n/commits?per_page=100" --jq '.[].sha' 2>/dev/null) || { echo ERR; continue; }
+    # the commits endpoint stops at 250: a longer PR counts as bringing upstream in until read by hand
+    if [ "$(grep -c . <<<"$shas")" -lt "${want:-0}" ]; then echo "$n"; continue; fi
+    while read -r s; do
+      [ -n "$s" ] && git -C "$TC" merge-base --is-ancestor "$s" upstream/master 2>/dev/null && { echo "$n"; break; }
+    done <<<"$shas"
+  done
+}
+upr=$(probe upstream-prs.txt upstream_prs)
+grep -qx ERR <<<"$upr" && { bump warn; facts+=("teamclaude upstream-PR check unreadable"); }
+for n in $(grep -E '^[0-9]+$' <<<"$upr" | sort -un); do
   bump warn; facts+=("teamclaude PR #$n brings upstream commits")
-  find_ "upr:$n" "security-scan: jphein/teamclaude PR $n brings upstream commits in: read the whole upstream diff before it merges"
+  find_ "upr:$n" "security-scan: jphein/teamclaude PR $n brings upstream commits in (or has more than the API lists): read the whole upstream diff before it merges"
 done
 
-# ---- running vs repo
+# ---- running vs repo: the VM's files, hashed where they run, against the merged commit's tree
 vm() {
-  # the node's start time comes from /proc/<pid>/stat field 22 (clock ticks after boot) + btime: the /proc/<pid>
-  # directory's own mtime is when procfs made the inode, which can be later than the start
-  timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=8 "$VM" sh -s 2>/dev/null <<'EOS'
-cd ~/teamclaude || exit 1
-echo "HEAD $(git rev-parse HEAD)"
-git status --porcelain --untracked-files=all -- src bin package.json | sed 's/^/DIRTY /'
-pid=$(pgrep -f 'src/index.js server' | head -1)
-if [ -n "$pid" ]; then
+  # The node's start comes from /proc/<pid>/stat field 22 (ticks after boot) + btime: the /proc/<pid> directory's
+  # own mtime is when procfs made the inode, which can be later than the start.
+  $VM_RUN "$VM_DIR" <<'EOS'
+cd "$1" 2>/dev/null || exit 1
+echo "HEAD $(git rev-parse HEAD 2>/dev/null)"
+pid=$(pgrep -f 'src/index.js server' 2>/dev/null | head -1)
+start=""
+if [ -n "$pid" ] && [ -r "/proc/$pid/stat" ]; then
   bt=$(awk '$1 == "btime" {print $2}' /proc/stat)
   st=$(sed 's/.*) //' "/proc/$pid/stat" | awk '{print $20}')
-  start=$((bt + st / 100))
-  echo "START $start"
-  find src bin -type f -exec stat -c '%Y %n' {} + 2>/dev/null | awk -v s="$start" '$1 > s {print "NEWER", $2}'
+  start=$((bt + st / 100)); echo "START $start"
 fi
-echo "NODE $(/opt/node/bin/node --version 2>/dev/null)"
+{ find src bin -type f 2>/dev/null; [ -f package.json ] && echo package.json; } | sort | while IFS= read -r p; do
+  echo "FILE $(sha256sum "$p" | cut -d' ' -f1) $p"
+  [ -n "$start" ] && [ "$(stat -c %Y "$p")" -gt "$start" ] && echo "NEWER $p"
+done
+echo "NODE $( (/opt/node/bin/node --version || node --version) 2>/dev/null)"
 EOS
+}
+expected_files() { # commit -> "FILE sha256 path" for src/ bin/ package.json in that tree
+  local d="$tmp/tree.$RANDOM" specs
+  mkdir -p "$d"
+  specs=$(git -C "$TC" ls-tree --name-only "$1" -- src bin package.json 2>/dev/null) || return 1
+  [ -n "$specs" ] || return 1
+  # shellcheck disable=SC2086
+  git -C "$TC" archive --format=tar "$1" -- $specs 2>/dev/null | tar -x -C "$d" || return 1
+  (cd "$d" && { find src bin -type f 2>/dev/null; [ -f package.json ] && echo package.json; } | sort | while IFS= read -r p; do
+    echo "FILE $(sha256sum "$p" | cut -d' ' -f1) $p"; done)
 }
 out=$(probe vm.txt vm)
 head_=$(awk '$1 == "HEAD" {print $2}' <<<"$out" | grep -E '^[0-9a-f]{40}$')
-if [ -z "$head_" ]; then bump warn; facts+=("VM checkout unreadable")
+if [ -z "$head_" ] || ! grep -q '^FILE ' <<<"$out"; then bump warn; facts+=("VM checkout unreadable")
 else
-  dirty=$(awk '$1 == "DIRTY" {print $NF}' <<<"$out" | clean); newer=$(awk '$1 == "NEWER" {print $2}' <<<"$out" | clean)
-  onmain=yes
-  if [ -n "$FX" ]; then grep -qx "$head_" "$FX/master-commits.txt" 2>/dev/null || onmain=no
-  else git -C "$TC" merge-base --is-ancestor "$head_" origin/master 2>/dev/null || onmain=no; fi
-  f="VM ${head_:0:7} $(awk '$1 == "NODE" {print $2}' <<<"$out" | clean)"; f0=$f
-  if [ "$onmain" = no ]; then bump fail; f+=" NOT on master"; find_ "vm:head:$head_" "security-scan: the VM proxy runs ${head_:0:9}, which is not on origin/master: find who deployed it, then deploy a merged commit"; fi
-  if [ -n "$dirty" ]; then bump fail; f+=" tainted: $dirty"; find_ "vm:dirty:$(md5sum <<<"$dirty" | cut -c1-12)" "security-scan: the VM teamclaude checkout has changes under src/bin/package.json not in git ($dirty): read them, then restore the merged commit"; fi
-  if [ -n "$newer" ]; then bump warn; f+=" src newer than the running node: $newer"; find_ "vm:newer:$(md5sum <<<"$newer" | cut -c1-12)" "security-scan: VM src changed after the proxy started ($newer): what runs is not what is on disk; restart it with notice"; fi
-  [ "$f" = "$f0" ] && f+=" clean, on master"
+  node=$(awk '$1 == "NODE" {print $2}' <<<"$out" | clean)
+  f="VM ${head_:0:7}${node:+ $node}"; f0=$f
+  if ! git -C "$TC" merge-base --is-ancestor "$head_" origin/master 2>/dev/null; then
+    bump fail; f+=" NOT on master"
+    find_ "vm:head:$head_" "security-scan: the VM proxy names commit $head_, which is not on origin/master: find who deployed it, then deploy a merged commit"
+  elif ! want=$(expected_files "$head_"); then
+    bump fail; f+=" tree of ${head_:0:7} unreadable here"
+  else
+    diffs=$(diff <(grep '^FILE ' <<<"$out" | sort -k3) <(sort -k3 <<<"$want") | awk '/^[<>] FILE / {print $4}' | sort -u | head -20 | clean)
+    if [ -n "$diffs" ]; then
+      bump fail; f+=" tainted: $diffs"
+      find_ "vm:files:$(md5sum <<<"$diffs" | cut -c1-12)" "security-scan: VM teamclaude files differ from merged commit ${head_:0:9} ($diffs): read the changes, then restore the merged tree"
+    fi
+  fi
+  newer=$(awk '$1 == "NEWER" {print $2}' <<<"$out" | head -20 | clean)
+  if [ -n "$newer" ]; then bump warn; f+=" src newer than the running node: $newer"
+    find_ "vm:newer:$(md5sum <<<"$newer" | cut -c1-12)" "security-scan: VM files changed after the proxy started ($newer): what runs is not what is on disk; restart it with notice"; fi
+  [ "$f" = "$f0" ] && f+=" files = merged tree"
   facts+=("$f")
 fi
+docker_probe() {
+  $DOCKER_RUN <<'EOS'
+for c in $(docker ps -q --filter name=forge-); do
+  n=$(docker inspect -f '{{.Name}}' "$c"); id=$(docker inspect -f '{{.Image}}' "$c")
+  echo "$n $id $(docker image inspect -f '{{join .RepoDigests " "}}' "$id" 2>/dev/null)"
+done
+EOS
+}
 pins=$(grep -oE 'image: *[^ ]+@sha256:[0-9a-f]{64}' <<<"$compose" | sed -E 's/image: *//')
-run=$(probe docker.txt timeout 30 ssh -o BatchMode=yes -o ConnectTimeout=8 ubox0 \
-  "docker inspect --format '{{.Name}} {{.Config.Image}}' \$(docker ps -q --filter name=forge-) 2>/dev/null")
+run=$(probe docker.txt docker_probe | grep '^/')
 if [ -z "$pins" ] || [ -z "$run" ]; then bump warn; facts+=("forge containers or pins unreadable")
 else
   bad=""
-  while read -r cname cimg; do
-    [ -n "$cname" ] || continue
-    grep -qxF "$cimg" <<<"$pins" || bad+="${cname#/}=${cimg##*@sha256:} "
+  while read -r cname cid rds; do
+    ok=no
+    for d in $rds; do grep -qxF "$d" <<<"$pins" && ok=yes; done
+    [ "$ok" = no ] && grep -q "@${cid}\$" <<<"$pins" && ok=yes   # an image store whose id is the manifest digest
+    [ "$ok" = yes ] || bad+="${cname#/}=${cid#sha256:} "
   done <<<"$run"
-  bad=$(clean <<<"${bad:0:200}")
+  bad=$(cut -c1-200 <<<"$bad" | clean)
   if [ -n "$bad" ]; then bump fail; facts+=("forge containers off their pins: $bad")
-    find_ "image:$(md5sum <<<"$bad" | cut -c1-12)" "security-scan: ubox0 forge containers run images not pinned in forge-gateway compose ($bad): find who pulled them; redeploy the pinned digests"
+    find_ "image:$(md5sum <<<"$bad" | cut -c1-12)" "security-scan: ubox0 forge containers run images whose runtime digests are not pinned in forge-gateway compose ($bad): find who pulled them; redeploy the pinned digests"
   else facts+=("forge $(grep -c . <<<"$run") containers on their pins"); fi
 fi
 
-# ---- findings become rows, once each
+# ---- findings become rows, once each; an upstream commit joins the baseline only once its row is filed
 filed="$DIR/$NAME.filed"; touch "$filed" 2>/dev/null
 nf=0; failed_rows=0
 for item in "${finds[@]}"; do
   key=${item%%$'\t'*}; text=${item#*$'\t'}
-  grep -qxF "$key" "$filed" 2>/dev/null && continue
-  if [ -n "${CHECK_SCAN_FLOW:-}" ]; then $CHECK_SCAN_FLOW "$text" >/dev/null 2>&1; else flow --who teamclaude order teamclaude "$text" >/dev/null 2>&1; fi \
-    && { printf '%s\n' "$key" >> "$filed"; nf=$((nf + 1)); } || failed_rows=$((failed_rows + 1))
+  if ! grep -qxF "$key" "$filed" 2>/dev/null; then
+    if [ -n "${CHECK_SCAN_FLOW:-}" ]; then $CHECK_SCAN_FLOW "$text" >/dev/null 2>&1; else flow --who teamclaude order teamclaude "$text" >/dev/null 2>&1; fi \
+      && { printf '%s\n' "$key" >> "$filed"; nf=$((nf + 1)); } || { failed_rows=$((failed_rows + 1)); continue; }
+  fi
+  case $key in upstream:*) printf '%s\n' "${key#upstream:}" >> "$base" ;; esac
 done
 [ "$failed_rows" -gt 0 ] && { bump warn; facts+=("$failed_rows rows could not be filed (retried next run)"); }
 fact=$(IFS=';'; echo "${facts[*]}" | sed 's/;/; /g')

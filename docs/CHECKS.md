@@ -27,7 +27,7 @@ How a run exits: always 0, whatever it found. A check reports, it never gates; `
 | `fable-use` | `teamclaude-check-fable-use.timer` | daily 07:40 | `GET 127.0.0.1:3456/teamclaude/quota`: each seat's Fable weekly bucket (`buckets.weeklyFable`), its used % and when it resets | teamclaude lane | On 2026-11-16 every seat's Fable week stood at 0 % used. The proxy rations Fable to the `fable.allow` client keys (JP, 2026-10-11), so a whole week's Fable allowance can expire unused with nobody seeing it. This check is the mechanism for JP's "use down all credits" rule on this pool (Sen, 2026-11-16 08:0x). |
 | `resets-banked` | `teamclaude-check-resets-banked.timer` | daily 07:45 | `GET 127.0.0.1:3456/teamclaude/quota` → `seats[].resets`: banked Claude usage-limit resets split weekly-clearing / 5h-only with each soonest expiry, and `resetsSpent7d` | teamclaude lane | On 2026-11-16 every seat's reset count read empty to the fleet lead (the field it looked at did not exist) and 5 of 7 seats' readings were 3–8 h stale behind 401s. A reset that expires unspent is lost, and the automatic reset strategy (JP, 2026-11-16 08:26) needs the count to be trusted. |
 | `forge-models` | `teamclaude-check-forge-models.timer` | daily 04:50 | Every model the fleet can reach is listed on the plan's Hearth › Forge, and every listed one answers a live probe. Listed = the gateway registry (`forge route show`), the host feed's stems, and `scripts/checks/forge-direct.json` (Claude seats, Azure Speech, Foundry media, other local, AI vendor keys). Every AI-vendor key in the vault must be listed or accounted for. Reachable = each provider's own catalog. Writes the direct rows to the plan's `data/forge/direct.json` | teamclaude lane; gateway owned by palace-nemotron; page owned by the plan lane | On 2026-11-17 at 05:03 JP said "Make sure the forge has comprehensive of all available models I notice some missing". The page listed 14 rows, 2 of them dead, out of 64 reachable models. Nothing compared the page with what the providers serve. |
-| `security-scan` | `teamclaude-check-security-scan.timer` | daily 06:40 | For teamclaude and the LiteLLM gateway: gitleaks over both repos' main history; npm audit of teamclaude (dev tools only, since it has no runtime deps); OSV advisories for the pinned LiteLLM version; upstream KarpelesLab commits that are new since the last run; open PRs that change dependencies or bring upstream code in; whether the VM runs a merged, untouched checkout that matches what is on disk; whether the forge containers on ubox0 run exactly the pinned digests. Each warn or fail finding is filed as a Flow row the same day, once. | teamclaude lane; gateway owned by palace-nemotron | On 2026-11-23 18:3x JP said "make sure we are scanning teamclaude and litellm all the time for any exploits or bad code coming in from upstream or our own tainted processes" (row f3fb83d4). Nothing compared what runs with what was merged, and nothing watched upstream. |
+| `security-scan` | `teamclaude-check-security-scan.timer` | daily 06:40 | For teamclaude and the LiteLLM gateway: gitleaks over both repos' main history; npm audit of teamclaude (dev tools only, since it has no runtime deps); OSV advisories for the pinned LiteLLM version; upstream KarpelesLab commits that are new since the last run; open PRs that change dependencies or bring upstream code in; the sha256 of every file the VM runs against the merged commit's tree, and no file newer than the running node; the forge containers' runtime digests against the pins in compose. A probe that can't see is never clean. Each warn or fail finding is filed as a Flow row the same day, once. | teamclaude lane; gateway owned by palace-nemotron | On 2026-11-23 18:3x JP said "make sure we are scanning teamclaude and litellm all the time for any exploits or bad code coming in from upstream or our own tainted processes" (row f3fb83d4). Nothing compared what runs with what was merged, and nothing watched upstream. |
 
 ### forge-models
 
@@ -142,12 +142,49 @@ Each night it reads what is listed and what is reachable, and probes every liste
 
 ### security-scan
 
-- **What runs (read-only, except fetch):** `git fetch` of teamclaude origin and upstream and of forge-gateway origin; `gitleaks git --redact` on each main history, honouring the `.gitleaksignore` committed on that main (fingerprints only, no values); `npm install --package-lock-only --ignore-scripts` then `npm audit --package-lock-only` on teamclaude's `package.json` from master, in a temp dir (nothing installed, no scripts run); an OSV query for the LiteLLM version on the compose image line (`# vX.Y.Z`); `gh api` for open PRs; one ssh to the VM (`git rev-parse`, `git status`, the node's start time from `/proc/<pid>/stat`) and one to ubox0 (`docker inspect`).
-- **fail:** a gitleaks finding (rule and file only, never the value); an npm advisory of high or critical severity; a HIGH or CRITICAL OSV advisory on the pinned LiteLLM; the VM running a commit that is not on origin/master; a change under `src/`, `bin/` or `package.json` in the VM checkout that git doesn't have; a forge container whose image is not a digest pinned in compose.
-- **warn:** a moderate npm advisory; any other OSV advisory; an upstream commit new since the last run (the first run records the 123 commits the fork has not taken as its baseline); an open PR that changes `package*.json`, `deploy/compose.yaml`, `go.mod` or `go.sum`, or that brings upstream commits in; a VM src file newer than the running node (what runs is not what is on disk); a probe that couldn't run (audit, OSV, VM, ubox0); a row that couldn't be filed.
-- **Rows:** each warn or fail finding is filed with `flow order` under the teamclaude lane, once per finding key (state `security-scan.filed`; a failed filing is retried on the next run).
-- **Not covered yet:** the weekly Claude Security scan the row asks for. It is a Claude session, so it waits until the ration allows spawns (row f3fb83d4).
-- **Example:** `CHECK security-scan ok · teamclaude gitleaks 0; forge-gateway gitleaks 0; npm audit 0 critical 0 high 0 moderate; litellm 1.106.9 OSV 0; upstream 123 not in the fork, 0 new; VM 1a1d8e9 v24.22.1 clean, on master; forge 3 containers on their pins; rows filed 0, at 06:42 · findings are Flow rows · next run tomorrow 06:40 · owner teamclaude lane`
+**A probe that can't see never reads as clean.** A blind scanner (gitleaks, npm audit, OSV) fails. A failed fetch, or an unreadable VM, ubox0 or PR list, warns. (This is from xreview round 1, Sen 2026-11-23.)
+
+**What runs** (read-only apart from `git fetch`):
+- `gitleaks git --redact` over each main history. It honours the `.gitleaksignore` committed on that main, which holds fingerprints only, never values.
+- `npm install --package-lock-only --ignore-scripts`, then `npm audit --package-lock-only`, on teamclaude's master `package.json` in a temp dir. Nothing is installed and no scripts run.
+- An OSV query for the LiteLLM version written on the compose image line (`# vX.Y.Z`).
+- `gh api --paginate` for open PRs, with their files and commits.
+- On the VM, a script that prints the sha256 of every file under `src/` and `bin/` plus `package.json`, and the node's start time (read from `/proc/<pid>/stat`). The same hashes are computed here from `git archive` of the merged commit the VM names. Git on the VM is never trusted for the comparison.
+- On ubox0, each `forge-` container's image id and that image's runtime `RepoDigests`.
+
+**fail:**
+- **gitleaks:**
+  - a finding (rule and file only, never the value);
+  - an exit other than 0 or 1, a report that is not a JSON array, or an exit that disagrees with the report.
+- **npm audit:**
+  - a high or critical advisory;
+  - an error exit, a lockfile that can't be resolved, missing counts, or an exit that disagrees with the counts (0 means no advisories, 1 means some).
+- **OSV:**
+  - **any** advisory on the pinned LiteLLM, so no severity mapping can under-classify one. The line and the row name each advisory's severity or CVSS vector;
+  - a non-zero exit, or an answer that is not an object (an object with no `vulns` means no advisories);
+  - no version written on the compose image line.
+- **The VM:**
+  - it names a commit that is not on origin/master;
+  - one of its files differs from that commit's tree, is missing, or isn't in it.
+- **ubox0:** a forge container whose runtime digests (or image id) are not a digest pinned in compose.
+
+**warn:**
+- a moderate npm advisory;
+- an upstream commit that is new since the baseline. The first run records the commits the fork has not taken (123 on 2026-11-23). A commit joins the baseline only after its row is filed. The row gives the SHA only, never the commit's own text;
+- an open PR that:
+  - changes `package*.json`, `deploy/compose.yaml`, `go.mod` or `go.sum`;
+  - has more files or commits than the API lists;
+  - or brings upstream commits in;
+- a VM file newer than the running node, meaning what runs is not what is on disk;
+- a failed fetch;
+- an unreadable VM, ubox0, PR list or upstream list;
+- a row that couldn't be filed.
+
+**Rows:** each warn or fail finding is filed with `flow order` under the teamclaude lane, once per finding key (kept in `security-scan.filed`). A failed filing is retried on the next run.
+
+**Not covered yet:** the weekly Claude Security scan. It needs a Claude session, so it waits for a seat (row f3fb83d4).
+
+**Example:** `CHECK security-scan ok · teamclaude gitleaks 0; forge-gateway gitleaks 0; npm audit 0 critical 0 high 0 moderate; litellm 1.106.9 OSV 0; upstream 123 not in the fork, 0 new; VM 1a1d8e9 v24.22.1 files = merged tree; forge 3 containers on their pins; rows filed 0, at 06:42 · findings are Flow rows · next run tomorrow 06:40 · owner teamclaude lane`
 
 ## Install, update and rollback
 

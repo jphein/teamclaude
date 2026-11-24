@@ -143,7 +143,10 @@ else
   # OSV answers a version with no advisory as {} with NO vulns key (measured 2026-11-24: litellm 1.106.9 -> {};
   # 1.40.0 -> {"vulns":[60 items]}), so an absent key is zero. A vulns key that is present must be an array:
   # null or anything else is malformed, as is anything that is not an object.
-  if [ "$rc" != 0 ] || ! ids=$(jq -er 'if type == "object" and ((has("vulns") | not) or (.vulns | type) == "array") then [(.vulns // [])[] | .id] | join(" ") else error end' <<<"$body" 2>/dev/null); then
+  # Every advisory must be an object with a non-empty string id (Sen's ruling on #98, point 3).
+  if [ "$rc" != 0 ] || ! ids=$(jq -er 'if type == "object" and ((has("vulns") | not) or ((.vulns | type) == "array"
+        and all(.vulns[]; type == "object" and (.id | type) == "string" and (.id | length) > 0)))
+      then [(.vulns // [])[] | .id] | join(" ") else error end' <<<"$body" 2>/dev/null); then
     blind fail osv "litellm $ver OSV could not be read (exit ${rc:-?})"
   else
     ids=$(clean <<<"$ids")
@@ -228,6 +231,7 @@ cd "$1" 2>/dev/null || exit 1
 echo "HEAD $(git rev-parse HEAD 2>/dev/null)"
 pid=$(pgrep -f 'src/index.js server' 2>/dev/null | head -1)
 start=""
+[ -n "$pid" ] && echo "PROC $pid"
 if [ -n "$pid" ] && [ -r "/proc/$pid/stat" ]; then
   bt=$(awk '$1 == "btime" {print $2}' /proc/stat)
   st=$(sed 's/.*) //' "/proc/$pid/stat" | awk '{print $20}')
@@ -251,6 +255,12 @@ if [ -z "$head_" ] || ! grep -q '^FILE ' <<<"$out"; then blind warn vm "VM check
 else
   node=$(awk '$1 == "NODE" {print $2}' <<<"$out" | clean)
   f="VM ${head_:0:7}${node:+ $node}"; f0=$f
+  # The expected set, named up front: one proxy process, `node src/index.js server`, with a readable start time.
+  # Not running (or no start time) is a fail, never a clean inventory (Sen's ruling on #98, point 1).
+  if ! grep -qE '^PROC [0-9]+$' <<<"$out" || ! grep -qE '^START [0-9]+$' <<<"$out"; then
+    bump fail; f+=" proxy (node src/index.js server) NOT running"
+    find_ "vm:noproc:$(date +%F)" "security-scan: on the VM the expected proxy process (node src/index.js server) is not running, or its start time is unreadable: check the teamclaude service"
+  fi
   if ! git -C "$TC" merge-base --is-ancestor "$head_" origin/master 2>/dev/null; then
     bump fail; f+=" NOT on master"
     find_ "vm:head:$head_" "security-scan: the VM proxy names commit $head_, which is not on origin/master: find who deployed it, then deploy a merged commit"
@@ -268,7 +278,7 @@ else
   newer=$(awk '$1 == "NEWER" { $1 = ""; sub(/^ +/, ""); print }' <<<"$out" | head -20 | clean)
   if [ -n "$newer" ]; then bump warn; f+=" files newer than the running node: $newer"
     find_ "vm:newer:$(md5sum <<<"$newer" | cut -c1-12)" "security-scan: VM files changed after the proxy started ($newer): what runs is not what is on disk; restart it with notice"; fi
-  [ "$f" = "$f0" ] && f+=" files = merged tree ($(grep -c '^FILE ' <<<"$out") files)"
+  [ "$f" = "$f0" ] && f+=" proxy running, files = merged tree ($(grep -c '^FILE ' <<<"$out") files)"
   facts+=("$f")
 fi
 
@@ -286,10 +296,17 @@ EOS
 # (a service line may carry a trailing comment: `  redis: # holds ...`; any other 2-space key starts a new service)
 pins=$(awk '/^services:/ { s = 1; next } /^[^ #]/ { s = 0 } s && /^  [^ #]/ { svc = ""; if ($0 ~ /^  [A-Za-z0-9_.-]+: *(#.*)?$/) { svc = $1; sub(/:$/, "", svc) } }
             s && svc != "" && /^    image: *[^ ]+@sha256:[0-9a-f]{64}/ { print svc, $2 }' <<<"$compose")
+# every service in compose, pinned or not: the expected set (Sen's ruling on #98, point 2)
+svcs=$(awk '/^services:/ { s = 1; next } /^[^ #]/ { s = 0 } s && /^  [A-Za-z0-9_.-]+: *(#.*)?$/ { v = $1; sub(/:$/, "", v); print v }' <<<"$compose" | sort -u)
 run=$(probe docker.txt docker_probe | grep '^/')
-if [ -z "$pins" ] || [ -z "$run" ]; then blind warn docker "forge containers or pins unreadable"
+if [ -z "$svcs" ] || [ -z "$run" ]; then blind warn docker "forge containers or compose services unreadable"
 else
   bad=""
+  # a service that is unpinned or has no running container is a fail, never a smaller clean inventory
+  for s in $svcs; do
+    [ "$(awk -v s="$s" '$1 == s' <<<"$pins" | grep -c .)" = 1 ] || bad+="${s}=unpinned "
+    awk -v s="$s" '$2 == s' <<<"$run" | grep -q . || bad+="${s}=not-running "
+  done
   while read -r cname svc cid rds; do
     pin=$(awk -v s="$svc" '$1 == s {print $2}' <<<"$pins")
     ok=no
@@ -300,9 +317,10 @@ else
     [ "$ok" = yes ] || bad+="${cname#/}(${svc})=${cid#sha256:} "
   done <<<"$run"
   bad=$(cut -c1-200 <<<"$bad" | clean)
-  if [ -n "$bad" ]; then bump fail; facts+=("forge containers off their service's pin: $bad")
-    find_ "image:$(md5sum <<<"$bad" | cut -c1-12)" "security-scan: ubox0 forge containers run images that are not their own service's pinned digest in forge-gateway compose ($bad): find who pulled them; redeploy the pinned digests"
-  else facts+=("forge $(grep -c . <<<"$run") containers on their service's pin"); fi
+  covered=$(tr '\n' ' ' <<<"$svcs" | sed 's/ $//' | clean)
+  if [ -n "$bad" ]; then bump fail; facts+=("forge services ($covered) NOT all on their pins: $bad")
+    find_ "image:$(md5sum <<<"$bad" | cut -c1-12)" "security-scan: ubox0 forge services ($covered) are not each running their own pinned digest from forge-gateway compose ($bad): find who pulled or stopped them; redeploy the pinned digests"
+  else facts+=("forge services ($covered): each running its pin"); fi
 fi
 
 # ---- findings become rows, once each

@@ -146,7 +146,7 @@ Each night it reads what is listed and what is reachable, and probes every liste
 
 **What runs** (read-only apart from `git fetch`):
 - `gitleaks git --redact` over each main history. It honours the `.gitleaksignore` committed on that main, which holds fingerprints only, never values.
-- `npm install --package-lock-only --ignore-scripts`, then `npm audit --package-lock-only`, on teamclaude's master `package.json` in a temp dir. Nothing is installed and no scripts run. Master keeps no lockfile on purpose: CI runs `npm install --ignore-scripts` with none (`.github/workflows/ci.yml`). So the graph CI tests is a fresh resolution, and that is the graph audited here.
+- `npm install --package-lock-only --ignore-scripts`, then `npm audit --package-lock-only`, on teamclaude's master `package.json` in a temp dir. Nothing is installed and no scripts run. Master keeps no lockfile on purpose: CI runs `npm install --ignore-scripts` with none (`.github/workflows/ci.yml`). So what is audited is **this run's resolved graph: CI's in practice, not provably** (a registry can resolve differently between the two runs). A committed lockfile with `npm ci` would close that gap; it has its own row.
 - An OSV query for the LiteLLM version written on the compose image line (`# vX.Y.Z`).
 - `gh api --paginate` for open PRs, with their files and commits.
 - On the VM, a script that prints the git mode and blob id (`git hash-object --no-filters`, a hash of the bytes) of every file in the checkout except `.git`, dotfiles included, and the node's start time (from `/proc/<pid>/stat`). This side lists the same for the merged commit the VM names, with `git ls-tree -r`. The VM's index and HEAD are never trusted for the comparison.
@@ -161,13 +161,17 @@ Each night it reads what is listed and what is reachable, and probes every liste
   - an error exit, a lockfile that can't be resolved, missing counts, or an exit that disagrees with the counts (0 means no advisories, 1 means some).
 - **OSV:**
   - **any** advisory on the pinned LiteLLM, so no severity mapping can under-classify one. The line and the row name each advisory's severity or CVSS vector;
-  - a non-zero exit; an answer that is not an object; a `vulns` key that is present but not an array (`null` included). OSV answers a version with no advisory as `{}`, without the key; that was measured on 2026-11-24 (litellm 1.106.9 → `{}`, 1.40.0 → 60 advisories), so an absent key is zero;
+  - a non-zero exit; an answer that is not an object; a `vulns` key that is present but not an array (`null` included); an advisory that is not an object with a non-empty string `id`. OSV answers a version with no advisory as `{}`, without the key; that was measured on 2026-11-24 (litellm 1.106.9 → `{}`, 1.40.0 → 60 advisories), so an absent key is zero;
   - no version written on the compose image line.
-- **The VM:**
+- **The VM** (the expected set, named in the line: one proxy process, `node src/index.js server`):
+  - that process is not running, or its start time can't be read; this is never a clean inventory;
   - it names a commit that is not on origin/master;
   - any file differs from that commit's tree in bytes or mode, is missing, or isn't in it;
   - that commit's tree can't be read here.
-- **ubox0:** a forge container whose runtime digests (or image id) are not **its own service's** pinned digest in compose (matched by the `com.docker.compose.service` label). A service with no pin, or with two, counts as off-pin.
+- **ubox0** (the expected set, named in the line: every service in forge-gateway's compose):
+  - a forge container whose runtime digests (or image id) are not **its own service's** pinned digest (matched by the `com.docker.compose.service` label), or whose service isn't in compose;
+  - a service with no digest pin, or two;
+  - a service with no running container.
 
 **warn:**
 - a moderate npm advisory;
@@ -187,7 +191,7 @@ Each night it reads what is listed and what is reachable, and probes every liste
 
 **Not covered yet:** the weekly Claude Security scan. It needs a Claude session, so it waits for a seat (row f3fb83d4).
 
-**Example:** `CHECK security-scan ok · teamclaude gitleaks 0; forge-gateway gitleaks 0; npm audit 0 critical 0 high 0 moderate; litellm 1.106.9 OSV 0; upstream 123 not in the fork, 0 new; VM 1a1d8e9 v24.22.1 files = merged tree (491 files); forge 3 containers on their service's pin; rows filed 0, at 06:42 · findings are Flow rows · next run tomorrow 06:40 · owner teamclaude lane`
+**Example:** `CHECK security-scan ok · teamclaude gitleaks 0; forge-gateway gitleaks 0; npm audit 0 critical 0 high 0 moderate; litellm 1.106.9 OSV 0; upstream 123 not in the fork, 0 new; VM 1a1d8e9 v24.22.1 proxy running, files = merged tree (491 files); forge services (db litellm redis): each running its pin; rows filed 0, at 06:42 · findings are Flow rows · next run tomorrow 06:40 · owner teamclaude lane`
 
 ## Install, update and rollback
 

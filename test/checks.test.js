@@ -1723,6 +1723,11 @@ test('forge-models collect: malformed Wyoming wake data is no answer, never a cr
 // network, the VM, ubox0, GitHub or the vault.
 const PIN = (c) => c.repeat(64);
 const SHA = (c) => c.repeat(40);
+// [live VM] tests expect the proxy process: a stand-in whose command line carries `src/index.js server` (the `; :`
+// keeps sh from exec'ing sleep, which would drop that argument), started before the files are made, killed after.
+const fakeProxy = spawn('sh', ['-c', 'sleep 600; :', 'src/index.js server'], { stdio: 'ignore' });
+after(() => fakeProxy.kill());
+spawnSync('sleep', ['1.1']);   // the stand-in's start second is before any file the tests write
 const git = (cwd, ...a) => {
   const r = spawnSync('git', a, { cwd, encoding: 'utf8', env: { ...BASE_ENV, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
   assert.equal(r.status, 0, `git ${a.join(' ')}: ${r.stderr}`);
@@ -1743,6 +1748,8 @@ function scanRepo() { // a fork with origin/master and upstream/master refs, and
   git(tc, 'update-ref', 'refs/remotes/upstream/master', sha);
   const vm = join(d, 'vm');
   git(d, 'clone', '-q', tc, vm);
+  // the VM's files predate the running proxy (the stand-in above), as a deployed checkout does
+  spawnSync('find', [vm, '-path', join(vm, '.git'), '-prune', '-o', '-exec', 'touch', '-h', '-d', '@1000000000', '{}', '+']);
   return { d, tc, vm, sha };
 }
 function stubs(dir, scripts) { // name -> shell body; returns a PATH with the stubs first
@@ -1786,7 +1793,7 @@ test('security-scan [live VM]: a clean day is ok, every tracked file (dotfiles t
   const r = scan(scanFixtures());
   assert.equal(r.status, 0);
   assert.match(r.line, LINE);
-  assert.match(r.line, /^CHECK security-scan ok · teamclaude gitleaks 0; forge-gateway gitleaks 0; npm audit 0 critical 0 high 0 moderate; litellm 1\.106\.9 OSV 0; upstream 2 commits not in the fork; VM [0-9a-f]{7}( \S+)? files = merged tree \(5 files\); forge 2 containers on their service's pin; upstream baseline recorded; rows filed 0, at \d\d:\d\d · /, r.line);
+  assert.match(r.line, /^CHECK security-scan ok · teamclaude gitleaks 0; forge-gateway gitleaks 0; npm audit 0 critical 0 high 0 moderate; litellm 1\.106\.9 OSV 0; upstream 2 commits not in the fork; VM [0-9a-f]{7}( \S+)? proxy running, files = merged tree \(5 files\); forge services \(db litellm\): each running its pin; upstream baseline recorded; rows filed 0, at \d\d:\d\d · /, r.line);
   assert.deepEqual(r.rows, []);
 });
 
@@ -1857,7 +1864,8 @@ test('security-scan [stub curl]: any OSV advisory fails with its severity; {} (O
   assert.match(scan(scanFixtures({ 'osv.json': '{"vulns":[]}\n#RC 0\n' })).line, /litellm 1\.106\.9 OSV 0; /);
   r = scan(scanFixtures({ 'osv.json': null }), { env: { PATH: stubs(fresh(), { curl: 'exit 6' }) } });
   assert.match(r.line, /^CHECK security-scan fail · .*litellm 1\.106\.9 OSV could not be read \(exit 6\)/, r.line);
-  for (const bad of ['{"vulns":null}\n#RC 0\n', '\n#RC 0\n', 'not json\n#RC 0\n', '{"vulns":"x"}\n#RC 0\n', '[]\n#RC 0\n']) {
+  for (const bad of ['{"vulns":null}\n#RC 0\n', '\n#RC 0\n', 'not json\n#RC 0\n', '{"vulns":"x"}\n#RC 0\n', '[]\n#RC 0\n',
+    '{"vulns":[{"summary":"no id"}]}\n#RC 0\n', '{"vulns":[{"id":""}]}\n#RC 0\n', '{"vulns":[{"id":5}]}\n#RC 0\n', '{"vulns":["GHSA-x"]}\n#RC 0\n']) {
     const b = scan(scanFixtures({ 'osv.json': bad }));
     assert.match(b.line, /^CHECK security-scan fail · .*OSV could not be read/, JSON.stringify(bad));
     assert.match(b.rows[0], /could not see: litellm 1\.106\.9 OSV could not be read/);
@@ -1912,23 +1920,47 @@ test('security-scan [live VM]: a VM commit not on master fails; an unreadable VM
   assert.match(r.rows[0], /could not see: VM checkout unreadable/);
   const ok = scanRepo();
   const files = git(ok.tc, 'ls-tree', '-r', 'HEAD').split('\n').map((l) => { const [m, , b] = l.split('\t')[0].split(' '); return `FILE ${m} ${b} ${l.split('\t')[1]}`; }).join('\n');
-  r = scan(scanFixtures({ 'vm.txt': `HEAD ${ok.sha}\nSTART 1\n${files}\nNEWER src/index.js\nNODE v24.22.1\n` }), { repo: ok });
+  r = scan(scanFixtures({ 'vm.txt': `HEAD ${ok.sha}\nPROC 42\nSTART 1\n${files}\nNEWER src/index.js\nNODE v24.22.1\n` }), { repo: ok });
   assert.match(r.line, /^CHECK security-scan warn · .*VM [0-9a-f]{7} v24\.22\.1 files newer than the running node: src\/index\.js/, r.line);
+});
+
+test('security-scan [live VM, stub pgrep]: the expected proxy process not running is a fail with a row, never a clean inventory', () => {
+  const PATH = stubs(fresh(), { pgrep: 'exit 1' });
+  let r = scan(scanFixtures(), { env: { CHECK_SCAN_VM_RUN: `env PATH=${PATH} sh -s --` } });
+  assert.match(r.line, /^CHECK security-scan fail · .*VM [0-9a-f]{7}( \S+)? proxy \(node src\/index\.js server\) NOT running/, r.line);
+  assert.doesNotMatch(r.line, /files = merged tree/);
+  assert.match(r.rows[0], /the expected proxy process \(node src\/index\.js server\) is not running/);
+  const ok = scanRepo();
+  const files = git(ok.tc, 'ls-tree', '-r', 'HEAD').split('\n').map((l) => { const [m, , b] = l.split('\t')[0].split(' '); return `FILE ${m} ${b} ${l.split('\t')[1]}`; }).join('\n');
+  r = scan(scanFixtures({ 'vm.txt': `HEAD ${ok.sha}\nPROC 42\n${files}\nNODE v24.22.1\n` }), { repo: ok });
+  assert.match(r.line, /^CHECK security-scan fail · .*NOT running/, 'a process with no readable start time is not a clean run');
+});
+
+test('security-scan: every compose service needs exactly one pin and a running container on it; the covered set is named', () => {
+  let r = scan(scanFixtures({ 'docker.txt': `/forge-litellm-1 litellm sha256:${PIN('9')} ghcr.io/berriai/litellm-non_root@sha256:${PIN('a')}\n` }));
+  assert.match(r.line, /^CHECK security-scan fail · .*forge services \(db litellm\) NOT all on their pins: db=not-running/, r.line);
+  r = scan(scanFixtures({ 'compose.yaml': `${COMPOSE.replace('networks:', '  web:\n    image: nginx:latest\nnetworks:')}`, 'docker.txt': `${DOCKER}/forge-web-1 web sha256:${PIN('6')} nginx@sha256:${PIN('6')}\n` }));
+  assert.match(r.line, /forge services \(db litellm web\) NOT all on their pins: web=unpinned .*forge-web-1\(web\)=6666/, r.line);
 });
 
 test('security-scan [stub docker]: each container must run its OWN service\'s pinned digest; a commented service line parses; another service\'s pin is not enough', () => {
   let r = scan(scanFixtures({ 'docker.txt': `/forge-litellm-1 litellm sha256:${PIN('9')} postgres@sha256:${PIN('b')}\n/forge-db-1 db sha256:${PIN('8')} postgres@sha256:${PIN('b')}\n` }));
-  assert.match(r.line, /^CHECK security-scan fail · .*forge containers off their service's pin: forge-litellm-1\(litellm\)=9999/, r.line);
-  assert.match(r.rows[0], /not their own service's pinned digest/);
-  assert.match(scan(scanFixtures({ 'docker.txt': `/forge-x-1 x sha256:${PIN('7')} postgres@sha256:${PIN('b')}\n` })).line, /off their service's pin: forge-x-1\(x\)/, 'a service with no pin fails');
-  const docker = `case "$1 $2" in
-  "ps -q") echo c1 ;;
-  "inspect -f") case "$3" in *Name*) echo /forge-db-1 ;; *compose.service*) echo db ;; *) echo "sha256:${PIN('b')}" ;; esac ;;
-  "image inspect") echo "" ;;
+  assert.match(r.line, /^CHECK security-scan fail · .*forge services \(db litellm\) NOT all on their pins: forge-litellm-1\(litellm\)=9999/, r.line);
+  assert.match(r.rows[0], /not each running their own pinned digest/);
+  assert.match(scan(scanFixtures({ 'docker.txt': `${DOCKER}/forge-x-1 x sha256:${PIN('7')} postgres@sha256:${PIN('b')}\n` })).line, /NOT all on their pins: forge-x-1\(x\)/, 'a container of a service compose does not have fails');
+  // two containers; each answers for itself (the container id is the inspect call's last argument)
+  const docker = `last=$(eval echo \\\${$#})
+case "$1 $2" in
+  "ps -q") echo c1 c2 ;;
+  "inspect -f") case "$3:$last" in
+      *Name*:c1) echo /forge-db-1 ;; *Name*:c2) echo /forge-litellm-1 ;;
+      *compose.service*:c1) echo db ;; *compose.service*:c2) echo litellm ;;
+      *:c1) echo "sha256:${PIN('b')}" ;; *:c2) echo "sha256:${PIN('9')}" ;; esac ;;
+  "image inspect") case "$last" in *${PIN('9')}) echo "ghcr.io/berriai/litellm-non_root@sha256:${PIN('a')}" ;; *) echo "" ;; esac ;;
 esac`;
   r = scan(scanFixtures({ 'docker.txt': null }), { env: { PATH: stubs(fresh(), { docker }), CHECK_SCAN_DOCKER_RUN: 'sh -s --' } });
-  assert.match(r.line, /forge 1 containers on their service's pin/, `an image id that is the manifest digest: ${r.line}`);
+  assert.match(r.line, /forge services \(db litellm\): each running its pin/, `db by image id = manifest digest, litellm by RepoDigests: ${r.line}`);
   r = scan(scanFixtures({ 'docker.txt': '' }));
-  assert.match(r.line, /^CHECK security-scan warn · .*forge containers or pins unreadable/);
-  assert.match(r.rows[0], /could not see: forge containers or pins unreadable/);
+  assert.match(r.line, /^CHECK security-scan warn · .*forge containers or compose services unreadable/);
+  assert.match(r.rows[0], /could not see: forge containers or compose services unreadable/);
 });

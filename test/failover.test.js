@@ -479,6 +479,22 @@ const qrResetWait = (text) => {
 test('policy: standInClients takes names only and defaults to none', () => {
   assert.deepEqual(failoverPolicy({ failover: { enabled: true, url: 'http://x' } }).standInClients, []);
   assert.deepEqual(failoverPolicy({ failover: { enabled: true, url: 'http://x', standInClients: ['ha', 3, '', null, '(shared key)'] } }).standInClients, ['ha', '(shared key)']);
+  // Malformed, not a list: nobody is allowed (xreview round 3 ruling 7135937851). A bare string is not
+  // read as a one-name list, an object's keys are not names, a number is nothing.
+  for (const bad of ['serialhub', { serialhub: true }, 7, true, null]) {
+    assert.deepEqual(failoverPolicy({ failover: { enabled: true, url: 'http://x', standInClients: bad } }).standInClients, [], JSON.stringify(bad));
+  }
+});
+
+test('a malformed standInClients (a bare string naming the lane) stand-ins nobody: HTTP 429', async () => {
+  const t = await setup({ ...LANE, failover: { standInClients: 'serialhub' } });
+  try {
+    const res = await t.post(MSG, null, 'k-serialhub', { 'user-agent': 'node' });
+    assert.equal(res.status, 429);
+    assert.equal(res.headers.get('x-teamclaude-failover'), null);
+    assert.equal(t.localSeen.length, 0);
+    assert.ok(t.logs.some((l) => REFUSED_LANE.test(l)), t.logs.join('\n'));
+  } finally { t.close(); }
 });
 
 test('eligibility is positive: only a named key gets a stand-in, and a Claude Code marker is refused even there', () => {

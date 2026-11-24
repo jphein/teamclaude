@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
@@ -497,29 +497,40 @@ test('eligibility is positive: only a named key gets a stand-in, and a Claude Co
   assert.deepEqual(failoverEligibility({ ...base, client: 'ha', userAgent: CLAUDE_CODE_UA }), { ok: false, why });
   assert.deepEqual(failoverEligibility({ ...base, client: 'ha', userAgent: 'Claude-CLI/3.0.0 (external, sdk-ts)' }), { ok: false, why }, 'any case, any entrypoint');
   assert.deepEqual(failoverEligibility({ ...base, client: 'ha', userAgent: 'node', claudeCodeSession: '0b7f' }), { ok: false, why }, 'x-claude-code-session-id alone is enough');
+  assert.deepEqual(failoverEligibility({ ...base, client: 'ha', userAgent: 'node', claudeCodeSession: '' }), { ok: false, why }, 'an EMPTY session header is still the marker: presence, not value');
   assert.equal(isClaudeCode('node', null), false);
-  assert.equal(isClaudeCode('node', ''), false);
+  assert.equal(isClaudeCode('node', undefined), false);
+  assert.equal(isClaudeCode('node', ''), true);
 });
 
-test('a lane with no seat gets the 429 quota_resume parses, with the reset it names equal to retry-after', async () => {
+test('a lane with no seat gets the 429 quota_resume parses: exact at a pinned clock, below, at and above a minute boundary', async () => {
   const t = await setup({ ...LANE, accounts: [0, 1].map((i) => ({ name: `s${i}`, type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 })) });
-  const s1 = t.am.accounts[1]; s1.quota.unified5h = 1; s1.quota.unified5hReset = Date.now() + 4 * 3600_000; s1.probing = false;
+  // The clock is injected, never read live: Date is frozen at NOW for the whole request.
+  const NOW = Math.floor(Date.now() / 1000) * 1000;
+  mock.timers.enable({ apis: ['Date'], now: NOW });
   try {
-    const res = await t.post(AGENT_TURN, null, 'k-serialhub', { 'user-agent': CLAUDE_CODE_UA });
-    const raw = await res.text();
-    assert.equal(res.status, 429);
-    assert.equal(res.headers.get('x-teamclaude-failover'), null);
+    // [seconds to the reset → retry-after, the wait quota_resume parses from the notice]. formatWait names
+    // whole minutes rounded up, so 2h 1m is the boundary: one second under it, on it, and one over it.
+    for (const [secs, notice, parsed] of [[7259, 'Quota resets in 2h 1m', 7260], [7260, 'Quota resets in 2h 1m', 7260], [7261, 'Quota resets in 2h 2m', 7320]]) {
+      for (const [i, a] of t.am.accounts.entries()) {
+        a.quota.unified5h = 1; a.probing = false;
+        a.quota.unified5hReset = NOW + (secs + i * 3600) * 1000;   // s0 resets first: it names the wait
+      }
+      const res = await t.post(AGENT_TURN, null, 'k-serialhub', { 'user-agent': CLAUDE_CODE_UA });
+      const raw = await res.text();
+      assert.equal(res.status, 429);
+      assert.equal(res.headers.get('x-teamclaude-failover'), null);
+      assert.equal(Number(res.headers.get('retry-after')), secs, 'retry-after is the exact wait to the reset');
+      // The pane line as Claude Code prints the error, read the way quota_resume reads it.
+      const pane = `● API Error: 429 ${raw}`;
+      assert.ok(QR_ERR.test(pane), pane);
+      assert.equal(QR_ERR.exec(pane)[1], 'all 2 accounts are at their quota');
+      assert.ok(pane.includes(notice), `${secs}s: ${pane}`);
+      assert.equal(qrResetWait(pane), parsed, `${secs}s`);
+    }
     assert.equal(t.localSeen.length, 0, 'nothing was sent to the local model');
     assert.ok(t.logs.some((l) => REFUSED_LANE.test(l)), t.logs.join('\n'));
-    // The pane line as Claude Code prints the error, read the way quota_resume reads it.
-    const pane = `● API Error: 429 ${raw}`;
-    assert.ok(QR_ERR.test(pane), pane);
-    const retryAfter = Number(res.headers.get('retry-after'));
-    const named = qrResetWait(pane);
-    assert.ok(retryAfter > 0, 'when to come back');
-    // formatWait names whole minutes, rounded up: the same moment to the minute, never earlier.
-    assert.ok(named >= retryAfter && named - retryAfter < 60, `notice says ${named}s, retry-after ${retryAfter}s`);
-  } finally { t.close(); }
+  } finally { mock.timers.reset(); t.close(); }
 });
 
 test('a header-stripped lane (no user-agent marker, no session header) still gets no stand-in', async () => {
@@ -537,7 +548,7 @@ test('a named consumer keeps the stand-in, x-app: cli included; a Claude Code ma
     const plain = await t.post(MSG, null, 'k-serialhub', { 'x-app': 'cli' });
     assert.equal(plain.status, 200, 'x-app is not a reserved marker');
     assert.equal(t.localSeen.length, 1);
-    for (const headers of [{ 'user-agent': CLAUDE_CODE_UA }, { 'x-claude-code-session-id': '0b7f2c1e-5d1a-4f00-9c3e-8a1b2c3d4e5f' }]) {
+    for (const headers of [{ 'user-agent': CLAUDE_CODE_UA }, { 'x-claude-code-session-id': '0b7f2c1e-5d1a-4f00-9c3e-8a1b2c3d4e5f' }, { 'user-agent': 'HomeAssistant/2026.11', 'x-claude-code-session-id': '' }]) {
       const res = await t.post(MSG, null, 'k-serialhub', headers);
       assert.equal(res.status, 429, JSON.stringify(headers));
     }

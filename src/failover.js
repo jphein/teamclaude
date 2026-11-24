@@ -173,7 +173,7 @@ export class FailoverState {
  * Whether this request may fail over now, and if not, why (for the log).
  * @param {{ policy: ReturnType<typeof failoverPolicy>, state: FailoverState, method?: string, url?: string,
  *   provider?: string, pinned?: boolean, allQuota: boolean, unservableMs: number, bodyBytes: number,
- *   maxTokens?: number, contentEncoding?: string|null, client?: string|null, userAgent?: string|null, claudeCodeSession?: string|null }} a
+ *   maxTokens?: number, contentEncoding?: string|null, client?: string|null, userAgent?: string|null, claudeCodeSession?: string|string[]|null }} a
  * @returns {{ ok: true } | { ok: false, why: string }}
  */
 export function failoverEligibility(a) {
@@ -207,13 +207,14 @@ export function failoverEligibility(a) {
 
 /**
  * Whether a request carries a marker reserved to Claude Code (any entrypoint: cli, sdk-ts, ...):
- * a user-agent `claude-cli/<version> (...)`, or an `x-claude-code-session-id` header. Either is
- * enough. Not `x-app: cli`: that name is generic, and a non-Claude client may send it. This is the
- * second line only; the first is failover.standInClients.
- * @param {string|null|undefined} userAgent @param {string|null|undefined} claudeCodeSession
+ * a user-agent `claude-cli/<version> (...)`, or an `x-claude-code-session-id` header PRESENT, with
+ * any value, empty included (xreview round 2). Either is enough. Not `x-app: cli`: that name is
+ * generic, and a non-Claude client may send it. This is the second line only; the first is
+ * failover.standInClients.
+ * @param {string|null|undefined} userAgent @param {string|string[]|null|undefined} claudeCodeSession
  */
 export function isClaudeCode(userAgent, claudeCodeSession) {
-  return /^claude-cli\//i.test(String(userAgent || '')) || (claudeCodeSession != null && String(claudeCodeSession) !== '');
+  return /^claude-cli\//i.test(String(userAgent || '')) || claudeCodeSession != null;
 }
 
 /**

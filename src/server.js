@@ -3689,7 +3689,8 @@ async function maybeFailover(req, res, body, ctx, accountManager, { immediate })
     contentEncoding: /** @type {string|undefined} */ (req.headers['content-encoding']) ?? null,
     client: ctx.client ?? null,
     userAgent: /** @type {string|undefined} */ (req.headers['user-agent']) ?? null,
-    claudeCodeSession: /** @type {string|undefined} */ (req.headers['x-claude-code-session-id']) ?? null,
+    // Presence, not value: an empty header is still the marker (xreview round 2).
+    claudeCodeSession: /** @type {string|string[]|undefined} */ (req.headers['x-claude-code-session-id']) ?? null,
   });
   if (!el.ok) {
     if (Date.now() - (ctx.failoverState.lastSkipLogAt || 0) > 30_000) {

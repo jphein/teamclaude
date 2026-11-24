@@ -151,6 +151,8 @@ export const FIELDS = [
     help: 'Client-key names (or "(shared key)") that never get a local stand-in answer: they get the usual 429 with the reset time instead. Set it for clients whose replies a person reads as authoritative (familiar\'s lanes: the lead\'s scheduled prompts).' },
   { key: 'failover.claudeOnly', group: 'Failover', label: 'Claude only (never a stand-in)', type: 'list', apply: 'hot', def: [],
     help: 'Client-key names (or "(shared key)") served only by Claude: never a local stand-in, and when no Claude seat can serve they get a retryable 503 (overloaded) instead of the 429 that reads as a usage limit. For browser-driving sessions with a person at the keys (Squire on katana).' },
+  { key: 'failover.standInClients', group: 'Failover', label: 'Stand in only for', type: 'list', apply: 'hot', def: [],
+    help: 'The ONLY client-key names (or "(shared key)") a local stand-in may answer; empty means none. Name a client only if a tool-less answer is useful to it: never an agent lane (its turn would be a no-op it cannot tell from work). A request carrying a Claude Code marker (user-agent claude-cli/, x-claude-code-session-id) is refused even on a named key.' },
   { key: 'failover.templateTokens', group: 'Failover', label: 'Template allowance (tokens)', type: 'int', apply: 'hot', def: 2048, min: 0,
     help: 'Tokens added to the local count for the chat template\'s framing when deciding whether a request fits the local window.' },
   { key: 'failover.timeoutSeconds', group: 'Failover', label: 'Local timeout (s)', type: 'int', apply: 'hot', def: 600, min: 10,
@@ -542,7 +544,7 @@ export const SSO_EDITABLE = new Set([
   'warmOnExhaustion', 'warmupSeconds', 'warmupSchedule', 'warmupStagger',
   'quotaBarPercent', 'accountSort',
 ]);
-// Left to the key on purpose (Oracle round 4): failover.excludeClients and failover.claudeOnly (who
+// Left to the key on purpose (Oracle round 4): failover.excludeClients, failover.claudeOnly and failover.standInClients (who
 // may be answered by a stand-in — the #39 protection), proxy.sessionDetail
 // (shows every client every conversation), quotaProbeSeconds (a 1 s probe of
 // every seat), routes (a free-form object stored verbatim).

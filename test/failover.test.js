@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
-import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, FailoverState, createFailoverRewriter, rewriteFailoverJson, failoverWarning, standInNote, FAILOVER_LABEL } from '../src/failover.js';
+import { failoverPolicy, failoverEligibility, bodyForFailover, prepareForClaude, FailoverState, createFailoverRewriter, rewriteFailoverJson, failoverWarning, standInNote, FAILOVER_LABEL, isClaudeCode } from '../src/failover.js';
 
 // Local-model failover (JP, 2026-10-12): when no Claude account can serve,
 // answer from the local model instead of stopping; back to Claude as soon as
@@ -21,7 +21,7 @@ test('policy: off unless enabled with a url; defaults', () => {
 });
 
 test('eligibility: every guard says why', () => {
-  const policy = failoverPolicy({ failover: { enabled: true, url: 'http://x', afterSeconds: 20, maxConcurrent: 1, contextTokens: 5000 } });
+  const policy = failoverPolicy({ failover: { enabled: true, url: 'http://x', afterSeconds: 20, maxConcurrent: 1, contextTokens: 5000, standInClients: ['(shared key)'] } });
   const base = { policy, state: new FailoverState(), method: 'POST', url: '/v1/messages', provider: 'anthropic', pinned: false, allQuota: false, unservableMs: 30_000, bodyBytes: 100, maxTokens: 10, contentEncoding: null };
   assert.deepEqual(failoverEligibility(base), { ok: true });
   assert.match(failoverEligibility({ ...base, unservableMs: 5000 }).why, /5s < 20s/);
@@ -80,7 +80,7 @@ test('prepareForClaude: removes unsigned thinking; turns thinking off when the l
 });
 
 // ── through the real proxy ───────────────────────────────────────────────
-async function setup({ failover = {}, exhausted = true, localStatus = 200, claudeHits = [], claude429 = false, localMode = 'ok', redirectTo = 'http://127.0.0.1:9/v1/messages', tokenizeCount = null, claudeRetryAfter = '3600', claudeBurst = false, proxyConf = {}, hooks = {}, accounts = null, claude429Count = Infinity } = {}) {
+async function setup({ failover = {}, exhausted = true, localStatus = 200, claudeHits = [], claude429 = false, localMode = 'ok', redirectTo = 'http://127.0.0.1:9/v1/messages', tokenizeCount = null, claudeRetryAfter = '3600', claudeBurst = false, proxyConf = {}, hooks = {}, accounts = null, claude429Count = Infinity, configExtra = {} } = {}) {
   const localSeen = [];
   const local = http.createServer((req, res) => {
     let raw = ''; req.on('data', (c) => { raw += c; }); req.on('end', () => {
@@ -114,7 +114,9 @@ async function setup({ failover = {}, exhausted = true, localStatus = 200, claud
   // The exhausted-fleet probe would forward one request to Claude anyway; a
   // probe already spent this hour is the state a real stall is in.
   am._nextProbeAt = Date.now() + 3600_000;
-  const config = { proxy: { apiKey: 'k', ...proxyConf }, upstream: `http://127.0.0.1:${cp}`, failover: { enabled: true, url: `http://127.0.0.1:${lp}`, afterSeconds: 20, ...failover } };
+  // The shared key ('k') is the stand-in consumer these tests exercise; failover.standInClients
+  // is the only way a client gets one (row bce0ab3d).
+  const config = { proxy: { apiKey: 'k', ...proxyConf }, upstream: `http://127.0.0.1:${cp}`, ...configExtra, failover: { enabled: true, url: `http://127.0.0.1:${lp}`, afterSeconds: 20, standInClients: ['(shared key)'], ...failover } };
   const logs = []; const orig = console.log; console.log = (...a) => { logs.push(a.join(' ')); };
   const proxy = createProxyServer(am, config, typeof hooks === 'function' ? hooks(am) : hooks);
   const port = await listen(proxy);
@@ -211,7 +213,7 @@ test('fail-back: the first request after an account frees up goes to Claude, rep
   const claudeHits = [];
   const t = await setup({ claudeHits });
   try {
-    await (await t.post(MSG, 's-local')).text();
+    await (await t.post(MSG, null, 'k', { 'session-id': 's-local' })).text();
     assert.equal(t.localSeen.length, 1, 'served locally while exhausted');
     // The account renews.
     t.am.accounts[0].quota.unified5h = 0.1;
@@ -219,7 +221,7 @@ test('fail-back: the first request after an account frees up goes to Claude, rep
       messages: [{ role: 'user', content: 'go' },
         { role: 'assistant', content: [{ type: 'thinking', thinking: 'local', signature: '' }, { type: 'tool_use', id: 'LoCaL123', name: 'Read', input: { p: 'x' } }] },
         { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'LoCaL123', content: 'ok' }] }] };
-    const res = await t.post(back, 's-local');
+    const res = await t.post(back, null, 'k', { 'session-id': 's-local' });
     const body = await res.json();
     assert.equal(res.status, 200);
     assert.equal(body.model, 'claude-opus-5-5', 'back on Claude');
@@ -229,7 +231,7 @@ test('fail-back: the first request after an account frees up goes to Claude, rep
     assert.ok(!JSON.stringify(sent.messages).includes('"signature":""'), 'unsigned thinking removed');
     assert.equal((await t.status()).failover.active, false);
     // Provenance: a session the local model never answered is left exactly as sent.
-    await (await t.post(back, 's-other')).json();
+    await (await t.post(back, null, 'k', { 'session-id': 's-other' })).json();
     assert.deepEqual(claudeHits.at(-1).thinking, { type: 'enabled', budget_tokens: 1024 }, 'not touched');
   } finally { t.close(); }
 });
@@ -413,13 +415,14 @@ test('bodyForFailover: no tools, earlier tool traffic as plain text, and the sta
 
 test('policy: excludeClients takes names only; eligibility refuses an excluded client and says why', () => {
   assert.deepEqual(failoverPolicy({ failover: { enabled: true, url: 'http://x' } }).excludeClients, []);
-  const policy = failoverPolicy({ failover: { enabled: true, url: 'http://x', excludeClients: ['familiar', 7, '', null, 'lane'] } });
+  // Every name is also a stand-in consumer, so this shows excludeClients wins over standInClients.
+  const policy = failoverPolicy({ failover: { enabled: true, url: 'http://x', excludeClients: ['familiar', 7, '', null, 'lane'], standInClients: ['familiar', 'jp-wakizashi', '(shared key)'] } });
   assert.deepEqual(policy.excludeClients, ['familiar', 'lane']);
   const base = { policy, state: { inFlight: 0 }, method: 'POST', url: '/v1/messages', allQuota: true, unservableMs: 0, bodyBytes: 10 };
   assert.deepEqual(failoverEligibility({ ...base, client: 'familiar' }), { ok: false, why: 'client "familiar" is excluded from failover' });
   assert.equal(failoverEligibility({ ...base, client: 'jp-wakizashi' }).ok, true);
   assert.equal(failoverEligibility({ ...base, client: null }).ok, true, 'the shared key is not excluded unless named');
-  const shared = failoverPolicy({ failover: { enabled: true, url: 'http://x', excludeClients: ['(shared key)'] } });
+  const shared = failoverPolicy({ failover: { enabled: true, url: 'http://x', excludeClients: ['(shared key)'], standInClients: ['familiar', '(shared key)'] } });
   assert.deepEqual(failoverEligibility({ ...base, policy: shared, client: null }), { ok: false, why: 'client "(shared key)" is excluded from failover' });
   assert.equal(failoverEligibility({ ...base, policy: shared, client: 'familiar' }).ok, true);
 });
@@ -450,48 +453,138 @@ test('an excluded client gets the honest no-capacity answer, never a stand-in', 
   } finally { t.close(); }
 });
 
-// ── Claude Code never gets the stand-in (Sen 2026-11-23 18:46, row bce0ab3d) ──
+// ── a stand-in only for a named consumer (Sen 2026-11-23 18:46 + round 1, row bce0ab3d) ──
 // The stand-in is tool-less, so a turn it answers for an agent harness does
-// nothing: the lane ends its turn on a no-op and sits there. A Claude Code
-// request gets the honest no-capacity answer instead, the one familiar's lanes
-// already get and quota_resume already resumes at the reset.
+// nothing: the lane ends its turn on a no-op and sits there. Eligibility is
+// positive (failover.standInClients names the key); a Claude Code marker is
+// refused even on a named key. Everyone else gets the honest no-capacity 429,
+// the one familiar's lanes already get and quota_resume resumes at the reset.
 
 const CLAUDE_CODE_UA = 'claude-cli/2.1.314 (external, cli)';
+const AGENT_TURN = { ...MSG, tools: [{ name: 'Bash', input_schema: { type: 'object' } }] };
+const LANE = { proxyConf: { clientKeys: [{ name: 'serialhub', key: 'k-serialhub' }] } };
+const REFUSED_LANE = /failover not used: client "serialhub" is not a stand-in consumer/;
 
-test('eligibility refuses a Claude Code request by user-agent or x-app, whatever its client key', () => {
-  const policy = failoverPolicy({ failover: { enabled: true, url: 'http://x' } });
-  const base = { policy, state: { inFlight: 0 }, method: 'POST', url: '/v1/messages', allQuota: true, unservableMs: 0, bodyBytes: 10, client: 'serialhub' };
-  const why = 'a Claude Code agent (the tool-less stand-in would answer it with a no-op turn)';
-  assert.deepEqual(failoverEligibility({ ...base, userAgent: CLAUDE_CODE_UA }), { ok: false, why });
-  assert.deepEqual(failoverEligibility({ ...base, userAgent: 'Claude-CLI/3.0.0 (external, sdk-ts)' }), { ok: false, why }, 'case and entrypoint do not matter');
-  assert.deepEqual(failoverEligibility({ ...base, userAgent: 'node', app: 'cli' }), { ok: false, why }, 'x-app: cli alone is enough');
-  assert.equal(failoverEligibility({ ...base, userAgent: 'HomeAssistant/2026.11' }).ok, true, 'other clients keep the stand-in');
-  assert.equal(failoverEligibility({ ...base, userAgent: 'not-claude-cli/1.0' }).ok, true, 'anchored at the start');
-  assert.equal(failoverEligibility({ ...base }).ok, true, 'no user-agent is not an agent');
+// dreamteam scripts/quota_resume.py at 7e194dc, verbatim (Python → JS: same syntax for these).
+const QR_ERR = /● API Error: .*?(Server is temporarily limiting requests|all \d+ accounts are at their quota)/;
+const QR_RESET = /resets in (?=\d)(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s)?/;
+/** quota_resume.reset_wait: seconds the notice names, or null. */
+const qrResetWait = (text) => {
+  const m = QR_RESET.exec(text);
+  if (!m || !m.slice(1).some(Boolean)) return null;
+  const [h, mi, s] = m.slice(1).map((x) => (x ? Number(x) : 0));
+  return h * 3600 + mi * 60 + s;
+};
+
+test('policy: standInClients takes names only and defaults to none', () => {
+  assert.deepEqual(failoverPolicy({ failover: { enabled: true, url: 'http://x' } }).standInClients, []);
+  assert.deepEqual(failoverPolicy({ failover: { enabled: true, url: 'http://x', standInClients: ['ha', 3, '', null, '(shared key)'] } }).standInClients, ['ha', '(shared key)']);
 });
 
-test('a Claude Code request with no seat to serve it gets the 429 quota_resume reads, never the stand-in', async () => {
-  const t = await setup({ proxyConf: { clientKeys: [{ name: 'serialhub', key: 'k-serialhub' }] } });
+test('eligibility is positive: only a named key gets a stand-in, and a Claude Code marker is refused even there', () => {
+  const policy = failoverPolicy({ failover: { enabled: true, url: 'http://x', standInClients: ['ha'] } });
+  const base = { policy, state: { inFlight: 0 }, method: 'POST', url: '/v1/messages', allQuota: true, unservableMs: 0, bodyBytes: 10 };
+  // Not named: refused whatever its headers say, a header-stripped lane included.
+  for (const extra of [{}, { userAgent: 'HomeAssistant/2026.11' }, { userAgent: null, claudeCodeSession: null }]) {
+    assert.deepEqual(failoverEligibility({ ...base, client: 'serialhub', ...extra }), { ok: false, why: 'client "serialhub" is not a stand-in consumer (failover.standInClients)' }, JSON.stringify(extra));
+  }
+  assert.deepEqual(failoverEligibility({ ...base, client: null }), { ok: false, why: 'client "(shared key)" is not a stand-in consumer (failover.standInClients)' });
+  // Named: eligible, unless it carries a marker only Claude Code sends.
+  assert.equal(failoverEligibility({ ...base, client: 'ha' }).ok, true);
+  assert.equal(failoverEligibility({ ...base, client: 'ha', userAgent: 'HomeAssistant/2026.11' }).ok, true);
+  assert.equal(failoverEligibility({ ...base, client: 'ha', userAgent: 'not-claude-cli/1.0' }).ok, true, 'the user-agent marker is anchored');
+  const why = 'a Claude Code agent (the tool-less stand-in would answer it with a no-op turn)';
+  assert.deepEqual(failoverEligibility({ ...base, client: 'ha', userAgent: CLAUDE_CODE_UA }), { ok: false, why });
+  assert.deepEqual(failoverEligibility({ ...base, client: 'ha', userAgent: 'Claude-CLI/3.0.0 (external, sdk-ts)' }), { ok: false, why }, 'any case, any entrypoint');
+  assert.deepEqual(failoverEligibility({ ...base, client: 'ha', userAgent: 'node', claudeCodeSession: '0b7f' }), { ok: false, why }, 'x-claude-code-session-id alone is enough');
+  assert.equal(isClaudeCode('node', null), false);
+  assert.equal(isClaudeCode('node', ''), false);
+});
+
+test('a lane with no seat gets the 429 quota_resume parses, with the reset it names equal to retry-after', async () => {
+  const t = await setup({ ...LANE, accounts: [0, 1].map((i) => ({ name: `s${i}`, type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 })) });
+  const s1 = t.am.accounts[1]; s1.quota.unified5h = 1; s1.quota.unified5hReset = Date.now() + 4 * 3600_000; s1.probing = false;
   try {
-    const res = await t.post({ ...MSG, tools: [{ name: 'Bash', input_schema: { type: 'object' } }] }, null, 'k-serialhub', { 'user-agent': CLAUDE_CODE_UA });
-    const body = await res.json();
+    const res = await t.post(AGENT_TURN, null, 'k-serialhub', { 'user-agent': CLAUDE_CODE_UA });
+    const raw = await res.text();
     assert.equal(res.status, 429);
-    assert.ok(Number(res.headers.get('retry-after')) > 0, 'when to come back');
     assert.equal(res.headers.get('x-teamclaude-failover'), null);
     assert.equal(t.localSeen.length, 0, 'nothing was sent to the local model');
-    // dreamteam scripts/quota_resume.py ERR and RESET: the lane resumes itself at the reset.
-    assert.match(body.error.message, /all \d+ accounts? are at their quota/);
-    assert.match(body.error.message, /resets in \d/);
-    assert.ok(t.logs.some((l) => /failover not used: a Claude Code agent/.test(l)), t.logs.join('\n'));
-    const other = await t.post(MSG, null, 'k-serialhub');
-    assert.equal(other.status, 200, 'the same key without Claude Code still gets the stand-in');
+    assert.ok(t.logs.some((l) => REFUSED_LANE.test(l)), t.logs.join('\n'));
+    // The pane line as Claude Code prints the error, read the way quota_resume reads it.
+    const pane = `● API Error: 429 ${raw}`;
+    assert.ok(QR_ERR.test(pane), pane);
+    const retryAfter = Number(res.headers.get('retry-after'));
+    const named = qrResetWait(pane);
+    assert.ok(retryAfter > 0, 'when to come back');
+    // formatWait names whole minutes, rounded up: the same moment to the minute, never earlier.
+    assert.ok(named >= retryAfter && named - retryAfter < 60, `notice says ${named}s, retry-after ${retryAfter}s`);
   } finally { t.close(); }
 });
 
-test('a Claude Code request on the long-429 path is not handed the stand-in either', async () => {
-  const t = await setup({ exhausted: false, claude429: true });
+test('a header-stripped lane (no user-agent marker, no session header) still gets no stand-in', async () => {
+  const t = await setup(LANE);
   try {
-    const res = await t.post(MSG, null, 'k', { 'user-agent': CLAUDE_CODE_UA });
+    const res = await t.post(AGENT_TURN, null, 'k-serialhub', { 'user-agent': 'node' });
+    assert.equal(res.status, 429);
+    assert.equal(t.localSeen.length, 0);
+  } finally { t.close(); }
+});
+
+test('a named consumer keeps the stand-in, x-app: cli included; a Claude Code marker on it is refused', async () => {
+  const t = await setup({ ...LANE, failover: { standInClients: ['serialhub'] } });
+  try {
+    const plain = await t.post(MSG, null, 'k-serialhub', { 'x-app': 'cli' });
+    assert.equal(plain.status, 200, 'x-app is not a reserved marker');
+    assert.equal(t.localSeen.length, 1);
+    for (const headers of [{ 'user-agent': CLAUDE_CODE_UA }, { 'x-claude-code-session-id': '0b7f2c1e-5d1a-4f00-9c3e-8a1b2c3d4e5f' }]) {
+      const res = await t.post(MSG, null, 'k-serialhub', headers);
+      assert.equal(res.status, 429, JSON.stringify(headers));
+    }
+    assert.equal(t.localSeen.length, 1, 'nothing more reached the local model');
+  } finally { t.close(); }
+});
+
+// Every way a request reaches a stand-in dispatch: the dry-pool branch (above), streamed,
+// after a hold, after an inline retry, and the long-retry-after 429 hop.
+
+test('dispatch, streamed: a lane gets the 429, never a stand-in stream', async () => {
+  const t = await setup({ ...LANE, localMode: 'sse' });
+  try {
+    const res = await t.post({ ...AGENT_TURN, stream: true }, null, 'k-serialhub');
+    assert.equal(res.status, 429);
+    assert.equal(t.localSeen.length, 0);
+  } finally { t.close(); }
+});
+
+test('dispatch, held: a lane is held for holdSeconds, then gets the 429, never a stand-in', async () => {
+  const t = await setup({ ...LANE, configExtra: { holdSeconds: 1 } });
+  try {
+    const res = await t.post(AGENT_TURN, null, 'k-serialhub');
+    assert.equal(res.status, 429);
+    assert.equal(t.localSeen.length, 0);
+    assert.ok(t.logs.some((l) => /holding connection/.test(l)), 'it was held');
+    assert.ok(t.logs.some((l) => REFUSED_LANE.test(l)), 'the guard ran');
+  } finally { t.close(); }
+});
+
+test('dispatch, inline retry: a lane waits for the seat that resets in seconds and is served by Claude', async () => {
+  const t = await setup(LANE);
+  t.am.accounts[0].quota.unified5hReset = Date.now() + 2000;
+  try {
+    const res = await t.post(AGENT_TURN, null, 'k-serialhub');
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).model, 'claude-opus-5-5', 'served by Claude after the wait');
+    assert.equal(t.localSeen.length, 0, 'the stand-in was never asked');
+    assert.ok(t.logs.some((l) => /All accounts exhausted — waiting \d+s before retry/.test(l)), t.logs.join('\n'));
+    assert.ok(t.logs.some((l) => REFUSED_LANE.test(l)), 'the guard ran before the wait');
+  } finally { t.close(); }
+});
+
+test('dispatch, long-retry-after 429 hop: a lane gets the 429, never a stand-in', async () => {
+  const t = await setup({ ...LANE, exhausted: false, claude429: true });
+  try {
+    const res = await t.post(AGENT_TURN, null, 'k-serialhub');
     assert.equal(res.status, 429);
     assert.equal(res.headers.get('x-teamclaude-failover'), null);
     assert.equal(t.localSeen.length, 0);

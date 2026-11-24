@@ -3689,7 +3689,7 @@ async function maybeFailover(req, res, body, ctx, accountManager, { immediate })
     contentEncoding: /** @type {string|undefined} */ (req.headers['content-encoding']) ?? null,
     client: ctx.client ?? null,
     userAgent: /** @type {string|undefined} */ (req.headers['user-agent']) ?? null,
-    app: /** @type {string|undefined} */ (req.headers['x-app']) ?? null,
+    claudeCodeSession: /** @type {string|undefined} */ (req.headers['x-claude-code-session-id']) ?? null,
   });
   if (!el.ok) {
     if (Date.now() - (ctx.failoverState.lastSkipLogAt || 0) > 30_000) {

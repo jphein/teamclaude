@@ -146,11 +146,11 @@ Each night it reads what is listed and what is reachable, and probes every liste
 
 **What runs** (read-only apart from `git fetch`):
 - `gitleaks git --redact` over each main history. It honours the `.gitleaksignore` committed on that main, which holds fingerprints only, never values.
-- `npm install --package-lock-only --ignore-scripts`, then `npm audit --package-lock-only`, on teamclaude's master `package.json` in a temp dir. Nothing is installed and no scripts run.
+- `npm install --package-lock-only --ignore-scripts`, then `npm audit --package-lock-only`, on teamclaude's master `package.json` in a temp dir. Nothing is installed and no scripts run. Master keeps no lockfile on purpose: CI runs `npm install --ignore-scripts` with none (`.github/workflows/ci.yml`). So the graph CI tests is a fresh resolution, and that is the graph audited here.
 - An OSV query for the LiteLLM version written on the compose image line (`# vX.Y.Z`).
 - `gh api --paginate` for open PRs, with their files and commits.
-- On the VM, a script that prints the sha256 of every file under `src/` and `bin/` plus `package.json`, and the node's start time (read from `/proc/<pid>/stat`). The same hashes are computed here from `git archive` of the merged commit the VM names. Git on the VM is never trusted for the comparison.
-- On ubox0, each `forge-` container's image id and that image's runtime `RepoDigests`.
+- On the VM, a script that prints the git mode and blob id (`git hash-object --no-filters`, a hash of the bytes) of every file in the checkout except `.git`, dotfiles included, and the node's start time (from `/proc/<pid>/stat`). This side lists the same for the merged commit the VM names, with `git ls-tree -r`. The VM's index and HEAD are never trusted for the comparison.
+- On ubox0, each `forge-` container's compose service label, image id, and that image's runtime `RepoDigests`.
 
 **fail:**
 - **gitleaks:**
@@ -161,16 +161,17 @@ Each night it reads what is listed and what is reachable, and probes every liste
   - an error exit, a lockfile that can't be resolved, missing counts, or an exit that disagrees with the counts (0 means no advisories, 1 means some).
 - **OSV:**
   - **any** advisory on the pinned LiteLLM, so no severity mapping can under-classify one. The line and the row name each advisory's severity or CVSS vector;
-  - a non-zero exit, or an answer that is not an object (an object with no `vulns` means no advisories);
+  - a non-zero exit; an answer that is not an object; a `vulns` key that is present but not an array (`null` included). OSV answers a version with no advisory as `{}`, without the key; that was measured on 2026-11-24 (litellm 1.106.9 → `{}`, 1.40.0 → 60 advisories), so an absent key is zero;
   - no version written on the compose image line.
 - **The VM:**
   - it names a commit that is not on origin/master;
-  - one of its files differs from that commit's tree, is missing, or isn't in it.
-- **ubox0:** a forge container whose runtime digests (or image id) are not a digest pinned in compose.
+  - any file differs from that commit's tree in bytes or mode, is missing, or isn't in it;
+  - that commit's tree can't be read here.
+- **ubox0:** a forge container whose runtime digests (or image id) are not **its own service's** pinned digest in compose (matched by the `com.docker.compose.service` label). A service with no pin, or with two, counts as off-pin.
 
 **warn:**
 - a moderate npm advisory;
-- an upstream commit that is new since the baseline. The first run records the commits the fork has not taken (123 on 2026-11-23). A commit joins the baseline only after its row is filed. The row gives the SHA only, never the commit's own text;
+- an upstream commit that is new since the baseline. The first baseline is written at the end of a run, and only if every probe saw and every row was filed (123 commits on 2026-11-24). A commit joins the baseline only after its row is filed. The row gives the SHA only, never the commit's own text;
 - an open PR that:
   - changes `package*.json`, `deploy/compose.yaml`, `go.mod` or `go.sum`;
   - has more files or commits than the API lists;
@@ -180,11 +181,13 @@ Each night it reads what is listed and what is reachable, and probes every liste
 - an unreadable VM, ubox0, PR list or upstream list;
 - a row that couldn't be filed.
 
-**Rows:** each warn or fail finding is filed with `flow order` under the teamclaude lane, once per finding key (kept in `security-scan.filed`). A failed filing is retried on the next run.
+**Rows:** every warn or fail files one row with `flow order` under the teamclaude lane, once per finding key (kept in `security-scan.filed`). A failed filing is retried on the next run.
+- A probe that couldn't see also files a row ("security-scan could not see: …"), once while it stays blind. Its key is dropped on a run where it sees again, so the next outage files a new row.
+- The only warn without a row is a row that couldn't be filed.
 
 **Not covered yet:** the weekly Claude Security scan. It needs a Claude session, so it waits for a seat (row f3fb83d4).
 
-**Example:** `CHECK security-scan ok · teamclaude gitleaks 0; forge-gateway gitleaks 0; npm audit 0 critical 0 high 0 moderate; litellm 1.106.9 OSV 0; upstream 123 not in the fork, 0 new; VM 1a1d8e9 v24.22.1 files = merged tree; forge 3 containers on their pins; rows filed 0, at 06:42 · findings are Flow rows · next run tomorrow 06:40 · owner teamclaude lane`
+**Example:** `CHECK security-scan ok · teamclaude gitleaks 0; forge-gateway gitleaks 0; npm audit 0 critical 0 high 0 moderate; litellm 1.106.9 OSV 0; upstream 123 not in the fork, 0 new; VM 1a1d8e9 v24.22.1 files = merged tree (491 files); forge 3 containers on their service's pin; rows filed 0, at 06:42 · findings are Flow rows · next run tomorrow 06:40 · owner teamclaude lane`
 
 ## Install, update and rollback
 

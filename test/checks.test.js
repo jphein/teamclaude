@@ -1716,9 +1716,11 @@ test('forge-models collect: malformed Wyoming wake data is no answer, never a cr
 });
 
 // ---------- security-scan (row f3fb83d4: JP 2026-11-23 "scan teamclaude and litellm all the time")
-// The probes run for real wherever a test does not record their output: the VM script runs locally against a
-// clone (CHECK_SCAN_VM_RUN), the docker script against a stub docker, and git fetch, gitleaks, npm and curl are
-// real or stubbed binaries whose exit status the check must read. A probe that cannot see is never clean.
+// What is real in these tests, by name: "[live VM]" runs the real VM script (sh, against a git clone) and the
+// real ls-tree comparison; "[live git]" runs real git fetch; "[stub X]" runs the real probe function with a stub
+// binary X on PATH (its exit status and output are what the check must read); everything else in a test comes
+// from recorded probe output (fixtures), parsed by the same code the live probes feed. No test reaches the
+// network, the VM, ubox0, GitHub or the vault.
 const PIN = (c) => c.repeat(64);
 const SHA = (c) => c.repeat(40);
 const git = (cwd, ...a) => {
@@ -1732,7 +1734,9 @@ function scanRepo() { // a fork with origin/master and upstream/master refs, and
   mkdirSync(join(tc, 'src'), { recursive: true }); mkdirSync(join(tc, 'bin'));
   writeFileSync(join(tc, 'package.json'), '{"name":"t","devDependencies":{"eslint":"^9.0.0"}}\n');
   writeFileSync(join(tc, 'src', 'index.js'), 'console.log(1)\n');
-  writeFileSync(join(tc, 'bin', 'tc'), '#!/bin/sh\n');
+  writeFileSync(join(tc, 'bin', 'tc'), '#!/bin/sh\n'); chmodSync(join(tc, 'bin', 'tc'), 0o755);
+  writeFileSync(join(tc, '.gitignore'), 'scratch/\n');
+  writeFileSync(join(tc, 'README.md'), 'r\n');
   git(d, 'init', '-q', tc); git(tc, 'add', '.'); git(tc, 'commit', '-qm', 'one');
   const sha = git(tc, 'rev-parse', 'HEAD');
   git(tc, 'update-ref', 'refs/remotes/origin/master', sha);
@@ -1746,7 +1750,9 @@ function stubs(dir, scripts) { // name -> shell body; returns a PATH with the st
   for (const [name, body] of Object.entries(scripts)) { writeFileSync(join(b, name), `#!/bin/sh\n${body}\n`); chmodSync(join(b, name), 0o755); }
   return `${b}:${process.env.PATH}`;
 }
-const AUDIT = (v = {}, rc = 1) => `${JSON.stringify({ metadata: { vulnerabilities: { critical: 0, high: 0, moderate: 0, low: 1, total: 1, ...v } }, vulnerabilities: {} })}\n#RC ${rc}\n`;
+const AUDIT = (v = {}, rc = 1, vulns = {}) => `${JSON.stringify({ metadata: { vulnerabilities: { critical: 0, high: 0, moderate: 0, low: 1, total: 1, ...v } }, vulnerabilities: vulns })}\n#RC ${rc}\n`;
+const COMPOSE = `services:\n  db: # the gateway's database\n    image: postgres@sha256:${PIN('b')}\n  litellm:\n    image: ghcr.io/berriai/litellm-non_root@sha256:${PIN('a')} # v1.106.9\nnetworks:\n  internal: {internal: true}\n`;
+const DOCKER = `/forge-litellm-1 litellm sha256:${PIN('9')} ghcr.io/berriai/litellm-non_root@sha256:${PIN('a')}\n/forge-db-1 db sha256:${PIN('8')} postgres@sha256:${PIN('b')}\n`;
 function scanFixtures(over = {}) {
   const fx = fresh();
   const files = {
@@ -1754,13 +1760,13 @@ function scanFixtures(over = {}) {
     'gitleaks-teamclaude.json': '[]\n#RC 0\n',
     'gitleaks-forge-gateway.json': '[]\n#RC 0\n',
     'audit.json': AUDIT(),
-    'compose.yaml': `services:\n  litellm:\n    image: ghcr.io/berriai/litellm-non_root@sha256:${PIN('a')} # v1.106.9\n  db:\n    image: postgres@sha256:${PIN('b')}\n`,
+    'compose.yaml': COMPOSE,
     'osv.json': '{}\n#RC 0\n',
     'upstream.txt': `${SHA('1')}\n${SHA('2')}\n`,
     'prs-teamclaude.txt': '5\tsrc/server.js\n',
     'prs-forge-gateway.txt': '',
     'upstream-prs.txt': '',
-    'docker.txt': `/forge-litellm-1 sha256:${PIN('9')} ghcr.io/berriai/litellm-non_root@sha256:${PIN('a')}\n/forge-db-1 sha256:${PIN('8')} postgres@sha256:${PIN('b')}\n`,
+    'docker.txt': DOCKER,
     ...over,
   };
   for (const [k, v] of Object.entries(files)) if (v !== null) writeFileSync(join(fx, k), v);
@@ -1776,20 +1782,33 @@ function scan(fx, { repo = scanRepo(), state = fresh(), flowFails = false, env =
   return { ...r, repo, rows: existsSync(rows) ? readFileSync(rows, 'utf8').trim().split('\n').filter(Boolean) : [] };
 }
 
-test('security-scan: a clean day is ok: the VM files are hashed against the merged tree, the baseline recorded, no row', () => {
+test('security-scan [live VM]: a clean day is ok, every tracked file (dotfiles too) equals the merged tree, the baseline recorded at the end, no row', () => {
   const r = scan(scanFixtures());
   assert.equal(r.status, 0);
   assert.match(r.line, LINE);
-  assert.match(r.line, /^CHECK security-scan ok · teamclaude gitleaks 0; forge-gateway gitleaks 0; npm audit 0 critical 0 high 0 moderate; litellm 1\.106\.9 OSV 0; upstream 2 commits not in the fork \(baseline recorded\); VM [0-9a-f]{7}( \S+)? files = merged tree; forge 2 containers on their pins; rows filed 0, at \d\d:\d\d · /, r.line);
+  assert.match(r.line, /^CHECK security-scan ok · teamclaude gitleaks 0; forge-gateway gitleaks 0; npm audit 0 critical 0 high 0 moderate; litellm 1\.106\.9 OSV 0; upstream 2 commits not in the fork; VM [0-9a-f]{7}( \S+)? files = merged tree \(5 files\); forge 2 containers on their service's pin; upstream baseline recorded; rows filed 0, at \d\d:\d\d · /, r.line);
   assert.deepEqual(r.rows, []);
 });
 
-test('security-scan: a failed fetch warns and says the compares used stale refs (real git, a remote that is gone)', () => {
+test('security-scan [live git]: a failed fetch warns, names the stale refs, and files a row', () => {
   const repo = scanRepo();
   git(repo.tc, 'remote', 'add', 'origin', join(repo.d, 'gone'));
   git(repo.tc, 'remote', 'add', 'upstream', join(repo.d, 'gone'));
   const r = scan(scanFixtures({ 'fetch.txt': null }), { repo });
   assert.match(r.line, /^CHECK security-scan warn · fetch failed: teamclaude upstream forge-gateway \(compared against the last fetched refs\); /, r.line);
+  assert.match(r.rows[0], /^security-scan could not see: fetch failed: teamclaude upstream forge-gateway/);
+  assert.match(r.line, /upstream baseline not recorded: the run was incomplete/, 'a blind run never writes the first baseline');
+});
+
+test('security-scan: a blind probe files one row while it stays blind, and a new one after it has seen again', () => {
+  const repo = scanRepo(); const state = fresh();
+  const blindFx = scanFixtures({ 'osv.json': 'oops\n#RC 0\n' });
+  assert.equal(scan(blindFx, { repo, state }).rows.length, 1);
+  assert.equal(scan(blindFx, { repo, state }).rows.length, 1, 'still blind: no second row');
+  scan(scanFixtures(), { repo, state });
+  const again = scan(blindFx, { repo, state });
+  assert.equal(again.rows.length, 2, 'blind again after seeing: a new row');
+  assert.match(again.rows[1], /^security-scan could not see: litellm 1\.106\.9 OSV could not be read/);
 });
 
 test('security-scan: a leak fails and becomes one row, never twice; values never reach the line', () => {
@@ -1804,107 +1823,112 @@ test('security-scan: a leak fails and becomes one row, never twice; values never
   assert.doesNotMatch(r.line, /REDACTED|k = /);
 });
 
-test('security-scan: gitleaks that cannot scan fails: an error exit (live stub), malformed output, or status and report disagreeing', () => {
-  const d = fresh();
-  const PATH = stubs(d, { gitleaks: 'exit 2' });
-  let r = scan(scanFixtures({ 'gitleaks-teamclaude.json': null }), { env: { PATH } });
+test('security-scan [stub gitleaks]: gitleaks that cannot scan fails with a row: an error exit, malformed output, status and report disagreeing', () => {
+  let r = scan(scanFixtures({ 'gitleaks-teamclaude.json': null }), { env: { PATH: stubs(fresh(), { gitleaks: 'exit 2' }) } });
   assert.match(r.line, /^CHECK security-scan fail · teamclaude gitleaks could not scan \(exit 2\); /, r.line);
+  assert.match(r.rows[0], /could not see: teamclaude gitleaks could not scan/);
   r = scan(scanFixtures({ 'gitleaks-teamclaude.json': 'oops\n#RC 0\n' }));
   assert.match(r.line, /^CHECK security-scan fail · teamclaude gitleaks could not scan \(exit 0\)/);
   r = scan(scanFixtures({ 'gitleaks-forge-gateway.json': '[]\n#RC 1\n' }));
   assert.match(r.line, /^CHECK security-scan fail · .*forge-gateway gitleaks could not scan \(exit 1\)/);
 });
 
-test('security-scan: npm audit high fails, moderate warns; an error exit, a disagreement or malformed JSON fails (live stub npm too)', () => {
-  let r = scan(scanFixtures({ 'audit.json': `${JSON.stringify({ metadata: { vulnerabilities: { critical: 0, high: 1, moderate: 0, total: 1 } }, vulnerabilities: { eslint: { severity: 'high' } } })}\n#RC 1\n` }));
+test('security-scan [stub npm]: npm audit high fails, moderate warns, counts without names still file; an error exit, a disagreement or malformed JSON fails with a row', () => {
+  let r = scan(scanFixtures({ 'audit.json': AUDIT({ high: 1, total: 1, low: 0 }, 1, { eslint: { severity: 'high' } }) }));
   assert.match(r.line, /^CHECK security-scan fail · .*npm audit 0 critical 1 high 0 moderate \(eslint\(high\)\)/);
   assert.match(r.rows.join('\n'), /npm audit flags eslint\(high\)/);
-  r = scan(scanFixtures({ 'audit.json': AUDIT({ moderate: 1, total: 1 }) }));
+  r = scan(scanFixtures({ 'audit.json': AUDIT({ moderate: 1, total: 1, low: 0 }) }));
   assert.match(r.line, /^CHECK security-scan warn · .*0 high 1 moderate/);
+  assert.match(r.rows[0], /npm audit counts 0 critical 0 high 1 moderate .* packages unnamed/);
   r = scan(scanFixtures({ 'audit.json': '{"metadata":{}}\n#RC 0\n' }));
   assert.match(r.line, /^CHECK security-scan fail · .*npm audit could not be read \(exit 0\)/, 'no counts is not zero counts');
-  r = scan(scanFixtures({ 'audit.json': AUDIT({ low: 0, total: 0 }, 1) }));
-  assert.match(r.line, /npm audit could not be read \(exit 1\)/, 'exit 1 with no advisory is a disagreement');
-  const d = fresh();
-  let PATH = stubs(d, { npm: '[ "$1" = install ] && exit 0; echo "npm ERR! network"; exit 7' });
-  r = scan(scanFixtures({ 'audit.json': null }), { env: { PATH } });
+  assert.match(r.rows[0], /could not see: npm audit could not be read/);
+  assert.match(scan(scanFixtures({ 'audit.json': AUDIT({ low: 0, total: 0 }, 1) })).line, /npm audit could not be read \(exit 1\)/, 'exit 1 with no advisory disagrees');
+  r = scan(scanFixtures({ 'audit.json': null }), { env: { PATH: stubs(fresh(), { npm: '[ "$1" = install ] && exit 0; echo "npm ERR! network"; exit 7' }) } });
   assert.match(r.line, /^CHECK security-scan fail · .*npm audit could not be read \(exit 7\)/, r.line);
-  PATH = stubs(fresh(), { npm: 'exit 1' });
-  r = scan(scanFixtures({ 'audit.json': null }), { env: { PATH } });
+  r = scan(scanFixtures({ 'audit.json': null }), { env: { PATH: stubs(fresh(), { npm: 'exit 1' }) } });
   assert.match(r.line, /npm audit could not be read \(exit install-1\)/, r.line);
 });
 
-test('security-scan: any OSV advisory on the pinned LiteLLM fails with its severity; unreachable or malformed fails', () => {
+test('security-scan [stub curl]: any OSV advisory fails with its severity; {} (OSV\'s no-advisory answer) is zero; null, malformed or unreachable fails with a row', () => {
   let r = scan(scanFixtures({ 'osv.json': `${JSON.stringify({ vulns: [{ id: 'GHSA-aaaa-bbbb-cccc', severity: [{ type: 'CVSS_V3', score: 'CVSS:3.1/AV:N' }] }, { id: 'PYSEC-1', database_specific: { severity: 'LOW' } }] })}\n#RC 0\n` }));
   assert.match(r.line, /^CHECK security-scan fail · .*litellm 1\.106\.9 OSV: GHSA-aaaa-bbbb-cccc=CVSS:3\.1\/AV:N PYSEC-1=LOW; /, 'a LOW advisory still fails: nothing is under-classified');
   assert.equal(r.rows.length, 2);
-  const PATH = stubs(fresh(), { curl: 'exit 6' });
-  r = scan(scanFixtures({ 'osv.json': null }), { env: { PATH } });
+  assert.match(scan(scanFixtures({ 'osv.json': '{"vulns":[]}\n#RC 0\n' })).line, /litellm 1\.106\.9 OSV 0; /);
+  r = scan(scanFixtures({ 'osv.json': null }), { env: { PATH: stubs(fresh(), { curl: 'exit 6' }) } });
   assert.match(r.line, /^CHECK security-scan fail · .*litellm 1\.106\.9 OSV could not be read \(exit 6\)/, r.line);
-  for (const bad of ['\n#RC 0\n', 'not json\n#RC 0\n', '{"vulns":"x"}\n#RC 0\n', '[]\n#RC 0\n']) {
-    assert.match(scan(scanFixtures({ 'osv.json': bad })).line, /^CHECK security-scan fail · .*OSV could not be read/, JSON.stringify(bad));
+  for (const bad of ['{"vulns":null}\n#RC 0\n', '\n#RC 0\n', 'not json\n#RC 0\n', '{"vulns":"x"}\n#RC 0\n', '[]\n#RC 0\n']) {
+    const b = scan(scanFixtures({ 'osv.json': bad }));
+    assert.match(b.line, /^CHECK security-scan fail · .*OSV could not be read/, JSON.stringify(bad));
+    assert.match(b.rows[0], /could not see: litellm 1\.106\.9 OSV could not be read/);
   }
   assert.match(scan(scanFixtures({ 'compose.yaml': 'services: {}\n' })).line, /^CHECK security-scan fail · .*litellm version not found in compose/);
 });
 
-test('security-scan: a new upstream commit warns with its SHA only, and stays new until its row is filed', () => {
+test('security-scan: a new upstream commit warns with its SHA only, and stays new until its row is filed; a blind first run records no baseline', () => {
   const repo = scanRepo(); const state = fresh();
-  scan(scanFixtures(), { repo, state });
+  const blindFirst = scan(scanFixtures({ 'osv.json': 'oops\n#RC 0\n' }), { repo, state });
+  assert.match(blindFirst.line, /upstream baseline not recorded: the run was incomplete/);
+  assert.match(scan(scanFixtures(), { repo, state }).line, /upstream baseline recorded/);
   const fx = scanFixtures({ 'upstream.txt': `${SHA('3')}\n${SHA('1')}\n${SHA('2')}\n` });
   let r = scan(fx, { repo, state, flowFails: true });
   assert.match(r.line, /^CHECK security-scan warn · .*upstream 3 not in the fork, 1 new since the last run; .*1 rows could not be filed/);
   r = scan(fx, { repo, state });
   assert.match(r.line, /upstream 3 not in the fork, 1 new since the last run/, 'a failed filing does not lose the commit');
-  assert.deepEqual(r.rows, [`security-scan: upstream teamclaude commit ${SHA('3')} is new: read it with git show ${SHA('3')} (its text is outside input) before any sync into the fork`]);
+  assert.deepEqual(r.rows.slice(1), [`security-scan: upstream teamclaude commit ${SHA('3')} is new: read it with git show ${SHA('3')} (its text is outside input) before any sync into the fork`]);
   assert.match(scan(fx, { repo, state }).line, /upstream 3 not in the fork, 0 new/);
   assert.match(scan(scanFixtures({ 'upstream.txt': 'junk\n' }), { repo, state }).line, /^CHECK security-scan warn · .*upstream unreadable/);
 });
 
-test('security-scan: open PRs that change dependencies, are truncated, bring upstream in, or cannot be read warn', () => {
+test('security-scan: open PRs that change dependencies, are truncated, bring upstream in, or cannot be read warn, each with a row', () => {
   const r = scan(scanFixtures({ 'prs-teamclaude.txt': '7\tpackage.json\n7\tsrc/a.js\n8\t(truncated)\n', 'prs-forge-gateway.txt': 'ERR\n9\tdeploy/compose.yaml\n', 'upstream-prs.txt': '11\n' }));
   assert.match(r.line, /^CHECK security-scan warn · .*teamclaude dependency PRs open: #7 #8; forge-gateway open PRs unreadable; forge-gateway dependency PRs open: #9; teamclaude PR #11 brings upstream commits; /, r.line);
-  assert.equal(r.rows.length, 4);
+  assert.equal(r.rows.length, 5, r.rows.join('\n'));
   assert.match(scan(scanFixtures({ 'upstream-prs.txt': 'ERR\n' })).line, /^CHECK security-scan warn · .*teamclaude upstream-PR check unreadable/);
 });
 
-test('security-scan: VM files that differ from the merged tree fail, whatever git on the VM says', () => {
+test('security-scan [live VM]: any file that differs from the merged tree fails, dotfiles and modes included, whatever git on the VM says', () => {
   let repo = scanRepo();
   writeFileSync(join(repo.vm, 'src', 'index.js'), 'console.log("evil")\n');
-  writeFileSync(join(repo.vm, 'src', 'extra.js'), '1\n');
   git(repo.vm, 'update-index', '--assume-unchanged', 'src/index.js');   // git status on the VM now says clean
+  writeFileSync(join(repo.vm, '.npmrc'), 'registry=http://evil\n');       // an untracked dotfile at the root
   let r = scan(scanFixtures(), { repo });
-  assert.match(r.line, /^CHECK security-scan fail · .*VM [0-9a-f]{7}.* tainted: src\/extra\.js src\/index\.js/, r.line);
+  assert.match(r.line, /^CHECK security-scan fail · .*VM [0-9a-f]{7}.* tainted: \.npmrc src\/index\.js/, r.line);
   assert.match(r.rows[0], /VM teamclaude files differ from merged commit/);
-  repo = scanRepo(); rmSync(join(repo.vm, 'bin', 'tc'));
-  assert.match(scan(scanFixtures(), { repo }).line, /tainted: bin\/tc/, 'a missing file differs too');
+  repo = scanRepo(); rmSync(join(repo.vm, 'README.md'));
+  assert.match(scan(scanFixtures(), { repo }).line, /tainted: README\.md/, 'a missing file outside src/ differs too');
+  repo = scanRepo(); chmodSync(join(repo.vm, 'src', 'index.js'), 0o755);
+  assert.match(scan(scanFixtures(), { repo }).line, /tainted: src\/index\.js/, 'a mode change differs');
 });
 
-test('security-scan: a VM commit not on master fails; src newer than the running node warns; an unreadable VM warns', () => {
+test('security-scan [live VM]: a VM commit not on master fails; an unreadable VM warns with a row; [fixture] files newer than the running node warn', () => {
   const repo = scanRepo();
   writeFileSync(join(repo.vm, 'src', 'index.js'), 'console.log(2)\n'); git(repo.vm, 'commit', '-qam', 'unmerged');
   let r = scan(scanFixtures(), { repo });
   assert.match(r.line, /^CHECK security-scan fail · .*VM [0-9a-f]{7}.* NOT on master/, r.line);
   assert.match(r.rows[0], /names commit [0-9a-f]{40}, which is not on origin\/master/);
-  const ok = scanRepo();
-  const h = git(ok.tc, 'rev-parse', 'HEAD');
-  const files = spawnSync('sh', ['-c', `cd '${ok.vm}' && for p in bin/tc package.json src/index.js; do echo "FILE $(sha256sum "$p" | cut -d' ' -f1) $p"; done`], { encoding: 'utf8' }).stdout;
-  r = scan(scanFixtures({ 'vm.txt': `HEAD ${h}\nSTART 1\n${files}NEWER src/index.js\nNODE v24.22.1\n` }), { repo: ok });
-  assert.match(r.line, /^CHECK security-scan warn · .*VM [0-9a-f]{7} v24\.22\.1 src newer than the running node: src\/index\.js/, r.line);
   r = scan(scanFixtures(), { env: { CHECK_SCAN_VM_RUN: 'false' } });
   assert.match(r.line, /^CHECK security-scan warn · .*VM checkout unreadable/);
+  assert.match(r.rows[0], /could not see: VM checkout unreadable/);
+  const ok = scanRepo();
+  const files = git(ok.tc, 'ls-tree', '-r', 'HEAD').split('\n').map((l) => { const [m, , b] = l.split('\t')[0].split(' '); return `FILE ${m} ${b} ${l.split('\t')[1]}`; }).join('\n');
+  r = scan(scanFixtures({ 'vm.txt': `HEAD ${ok.sha}\nSTART 1\n${files}\nNEWER src/index.js\nNODE v24.22.1\n` }), { repo: ok });
+  assert.match(r.line, /^CHECK security-scan warn · .*VM [0-9a-f]{7} v24\.22\.1 files newer than the running node: src\/index\.js/, r.line);
 });
 
-test('security-scan: a forge container whose runtime digests are not pinned fails; the image id may be the digest (live stub docker)', () => {
-  let r = scan(scanFixtures({ 'docker.txt': `/forge-litellm-1 sha256:${PIN('9')} ghcr.io/berriai/litellm-non_root@sha256:${PIN('f')}\n/forge-db-1 sha256:${PIN('8')} postgres@sha256:${PIN('b')}\n` }));
-  assert.match(r.line, /^CHECK security-scan fail · .*forge containers off their pins: forge-litellm-1=9999/);
-  assert.match(r.rows[0], /runtime digests are not pinned in forge-gateway compose/);
+test('security-scan [stub docker]: each container must run its OWN service\'s pinned digest; a commented service line parses; another service\'s pin is not enough', () => {
+  let r = scan(scanFixtures({ 'docker.txt': `/forge-litellm-1 litellm sha256:${PIN('9')} postgres@sha256:${PIN('b')}\n/forge-db-1 db sha256:${PIN('8')} postgres@sha256:${PIN('b')}\n` }));
+  assert.match(r.line, /^CHECK security-scan fail · .*forge containers off their service's pin: forge-litellm-1\(litellm\)=9999/, r.line);
+  assert.match(r.rows[0], /not their own service's pinned digest/);
+  assert.match(scan(scanFixtures({ 'docker.txt': `/forge-x-1 x sha256:${PIN('7')} postgres@sha256:${PIN('b')}\n` })).line, /off their service's pin: forge-x-1\(x\)/, 'a service with no pin fails');
   const docker = `case "$1 $2" in
   "ps -q") echo c1 ;;
-  "inspect -f") case "$3" in *Name*) echo /forge-litellm-1 ;; *) echo "sha256:${PIN('a')}" ;; esac ;;
+  "inspect -f") case "$3" in *Name*) echo /forge-db-1 ;; *compose.service*) echo db ;; *) echo "sha256:${PIN('b')}" ;; esac ;;
   "image inspect") echo "" ;;
 esac`;
-  const PATH = stubs(fresh(), { docker });
-  r = scan(scanFixtures({ 'docker.txt': null }), { env: { PATH, CHECK_SCAN_DOCKER_RUN: 'sh -s --' } });
-  assert.match(r.line, /forge 1 containers on their pins/, r.line);
-  assert.match(scan(scanFixtures({ 'docker.txt': '' })).line, /^CHECK security-scan warn · .*forge containers or pins unreadable/);
+  r = scan(scanFixtures({ 'docker.txt': null }), { env: { PATH: stubs(fresh(), { docker }), CHECK_SCAN_DOCKER_RUN: 'sh -s --' } });
+  assert.match(r.line, /forge 1 containers on their service's pin/, `an image id that is the manifest digest: ${r.line}`);
+  r = scan(scanFixtures({ 'docker.txt': '' }));
+  assert.match(r.line, /^CHECK security-scan warn · .*forge containers or pins unreadable/);
+  assert.match(r.rows[0], /could not see: forge containers or pins unreadable/);
 });

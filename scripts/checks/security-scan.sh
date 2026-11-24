@@ -53,6 +53,13 @@ body_of() { grep -v '^#RC '; }
 status=ok; facts=(); finds=()   # finds: "key<TAB>row text"
 bump() { case $1 in fail) status=fail ;; warn) [ "$status" = fail ] || status=warn ;; esac; }
 find_() { finds+=("$1"$'\t'"$2"); }
+# A probe that could not see: its warn/fail AND a row, keyed per probe. The key is dropped from the filed list on
+# a run where that probe sees again, so the next outage files a new row (xreview round 2, point 6).
+blind=0
+blind() { # warn|fail probe-key fact
+  bump "$1"; facts+=("$3"); blind=1
+  find_ "blind:$2" "security-scan could not see: $3. Fix the probe; until then that part of the scan is unknown, not clean"
+}
 
 # ---- fetch
 do_fetch() {
@@ -67,7 +74,7 @@ out=$(probe fetch.txt do_fetch)
 stale=""
 for r in teamclaude upstream forge-gateway; do grep -qx "$r 0" <<<"$out" || stale+="$r "; done
 stale=${stale% }
-[ -n "$stale" ] && { bump warn; facts+=("fetch failed: $stale (compared against the last fetched refs)"); }
+[ -n "$stale" ] && blind warn fetch "fetch failed: $stale (compared against the last fetched refs)"
 
 # ---- leaks
 leaks() { # repo ref -> the redacted gitleaks JSON report, then "#RC n"
@@ -85,7 +92,7 @@ for pair in "teamclaude:$TC:origin/master" "forge-gateway:$FG:origin/main"; do
   # gitleaks exits 0 with no leaks and 1 with leaks; anything else, or a report that is not an array, is blind
   if { [ "$rc" != 0 ] && [ "$rc" != 1 ]; } || ! n=$(jq -er 'if type == "array" then length else error end' <<<"$body" 2>/dev/null) \
      || { [ "$rc" = 0 ] && [ "$n" -gt 0 ]; } || { [ "$rc" = 1 ] && [ "$n" = 0 ]; }; then
-    bump fail; facts+=("$repo gitleaks could not scan (exit ${rc:-?})"); continue
+    blind fail "gitleaks:$repo" "$repo gitleaks could not scan (exit ${rc:-?})"; continue
   fi
   if [ "$n" -gt 0 ]; then
     bump fail; facts+=("$repo gitleaks $n: $(jq -r '[.[] | "\(.RuleID) \(.File)"] | unique | join(", ")' <<<"$body" | clean)")
@@ -96,6 +103,9 @@ done
 
 # ---- audit (teamclaude dev tools)
 audit() { # -> npm audit JSON, then "#RC n" ("#RC install-n" when the lockfile could not be resolved)
+  # master keeps no lockfile on purpose: CI runs `npm install --ignore-scripts` with none (.github/workflows/ci.yml,
+  # "there is no lockfile for npm ci to consume"), so the graph CI tests is a fresh resolution of package.json,
+  # and that is the graph audited here, resolved the same way.
   local rc
   mkdir -p "$tmp/audit"
   git -C "$TC" show origin/master:package.json > "$tmp/audit/package.json" 2>/dev/null || { echo "#RC show-1"; return; }
@@ -108,12 +118,14 @@ out=$(probe audit.json audit); rc=$(rc_of <<<"$out"); body=$(body_of <<<"$out")
 v=$(jq -er '.metadata.vulnerabilities | [.critical, .high, .moderate, .total] | if all(type == "number") then map(tostring) | join(" ") else error end' <<<"$body" 2>/dev/null)
 read -r crit high mod total <<<"${v:-x x x x}"
 if [ -z "$v" ] || { [ "$rc" != 0 ] && [ "$rc" != 1 ]; } || { [ "$rc" = 0 ] && [ "$total" != 0 ]; } || { [ "$rc" = 1 ] && [ "$total" = 0 ]; }; then
-  bump fail; facts+=("npm audit could not be read (exit ${rc:-?})")
+  blind fail audit "npm audit could not be read (exit ${rc:-?})"
 else
   names=$(jq -r '[.vulnerabilities // {} | to_entries[] | select(.value.severity == "critical" or .value.severity == "high" or .value.severity == "moderate") | "\(.key)(\(.value.severity))"] | join(" ")' <<<"$body" | clean)
   if [ $((crit + high)) -gt 0 ]; then bump fail; elif [ "$mod" -gt 0 ]; then bump warn; fi
   facts+=("npm audit $crit critical $high high $mod moderate${names:+ ($names)}")
   for p in $names; do find_ "audit:$p" "security-scan: npm audit flags $p in teamclaude's dev tools on master: bump or pin it"; done
+  # counts with no named package still file a row: no warn or fail goes without one
+  [ -z "$names" ] && [ $((crit + high + mod)) -gt 0 ] && find_ "audit:counts:$crit-$high-$mod" "security-scan: npm audit counts $crit critical $high high $mod moderate in teamclaude's dev tools, packages unnamed: run npm audit by hand"
 fi
 
 # ---- osv (the LiteLLM version the compose pins)
@@ -125,12 +137,14 @@ osv() {
     -d "{\"package\":{\"name\":\"litellm\",\"ecosystem\":\"PyPI\"},\"version\":\"$1\"}" https://api.osv.dev/v1/query; rc=$?
   echo; echo "#RC $rc"
 }
-if [ -z "$ver" ]; then bump fail; facts+=("litellm version not found in compose: OSV not asked")
+if [ -z "$ver" ]; then blind fail osv-version "litellm version not found in compose: OSV not asked"
 else
   out=$(probe osv.json osv "$ver"); rc=$(rc_of <<<"$out"); body=$(body_of <<<"$out")
-  # OSV answers {} when nothing applies; anything that is not an object with an optional vulns array is unread
-  if [ "$rc" != 0 ] || ! ids=$(jq -er 'if type == "object" and ((.vulns // []) | type) == "array" then [(.vulns // [])[] | .id] | join(" ") else error end' <<<"$body" 2>/dev/null); then
-    bump fail; facts+=("litellm $ver OSV could not be read (exit ${rc:-?})")
+  # OSV answers a version with no advisory as {} with NO vulns key (measured 2026-11-24: litellm 1.106.9 -> {};
+  # 1.40.0 -> {"vulns":[60 items]}), so an absent key is zero. A vulns key that is present must be an array:
+  # null or anything else is malformed, as is anything that is not an object.
+  if [ "$rc" != 0 ] || ! ids=$(jq -er 'if type == "object" and ((has("vulns") | not) or (.vulns | type) == "array") then [(.vulns // [])[] | .id] | join(" ") else error end' <<<"$body" 2>/dev/null); then
+    blind fail osv "litellm $ver OSV could not be read (exit ${rc:-?})"
   else
     ids=$(clean <<<"$ids")
     if [ -n "$ids" ]; then
@@ -145,10 +159,11 @@ fi
 # ---- upstream (KarpelesLab commits not in the fork)
 up=$(probe upstream.txt git -C "$TC" rev-list origin/master..upstream/master 2>/dev/null); uprc=$?
 base="$DIR/$NAME.upstream-seen"
-if [ "$uprc" != 0 ] || grep -qvE '^[0-9a-f]{40}$|^$' <<<"$up"; then bump warn; facts+=("upstream unreadable")
+if [ "$uprc" != 0 ] || grep -qvE '^[0-9a-f]{40}$|^$' <<<"$up"; then blind warn upstream "upstream unreadable"
 else
   total=$(grep -cE '^[0-9a-f]{40}$' <<<"$up")
-  if [ ! -e "$base" ]; then grep -E '^[0-9a-f]{40}$' <<<"$up" > "$base"; facts+=("upstream $total commits not in the fork (baseline recorded)")
+  # the first baseline is written at the end, and only by a run where every probe saw and every row was filed
+  if [ ! -e "$base" ]; then first_base=$(grep -E '^[0-9a-f]{40}$' <<<"$up"); facts+=("upstream $total commits not in the fork")
   else
     new=$(grep -E '^[0-9a-f]{40}$' <<<"$up" | grep -vxF -f "$base")
     if [ -n "$new" ]; then
@@ -174,7 +189,7 @@ prs() { # owner/repo -> "number<TAB>file" per file of every open PR; "number<TAB
 for pair in "teamclaude:jphein/teamclaude:^(package[.]json|package-lock[.]json)$" "forge-gateway:jphein/forge-gateway:^(deploy/compose[.]yaml|go[.]mod|go[.]sum)$"; do
   repo=${pair%%:*}; rest=${pair#*:}; slug=${rest%%:*}; pat=${rest#*:}
   out=$(probe "prs-$repo.txt" prs "$slug")
-  grep -qx ERR <<<"$out" && { bump warn; facts+=("$repo open PRs unreadable"); }
+  grep -qx ERR <<<"$out" && blind warn "prs:$repo" "$repo open PRs unreadable"
   hits=$(awk -F'\t' -v p="$pat" '$2 ~ p || $2 == "(truncated)" {print $1}' <<<"$out" | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ' | sed 's/ $//')
   if [ -n "$hits" ]; then
     bump warn; facts+=("$repo dependency PRs open: $(sed 's/[0-9]\+/#&/g' <<<"$hits")")
@@ -195,13 +210,16 @@ upstream_prs() { # PR numbers whose commits include an upstream commit (or canno
   done
 }
 upr=$(probe upstream-prs.txt upstream_prs)
-grep -qx ERR <<<"$upr" && { bump warn; facts+=("teamclaude upstream-PR check unreadable"); }
+grep -qx ERR <<<"$upr" && blind warn upstream-prs "teamclaude upstream-PR check unreadable"
 for n in $(grep -E '^[0-9]+$' <<<"$upr" | sort -un); do
   bump warn; facts+=("teamclaude PR #$n brings upstream commits")
   find_ "upr:$n" "security-scan: jphein/teamclaude PR $n brings upstream commits in (or has more than the API lists): read the whole upstream diff before it merges"
 done
 
-# ---- running vs repo: the VM's files, hashed where they run, against the merged commit's tree
+# ---- running vs repo: every file of the VM checkout, hashed where it runs, against the merged commit's tree
+# The VM prints, for every file under its checkout except .git (dotfiles included), its git mode and blob id
+# (git hash-object --no-filters: a hash of the bytes, not a read of the VM's index or HEAD); this side lists the same
+# for the commit the VM names with git ls-tree -r. Any file added, removed, changed or re-moded is tainted.
 vm() {
   # The node's start comes from /proc/<pid>/stat field 22 (ticks after boot) + btime: the /proc/<pid> directory's
   # own mtime is when procfs made the inode, which can be later than the start.
@@ -215,83 +233,98 @@ if [ -n "$pid" ] && [ -r "/proc/$pid/stat" ]; then
   st=$(sed 's/.*) //' "/proc/$pid/stat" | awk '{print $20}')
   start=$((bt + st / 100)); echo "START $start"
 fi
-{ find src bin -type f 2>/dev/null; [ -f package.json ] && echo package.json; } | sort | while IFS= read -r p; do
-  echo "FILE $(sha256sum "$p" | cut -d' ' -f1) $p"
-  [ -n "$start" ] && [ "$(stat -c %Y "$p")" -gt "$start" ] && echo "NEWER $p"
+find . -path ./.git -prune -o \( -type f -o -type l \) -print | sed 's|^\./||' | sort | while IFS= read -r p; do
+  if [ -L "$p" ]; then m=120000; b=$(printf %s "$(readlink "$p")" | git hash-object --stdin)
+  else if [ -x "$p" ]; then m=100755; else m=100644; fi; b=$(git hash-object --no-filters "$p"); fi
+  echo "FILE $m $b $p"
+  [ -n "$start" ] && [ ! -L "$p" ] && [ "$(stat -c %Y "$p")" -gt "$start" ] && echo "NEWER $p"
 done
 echo "NODE $( (/opt/node/bin/node --version || node --version) 2>/dev/null)"
 EOS
 }
-expected_files() { # commit -> "FILE sha256 path" for src/ bin/ package.json in that tree
-  local d="$tmp/tree.$RANDOM" specs
-  mkdir -p "$d"
-  specs=$(git -C "$TC" ls-tree --name-only "$1" -- src bin package.json 2>/dev/null) || return 1
-  [ -n "$specs" ] || return 1
-  # shellcheck disable=SC2086
-  git -C "$TC" archive --format=tar "$1" -- $specs 2>/dev/null | tar -x -C "$d" || return 1
-  (cd "$d" && { find src bin -type f 2>/dev/null; [ -f package.json ] && echo package.json; } | sort | while IFS= read -r p; do
-    echo "FILE $(sha256sum "$p" | cut -d' ' -f1) $p"; done)
+expected_files() { # commit -> "FILE mode blob path" for every file of its tree
+  git -C "$TC" ls-tree -r --full-tree "$1" 2>/dev/null | awk -F'\t' '{ split($1, a, " "); if (a[2] == "blob") print "FILE " a[1] " " a[3] " " $2 }'
 }
 out=$(probe vm.txt vm)
 head_=$(awk '$1 == "HEAD" {print $2}' <<<"$out" | grep -E '^[0-9a-f]{40}$')
-if [ -z "$head_" ] || ! grep -q '^FILE ' <<<"$out"; then bump warn; facts+=("VM checkout unreadable")
+if [ -z "$head_" ] || ! grep -q '^FILE ' <<<"$out"; then blind warn vm "VM checkout unreadable"
 else
   node=$(awk '$1 == "NODE" {print $2}' <<<"$out" | clean)
   f="VM ${head_:0:7}${node:+ $node}"; f0=$f
   if ! git -C "$TC" merge-base --is-ancestor "$head_" origin/master 2>/dev/null; then
     bump fail; f+=" NOT on master"
     find_ "vm:head:$head_" "security-scan: the VM proxy names commit $head_, which is not on origin/master: find who deployed it, then deploy a merged commit"
-  elif ! want=$(expected_files "$head_"); then
-    bump fail; f+=" tree of ${head_:0:7} unreadable here"
+  elif ! want=$(expected_files "$head_") || [ -z "$want" ]; then
+    blind fail vm-tree "VM ${head_:0:7}: its tree is unreadable here"; f+=" (tree unreadable)"
   else
-    diffs=$(diff <(grep '^FILE ' <<<"$out" | sort -k3) <(sort -k3 <<<"$want") | awk '/^[<>] FILE / {print $4}' | sort -u | head -20 | clean)
+    # path = everything after the third field, so a path with spaces stays whole
+    diffs=$(diff <(grep '^FILE ' <<<"$out" | sort -k4) <(sort -k4 <<<"$want") \
+      | awk '/^[<>] FILE / { $1 = $2 = $3 = $4 = ""; sub(/^ +/, ""); print }' | sort -u | head -20 | clean)
     if [ -n "$diffs" ]; then
       bump fail; f+=" tainted: $diffs"
       find_ "vm:files:$(md5sum <<<"$diffs" | cut -c1-12)" "security-scan: VM teamclaude files differ from merged commit ${head_:0:9} ($diffs): read the changes, then restore the merged tree"
     fi
   fi
-  newer=$(awk '$1 == "NEWER" {print $2}' <<<"$out" | head -20 | clean)
-  if [ -n "$newer" ]; then bump warn; f+=" src newer than the running node: $newer"
+  newer=$(awk '$1 == "NEWER" { $1 = ""; sub(/^ +/, ""); print }' <<<"$out" | head -20 | clean)
+  if [ -n "$newer" ]; then bump warn; f+=" files newer than the running node: $newer"
     find_ "vm:newer:$(md5sum <<<"$newer" | cut -c1-12)" "security-scan: VM files changed after the proxy started ($newer): what runs is not what is on disk; restart it with notice"; fi
-  [ "$f" = "$f0" ] && f+=" files = merged tree"
+  [ "$f" = "$f0" ] && f+=" files = merged tree ($(grep -c '^FILE ' <<<"$out") files)"
   facts+=("$f")
 fi
+
+# ---- forge containers: each one's runtime digests against ITS OWN service's pin in compose
 docker_probe() {
   $DOCKER_RUN <<'EOS'
 for c in $(docker ps -q --filter name=forge-); do
   n=$(docker inspect -f '{{.Name}}' "$c"); id=$(docker inspect -f '{{.Image}}' "$c")
-  echo "$n $id $(docker image inspect -f '{{join .RepoDigests " "}}' "$id" 2>/dev/null)"
+  s=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$c")
+  echo "$n ${s:--} $id $(docker image inspect -f '{{join .RepoDigests " "}}' "$id" 2>/dev/null)"
 done
 EOS
 }
-pins=$(grep -oE 'image: *[^ ]+@sha256:[0-9a-f]{64}' <<<"$compose" | sed -E 's/image: *//')
+# "service image@sha256:..." for every service whose image is pinned by digest
+# (a service line may carry a trailing comment: `  redis: # holds ...`; any other 2-space key starts a new service)
+pins=$(awk '/^services:/ { s = 1; next } /^[^ #]/ { s = 0 } s && /^  [^ #]/ { svc = ""; if ($0 ~ /^  [A-Za-z0-9_.-]+: *(#.*)?$/) { svc = $1; sub(/:$/, "", svc) } }
+            s && svc != "" && /^    image: *[^ ]+@sha256:[0-9a-f]{64}/ { print svc, $2 }' <<<"$compose")
 run=$(probe docker.txt docker_probe | grep '^/')
-if [ -z "$pins" ] || [ -z "$run" ]; then bump warn; facts+=("forge containers or pins unreadable")
+if [ -z "$pins" ] || [ -z "$run" ]; then blind warn docker "forge containers or pins unreadable"
 else
   bad=""
-  while read -r cname cid rds; do
+  while read -r cname svc cid rds; do
+    pin=$(awk -v s="$svc" '$1 == s {print $2}' <<<"$pins")
     ok=no
-    for d in $rds; do grep -qxF "$d" <<<"$pins" && ok=yes; done
-    [ "$ok" = no ] && grep -q "@${cid}\$" <<<"$pins" && ok=yes   # an image store whose id is the manifest digest
-    [ "$ok" = yes ] || bad+="${cname#/}=${cid#sha256:} "
+    if [ -n "$pin" ] && [ "$(grep -c . <<<"$pin")" = 1 ]; then   # no pin, or two for one service: not a match
+      for d in $rds; do [ "$d" = "$pin" ] && ok=yes; done
+      [ "${pin##*@}" = "$cid" ] && ok=yes   # an image store whose image id is the manifest digest
+    fi
+    [ "$ok" = yes ] || bad+="${cname#/}(${svc})=${cid#sha256:} "
   done <<<"$run"
   bad=$(cut -c1-200 <<<"$bad" | clean)
-  if [ -n "$bad" ]; then bump fail; facts+=("forge containers off their pins: $bad")
-    find_ "image:$(md5sum <<<"$bad" | cut -c1-12)" "security-scan: ubox0 forge containers run images whose runtime digests are not pinned in forge-gateway compose ($bad): find who pulled them; redeploy the pinned digests"
-  else facts+=("forge $(grep -c . <<<"$run") containers on their pins"); fi
+  if [ -n "$bad" ]; then bump fail; facts+=("forge containers off their service's pin: $bad")
+    find_ "image:$(md5sum <<<"$bad" | cut -c1-12)" "security-scan: ubox0 forge containers run images that are not their own service's pinned digest in forge-gateway compose ($bad): find who pulled them; redeploy the pinned digests"
+  else facts+=("forge $(grep -c . <<<"$run") containers on their service's pin"); fi
 fi
 
-# ---- findings become rows, once each; an upstream commit joins the baseline only once its row is filed
+# ---- findings become rows, once each
+# An upstream commit joins the baseline only once its row is filed. A blind:* key leaves the filed list on a run
+# where its probe saw again, so the next outage files a new row.
 filed="$DIR/$NAME.filed"; touch "$filed" 2>/dev/null
-nf=0; failed_rows=0
+nf=0; failed_rows=0; keys=""
 for item in "${finds[@]}"; do
-  key=${item%%$'\t'*}; text=${item#*$'\t'}
+  key=${item%%$'\t'*}; text=${item#*$'\t'}; keys+="$key"$'\n'
   if ! grep -qxF "$key" "$filed" 2>/dev/null; then
     if [ -n "${CHECK_SCAN_FLOW:-}" ]; then $CHECK_SCAN_FLOW "$text" >/dev/null 2>&1; else flow --who teamclaude order teamclaude "$text" >/dev/null 2>&1; fi \
       && { printf '%s\n' "$key" >> "$filed"; nf=$((nf + 1)); } || { failed_rows=$((failed_rows + 1)); continue; }
   fi
   case $key in upstream:*) printf '%s\n' "${key#upstream:}" >> "$base" ;; esac
 done
-[ "$failed_rows" -gt 0 ] && { bump warn; facts+=("$failed_rows rows could not be filed (retried next run)"); }
+grep -v '^blind:' "$filed" > "$filed.tmp" 2>/dev/null; grep '^blind:' "$filed" 2>/dev/null | grep -xF -f <(printf '%s' "$keys" | grep '^blind:') >> "$filed.tmp"
+mv -f "$filed.tmp" "$filed"
+[ "$failed_rows" -gt 0 ] && { bump warn; facts+=("$failed_rows rows could not be filed (retried next run; this one cannot be a row)"); }
+# the first upstream baseline: only from a run where every probe saw and every row was filed
+if [ -n "${first_base+x}" ]; then
+  if [ "$blind" = 0 ] && [ "$failed_rows" = 0 ]; then printf '%s\n' "$first_base" > "$base"; facts+=("upstream baseline recorded")
+  else facts+=("upstream baseline not recorded: the run was incomplete"); fi
+fi
 fact=$(IFS=';'; echo "${facts[*]}" | sed 's/;/; /g')
 check_emit "$NAME" "$status" "$fact; rows filed $nf, at $(check_now)" "$NEXT"

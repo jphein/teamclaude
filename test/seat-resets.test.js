@@ -142,7 +142,8 @@ test('seatRows: window state, next window from the stagger, windows left, resets
     { name: 'b', type: 'oauth', quota: { unified7d: 1, unified7dReset: NOW + 3 * 24 * H } },
     { name: 'x', type: 'oauth', provider: 'codex', quota: {} },
   ];
-  const ledger = new WindowLedger({ log: () => {} });
+  // the ledger reads the fixed NOW too: on the real clock, burn() aged these windows out 7 days after NOW (2026-11-23)
+  const ledger = new WindowLedger({ now: () => NOW, log: () => {} });
   ledger.seats.a = [{ start: NOW - 10 * H, weeklyAtStart: 0.3, burn: 0.1 }, { start: NOW - 2 * H, weeklyAtStart: 0.4 }];
   const probe = new ResetsProbe({ accounts: () => [], now: () => NOW });
   probe.byName.set('b', { kept: keepStatus(status()), okAt: NOW, triedAt: NOW, error: null });

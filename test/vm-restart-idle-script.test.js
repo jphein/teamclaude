@@ -196,6 +196,23 @@ test('the 11-15 orphan: a new child recorded but the old one still alive and on 
   assert.match(r.err, /old child 4242:100 is STILL ALIVE.*:3456 listeners are \[4242\], not only the new child 5151/);
 });
 
+// Row 6ff2d7bb (CI 11-23 node 24, 11-24 node 20): under load the loop's last pass reached the lookup
+// with 0 s left, which fails at once, and the reason named "listener lookup failed" over the [4242]
+// every earlier pass had seen. Deterministic here: the lookup answers once, then always fails.
+const ONCE_THEN_FAIL = 'if [ -e $D/looked ]; then exit 1; fi; touch $D/looked; cat $D/listener';
+
+test('a lookup that fails on a later pass keeps the listener set it saw: the orphan is still named', async () => {
+  const r = await restartRun({ restart: `NEWCHILD(5151,200); echo '${ONCE_THEN_FAIL}' > $D/lcmd`, listenerCmd: 'sh $D/lcmd' });
+  assert.equal(r.code, 3);
+  assert.match(r.err, /old child 4242:100 is STILL ALIVE.*:3456 listeners are \[4242\], not only the new child 5151/);
+});
+
+test('an earlier listener set never stands in for a fresh one: no success once lookups fail', async () => {
+  const r = await restartRun({ restart: `OLDGONE; NEWCHILD(5151,200); LISTENER(5151); echo '${ONCE_THEN_FAIL}' > $D/lcmd`, listenerCmd: 'sh $D/lcmd' });
+  assert.equal(r.code, 3, r.out);
+  assert.doesNotMatch(r.out, /restarted/);
+});
+
 test('no child on record before, an orphan still serving :3456 → exit 3 (no success without a proof)', async () => {
   const r = await restartRun({ before: 'mkdir -p $D/proc/9999; echo "9999 (node) S 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 50 0" > $D/proc/9999/stat; echo 9999 > $D/listener', restart: 'NEWCHILD(5151,200)' });
   assert.equal(r.code, 3);

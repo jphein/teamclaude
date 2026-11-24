@@ -163,7 +163,11 @@ verify() {
   while :; do
     [ "$(left 3)" -gt 0 ] || break
     ostate=$(old_state "$old"); new=$(child)
-    own=$(owners "$(left 3)") || own="? (listener lookup failed or timed out)"
+    # A failed lookup keeps the last set a lookup returned: under load the last pass can reach here
+    # with 0 s left, which fails at once, and must not erase the orphan seen before (row 6ff2d7bb).
+    # Success never rests on that kept set: it needs own2, a lookup made after the proxy answered.
+    if o=$(owners "$(left 3)"); then own=$o
+    elif [ -z "$own" ]; then own="? (listener lookup failed or timed out)"; fi
     if [ "$ostate" = gone ] && [ -n "$new" ] && [ "$new" != "$old" ] && [ "$own" = "${new%%:*}" ]; then
       t=$(left 5); [ "$t" -gt 0 ] || break
       if serving "$t"; then

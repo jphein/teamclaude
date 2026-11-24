@@ -1,0 +1,9 @@
+[Unit]
+Description=CHECK proxy-creds: no teamclaude client key in a proxy URL on any client host (teamclaude docs/CHECKS.md)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/libexec/teamclaude-checks/proxy-creds.sh
+TimeoutStartSec=300
+Nice=10

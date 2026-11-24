@@ -506,7 +506,7 @@ test('lib: an unknown status becomes fail (still exit 0); the line file is writt
 });
 
 test('units: every check has a service and a timer; services run the installed copy', () => {
-  for (const name of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use', 'resets-banked', 'forge-models']) {
+  for (const name of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use', 'resets-banked', 'forge-models', 'proxy-creds']) {
     const svc = readFileSync(join(C, 'systemd', `teamclaude-check-${name}.service`), 'utf8');
     assert.match(svc, new RegExp(`^ExecStart=%h/\\.local/libexec/teamclaude-checks/${name}\\.sh$`, 'm'));
     assert.match(readFileSync(join(C, 'systemd', `teamclaude-check-${name}.timer`), 'utf8'), /^Persistent=true$/m);
@@ -525,8 +525,8 @@ function repoAt(files) {
 }
 const payload = (omit = []) => {
   const files = {};
-  for (const f of ['lib.sh', 'pool-quota.sh', 'proxy-probe.sh', 'proxy-wrapper.sh', 'forge-keys.sh', 'fable-use.sh', 'resets-banked.sh', 'summary.sh', 'install.sh', 'forge-models.sh', 'forge-models.mjs', 'forge-direct.json']) if (!omit.includes(f)) files[`scripts/checks/${f}`] = readFileSync(join(C, f), 'utf8');
-  for (const n of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use', 'resets-banked', 'forge-models']) for (const ext of ['service', 'timer']) files[`scripts/checks/systemd/teamclaude-check-${n}.${ext}`] = readFileSync(join(C, 'systemd', `teamclaude-check-${n}.${ext}`), 'utf8');
+  for (const f of ['lib.sh', 'pool-quota.sh', 'proxy-probe.sh', 'proxy-wrapper.sh', 'forge-keys.sh', 'fable-use.sh', 'resets-banked.sh', 'summary.sh', 'install.sh', 'forge-models.sh', 'forge-models.mjs', 'forge-direct.json', 'proxy-creds.sh', 'proxy-creds-probe.sh']) if (!omit.includes(f)) files[`scripts/checks/${f}`] = readFileSync(join(C, f), 'utf8');
+  for (const n of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use', 'resets-banked', 'forge-models', 'proxy-creds']) for (const ext of ['service', 'timer']) files[`scripts/checks/systemd/teamclaude-check-${n}.${ext}`] = readFileSync(join(C, 'systemd', `teamclaude-check-${n}.${ext}`), 'utf8');
   files['scripts/claude-wrapper.sh'] = NEW_WRAPPER;
   return files;
 };
@@ -540,7 +540,7 @@ test('install: a complete merged commit is published and its timers enabled', ()
   assert.equal(r.status, 0, r.stderr);
   assert.equal(readFileSync(join(h, '.local/libexec/teamclaude-checks/claude-wrapper.sh'), 'utf8'), NEW_WRAPPER);
   assert.ok(existsSync(join(h, '.config/systemd/user/teamclaude-check-forge-keys.timer')));
-  assert.match(readFileSync(join(h, 'systemctl.log'), 'utf8'), /^--user enable --now teamclaude-check-pool-quota\.timer teamclaude-check-proxy-wrapper\.timer teamclaude-check-forge-keys\.timer teamclaude-check-fable-use\.timer teamclaude-check-resets-banked\.timer teamclaude-check-forge-models\.timer$/m);
+  assert.match(readFileSync(join(h, 'systemctl.log'), 'utf8'), /^--user enable --now teamclaude-check-pool-quota\.timer teamclaude-check-proxy-wrapper\.timer teamclaude-check-forge-keys\.timer teamclaude-check-fable-use\.timer teamclaude-check-resets-banked\.timer teamclaude-check-forge-models\.timer teamclaude-check-proxy-creds\.timer$/m);
 });
 
 test('install: a commit missing a file publishes nothing over the existing install', () => {
@@ -699,7 +699,7 @@ test('install: an unexpected failure after the stop (daemon-reload) still starts
   const r = installWith(repoAt(payload()), h, RUNNING(h) + `\ncase "$2" in daemon-reload) if [ ! -e '${once}' ]; then : > '${once}'; exit 1; fi ;; esac`);
   assert.notEqual(r.status, 0);
   const log = readFileSync(join(h, 'systemctl.log'), 'utf8').trim().split('\n');
-  assert.equal(log[log.length - 1], '--user start teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer teamclaude-check-resets-banked.timer teamclaude-check-forge-models.timer', log.join(' | '));
+  assert.equal(log[log.length - 1], '--user start teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer teamclaude-check-resets-banked.timer teamclaude-check-forge-models.timer teamclaude-check-proxy-creds.timer', log.join(' | '));
 });
 
 test('install: a second install while one holds the lock is refused', async () => {
@@ -798,7 +798,7 @@ test('install: a partial enable --now failure leaves no timer running that was n
   const enable = log.findIndex((l) => l.startsWith('--user enable --now '));
   assert.ok(enable >= 0, log.join(' | '));
   // stop all three timers first, then (after the wait) restore the files and reload; none was running before
-  assert.equal(log[enable + 1], '--user stop teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer teamclaude-check-resets-banked.timer teamclaude-check-forge-models.timer', log.join(' | '));
+  assert.equal(log[enable + 1], '--user stop teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer teamclaude-check-resets-banked.timer teamclaude-check-forge-models.timer teamclaude-check-proxy-creds.timer', log.join(' | '));
   assert.ok(log.slice(enable + 2).includes('--user daemon-reload'), log.join(' | '));
   assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false, 'a first install that failed must not leave its files');
   assert.equal(log.slice(enable + 1).some((l) => l.startsWith('--user start ')), false);
@@ -1713,4 +1713,56 @@ test('forge-models collect: malformed Wyoming wake data is no answer, never a cr
     srv.close();
     assert.match(r.out ?? '', /^fail\t.*openwakeword \(no answer\)/, JSON.stringify(data));
   }
+});
+
+// ---------- proxy-creds (Flow 0d1ee709: no client key in a proxy URL on any client host)
+const FAKE_KEY = 'tc-' + 'ab12'.repeat(12);
+function pcHome({ files = {}, procs = [] } = {}) {
+  const home = fresh(), proc = join(home, 'proc');
+  for (const [rel, body] of Object.entries(files)) { mkdirSync(dirname(join(home, rel)), { recursive: true }); writeFileSync(join(home, rel), body); }
+  mkdirSync(proc);
+  procs.forEach(([comm, env], i) => { const d = join(proc, String(100 + i)); mkdirSync(d); writeFileSync(join(d, 'comm'), comm + '\n'); writeFileSync(join(d, 'environ'), env.join('\0') + '\0'); });
+  return { HOME: home, CHECK_PROC_DIR: proc };
+}
+const pc = (env, hosts = 'local') => run('proxy-creds.sh', { CHECK_PROXY_CREDS_HOSTS: hosts, ...env });
+
+test('proxy-creds: loopback proxies without userinfo, everywhere, are ok', () => {
+  const r = pc(pcHome({
+    files: { '.config/claude-code/env.sh': 'export HTTPS_PROXY=http://127.0.0.1:3456\nexport NO_PROXY=localhost\n',
+             '.claude/settings.json': JSON.stringify({ env: { HTTPS_PROXY: 'http://127.0.0.1:3456', NOTE: 'mail me at a@b.c' } }) },
+    procs: [['claude', ['HTTPS_PROXY=http://127.0.0.1:3456', 'GIT_URL=https://u:p@github.com/x']]] }));
+  assert.equal(r.status, 0);
+  assert.match(r.line, LINE);
+  assert.match(r.line, /^CHECK proxy-creds ok · no key in a proxy URL on 1 hosts \(/);
+});
+
+test('proxy-creds: a key in a proxy URL fails in each config syntax and in a process environment, naming paths, never the key', () => {
+  const cases = [
+    ['.config/claude-code/env.sh', `export HTTPS_PROXY=https://${FAKE_KEY}@10.0.6.145:3443\n`],
+    ['.claude/settings.json', JSON.stringify({ env: { HTTPS_PROXY: `http://${FAKE_KEY}@127.0.0.1:3456` } }, null, 2)],
+    ['.config/systemd/user/x.service', `[Service]\nEnvironment=https_proxy=http://k:${FAKE_KEY}@127.0.0.1:3456\n`],
+    ['.config/environment.d/50-proxy.conf', `ALL_PROXY="http://${FAKE_KEY}@10.0.6.145:3456"\n`],
+  ];
+  for (const [rel, body] of cases) {
+    const r = pc(pcHome({ files: { [rel]: body } }));
+    assert.match(r.line, new RegExp(`^CHECK proxy-creds fail · key in a proxy URL on 1 host\\(s\\): [^:]+: ${rel.replace(/[.]/g, '\\.')},`), rel);
+    assert.ok(!r.stdout.includes(FAKE_KEY) && !readFileSync(join(r.state, 'proxy-creds.line'), 'utf8').includes(FAKE_KEY), `${rel}: key printed`);
+  }
+  const r = pc(pcHome({ procs: [['2.1.319', ['A=1', `HTTPS_PROXY=https://${FAKE_KEY}@10.0.6.145:3443`]], ['2.1.319', [`http_proxy=http://${FAKE_KEY}@x:1`]], ['bash', ['HTTPS_PROXY=http://127.0.0.1:3456']]] }));
+  assert.match(r.line, /fail · .*: 2 process\(es\) \(2\.1\.319×2\), at /);
+  assert.ok(!r.stdout.includes(FAKE_KEY));
+});
+
+test('proxy-creds: cc\'s teamclaude-remote.env fails (cc teams would write its key back into env.sh)', () => {
+  const r = pc(pcHome({ files: { '.config/claude-code/teamclaude-remote.env': `TC_REMOTE=10.0.6.145:3443\nTC_KEY=${FAKE_KEY}\n` } }));
+  assert.match(r.line, /^CHECK proxy-creds fail · .*cc remote\.env present, at /);
+  assert.ok(!r.stdout.includes(FAKE_KEY));
+});
+
+test('proxy-creds: a host that cannot be read warns by name and is never counted clean; with a finding it still fails', () => {
+  const clean = pcHome({ files: { '.config/claude-code/env.sh': 'export HTTPS_PROXY=http://127.0.0.1:3456\n' } });
+  let r = pc(clean, 'local nohost.invalid');
+  assert.match(r.line, /^CHECK proxy-creds warn · no key in a proxy URL on \S+; could not read nohost\.invalid, at /);
+  r = pc(pcHome({ files: { '.bashrc': `export https_proxy=http://${FAKE_KEY}@127.0.0.1:3456\n` } }), 'local nohost.invalid');
+  assert.match(r.line, /^CHECK proxy-creds fail · .*\.bashrc; unread: nohost\.invalid, at /);
 });

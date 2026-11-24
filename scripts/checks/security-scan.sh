@@ -38,6 +38,9 @@ TC=${CHECK_SCAN_TC_REPO:-$HOME/Projects/teamclaude}
 FG=${CHECK_SCAN_FG_REPO:-$HOME/Projects/forge-gateway}
 VM_RUN=${CHECK_SCAN_VM_RUN:-timeout 90 ssh -o BatchMode=yes -o ConnectTimeout=8 jp@10.0.6.145 sh -s --}
 VM_DIR=${CHECK_SCAN_VM_DIR:-teamclaude}
+# the proxy's command line on the VM, as a regex: the node process itself, not supervise-daemon, whose own argv
+# carries the same "... src/index.js server" after its options (tests: a unique stand-in)
+VM_PROC=${CHECK_SCAN_VM_PROC:-^[^ ]*node [^ ]*src/index[.]js server}
 DOCKER_RUN=${CHECK_SCAN_DOCKER_RUN:-timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=8 ubox0 sh -s --}
 DIR=${CHECK_STATE_DIR:-$HOME/.local/state/checks}
 mkdir -p "$DIR" 2>/dev/null
@@ -226,10 +229,15 @@ done
 vm() {
   # The node's start comes from /proc/<pid>/stat field 22 (ticks after boot) + btime: the /proc/<pid> directory's
   # own mtime is when procfs made the inode, which can be later than the start.
-  $VM_RUN "$VM_DIR" <<'EOS'
+  # PAT, the proxy's command-line regex, arrives on stdin as the script's first line, never in argv: in argv, this
+  # script's own shell would match it under pgrep -f. Every match is counted (the expected set is exactly one), and
+  # the start time is the oldest match's, so an orphan from an earlier deploy (2026-11-15) is the one compared.
+  case $VM_PROC in *"'"*) return 1 ;; esac
+  { printf "PAT='%s'\n" "$VM_PROC"; cat <<'EOS'
 cd "$1" 2>/dev/null || exit 1
 echo "HEAD $(git rev-parse HEAD 2>/dev/null)"
-pid=$(pgrep -f 'src/index.js server' 2>/dev/null | head -1)
+echo "PROCS $(pgrep -f -- "$PAT" 2>/dev/null | grep -c .)"
+pid=$(pgrep -o -f -- "$PAT" 2>/dev/null | head -1)
 start=""
 [ -n "$pid" ] && echo "PROC $pid"
 if [ -n "$pid" ] && [ -r "/proc/$pid/stat" ]; then
@@ -245,6 +253,7 @@ find . -path ./.git -prune -o \( -type f -o -type l \) -print | sed 's|^\./||' |
 done
 echo "NODE $( (/opt/node/bin/node --version || node --version) 2>/dev/null)"
 EOS
+  } | $VM_RUN "$VM_DIR"
 }
 expected_files() { # commit -> "FILE mode blob path" for every file of its tree
   git -C "$TC" ls-tree -r --full-tree "$1" 2>/dev/null | awk -F'\t' '{ split($1, a, " "); if (a[2] == "blob") print "FILE " a[1] " " a[3] " " $2 }'
@@ -257,9 +266,13 @@ else
   f="VM ${head_:0:7}${node:+ $node}"; f0=$f
   # The expected set, named up front: one proxy process, `node src/index.js server`, with a readable start time.
   # Not running (or no start time) is a fail, never a clean inventory (Sen's ruling on #98, point 1).
+  procs=$(awk '$1 == "PROCS" {print $2}' <<<"$out" | grep -E '^[0-9]+$')
   if ! grep -qE '^PROC [0-9]+$' <<<"$out" || ! grep -qE '^START [0-9]+$' <<<"$out"; then
     bump fail; f+=" proxy (node src/index.js server) NOT running"
     find_ "vm:noproc:$(date +%F)" "security-scan: on the VM the expected proxy process (node src/index.js server) is not running, or its start time is unreadable: check the teamclaude service"
+  elif [ "${procs:-0}" != 1 ]; then
+    bump fail; f+=" ${procs:-?} proxy processes (expected exactly 1)"
+    find_ "vm:procs:$(date +%F)" "security-scan: on the VM ${procs:-?} processes match the proxy (expected exactly 1): an orphan from an earlier deploy may still hold old code (2026-11-15); find and stop the extra one with notice"
   fi
   if ! git -C "$TC" merge-base --is-ancestor "$head_" origin/master 2>/dev/null; then
     bump fail; f+=" NOT on master"

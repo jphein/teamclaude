@@ -1723,9 +1723,12 @@ test('forge-models collect: malformed Wyoming wake data is no answer, never a cr
 // network, the VM, ubox0, GitHub or the vault.
 const PIN = (c) => c.repeat(64);
 const SHA = (c) => c.repeat(40);
-// [live VM] tests expect the proxy process: a stand-in whose command line carries `src/index.js server` (the `; :`
-// keeps sh from exec'ing sleep, which would drop that argument), started before the files are made, killed after.
-const fakeProxy = spawn('sh', ['-c', 'sleep 600; :', 'src/index.js server'], { stdio: 'ignore' });
+// [live VM] tests expect the proxy process: a stand-in whose command line carries a pattern unique to this test
+// process (CI runs other suites' real `src/index.js server` at the same time, and pgrep sees the whole host: on
+// 2026-11-24 the shared pattern matched one of those). The `; :` keeps sh from exec'ing sleep, which would drop
+// that argument. Started before the files are made, killed after.
+const PROC_PATTERN = `tc-scan-test-proxy-${process.pid}`;
+const fakeProxy = spawn('sh', ['-c', 'sleep 600; :', PROC_PATTERN], { stdio: 'ignore' });
 after(() => fakeProxy.kill());
 spawnSync('sleep', ['1.1']);   // the stand-in's start second is before any file the tests write
 const git = (cwd, ...a) => {
@@ -1785,7 +1788,7 @@ function scan(fx, { repo = scanRepo(), state = fresh(), flowFails = false, env =
   writeFileSync(flow, flowFails ? '#!/bin/sh\nexit 1\n' : `#!/bin/sh\nprintf '%s\\n' "$1" >> '${rows}'\n`);
   chmodSync(flow, 0o755);
   const r = run('security-scan.sh', { CHECK_STATE_DIR: state, CHECK_SCAN_FIXTURES: fx, CHECK_SCAN_FLOW: flow, CHECK_SCAN_TC_REPO: repo.tc,
-    CHECK_SCAN_FG_REPO: repo.tc, CHECK_SCAN_VM_RUN: 'sh -s --', CHECK_SCAN_VM_DIR: repo.vm, ...env });
+    CHECK_SCAN_FG_REPO: repo.tc, CHECK_SCAN_VM_RUN: 'sh -s --', CHECK_SCAN_VM_DIR: repo.vm, CHECK_SCAN_VM_PROC: PROC_PATTERN, ...env });
   return { ...r, repo, rows: existsSync(rows) ? readFileSync(rows, 'utf8').trim().split('\n').filter(Boolean) : [] };
 }
 
@@ -1920,7 +1923,7 @@ test('security-scan [live VM]: a VM commit not on master fails; an unreadable VM
   assert.match(r.rows[0], /could not see: VM checkout unreadable/);
   const ok = scanRepo();
   const files = git(ok.tc, 'ls-tree', '-r', 'HEAD').split('\n').map((l) => { const [m, , b] = l.split('\t')[0].split(' '); return `FILE ${m} ${b} ${l.split('\t')[1]}`; }).join('\n');
-  r = scan(scanFixtures({ 'vm.txt': `HEAD ${ok.sha}\nPROC 42\nSTART 1\n${files}\nNEWER src/index.js\nNODE v24.22.1\n` }), { repo: ok });
+  r = scan(scanFixtures({ 'vm.txt': `HEAD ${ok.sha}\nPROCS 1\nPROC 42\nSTART 1\n${files}\nNEWER src/index.js\nNODE v24.22.1\n` }), { repo: ok });
   assert.match(r.line, /^CHECK security-scan warn · .*VM [0-9a-f]{7} v24\.22\.1 files newer than the running node: src\/index\.js/, r.line);
 });
 
@@ -1932,8 +1935,32 @@ test('security-scan [live VM, stub pgrep]: the expected proxy process not runnin
   assert.match(r.rows[0], /the expected proxy process \(node src\/index\.js server\) is not running/);
   const ok = scanRepo();
   const files = git(ok.tc, 'ls-tree', '-r', 'HEAD').split('\n').map((l) => { const [m, , b] = l.split('\t')[0].split(' '); return `FILE ${m} ${b} ${l.split('\t')[1]}`; }).join('\n');
-  r = scan(scanFixtures({ 'vm.txt': `HEAD ${ok.sha}\nPROC 42\n${files}\nNODE v24.22.1\n` }), { repo: ok });
+  r = scan(scanFixtures({ 'vm.txt': `HEAD ${ok.sha}\nPROCS 1\nPROC 42\n${files}\nNODE v24.22.1\n` }), { repo: ok });
   assert.match(r.line, /^CHECK security-scan fail · .*NOT running/, 'a process with no readable start time is not a clean run');
+});
+
+test('security-scan [live VM]: the default-shaped pattern counts the node process, not a supervisor carrying its command line (VM 2026-11-24)', () => {
+  const d = fresh(); const tag = `tcscan${process.pid}sv`;
+  mkdirSync(join(d, tag, 'src'), { recursive: true });
+  const script = join(d, tag, 'src', 'index.js');
+  writeFileSync(script, 'setTimeout(() => {}, 600000);\n');
+  const node = spawn(process.execPath, [script, 'server'], { stdio: 'ignore' });
+  const sup = spawn('sh', ['-c', 'sleep 600; :', `supervise-daemon teamclaude --start /opt/node/bin/node -- ${script} server`], { stdio: 'ignore' });
+  try {
+    spawnSync('sleep', ['0.5']);
+    const r = scan(scanFixtures(), { env: { CHECK_SCAN_VM_PROC: `^[^ ]*node [^ ]*${tag}/src/index[.]js server` } });
+    assert.match(r.line, /VM [0-9a-f]{7}( \S+)? proxy running, files = merged tree/, r.line);
+  } finally { node.kill(); sup.kill(); }
+});
+
+test('security-scan [live VM]: two processes matching the proxy fail (the expected set is exactly one: an orphan holds old code)', () => {
+  const orphan = spawn('sh', ['-c', 'sleep 600; :', PROC_PATTERN], { stdio: 'ignore' });
+  try {
+    spawnSync('sleep', ['0.3']);
+    const r = scan(scanFixtures());
+    assert.match(r.line, /^CHECK security-scan fail · .*VM [0-9a-f]{7}( \S+)? 2 proxy processes \(expected exactly 1\)/, r.line);
+    assert.match(r.rows[0], /2 processes match the proxy \(expected exactly 1\)/);
+  } finally { orphan.kill(); }
 });
 
 test('security-scan: every compose service needs exactly one pin and a running container on it; the covered set is named', () => {

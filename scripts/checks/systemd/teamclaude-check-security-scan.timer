@@ -1,0 +1,10 @@
+[Unit]
+Description=CHECK security-scan timer (*-*-* 06:40)
+
+[Timer]
+OnCalendar=*-*-* 06:40
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

@@ -472,12 +472,12 @@ function summary(files, now = Math.floor(Date.now() / 1000)) {
 }
 
 test('summary: silent when every check is ok and fresh', () => {
-  const r = summary({ 'pool-quota': ['CHECK pool-quota ok · x · y', 5], 'proxy-wrapper': ['CHECK proxy-wrapper ok · x · y', 5], 'forge-keys': ['CHECK forge-keys ok · x · y', 600], 'fable-use': ['CHECK fable-use ok · x · y', 600], 'resets-banked': ['CHECK resets-banked ok · x · y', 600] });
+  const r = summary({ 'pool-quota': ['CHECK pool-quota ok · x · y', 5], 'proxy-wrapper': ['CHECK proxy-wrapper ok · x · y', 5], 'forge-keys': ['CHECK forge-keys ok · x · y', 600], 'fable-use': ['CHECK fable-use ok · x · y', 600], 'resets-banked': ['CHECK resets-banked ok · x · y', 600], 'security-scan': ['CHECK security-scan ok · x · y', 600] });
   assert.equal(r.status, 0); assert.equal(r.stdout, '');
 });
 
 test('summary: a malformed or multi-line result is a warn, never silence', () => {
-  const r = summary({ 'pool-quota': ['CHECK pool-quota ok garbage', 5], 'proxy-wrapper': ['CHECK proxy-wrapper ok · x · y\nCHECK proxy-wrapper fail · z · y', 5], 'forge-keys': ['CHECK forge-keys ok · x · y', 5], 'fable-use': ['CHECK fable-use ok · x · y', 5], 'resets-banked': ['CHECK resets-banked ok · x · y', 5] });
+  const r = summary({ 'pool-quota': ['CHECK pool-quota ok garbage', 5], 'proxy-wrapper': ['CHECK proxy-wrapper ok · x · y\nCHECK proxy-wrapper fail · z · y', 5], 'forge-keys': ['CHECK forge-keys ok · x · y', 5], 'fable-use': ['CHECK fable-use ok · x · y', 5], 'resets-banked': ['CHECK resets-banked ok · x · y', 5], 'security-scan': ['CHECK security-scan ok · x · y', 5] });
   const lines = r.stdout.trim().split('\n');
   assert.equal(lines.length, 2);
   assert.match(lines[0], /^CHECK pool-quota warn · last result is malformed/);
@@ -506,7 +506,7 @@ test('lib: an unknown status becomes fail (still exit 0); the line file is writt
 });
 
 test('units: every check has a service and a timer; services run the installed copy', () => {
-  for (const name of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use', 'resets-banked', 'forge-models']) {
+  for (const name of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use', 'resets-banked', 'forge-models', 'security-scan']) {
     const svc = readFileSync(join(C, 'systemd', `teamclaude-check-${name}.service`), 'utf8');
     assert.match(svc, new RegExp(`^ExecStart=%h/\\.local/libexec/teamclaude-checks/${name}\\.sh$`, 'm'));
     assert.match(readFileSync(join(C, 'systemd', `teamclaude-check-${name}.timer`), 'utf8'), /^Persistent=true$/m);
@@ -525,8 +525,8 @@ function repoAt(files) {
 }
 const payload = (omit = []) => {
   const files = {};
-  for (const f of ['lib.sh', 'pool-quota.sh', 'proxy-probe.sh', 'proxy-wrapper.sh', 'forge-keys.sh', 'fable-use.sh', 'resets-banked.sh', 'summary.sh', 'install.sh', 'forge-models.sh', 'forge-models.mjs', 'forge-direct.json']) if (!omit.includes(f)) files[`scripts/checks/${f}`] = readFileSync(join(C, f), 'utf8');
-  for (const n of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use', 'resets-banked', 'forge-models']) for (const ext of ['service', 'timer']) files[`scripts/checks/systemd/teamclaude-check-${n}.${ext}`] = readFileSync(join(C, 'systemd', `teamclaude-check-${n}.${ext}`), 'utf8');
+  for (const f of ['lib.sh', 'pool-quota.sh', 'proxy-probe.sh', 'proxy-wrapper.sh', 'forge-keys.sh', 'fable-use.sh', 'resets-banked.sh', 'summary.sh', 'install.sh', 'forge-models.sh', 'forge-models.mjs', 'forge-direct.json', 'security-scan.sh']) if (!omit.includes(f)) files[`scripts/checks/${f}`] = readFileSync(join(C, f), 'utf8');
+  for (const n of ['pool-quota', 'proxy-wrapper', 'forge-keys', 'fable-use', 'resets-banked', 'forge-models', 'security-scan']) for (const ext of ['service', 'timer']) files[`scripts/checks/systemd/teamclaude-check-${n}.${ext}`] = readFileSync(join(C, 'systemd', `teamclaude-check-${n}.${ext}`), 'utf8');
   files['scripts/claude-wrapper.sh'] = NEW_WRAPPER;
   return files;
 };
@@ -540,7 +540,7 @@ test('install: a complete merged commit is published and its timers enabled', ()
   assert.equal(r.status, 0, r.stderr);
   assert.equal(readFileSync(join(h, '.local/libexec/teamclaude-checks/claude-wrapper.sh'), 'utf8'), NEW_WRAPPER);
   assert.ok(existsSync(join(h, '.config/systemd/user/teamclaude-check-forge-keys.timer')));
-  assert.match(readFileSync(join(h, 'systemctl.log'), 'utf8'), /^--user enable --now teamclaude-check-pool-quota\.timer teamclaude-check-proxy-wrapper\.timer teamclaude-check-forge-keys\.timer teamclaude-check-fable-use\.timer teamclaude-check-resets-banked\.timer teamclaude-check-forge-models\.timer$/m);
+  assert.match(readFileSync(join(h, 'systemctl.log'), 'utf8'), /^--user enable --now teamclaude-check-pool-quota\.timer teamclaude-check-proxy-wrapper\.timer teamclaude-check-forge-keys\.timer teamclaude-check-fable-use\.timer teamclaude-check-resets-banked\.timer teamclaude-check-forge-models\.timer teamclaude-check-security-scan\.timer$/m);
 });
 
 test('install: a commit missing a file publishes nothing over the existing install', () => {
@@ -699,7 +699,7 @@ test('install: an unexpected failure after the stop (daemon-reload) still starts
   const r = installWith(repoAt(payload()), h, RUNNING(h) + `\ncase "$2" in daemon-reload) if [ ! -e '${once}' ]; then : > '${once}'; exit 1; fi ;; esac`);
   assert.notEqual(r.status, 0);
   const log = readFileSync(join(h, 'systemctl.log'), 'utf8').trim().split('\n');
-  assert.equal(log[log.length - 1], '--user start teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer teamclaude-check-resets-banked.timer teamclaude-check-forge-models.timer', log.join(' | '));
+  assert.equal(log[log.length - 1], '--user start teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer teamclaude-check-resets-banked.timer teamclaude-check-forge-models.timer teamclaude-check-security-scan.timer', log.join(' | '));
 });
 
 test('install: a second install while one holds the lock is refused', async () => {
@@ -798,7 +798,7 @@ test('install: a partial enable --now failure leaves no timer running that was n
   const enable = log.findIndex((l) => l.startsWith('--user enable --now '));
   assert.ok(enable >= 0, log.join(' | '));
   // stop all three timers first, then (after the wait) restore the files and reload; none was running before
-  assert.equal(log[enable + 1], '--user stop teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer teamclaude-check-resets-banked.timer teamclaude-check-forge-models.timer', log.join(' | '));
+  assert.equal(log[enable + 1], '--user stop teamclaude-check-pool-quota.timer teamclaude-check-proxy-wrapper.timer teamclaude-check-forge-keys.timer teamclaude-check-fable-use.timer teamclaude-check-resets-banked.timer teamclaude-check-forge-models.timer teamclaude-check-security-scan.timer', log.join(' | '));
   assert.ok(log.slice(enable + 2).includes('--user daemon-reload'), log.join(' | '));
   assert.equal(existsSync(join(h, '.local/libexec/teamclaude-checks/pool-quota.sh')), false, 'a first install that failed must not leave its files');
   assert.equal(log.slice(enable + 1).some((l) => l.startsWith('--user start ')), false);
@@ -1713,4 +1713,122 @@ test('forge-models collect: malformed Wyoming wake data is no answer, never a cr
     srv.close();
     assert.match(r.out ?? '', /^fail\t.*openwakeword \(no answer\)/, JSON.stringify(data));
   }
+});
+
+// ---------- security-scan (row f3fb83d4: JP 2026-11-23 "scan teamclaude and litellm all the time")
+const SHA = (c) => c.repeat(40);
+const PIN = (c) => c.repeat(64);
+function scanFixtures(over = {}) {
+  const fx = fresh();
+  const files = {
+    'gitleaks-teamclaude.json': '[]',
+    'gitleaks-forge-gateway.json': '[]',
+    'audit.json': JSON.stringify({ metadata: { vulnerabilities: { critical: 0, high: 0, moderate: 0, low: 1 } }, vulnerabilities: {} }),
+    'compose.yaml': `services:\n  litellm:\n    image: ghcr.io/berriai/litellm-non_root@sha256:${PIN('a')} # v1.106.9\n  db:\n    image: postgres@sha256:${PIN('b')}\n`,
+    'osv.json': '{}',
+    'upstream.txt': `${SHA('1')}\n${SHA('2')}\n`,
+    'prs-teamclaude.txt': '5\tsrc/server.js\n',
+    'prs-forge-gateway.txt': '',
+    'upstream-prs.txt': '',
+    'vm.txt': `HEAD ${SHA('c')}\nSTART 1700000000\nNODE v24.22.1\n`,
+    'master-commits.txt': `${SHA('c')}\n`,
+    'docker.txt': `/forge-litellm-1 ghcr.io/berriai/litellm-non_root@sha256:${PIN('a')}\n/forge-db-1 postgres@sha256:${PIN('b')}\n`,
+    ...over,
+  };
+  for (const [k, v] of Object.entries(files)) if (v !== null) writeFileSync(join(fx, k), v);
+  return fx;
+}
+function scan(fx, { state = fresh(), flowFails = false } = {}) {
+  const rows = join(state, 'rows.txt');
+  const flow = join(state, 'flow.sh');
+  writeFileSync(flow, flowFails ? '#!/bin/sh\nexit 1\n' : `#!/bin/sh\nprintf '%s\\n' "$1" >> '${rows}'\n`);
+  chmodSync(flow, 0o755);
+  const r = run('security-scan.sh', { CHECK_STATE_DIR: state, CHECK_SCAN_FIXTURES: fx, CHECK_SCAN_FLOW: flow });
+  return { ...r, rows: existsSync(rows) ? readFileSync(rows, 'utf8').trim().split('\n').filter(Boolean) : [] };
+}
+
+test('security-scan: a clean day is ok, names every part, and files no row; the first run records the upstream baseline', () => {
+  const r = scan(scanFixtures());
+  assert.equal(r.status, 0);
+  assert.match(r.line, LINE);
+  assert.match(r.line, /^CHECK security-scan ok · teamclaude gitleaks 0; forge-gateway gitleaks 0; npm audit 0 critical 0 high 0 moderate; litellm 1\.106\.9 OSV 0; upstream 2 commits not in the fork \(baseline recorded\); VM cccccc\S* v24\.22\.1 clean, on master; forge 2 containers on their pins; rows filed 0, at \d\d:\d\d · /, r.line);
+  assert.deepEqual(r.rows, []);
+});
+
+test('security-scan: a leak fails and becomes one row, never twice; values never reach the line', () => {
+  const leak = JSON.stringify([{ RuleID: 'generic-api-key', File: 'src/x.js', StartLine: 3, Commit: SHA('d'), Fingerprint: `${SHA('d')}:src/x.js:generic-api-key:3`, Secret: 'REDACTED', Match: 'k = REDACTED' }]);
+  const state = fresh();
+  const fx = scanFixtures({ 'gitleaks-teamclaude.json': leak });
+  const r = scan(fx, { state });
+  assert.match(r.line, /^CHECK security-scan fail · teamclaude gitleaks 1: generic-api-key src\/x\.js; /);
+  assert.equal(r.rows.length, 1);
+  assert.match(r.rows[0], /gitleaks found generic-api-key at src\/x\.js:3 \(ddddddd\) in teamclaude main history/);
+  assert.equal(scan(fx, { state }).rows.length, 1, 'the second run files nothing new');
+  assert.doesNotMatch(r.line, /REDACTED|k = /);
+});
+
+test('security-scan: npm audit high or critical fails, moderate warns, an audit that did not run warns', () => {
+  const audit = (sev) => JSON.stringify({ metadata: { vulnerabilities: { critical: 0, high: sev === 'high' ? 1 : 0, moderate: sev === 'moderate' ? 1 : 0 } }, vulnerabilities: { eslint: { severity: sev } } });
+  let r = scan(scanFixtures({ 'audit.json': audit('high') }));
+  assert.match(r.line, /^CHECK security-scan fail · .*npm audit 0 critical 1 high 0 moderate \(eslint\(high\)\)/);
+  assert.match(r.rows.join('\n'), /npm audit flags eslint\(high\)/);
+  r = scan(scanFixtures({ 'audit.json': audit('moderate') }));
+  assert.match(r.line, /^CHECK security-scan warn · .*1 moderate/);
+  r = scan(scanFixtures({ 'audit.json': '' }));
+  assert.match(r.line, /^CHECK security-scan warn · .*npm audit did not run/);
+});
+
+test('security-scan: an OSV advisory on the pinned LiteLLM warns, a HIGH one fails, each a row', () => {
+  let r = scan(scanFixtures({ 'osv.json': JSON.stringify({ vulns: [{ id: 'GHSA-aaaa-bbbb-cccc' }] }) }));
+  assert.match(r.line, /^CHECK security-scan warn · .*litellm 1\.106\.9 OSV GHSA-aaaa-bbbb-cccc; /);
+  assert.match(r.rows[0], /OSV GHSA-aaaa-bbbb-cccc affects LiteLLM 1\.106\.9/);
+  r = scan(scanFixtures({ 'osv.json': JSON.stringify({ vulns: [{ id: 'GHSA-1', database_specific: { severity: 'HIGH' } }] }) }));
+  assert.match(r.line, /^CHECK security-scan fail · .*OSV GHSA-1 \(high: GHSA-1\)/);
+  r = scan(scanFixtures({ 'osv.json': 'oops' }));
+  assert.match(r.line, /^CHECK security-scan warn · .*litellm 1\.106\.9 OSV did not answer/);
+  r = scan(scanFixtures({ 'compose.yaml': 'services: {}\n' }));
+  assert.match(r.line, /^CHECK security-scan warn · .*litellm version not found in compose/);
+});
+
+test('security-scan: a new upstream commit after the baseline warns and is one row, its subject made safe', () => {
+  const state = fresh();
+  scan(scanFixtures(), { state });
+  const r = scan(scanFixtures({ 'upstream.txt': `${SHA('3')}\n${SHA('1')}\n${SHA('2')}\n`, [`subject-${SHA('3')}`]: 'Bump \u001b[2Jdeps; rm -rf /\n' }), { state });
+  assert.match(r.line, /^CHECK security-scan warn · .*upstream 3 not in the fork, 1 new since the last run; /);
+  assert.equal(r.rows.length, 1);
+  assert.match(r.rows[0], /^security-scan: upstream teamclaude 333333333 "Bump \?\?2Jdeps\? rm -rf \/" is new: read its diff/);
+  assert.equal(scan(scanFixtures({ 'upstream.txt': `${SHA('3')}\n${SHA('1')}\n${SHA('2')}\n` }), { state }).line.includes('0 new'), true, 'seen once, it is not new again');
+});
+
+test('security-scan: an open PR that changes dependencies or brings upstream commits warns until it merges', () => {
+  const r = scan(scanFixtures({ 'prs-teamclaude.txt': '7\tpackage.json\n7\tsrc/a.js\n', 'prs-forge-gateway.txt': '9\tdeploy/compose.yaml\n', 'upstream-prs.txt': '11\n' }));
+  assert.match(r.line, /^CHECK security-scan warn · .*teamclaude dependency PRs open: #7; forge-gateway dependency PRs open: #9; teamclaude PR #11 brings upstream commits; /);
+  assert.equal(r.rows.length, 3);
+});
+
+test('security-scan: the VM running unmerged or tainted code fails; src newer than the running node warns', () => {
+  let r = scan(scanFixtures({ 'master-commits.txt': `${SHA('e')}\n` }));
+  assert.match(r.line, /^CHECK security-scan fail · .*VM cccccc\S* v24\.22\.1 NOT on master/);
+  assert.match(r.rows[0], /runs cccccc\S*, which is not on origin\/master/);
+  r = scan(scanFixtures({ 'vm.txt': `HEAD ${SHA('c')}\nDIRTY  M src/server.js\nDIRTY ?? src/evil.js\nNODE v24.22.1\n` }));
+  assert.match(r.line, /^CHECK security-scan fail · .*tainted: src\/server\.js src\/evil\.js/);
+  r = scan(scanFixtures({ 'vm.txt': `HEAD ${SHA('c')}\nNEWER src/quota-summary.js\nNODE v24.22.1\n` }));
+  assert.match(r.line, /^CHECK security-scan warn · .*src newer than the running node: src\/quota-summary\.js/);
+  r = scan(scanFixtures({ 'vm.txt': '' }));
+  assert.match(r.line, /^CHECK security-scan warn · .*VM checkout unreadable/);
+});
+
+test('security-scan: a forge container off its pinned digest fails', () => {
+  const r = scan(scanFixtures({ 'docker.txt': `/forge-litellm-1 ghcr.io/berriai/litellm-non_root@sha256:${PIN('f')}\n/forge-db-1 postgres@sha256:${PIN('b')}\n` }));
+  assert.match(r.line, /^CHECK security-scan fail · .*forge containers off their pins: forge-litellm-1=ffff/);
+  assert.match(r.rows[0], /run images not pinned in forge-gateway compose/);
+  assert.match(scan(scanFixtures({ 'docker.txt': '' })).line, /forge containers or pins unreadable/);
+});
+
+test('security-scan: a row that cannot be filed warns and is retried on the next run', () => {
+  const state = fresh();
+  const fx = scanFixtures({ 'osv.json': JSON.stringify({ vulns: [{ id: 'GHSA-x' }] }) });
+  const r = scan(fx, { state, flowFails: true });
+  assert.match(r.line, /^CHECK security-scan warn · .*1 rows could not be filed \(retried next run\)/);
+  assert.equal(scan(fx, { state }).rows.length, 1, 'filed on the retry');
 });

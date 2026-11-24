@@ -1,0 +1,11 @@
+[Unit]
+Description=CHECK security-scan: leaks, vulnerable or unread upstream code, and tainted running code for teamclaude and LiteLLM (teamclaude docs/CHECKS.md)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/libexec/teamclaude-checks/security-scan.sh
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+TimeoutStartSec=1200
+Nice=15
+IOSchedulingClass=idle

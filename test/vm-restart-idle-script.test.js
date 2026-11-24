@@ -143,7 +143,9 @@ async function restartRun(o) {
     .replace(/OLDGONE/g, `rm -rf ${d}/proc/4242`)
     .replaceAll('$D', d);
   // the quota server; with o.onRequest it first runs that fixture edit (e.g. a respawn while answering)
+  let hits = 0;   // requests that reached the quota route: each is a real request the proxy answered
   const server = createServer((req, res) => {
+    hits++;
     // the fixture edit is finished BEFORE the answer is sent (an unawaited edit raced the reply under
     // a loaded parallel suite: CI 2026-11-16, the respawn landed after the script had re-read the record)
     const edited = o.onRequest ? new Promise(r => spawn('sh', ['-c', expand(o.onRequest)]).on('exit', r)) : Promise.resolve();
@@ -167,7 +169,7 @@ async function restartRun(o) {
       let out = '', err = '';
       child.stdout.on('data', c => { out += c; });
       child.stderr.on('data', c => { err += c; });
-      child.on('exit', code => resolve({ code, out, err, dir: d }));
+      child.on('exit', code => resolve({ code, out, err, dir: d, hits }));
       child.stdin.end(remote);
     });
   } finally {
@@ -194,6 +196,34 @@ test('the 11-15 orphan: a new child recorded but the old one still alive and on 
   assert.equal(r.code, 3);
   assert.doesNotMatch(r.out, /restarted/);
   assert.match(r.err, /old child 4242:100 is STILL ALIVE.*:3456 listeners are \[4242\], not only the new child 5151/);
+});
+
+// Row 6ff2d7bb (CI 11-23 node 24, 11-24 node 20): under load the loop's last pass reached the lookup
+// with 0 s left, which fails at once, and the reason named "listener lookup failed" over the [4242]
+// every earlier pass had seen. Deterministic here: the lookup answers once, then always fails.
+const ONCE_THEN_FAIL = 'if [ -e $D/looked ]; then exit 1; fi; touch $D/looked; cat $D/listener';
+
+test('a lookup that fails on a later pass keeps the listener set it saw: the orphan is still named', async () => {
+  const r = await restartRun({ restart: `NEWCHILD(5151,200); echo '${ONCE_THEN_FAIL}' > $D/lcmd`, listenerCmd: 'sh $D/lcmd' });
+  assert.equal(r.code, 3);
+  assert.match(r.err, /old child 4242:100 is STILL ALIVE.*:3456 listeners are \[4242\], not only the new child 5151/);
+});
+
+test('an earlier listener set never stands in for a fresh one: no success, and it never opens the success branch', async () => {
+  const r = await restartRun({ restart: `OLDGONE; NEWCHILD(5151,200); LISTENER(5151); echo '${ONCE_THEN_FAIL}' > $D/lcmd`, listenerCmd: 'sh $D/lcmd' });
+  assert.equal(r.code, 3, r.out);
+  assert.doesNotMatch(r.out, /restarted/);
+  // Only the pass whose lookup succeeded asked the proxy; the kept set on later passes did not
+  // (xreview 7135725382 item 2: the branch needs a fresh lookup on this pass, then a fresh own2).
+  assert.equal(r.hits, 1, `quota requests: ${r.hits}`);
+});
+
+test('a later lookup that succeeds but finds no listener (genuinely gone) fails the restart and says so', async () => {
+  const onceThenEmpty = 'if [ -e $D/looked ]; then exit 0; fi; touch $D/looked; cat $D/listener';
+  const r = await restartRun({ restart: `OLDGONE; NEWCHILD(5151,200); LISTENER(5151); echo '${onceThenEmpty}' > $D/lcmd`, listenerCmd: 'sh $D/lcmd' });
+  assert.equal(r.code, 3, r.out);
+  assert.doesNotMatch(r.out, /restarted/);
+  assert.match(r.err, /:3456 listeners are \[\], not only the new child 5151/);
 });
 
 test('no child on record before, an orphan still serving :3456 → exit 3 (no success without a proof)', async () => {

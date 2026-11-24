@@ -158,18 +158,26 @@ left() { # whole seconds before the deadline, capped at $1
 # observations (nothing is probed after the deadline). Runs where set -e is suppressed: every step is
 # explicit.
 verify() {
-  old=$1; end=$(( $(date +%s) + VERIFY_WAIT )); new=""; own=""; answered=no; ostate=unknown
+  old=$1; end=$(( $(date +%s) + VERIFY_WAIT )); new=""; own=""; looked=no; answered=no; ostate=unknown
   [ "$old" = none ] && old=""
   while :; do
     [ "$(left 3)" -gt 0 ] || break
     ostate=$(old_state "$old"); new=$(child)
-    own=$(owners "$(left 3)") || own="? (listener lookup failed or timed out)"
-    if [ "$ostate" = gone ] && [ -n "$new" ] && [ "$new" != "$old" ] && [ "$own" = "${new%%:*}" ]; then
+    # The time left is read again here, after old_state and child spent some of it, and the lookup is
+    # skipped below its 1 s minimum: under load the last pass reached it with 0 s left, which fails at
+    # once (row 6ff2d7bb, xreview 7135725382). A skipped or failed lookup keeps the last set a lookup
+    # returned, for the reason only: it never erases the orphan seen before, and it never opens the
+    # success branch, which needs a lookup that succeeded on THIS pass (fresh) and then own2, a
+    # second fresh lookup after the proxy answered a real request.
+    fresh=no; lt=$(left 3)
+    if [ "$lt" -ge 1 ] && o=$(owners "$lt"); then own=$o; fresh=yes; looked=yes
+    elif [ "$looked" = no ]; then own="? (listener lookup failed or timed out)"; fi
+    if [ "$fresh" = yes ] && [ "$ostate" = gone ] && [ -n "$new" ] && [ "$new" != "$old" ] && [ "$own" = "${new%%:*}" ]; then
       t=$(left 5); [ "$t" -gt 0 ] || break
       if serving "$t"; then
         answered=yes
         [ "$(left 3)" -gt 0 ] || break
-        if [ "$(child)" = "$new" ] && own2=$(owners "$(left 3)") && [ "$own2" = "${new%%:*}" ] && [ "$(date +%s)" -le "$end" ]; then
+        if [ "$(child)" = "$new" ] && l2=$(left 3) && [ "$l2" -ge 1 ] && own2=$(owners "$l2") && [ "$own2" = "${new%%:*}" ] && [ "$(date +%s)" -le "$end" ]; then
           echo "restarted at 0 in-flight: old child ${old:-none on record} gone, new child $new alone on :3456 and serving"
           return 0
         fi

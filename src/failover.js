@@ -47,6 +47,11 @@ export function failoverPolicy(config) {
     // seat can serve they get a retryable 503 overloaded_error (Claude Code retries it) instead of
     // the 429 that reads as a usage limit.
     claudeOnly: Array.isArray(f?.claudeOnly) ? f.claudeOnly.filter((/** @type {unknown} */ c) => typeof c === 'string' && c) : [],
+    // The ONLY client-key names (or "(shared key)") a stand-in may answer (Sen 2026-11-24 round 1,
+    // row bce0ab3d). Default none: a client is a stand-in consumer only when named here, never
+    // because it does not look like an agent. 11-18..11-24 the stand-in answered 19 turns, every one
+    // to serialhub's lanes, where a tool-less turn is a no-op the lane cannot tell from work.
+    standInClients: Array.isArray(f?.standInClients) ? f.standInClients.filter((/** @type {unknown} */ c) => typeof c === 'string' && c) : [],
   };
 }
 
@@ -168,7 +173,7 @@ export class FailoverState {
  * Whether this request may fail over now, and if not, why (for the log).
  * @param {{ policy: ReturnType<typeof failoverPolicy>, state: FailoverState, method?: string, url?: string,
  *   provider?: string, pinned?: boolean, allQuota: boolean, unservableMs: number, bodyBytes: number,
- *   maxTokens?: number, contentEncoding?: string|null, client?: string|null }} a
+ *   maxTokens?: number, contentEncoding?: string|null, client?: string|null, userAgent?: string|null, claudeCodeSession?: string|string[]|null }} a
  * @returns {{ ok: true } | { ok: false, why: string }}
  */
 export function failoverEligibility(a) {
@@ -182,6 +187,13 @@ export function failoverEligibility(a) {
   const who = a.client || '(shared key)';
   if (policy.excludeClients?.includes(who)) return { ok: false, why: `client "${who}" is excluded from failover` };
   if (policy.claudeOnly?.includes(who)) return { ok: false, why: `client "${who}" is Claude-only` };
+  // An agent must never get a stand-in turn (Sen 2026-11-23 18:46, row bce0ab3d): it is tool-less,
+  // so the lane ends its turn on a no-op, not knowing. Eligibility is positive: the client's key is
+  // named in failover.standInClients. Everyone else gets the honest no-capacity answer, which
+  // quota_resume reads and resumes at the reset.
+  if (!policy.standInClients?.includes(who)) return { ok: false, why: `client "${who}" is not a stand-in consumer (failover.standInClients)` };
+  // Belt and braces for a named key: a request carrying a marker only Claude Code sends is refused.
+  if (isClaudeCode(a.userAgent, a.claudeCodeSession)) return { ok: false, why: 'a Claude Code agent (the tool-less stand-in would answer it with a no-op turn)' };
   if (a.contentEncoding && a.contentEncoding !== 'identity') return { ok: false, why: 'compressed body' };
   if (!a.allQuota && a.unservableMs < policy.afterSeconds * 1000) return { ok: false, why: `fleet unservable for ${Math.round(a.unservableMs / 1000)}s < ${policy.afterSeconds}s` };
   // Best effort, not a guarantee (see estimateInputTokens). A request that
@@ -191,6 +203,18 @@ export function failoverEligibility(a) {
   // estimate only when it cannot be asked), not here.
   if (a.state.inFlight >= policy.maxConcurrent) return { ok: false, why: `local model busy (${a.state.inFlight}/${policy.maxConcurrent})` };
   return { ok: true };
+}
+
+/**
+ * Whether a request carries a marker reserved to Claude Code (any entrypoint: cli, sdk-ts, ...):
+ * a user-agent `claude-cli/<version> (...)`, or an `x-claude-code-session-id` header PRESENT, with
+ * any value, empty included (xreview round 2). Either is enough. Not `x-app: cli`: that name is
+ * generic, and a non-Claude client may send it. This is the second line only; the first is
+ * failover.standInClients.
+ * @param {string|null|undefined} userAgent @param {string|string[]|null|undefined} claudeCodeSession
+ */
+export function isClaudeCode(userAgent, claudeCodeSession) {
+  return /^claude-cli\//i.test(String(userAgent || '')) || claudeCodeSession != null;
 }
 
 /**

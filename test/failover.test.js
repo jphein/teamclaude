@@ -120,7 +120,7 @@ async function setup({ failover = {}, exhausted = true, localStatus = 200, claud
   const port = await listen(proxy);
   return {
     am, localSeen, claudeHits, logs,
-    post: (body, session = null, key = 'k') => fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': key, ...(session ? { 'x-claude-code-session-id': session } : {}) }, body: JSON.stringify(body) }),
+    post: (body, session = null, key = 'k', headers = {}) => fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': key, ...(session ? { 'x-claude-code-session-id': session } : {}), ...headers }, body: JSON.stringify(body) }),
     state: () => proxy,
     status: () => fetch(`http://127.0.0.1:${port}/teamclaude/status`, { headers: { 'x-api-key': 'k' } }).then((r) => r.json()),
     signal: (key = 'k') => fetch(`http://127.0.0.1:${port}/teamclaude/failover`, { headers: key ? { 'x-api-key': key } : {} }),
@@ -447,6 +447,54 @@ test('an excluded client gets the honest no-capacity answer, never a stand-in', 
     assert.ok(t.logs.some((l) => /failover not used: client "familiar" is excluded/.test(l)), t.logs.join('\n'));
     const other = await t.post(MSG);
     assert.equal(other.status, 200, 'the shared key still gets the stand-in');
+  } finally { t.close(); }
+});
+
+// ── Claude Code never gets the stand-in (Sen 2026-11-23 18:46, row bce0ab3d) ──
+// The stand-in is tool-less, so a turn it answers for an agent harness does
+// nothing: the lane ends its turn on a no-op and sits there. A Claude Code
+// request gets the honest no-capacity answer instead, the one familiar's lanes
+// already get and quota_resume already resumes at the reset.
+
+const CLAUDE_CODE_UA = 'claude-cli/2.1.314 (external, cli)';
+
+test('eligibility refuses a Claude Code request by user-agent or x-app, whatever its client key', () => {
+  const policy = failoverPolicy({ failover: { enabled: true, url: 'http://x' } });
+  const base = { policy, state: { inFlight: 0 }, method: 'POST', url: '/v1/messages', allQuota: true, unservableMs: 0, bodyBytes: 10, client: 'serialhub' };
+  const why = 'a Claude Code agent (the tool-less stand-in would answer it with a no-op turn)';
+  assert.deepEqual(failoverEligibility({ ...base, userAgent: CLAUDE_CODE_UA }), { ok: false, why });
+  assert.deepEqual(failoverEligibility({ ...base, userAgent: 'Claude-CLI/3.0.0 (external, sdk-ts)' }), { ok: false, why }, 'case and entrypoint do not matter');
+  assert.deepEqual(failoverEligibility({ ...base, userAgent: 'node', app: 'cli' }), { ok: false, why }, 'x-app: cli alone is enough');
+  assert.equal(failoverEligibility({ ...base, userAgent: 'HomeAssistant/2026.11' }).ok, true, 'other clients keep the stand-in');
+  assert.equal(failoverEligibility({ ...base, userAgent: 'not-claude-cli/1.0' }).ok, true, 'anchored at the start');
+  assert.equal(failoverEligibility({ ...base }).ok, true, 'no user-agent is not an agent');
+});
+
+test('a Claude Code request with no seat to serve it gets the 429 quota_resume reads, never the stand-in', async () => {
+  const t = await setup({ proxyConf: { clientKeys: [{ name: 'serialhub', key: 'k-serialhub' }] } });
+  try {
+    const res = await t.post({ ...MSG, tools: [{ name: 'Bash', input_schema: { type: 'object' } }] }, null, 'k-serialhub', { 'user-agent': CLAUDE_CODE_UA });
+    const body = await res.json();
+    assert.equal(res.status, 429);
+    assert.ok(Number(res.headers.get('retry-after')) > 0, 'when to come back');
+    assert.equal(res.headers.get('x-teamclaude-failover'), null);
+    assert.equal(t.localSeen.length, 0, 'nothing was sent to the local model');
+    // dreamteam scripts/quota_resume.py ERR and RESET: the lane resumes itself at the reset.
+    assert.match(body.error.message, /all \d+ accounts? are at their quota/);
+    assert.match(body.error.message, /resets in \d/);
+    assert.ok(t.logs.some((l) => /failover not used: a Claude Code agent/.test(l)), t.logs.join('\n'));
+    const other = await t.post(MSG, null, 'k-serialhub');
+    assert.equal(other.status, 200, 'the same key without Claude Code still gets the stand-in');
+  } finally { t.close(); }
+});
+
+test('a Claude Code request on the long-429 path is not handed the stand-in either', async () => {
+  const t = await setup({ exhausted: false, claude429: true });
+  try {
+    const res = await t.post(MSG, null, 'k', { 'user-agent': CLAUDE_CODE_UA });
+    assert.equal(res.status, 429);
+    assert.equal(res.headers.get('x-teamclaude-failover'), null);
+    assert.equal(t.localSeen.length, 0);
   } finally { t.close(); }
 });
 

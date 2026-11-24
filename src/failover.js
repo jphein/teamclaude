@@ -168,7 +168,7 @@ export class FailoverState {
  * Whether this request may fail over now, and if not, why (for the log).
  * @param {{ policy: ReturnType<typeof failoverPolicy>, state: FailoverState, method?: string, url?: string,
  *   provider?: string, pinned?: boolean, allQuota: boolean, unservableMs: number, bodyBytes: number,
- *   maxTokens?: number, contentEncoding?: string|null, client?: string|null }} a
+ *   maxTokens?: number, contentEncoding?: string|null, client?: string|null, userAgent?: string|null, app?: string|null }} a
  * @returns {{ ok: true } | { ok: false, why: string }}
  */
 export function failoverEligibility(a) {
@@ -182,6 +182,10 @@ export function failoverEligibility(a) {
   const who = a.client || '(shared key)';
   if (policy.excludeClients?.includes(who)) return { ok: false, why: `client "${who}" is excluded from failover` };
   if (policy.claudeOnly?.includes(who)) return { ok: false, why: `client "${who}" is Claude-only` };
+  // An agent harness never gets the stand-in (Sen 2026-11-23 18:46, row bce0ab3d): the stand-in is
+  // tool-less, so the turn it answers does nothing and the lane sits on it, not knowing. Claude Code
+  // gets the honest no-capacity answer instead, which quota_resume reads and resumes at the reset.
+  if (isClaudeCode(a.userAgent, a.app)) return { ok: false, why: 'a Claude Code agent (the tool-less stand-in would answer it with a no-op turn)' };
   if (a.contentEncoding && a.contentEncoding !== 'identity') return { ok: false, why: 'compressed body' };
   if (!a.allQuota && a.unservableMs < policy.afterSeconds * 1000) return { ok: false, why: `fleet unservable for ${Math.round(a.unservableMs / 1000)}s < ${policy.afterSeconds}s` };
   // Best effort, not a guarantee (see estimateInputTokens). A request that
@@ -191,6 +195,15 @@ export function failoverEligibility(a) {
   // estimate only when it cannot be asked), not here.
   if (a.state.inFlight >= policy.maxConcurrent) return { ok: false, why: `local model busy (${a.state.inFlight}/${policy.maxConcurrent})` };
   return { ok: true };
+}
+
+/**
+ * Whether a request comes from Claude Code (any entrypoint: cli, sdk-ts, ...): its user-agent is
+ * `claude-cli/<version> (...)`, and it sends `x-app: cli`. Either is enough.
+ * @param {string|null|undefined} userAgent @param {string|null|undefined} app
+ */
+export function isClaudeCode(userAgent, app) {
+  return /^claude-cli\//i.test(String(userAgent || '')) || String(app || '').toLowerCase() === 'cli';
 }
 
 /**

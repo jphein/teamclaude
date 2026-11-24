@@ -3688,6 +3688,8 @@ async function maybeFailover(req, res, body, ctx, accountManager, { immediate })
     pinned: ctx.pinnedIndex != null, allQuota: allQuota || immediate, unservableMs, bodyBytes: body.length, maxTokens: Number(maxTokens) || 0,
     contentEncoding: /** @type {string|undefined} */ (req.headers['content-encoding']) ?? null,
     client: ctx.client ?? null,
+    userAgent: /** @type {string|undefined} */ (req.headers['user-agent']) ?? null,
+    app: /** @type {string|undefined} */ (req.headers['x-app']) ?? null,
   });
   if (!el.ok) {
     if (Date.now() - (ctx.failoverState.lastSkipLogAt || 0) > 30_000) {

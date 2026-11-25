@@ -1117,6 +1117,55 @@ test('forge-models: a disabled-row reason shaped like a credential is not printe
   assert.doesNotMatch(r.line, /sk-abc/);
 });
 
+// xreview #102 round 1 (comment 7148597394): every accounted entry printed; the collection boundary
+// tested from raw registry JSON; the reason's own rule.
+test('forge-models: every model unlisted on purpose is named with its reason, never "+N more" (eight here)', () => {
+  const ids = Array.from({ length: 8 }, (_, k) => `vendor/m${k}-fast`);
+  const i = fmIn({ nebius: ['zai-org/GLM-5.3', ...ids],
+    registry: [...fmIn().registry, ...ids.map((id, k) => ({ name: `nebius/m${k}`, provider: 'nebius', enabled: false, disabledReason: `no price for tier ${k}`, mode: 'chat', upstream: `nebius/${id}` }))] });
+  const r = fm(i);
+  assert.match(r.line, /^CHECK forge-models warn · /);
+  for (const [k, id] of ids.entries()) assert.ok(r.line.includes(`nebius:${id} (no price for tier ${k})`), `${id} missing: ${r.line}`);
+  assert.doesNotMatch(r.line, /more\b/);
+});
+
+test('forge-models: the collection boundary reads disabled_reason from the raw registry JSON (forge route show --json)', async () => {
+  const { registryRows, judge } = await import(join(C, 'forge-models.mjs'));
+  const raw = { ok: true, models: [
+    ...fmIn().registry.map(({ name, provider, enabled, mode, upstream }) => ({ name, provider, enabled, mode, upstream, host: 'ubox0', billing_class: 'credit' })),
+    { name: 'nebius/dsv4-fast', provider: 'nebius', enabled: false, upstream: 'nebius/deepseek-ai/DeepSeek-V4.1-Flash-1017-fast', disabled_reason: '  no price for the -fast tier  ' },
+    { name: 'nebius/odd', provider: 'nebius', enabled: false, upstream: 'nebius/x/odd', disabled_reason: 7 },
+    { name: 'nebius/none', provider: 'nebius', enabled: false, upstream: 'nebius/x/none' },
+  ] };
+  const rows = registryRows(0, raw);
+  assert.deepEqual(rows.slice(-3).map((m) => [m.name, m.enabled, m.disabledReason]),
+    [['nebius/dsv4-fast', false, 'no price for the -fast tier'], ['nebius/odd', false, ''], ['nebius/none', false, '']], 'trimmed; a non-string or missing reason is none');
+  assert.equal(registryRows(1, raw), null, 'a failed command is unreadable');
+  assert.equal(registryRows(0, { ...raw, ok: false }), null);
+  assert.equal(registryRows(0, { ok: true }), null);
+  // and through judge(): the raw field decides the verdict
+  const v = judge(FM_CFG, fmIn({ nebius: ['zai-org/GLM-5.3', 'deepseek-ai/DeepSeek-V4.1-Flash-1017-fast', 'x/odd'], registry: rows }), FM_NOW);
+  assert.equal(v.state, 'fail', 'x/odd has no usable reason: still unlisted');
+  assert.deepEqual(v.accounted, ['nebius:deepseek-ai/DeepSeek-V4.1-Flash-1017-fast (no price for the -fast tier)']);
+  assert.deepEqual(v.unlisted, ['nebius:x/odd']);
+});
+
+test('forge-models: a reason passes only as a plain sentence; URLs and key shapes print "reason not shown"', async () => {
+  const { safeReason } = await import(join(C, 'forge-models.mjs'));
+  for (const ok of ['no price for the -fast tier', 'no-price-for-the-fast-tier-yet', 'preview, no SLA (until 2026-12)', 'deepseek-ai/DeepSeek-V4.1-Flash-1017-fast is too costly'])
+    assert.equal(safeReason(ok), ok, ok);
+  for (const bad of [
+    'see https://example.com/pricing',              // a URL
+    'token 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b', // 32+ hex (letters and digits)
+    'pin 12345678901234567890123456789012',            // 32+ hex of digits only: the hex rule alone sees it
+    'blob dGhpcyBpcyBhIHNlY3JldCBrZXkgMTIzNDU2',       // base64 run with letters and digits
+    'old key sk-abcdef123456 revoked',               // sk- prefix
+    'aws AKIAIOSFODNN7EXAMPLE',                       // AKIA
+    'x'.repeat(121),                                  // over the 120 cap
+    'quote "this"', 'semi;colon', 'new\nline', '',     // outside the charset, or empty
+  ]) assert.equal(safeReason(bad), 'reason not shown', JSON.stringify(bad));
+});
+
 test('forge-models: a duplicate Foundry deployment of a listed model is covered, not unlisted', () => {
   const r = fm(fmIn());
   assert.doesNotMatch(r.line, /gpt-5\.4-pro-1/);

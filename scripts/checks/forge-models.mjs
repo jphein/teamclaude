@@ -50,10 +50,23 @@ export function safeId(s) {
   return /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$/.test(v) && !/[A-Za-z0-9+]{20,}/.test(v) && !/(bearer|sk-|key|token|secret|password)/i.test(v) ? v : '(unrecognized id)';
 }
 
-// a registry row's disabled_reason for the line: written by people, so held to the vault-name rules
+// A registry row's disabled_reason for the line (xreview #102 round 1: its own rule, not safeName's).
+// Written by people, so only a plain sentence passes: the vault-name charset, at most 120 characters,
+// no URL ("://"), and no key shape: a known key prefix (sk-, pk-, AKIA, ghp_ ...), a run of 32+ hex
+// digits, or a base64-like run of 24+ characters. Anything else prints "reason not shown".
+const REASON_CHARS = /^[A-Za-z0-9 ._:()\/@,'-]{1,120}$/;
+const REASON_KEY_SHAPES = [
+  /:\/\//,
+  /(^|[^A-Za-z0-9])(sk|pk|rk|nvapi|gsk|hf|r8|fal|xai|ghp|gho|ghs|glpat|xox[abpr])[-_][A-Za-z0-9]{6,}/i,
+  /AKIA[0-9A-Z]{12,}/,
+  /[0-9a-fA-F]{32,}/,
+];
+// base64 / base64url: a 24+ run of its alphabet holding both letters and digits (a plain hyphenated
+// phrase such as "no-price-for-the-fast-tier" has no digits and is not a blob)
+const base64Run = (v) => (v.match(/[A-Za-z0-9+\/=_-]{24,}/g) || []).some((r) => /[0-9]/.test(r) && /[A-Za-z]/.test(r));
 export function safeReason(s) {
-  const v = safeName(s);
-  return v === '(unrecognized name)' ? 'reason not shown' : v;
+  const v = String(s ?? '').trim();
+  return REASON_CHARS.test(v) && !REASON_KEY_SHAPES.some((rx) => rx.test(v)) && !base64Run(v) ? v : 'reason not shown';
 }
 
 // a vault item name for the line and the page: names are written by people, so only plain ones pass
@@ -200,6 +213,18 @@ function seatCount() {   // forge-check's request counter at the proxy (null whe
 }
 
 // ---------- reads (each returns null when its source can't be read)
+/**
+ * The gateway registry as `forge route show --json` printed it, normalized for judge(), or null when
+ * unreadable. Pure, so the collection boundary (the raw `disabled_reason` field) is tested directly
+ * (xreview #102 round 1).
+ * @param {number|null} status the command's exit status @param {any} reg its parsed stdout
+ */
+export function registryRows(status, reg) {
+  if (status !== 0 || !reg?.ok || !Array.isArray(reg.models)) return null;
+  return reg.models.map((/** @type {any} */ m) => ({ name: String(m.name), provider: String(m.provider), enabled: !!m.enabled, mode: m.mode || 'chat',
+    upstream: String(m.upstream || ''), disabledReason: typeof m.disabled_reason === 'string' ? m.disabled_reason.trim() : '' }));
+}
+
 export async function collect() {
   const inp = {};
   // 1. Foundry deployments FIRST (r1.1): what each deployment serves decides whether it may be probed
@@ -234,7 +259,7 @@ export async function collect() {
   // 2. the gateway registry, then one probe per enabled model (a Foundry route only when safe, above)
   const show = run('forge', ['route', 'show', '--json'], { timeout: 60_000 });
   const reg = json(show.stdout);
-  inp.registry = show.status === 0 && reg?.ok && Array.isArray(reg.models) ? reg.models.map((m) => ({ name: String(m.name), provider: String(m.provider), enabled: !!m.enabled, mode: m.mode || 'chat', upstream: String(m.upstream || ''), disabledReason: String(m.disabled_reason ?? '').trim() })) : null;
+  inp.registry = registryRows(show.status, reg);
   inp.gatewayProbes = {};
   for (const m of (inp.registry || []).filter((x) => x.enabled)) {
     if (m.provider === 'azure' && !safeAzure.has(m.upstream)) { inp.gatewayProbes[m.name] = { ok: false, error: 'not probed: deployment unverified' }; continue; }
@@ -582,7 +607,9 @@ export function judge(cfg, inp, nowMs) {
   if (vendors.length) fact += `; ${vendors.length} vendor keys (${vendors.filter((v) => v.probe).length} probed)`;
   fact += unreachable.length ? `; didn't answer: ${few(unreachable)}` : unread.length || asleep.length ? '; none of the models probed failed' : '; every listed model answered';
   if (unlisted.length) fact += `; reachable but unlisted: ${few(unlisted)}`;
-  if (accounted.length) fact += `; unlisted on purpose: ${few(accounted)}`;
+  // Every one, never "+N more": each entry is a standing decision, and its id and reason must stay in
+  // sight (xreview #102 round 1).
+  if (accounted.length) fact += `; unlisted on purpose: ${accounted.join(', ')}`;
   if (drift.length) fact += `; deployment drift: ${few(drift)}`;
   if (asleep.length) fact += `; asleep: ${asleep.join(', ')}`;
   if (unread.length) fact += `; not read: ${few(unread)}`;

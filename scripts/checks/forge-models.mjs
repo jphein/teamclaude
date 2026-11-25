@@ -50,27 +50,16 @@ export function safeId(s) {
   return /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$/.test(v) && !/[A-Za-z0-9+]{20,}/.test(v) && !/(bearer|sk-|key|token|secret|password)/i.test(v) ? v : '(unrecognized id)';
 }
 
-// A registry row's disabled_reason for the line. An ALLOWLIST of what a reason looks like (xreview
-// #102 round 2, comment 7148792741: a denylist of secret shapes always has a next bypass). Anything
-// that does not look like a plain sentence prints "reason not shown":
-//   * letters, digits, spaces and , . ( ) - _ only, 1 to 120 characters (so no / : ? = @: no URL, no
-//     host path, no query, no email, no base64 padding);
-//   * no whitespace-separated token over 20 characters that mixes letters and digits;
-//   * no key prefix (sk- pk- ghp_ xoxb- AKIA eyJ), whatever follows it;
-//   * none of password, passwd, secret, token, key, bearer followed by another token.
-// Stricter still, kept from safeName (security review of 4bd7ce7): no 16+ word between separators
-// that mixes letters and digits, no 24+ alphanumeric run (which covers a 32+ hex run).
-const REASON_CHARS = /^[A-Za-z0-9 ,.()_-]{1,120}$/;
-const REASON_PREFIX = /(^|[^A-Za-z0-9])(sk-|pk-|ghp_|xoxb-|AKIA|eyJ)/i;
-const REASON_SECRET_WORD = /(^|[^A-Za-z0-9])(password|passwd|secret|token|key|bearer)\s+\S/i;
-const mixesLettersDigits = (/** @type {string} */ w) => /[0-9]/.test(w) && /[A-Za-z]/.test(w);
-export function safeReason(s) {
-  const v = String(s ?? '').trim();
-  const plain = REASON_CHARS.test(v) && !REASON_PREFIX.test(v) && !REASON_SECRET_WORD.test(v)
-    && !v.split(/\s+/).some((t) => t.length > 20 && mixesLettersDigits(t))
-    && !v.split(/[ ,.()_-]+/).some((w) => w.length >= 16 && mixesLettersDigits(w))
-    && !/[A-Za-z0-9]{24,}/.test(v);   // (a 32+ hex run is one of these, so it needs no rule of its own)
-  return plain ? v : 'reason not shown';
+// A registry row's disabled_reason is a CODE from this fixed vocabulary, compared exactly (the lead's
+// ruling on #102, comment 7149024330). The CHECK line prints no free text from the registry, so there is
+// no sanitizer to get wrong: it prints the model id and the code, and anything outside the vocabulary
+// prints "reason not shown" while still accounting for the model. A human note, if wanted, goes in a
+// field this check never reads.
+export const REASON_CODES = Object.freeze(['no-published-price', 'upstream-deprecated', 'cost', 'quality', 'duplicate', 'policy', 'other']);
+const REASON_CODE_SET = new Set(REASON_CODES);
+/** @param {unknown} s @returns {string} the code itself, or "reason not shown" */
+export function reasonCode(s) {
+  return typeof s === 'string' && REASON_CODE_SET.has(s) ? s : 'reason not shown';
 }
 
 // a vault item name for the line and the page: names are written by people, so only plain ones pass
@@ -515,7 +504,7 @@ export function judge(cfg, inp, nowMs) {
     if (upstreams.has(upstream)) return true;
     const why = disabledWhy.get(upstream);
     if (why == null) return false;
-    accounted.push(`${label} (${safeReason(why)})`);
+    accounted.push(`${label} (${reasonCode(why)})`);
     return true;
   };
   const asleepStems = new Set();

@@ -1084,18 +1084,20 @@ test('forge-models: a reachable model that is not listed fails, named by source'
   assert.match(r.line, /^CHECK forge-models fail · .*reachable but unlisted: claude:claude-opus-6, foundry:gpt-7 \(gpt-7\), nebius:zai-org\/GLM-6, unit:whisper-large, katana:llama4:8b/);
 });
 
-// Row 1d742c98 (ubox0-93 2026-11-24 12:0x, Sen's wording "state on the row why they stay unlisted, and the
-// check line turns ok or warn with that reason"): a registry row enabled:false with a disabled_reason
-// accounts for its upstream; warn, not ok, so it stays in sight. No reason: still unlisted (fail).
-test('forge-models: a disabled registry row with a reason accounts for its upstream: warn, the reason quoted', () => {
+// Row 1d742c98 (ubox0-93 2026-11-24 12:0x; the lead's ruling on #102, comment 7149024330): a registry row
+// enabled:false with a disabled_reason accounts for its upstream; warn, not ok, so it stays in sight. The
+// reason is a CODE from a fixed vocabulary, compared exactly; the line prints the model id and the code,
+// and anything else prints "reason not shown". No free text from the registry ever reaches the line.
+// No reason at all: still unlisted (fail).
+test('forge-models: a disabled registry row with a reason code accounts for its upstream: warn, the code printed', () => {
   const i = fmIn({ nebius: ['zai-org/GLM-5.3', 'deepseek-ai/DeepSeek-V4.1-Flash-1017-fast'],
     foundry: [...fmIn().foundry, { id: 'gpt-7', model: 'gpt-7', status: 'succeeded' }],
     registry: [...fmIn().registry,
-      { name: 'nebius/deepseek-v4.1-flash-fast', provider: 'nebius', enabled: false, disabledReason: 'Nebius gives no price for the -fast tier', mode: 'chat', upstream: 'nebius/deepseek-ai/DeepSeek-V4.1-Flash-1017-fast' },
-      { name: 'foundry/gpt-7', provider: 'azure', enabled: false, disabledReason: 'preview, no SLA', mode: 'chat', upstream: 'azure/gpt-7' }] });
+      { name: 'nebius/deepseek-v4.1-flash-fast', provider: 'nebius', enabled: false, disabledReason: 'no-published-price', mode: 'chat', upstream: 'nebius/deepseek-ai/DeepSeek-V4.1-Flash-1017-fast' },
+      { name: 'foundry/gpt-7', provider: 'azure', enabled: false, disabledReason: 'policy', mode: 'chat', upstream: 'azure/gpt-7' }] });
   const r = fm(i);
   assert.match(r.line, /^CHECK forge-models warn · 12 listed \(4 gateway, /, 'a disabled row is not counted as listed');
-  assert.match(r.line, /; unlisted on purpose: foundry:gpt-7 \(preview, no SLA\), nebius:deepseek-ai\/DeepSeek-V4\.1-Flash-1017-fast \(Nebius gives no price for the -fast tier\)/);
+  assert.match(r.line, /; unlisted on purpose: foundry:gpt-7 \(policy\), nebius:deepseek-ai\/DeepSeek-V4\.1-Flash-1017-fast \(no-published-price\)/);
   assert.doesNotMatch(r.line, /reachable but unlisted/);
 });
 
@@ -1109,37 +1111,43 @@ test('forge-models: a disabled row with no reason (or a blank one) still leaves 
   }
 });
 
-test('forge-models: a disabled-row reason shaped like a credential is not printed', () => {
-  const i = fmIn({ nebius: ['zai-org/GLM-5.3', 'x/m-fast'],
-    registry: [...fmIn().registry, { name: 'nebius/m-fast', provider: 'nebius', enabled: false, disabledReason: 'key sk-abcdefghijklmnop1234 revoked', mode: 'chat', upstream: 'nebius/x/m-fast' }] });
-  const r = fm(i);
-  assert.match(r.line, /unlisted on purpose: nebius:x\/m-fast \(reason not shown\)/);
-  assert.doesNotMatch(r.line, /sk-abc/);
+test('forge-models: a reason outside the vocabulary still accounts for the model and prints "reason not shown", never its text', () => {
+  for (const reason of ['key sk-abcdefghijklmnop1234 revoked', 'see https://example.com/pricing', 'password(hunter2)', 'Nebius gives no price for the -fast tier']) {
+    const i = fmIn({ nebius: ['zai-org/GLM-5.3', 'x/mq'],
+      registry: [...fmIn().registry, { name: 'nebius/mq', provider: 'nebius', enabled: false, disabledReason: reason, mode: 'chat', upstream: 'nebius/x/mq' }] });
+    const r = fm(i);
+    assert.match(r.line, /^CHECK forge-models warn · .*unlisted on purpose: nebius:x\/mq \(reason not shown\)/, reason);
+    for (const piece of reason.split(/[\s()]+/).filter((p) => p.length > 3)) assert.ok(!r.line.includes(piece), `"${piece}" leaked: ${r.line}`);
+  }
 });
 
 // xreview #102 round 1 (comment 7148597394): every accounted entry printed; the collection boundary
-// tested from raw registry JSON; the reason's own rule.
-test('forge-models: every model unlisted on purpose is named with its reason, never "+N more" (eight here)', () => {
+// tested from raw registry JSON.
+test('forge-models: every model unlisted on purpose is named with its code, never "+N more" (eight here)', () => {
   const ids = Array.from({ length: 8 }, (_, k) => `vendor/m${k}-fast`);
+  const codes = ['no-published-price', 'upstream-deprecated', 'cost', 'quality', 'duplicate', 'policy', 'other', 'not-a-code'];
   const i = fmIn({ nebius: ['zai-org/GLM-5.3', ...ids],
-    registry: [...fmIn().registry, ...ids.map((id, k) => ({ name: `nebius/m${k}`, provider: 'nebius', enabled: false, disabledReason: `no price for tier ${k}`, mode: 'chat', upstream: `nebius/${id}` }))] });
+    registry: [...fmIn().registry, ...ids.map((id, k) => ({ name: `nebius/m${k}`, provider: 'nebius', enabled: false, disabledReason: codes[k], mode: 'chat', upstream: `nebius/${id}` }))] });
   const r = fm(i);
   assert.match(r.line, /^CHECK forge-models warn · /);
-  for (const [k, id] of ids.entries()) assert.ok(r.line.includes(`nebius:${id} (no price for tier ${k})`), `${id} missing: ${r.line}`);
-  assert.doesNotMatch(r.line, /more\b/);
+  for (const [k, id] of ids.entries()) {
+    const shown = k < 7 ? codes[k] : 'reason not shown';
+    assert.ok(r.line.includes(`nebius:${id} (${shown})`), `${id} missing: ${r.line}`);
+  }
+  assert.doesNotMatch(r.line, /more\b|not-a-code/);
 });
 
 test('forge-models: the collection boundary reads disabled_reason from the raw registry JSON (forge route show --json)', async () => {
   const { registryRows, judge } = await import(join(C, 'forge-models.mjs'));
   const raw = { ok: true, models: [
     ...fmIn().registry.map(({ name, provider, enabled, mode, upstream }) => ({ name, provider, enabled, mode, upstream, host: 'ubox0', billing_class: 'credit' })),
-    { name: 'nebius/dsv4-fast', provider: 'nebius', enabled: false, upstream: 'nebius/deepseek-ai/DeepSeek-V4.1-Flash-1017-fast', disabled_reason: '  no price for the -fast tier  ' },
+    { name: 'nebius/dsv4-fast', provider: 'nebius', enabled: false, upstream: 'nebius/deepseek-ai/DeepSeek-V4.1-Flash-1017-fast', disabled_reason: '  no-published-price  ' },
     { name: 'nebius/odd', provider: 'nebius', enabled: false, upstream: 'nebius/x/odd', disabled_reason: 7 },
     { name: 'nebius/none', provider: 'nebius', enabled: false, upstream: 'nebius/x/none' },
   ] };
   const rows = registryRows(0, raw);
   assert.deepEqual(rows.slice(-3).map((m) => [m.name, m.enabled, m.disabledReason]),
-    [['nebius/dsv4-fast', false, 'no price for the -fast tier'], ['nebius/odd', false, ''], ['nebius/none', false, '']], 'trimmed; a non-string or missing reason is none');
+    [['nebius/dsv4-fast', false, 'no-published-price'], ['nebius/odd', false, ''], ['nebius/none', false, '']], 'trimmed; a non-string or missing reason is none');
   assert.equal(registryRows(1, raw), null, 'a failed command is unreadable');
   assert.equal(registryRows(0, { ...raw, ok: false }), null);
   assert.equal(registryRows(0, { ok: true }), null);
@@ -1148,38 +1156,23 @@ test('forge-models: the collection boundary reads disabled_reason from the raw r
     assert.equal(registryRows(0, { ok: true, models: bad }), null, JSON.stringify(bad).slice(0, 60));
   // and through judge(): the raw field decides the verdict
   const v = judge(FM_CFG, fmIn({ nebius: ['zai-org/GLM-5.3', 'deepseek-ai/DeepSeek-V4.1-Flash-1017-fast', 'x/odd'], registry: rows }), FM_NOW);
-  assert.equal(v.state, 'fail', 'x/odd has no usable reason: still unlisted');
-  assert.deepEqual(v.accounted, ['nebius:deepseek-ai/DeepSeek-V4.1-Flash-1017-fast (no price for the -fast tier)']);
+  assert.equal(v.state, 'fail', 'x/odd has no reason: still unlisted');
+  assert.deepEqual(v.accounted, ['nebius:deepseek-ai/DeepSeek-V4.1-Flash-1017-fast (no-published-price)']);
   assert.deepEqual(v.unlisted, ['nebius:x/odd']);
 });
 
-test('forge-models: a reason passes only as a plain sentence; URLs and key shapes print "reason not shown"', async () => {
-  const { safeReason } = await import(join(C, 'forge-models.mjs'));
-  for (const ok of ['no price for the -fast tier', 'no-price-for-the-fast-tier-yet', 'preview, no SLA (until 2026-12)', 'DeepSeek V4.1 Flash is too costly', 'rotate the key'])
-    assert.equal(safeReason(ok), ok, ok);
-  for (const bad of [
-    'see https://example.com/pricing',              // a URL
-    'token 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b', // 32+ hex (letters and digits)
-    'pin 12345678901234567890123456789012',            // 32+ hex of digits only: the hex rule alone sees it
-    'blob dGhpcyBpcyBhIHNlY3JldCBrZXkgMTIzNDU2',       // base64 run with letters and digits
-    'old key sk-abcdef123456 revoked',               // sk- prefix
-    'aws AKIAIOSFODNN7EXAMPLE',                       // AKIA
-    'x'.repeat(121),                                  // over the 120 cap
-    // safeName's shapes, kept (security review of 4bd7ce7)
-    'browser key AIzaSyA1b2c3d4e5f6',                 // AIza prefix
-    'word abcd1234efgh5678 here',                     // a 16+ word mixing letters and digits
-    'run abcdefghijklmnopqrstuvwxyz',                 // a 24+ alphanumeric run, letters only
-    'quote "this"', 'semi;colon', 'new\nline', '',     // outside the charset, or empty
-    // round 2's bypasses of the denylist (comment 7148792741), refused by the allowlist
-    'see example.com/path',                           // a host path with no scheme
-    'priced at api.nebius.ai/pricing soon',           // a scheme-less host with a dot and a slash
-    'old sk-abc12 revoked',                           // a key prefix with only five characters after it
-    'password hunter2',                               // a secret word followed by another token
-    'jwt eyJhbGciOi.eyJzdWIi.c2ln',                    // a JWT whose parts sit under every length threshold
-    'mail ops@example.com', 'q a=1', 'why? no',        // @ = ? are not reason characters
-    'id ab12-cd34-ef56-gh78-ij90',                     // a 24-char token mixing letters and digits whose pieces are all short:
-                                                       // only the over-20 token rule sees it
-  ]) assert.equal(safeReason(bad), 'reason not shown', JSON.stringify(bad));
+test('forge-models: reasonCode prints each code in the vocabulary exactly, and "reason not shown" for anything else', async () => {
+  const { reasonCode, REASON_CODES } = await import(join(C, 'forge-models.mjs'));
+  assert.deepEqual([...REASON_CODES], ['no-published-price', 'upstream-deprecated', 'cost', 'quality', 'duplicate', 'policy', 'other']);
+  for (const code of REASON_CODES) assert.equal(reasonCode(code), code, code);
+  for (const other of [
+    'cheap',                                          // an unknown code
+    'Cost', 'cost ', ' policy', 'no published price',  // exact: case, spacing and spelling count
+    'key sk-abcdef123456',                            // credential-shaped
+    'https://example.com/pricing', 'example.com/path', // a URL, a scheme-less host path
+    'password(hunter2)', 'key-abc123', 'ab12-cd34-ef56-gh78', // round 3's allowlist bypasses
+    '', '   ', null, undefined, 7, ['cost'], { cost: 1 }, // empty, or not a string
+  ]) assert.equal(reasonCode(other), 'reason not shown', JSON.stringify(other));
 });
 
 test('forge-models: a duplicate Foundry deployment of a listed model is covered, not unlisted', () => {

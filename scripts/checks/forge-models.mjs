@@ -50,6 +50,18 @@ export function safeId(s) {
   return /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$/.test(v) && !/[A-Za-z0-9+]{20,}/.test(v) && !/(bearer|sk-|key|token|secret|password)/i.test(v) ? v : '(unrecognized id)';
 }
 
+// A registry row's disabled_reason is a CODE from this fixed vocabulary, compared exactly (the lead's
+// ruling on #102, comment 7149024330). The CHECK line prints no free text from the registry, so there is
+// no sanitizer to get wrong: it prints the model id and the code, and anything outside the vocabulary
+// prints "reason not shown" while still accounting for the model. A human note, if wanted, goes in a
+// field this check never reads.
+export const REASON_CODES = Object.freeze(['no-published-price', 'upstream-deprecated', 'cost', 'quality', 'duplicate', 'policy', 'other']);
+const REASON_CODE_SET = new Set(REASON_CODES);
+/** @param {unknown} s @returns {string} the code itself, or "reason not shown" */
+export function reasonCode(s) {
+  return typeof s === 'string' && REASON_CODE_SET.has(s) ? s : 'reason not shown';
+}
+
 // a vault item name for the line and the page: names are written by people, so only plain ones pass
 // (r1.5) Not a guarantee against a secret typed into a name, but a credential's usual shapes are refused: a long
 // run, a known key prefix, or a 16+ character word mixing letters and digits.
@@ -194,6 +206,21 @@ function seatCount() {   // forge-check's request counter at the proxy (null whe
 }
 
 // ---------- reads (each returns null when its source can't be read)
+/**
+ * The gateway registry as `forge route show --json` printed it, normalized for judge(), or null when
+ * unreadable. Pure, so the collection boundary (the raw `disabled_reason` field) is tested directly
+ * (xreview #102 round 1).
+ * @param {number|null} status the command's exit status @param {any} reg its parsed stdout
+ */
+export function registryRows(status, reg) {
+  if (status !== 0 || !reg?.ok || !Array.isArray(reg.models)) return null;
+  // Every row an object with a string name before any property is read; one malformed row makes the
+  // whole registry unreadable (null), never a partial list (xreview #102 round 2).
+  if (!reg.models.every((/** @type {any} */ m) => m !== null && typeof m === 'object' && !Array.isArray(m) && typeof m.name === 'string')) return null;
+  return reg.models.map((/** @type {any} */ m) => ({ name: String(m.name), provider: String(m.provider), enabled: !!m.enabled, mode: m.mode || 'chat',
+    upstream: String(m.upstream || ''), disabledReason: typeof m.disabled_reason === 'string' ? m.disabled_reason.trim() : '' }));
+}
+
 export async function collect() {
   const inp = {};
   // 1. Foundry deployments FIRST (r1.1): what each deployment serves decides whether it may be probed
@@ -228,7 +255,7 @@ export async function collect() {
   // 2. the gateway registry, then one probe per enabled model (a Foundry route only when safe, above)
   const show = run('forge', ['route', 'show', '--json'], { timeout: 60_000 });
   const reg = json(show.stdout);
-  inp.registry = show.status === 0 && reg?.ok && Array.isArray(reg.models) ? reg.models.map((m) => ({ name: String(m.name), provider: String(m.provider), enabled: !!m.enabled, mode: m.mode || 'chat', upstream: String(m.upstream || '') })) : null;
+  inp.registry = registryRows(show.status, reg);
   inp.gatewayProbes = {};
   for (const m of (inp.registry || []).filter((x) => x.enabled)) {
     if (m.provider === 'azure' && !safeAzure.has(m.upstream)) { inp.gatewayProbes[m.name] = { ok: false, error: 'not probed: deployment unverified' }; continue; }
@@ -466,6 +493,20 @@ export function judge(cfg, inp, nowMs) {
   if (!reg) unread.push('gateway registry');
   const enabled = (reg || []).filter((m) => m.enabled);
   const upstreams = new Set(enabled.map((m) => m.upstream).filter(Boolean));
+  // A registry row enabled:false with a disabled_reason states why its upstream stays unlisted (row
+  // 1d742c98, ubox0-93 2026-11-24): it is accounted for, the line warns and quotes the reason. A
+  // disabled row with no reason accounts for nothing: its upstream stays unlisted (fail).
+  const disabledWhy = new Map((reg || []).filter((m) => !m.enabled && m.upstream && String(m.disabledReason ?? '').trim())
+    .map((m) => [m.upstream, String(m.disabledReason).trim()]));
+  const accounted = [];
+  /** @param {string} upstream @param {string} label @returns {boolean} the upstream is listed or accounted for */
+  const coveredOrAccounted = (upstream, label) => {
+    if (upstreams.has(upstream)) return true;
+    const why = disabledWhy.get(upstream);
+    if (why == null) return false;
+    accounted.push(`${label} (${reasonCode(why)})`);
+    return true;
+  };
   const asleepStems = new Set();
   for (const [stem, gw] of Object.entries(cfg.feedStems)) {
     const f = inp.feed?.[stem];
@@ -509,7 +550,7 @@ export function judge(cfg, inp, nowMs) {
       if (CLAUDE_RE.test(`${d.id} ${d.model}`)) { if (!mine.includes(d.id)) blocked.foundry_claude++; continue; }
       if (thirdParty.has(d.model)) { if (!mine.includes(d.id)) blocked.foundry_third_party++; continue; }
       if (mine.includes(d.id)) continue;   // judged below
-      if (!listedModels.has(d.model)) unlisted.push(`foundry:${safeId(d.id)} (${safeId(d.model)})`);
+      if (!listedModels.has(d.model) && !coveredOrAccounted(`azure/${d.id}`, `foundry:${safeId(d.id)}`)) unlisted.push(`foundry:${safeId(d.id)} (${safeId(d.model)})`);
     }
     for (const id of mine) {
       const d = fd.get(id);
@@ -519,7 +560,7 @@ export function judge(cfg, inp, nowMs) {
     }
   }
   if (!inp.nebius) unread.push('Nebius catalog (vault locked?)');
-  else for (const id of new Set(inp.nebius)) if (!upstreams.has(`nebius/${id}`)) unlisted.push(`nebius:${safeId(id)}`);
+  else for (const id of new Set(inp.nebius)) if (!coveredOrAccounted(`nebius/${id}`, `nebius:${safeId(id)}`)) unlisted.push(`nebius:${safeId(id)}`);
   if (!inp.speech) unread.push('Azure Speech (vault locked?)');
   else for (const s of cfg.speech) if (!inp.speech[s.id]?.ok) unreachable.push(`${s.id} (${/^(http [0-9]{1,3}|no audio to transcribe|bad answer)$/.test(inp.speech[s.id]?.error || '') ? inp.speech[s.id].error : 'no answer'})`);
   if (!inp.units) unread.push('running units');
@@ -556,12 +597,15 @@ export function judge(cfg, inp, nowMs) {
 
   const nGateway = enabled.length, nFeed = Object.values(cfg.feedStems).filter((g) => !g).length;
   const nDirect = cfg.claude.length + cfg.speech.length + cfg.foundryDirect.length + cfg.local.length;
-  const state = unlisted.length || unreachable.length || drift.length ? 'fail' : unread.length || asleep.length ? 'warn' : 'ok';
+  const state = unlisted.length || unreachable.length || drift.length ? 'fail' : unread.length || asleep.length || accounted.length ? 'warn' : 'ok';
   const few = (a) => a.slice(0, 6).join(', ') + (a.length > 6 ? ` +${a.length - 6} more` : '');
   let fact = `${nGateway + nFeed + nDirect} listed (${nGateway} gateway, ${nFeed} host-feed voices, ${nDirect} direct)`;
   if (vendors.length) fact += `; ${vendors.length} vendor keys (${vendors.filter((v) => v.probe).length} probed)`;
   fact += unreachable.length ? `; didn't answer: ${few(unreachable)}` : unread.length || asleep.length ? '; none of the models probed failed' : '; every listed model answered';
   if (unlisted.length) fact += `; reachable but unlisted: ${few(unlisted)}`;
+  // Every one, never "+N more": each entry is a standing decision, and its id and reason must stay in
+  // sight (xreview #102 round 1).
+  if (accounted.length) fact += `; unlisted on purpose: ${accounted.join(', ')}`;
   if (drift.length) fact += `; deployment drift: ${few(drift)}`;
   if (asleep.length) fact += `; asleep: ${asleep.join(', ')}`;
   if (unread.length) fact += `; not read: ${few(unread)}`;
@@ -592,7 +636,7 @@ export function judge(cfg, inp, nowMs) {
           : /^(http [0-9]{1,3}|bad answer)$/.test(fp?.error || '') ? fp.error : 'not probed', f.kind === 'image' ? 'one low-quality image' : 'one short spoken answer'); }),
     ...cfg.local.map((l) => row({ name: l.id, label: l.label, route: 'local', kind: l.kind, host: l.host, tier: 'local', policy: 'local' }, localOk[l.kind], 'no answer', l.health ? 'health endpoint' : 'wyoming describe')),
   ];
-  return { state, fact, unlisted, unreachable, drift, unread, asleep, blocked,
+  return { state, fact, unlisted, accounted, unreachable, drift, unread, asleep, blocked,
     direct: { schema: 'forge.direct/v1', ts: at, poller: 'teamclaude-check-forge-models', models: rows, blocked,
       ...(vendors.length || aiRx ? { vendorsWithoutKey: (cfg.vendorsWithoutKey || []).map((x) => ({ vendor: safeName(x.vendor), status: String(x.status ?? '').slice(0, 120) })),
         vaultAccounted: [...Object.entries(scan.accountedNames || {}).map(([why, names]) => ({ why, names: names.map(safeName) })),

@@ -459,6 +459,9 @@
       "\\(DEAD key": "retired key"
     },
     "accountedNames": {
+      "a teamclaude client key, not an AI vendor (matches the \"claude\" pattern; ubox0-93 2026-11-24)": [
+        "needle-teamclaude-katana-client-2026-11-17"
+      ],
       "web login, no API key": [
         "anthropic.skilljar.com",
         "app.coqui.ai",

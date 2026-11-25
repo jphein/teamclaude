@@ -1084,6 +1084,39 @@ test('forge-models: a reachable model that is not listed fails, named by source'
   assert.match(r.line, /^CHECK forge-models fail · .*reachable but unlisted: claude:claude-opus-6, foundry:gpt-7 \(gpt-7\), nebius:zai-org\/GLM-6, unit:whisper-large, katana:llama4:8b/);
 });
 
+// Row 1d742c98 (ubox0-93 2026-11-24 12:0x, Sen's wording "state on the row why they stay unlisted, and the
+// check line turns ok or warn with that reason"): a registry row enabled:false with a disabled_reason
+// accounts for its upstream; warn, not ok, so it stays in sight. No reason: still unlisted (fail).
+test('forge-models: a disabled registry row with a reason accounts for its upstream: warn, the reason quoted', () => {
+  const i = fmIn({ nebius: ['zai-org/GLM-5.3', 'deepseek-ai/DeepSeek-V4.1-Flash-1017-fast'],
+    foundry: [...fmIn().foundry, { id: 'gpt-7', model: 'gpt-7', status: 'succeeded' }],
+    registry: [...fmIn().registry,
+      { name: 'nebius/deepseek-v4.1-flash-fast', provider: 'nebius', enabled: false, disabledReason: 'Nebius gives no price for the -fast tier', mode: 'chat', upstream: 'nebius/deepseek-ai/DeepSeek-V4.1-Flash-1017-fast' },
+      { name: 'foundry/gpt-7', provider: 'azure', enabled: false, disabledReason: 'preview, no SLA', mode: 'chat', upstream: 'azure/gpt-7' }] });
+  const r = fm(i);
+  assert.match(r.line, /^CHECK forge-models warn · 12 listed \(4 gateway, /, 'a disabled row is not counted as listed');
+  assert.match(r.line, /; unlisted on purpose: foundry:gpt-7 \(preview, no SLA\), nebius:deepseek-ai\/DeepSeek-V4\.1-Flash-1017-fast \(Nebius gives no price for the -fast tier\)/);
+  assert.doesNotMatch(r.line, /reachable but unlisted/);
+});
+
+test('forge-models: a disabled row with no reason (or a blank one) still leaves its upstream unlisted: fail', () => {
+  for (const disabledReason of [undefined, '', '   ']) {
+    const i = fmIn({ nebius: ['zai-org/GLM-5.3', 'deepseek-ai/DeepSeek-V4.1-Flash-1017-fast'],
+      registry: [...fmIn().registry, { name: 'nebius/deepseek-v4.1-flash-fast', provider: 'nebius', enabled: false, disabledReason, mode: 'chat', upstream: 'nebius/deepseek-ai/DeepSeek-V4.1-Flash-1017-fast' }] });
+    const r = fm(i);
+    assert.match(r.line, /^CHECK forge-models fail · .*reachable but unlisted: nebius:deepseek-ai\/DeepSeek-V4\.1-Flash-1017-fast/, JSON.stringify(disabledReason));
+    assert.doesNotMatch(r.line, /unlisted on purpose/);
+  }
+});
+
+test('forge-models: a disabled-row reason shaped like a credential is not printed', () => {
+  const i = fmIn({ nebius: ['zai-org/GLM-5.3', 'x/m-fast'],
+    registry: [...fmIn().registry, { name: 'nebius/m-fast', provider: 'nebius', enabled: false, disabledReason: 'key sk-abcdefghijklmnop1234 revoked', mode: 'chat', upstream: 'nebius/x/m-fast' }] });
+  const r = fm(i);
+  assert.match(r.line, /unlisted on purpose: nebius:x\/m-fast \(reason not shown\)/);
+  assert.doesNotMatch(r.line, /sk-abc/);
+});
+
 test('forge-models: a duplicate Foundry deployment of a listed model is covered, not unlisted', () => {
   const r = fm(fmIn());
   assert.doesNotMatch(r.line, /gpt-5\.4-pro-1/);

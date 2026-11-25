@@ -64,11 +64,11 @@ Each night it reads what is listed and what is reachable, and probes every liste
 
 **States:**
 - **fail:** a reachable model is unlisted; a listed one did not answer, or left the seat catalog; deployment drift.
-- **warn:** a source could not be read (each is named); a desktop host is asleep. Katana's failed probe is then not counted as dead.
+- **warn:** a source could not be read (each is named); a desktop host is asleep. Katana's failed probe is then not counted as dead. Also warn: a model unlisted on purpose. That is a gateway registry row with `enabled: false` and a non-empty `disabled_reason`, which accounts for its upstream (a Nebius id or a Foundry deployment). The line names it with its reason (`unlisted on purpose: nebius:<id> (<reason>)`); a reason shaped like a credential is shown as `reason not shown`. A disabled row with no reason accounts for nothing (fail). Added 2026-11-24 (row 1d742c98): Nebius publishes no price for its `-fast` tier, so it cannot get an enabled row.
 - **ok:** every listed model answered, and nothing reachable is unlisted.
 
 **When it fails on an unlisted model:**
-- A gateway-capable cloud model goes in forge-gateway's `registry/models.yaml` plus the code allowlist (`azureModes` or `nebiusModes`), through that repo's gate.
+- A gateway-capable cloud model goes in forge-gateway's `registry/models.yaml` plus the code allowlist (`azureModes` or `nebiusModes`), through that repo's gate. If it must stay off, add it there with `enabled: false` and a `disabled_reason`: the line turns warn and names the reason.
 - Anything else is a row in `scripts/checks/forge-direct.json` here.
 
 **The page:** `data/forge/direct.json` (`forge.direct/v1`, 0640, temp file then rename) carries each direct row with its result from last night. Vendor rows come first (`route: "vendor"`, with `provider`, `modality`, `tier`, `policy` and `vault`, the item name, never its value), then `vendorsWithoutKey` and `vaultAccounted`. The plan lane renders it on Hearth › Forge.

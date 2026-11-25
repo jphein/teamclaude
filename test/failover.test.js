@@ -81,7 +81,7 @@ test('prepareForClaude: removes unsigned thinking; turns thinking off when the l
 
 // ── through the real proxy ───────────────────────────────────────────────
 async function setup({ failover = {}, exhausted = true, localStatus = 200, claudeHits = [], claude429 = false, localMode = 'ok', redirectTo = 'http://127.0.0.1:9/v1/messages', tokenizeCount = null, claudeRetryAfter = '3600', claudeBurst = false, proxyConf = {}, hooks = {}, accounts = null, claude429Count = Infinity, configExtra = {} } = {}) {
-  const localSeen = [];
+  const localSeen = []; const strays = [];
   const local = http.createServer((req, res) => {
     let raw = ''; req.on('data', (c) => { raw += c; }); req.on('end', () => {
       if (req.url === '/tokenize') { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ tokens: new Array(tokenizeCount ?? Math.ceil(raw.length / 4)).fill(1) })); return; }
@@ -102,7 +102,20 @@ async function setup({ failover = {}, exhausted = true, localStatus = 200, claud
   });
   const claude = http.createServer((req, res) => {
     let raw = ''; req.on('data', (c) => { raw += c; }); req.on('end', () => {
-      claudeHits.push(JSON.parse(raw));
+      // Row aab52078: a body-less request reached this server once under load (#102 gate, familiar at
+      // load 12) and JSON.parse threw an uncaught exception, failing whichever test was running. Not
+      // reproduced in 6 traced runs. A request that is not a JSON message is recorded, named on stderr
+      // (so the next gate log says what it was), answered 400, and never counted as a Claude hit.
+      let msg;
+      try { msg = JSON.parse(raw); } catch { msg = undefined; }
+      if (!msg || typeof msg !== 'object') {
+        strays.push(`${req.method} ${req.url}`);
+        process.stderr.write(`[failover.test] fake Claude got a non-JSON ${req.method} ${req.url} (${raw.length} bytes); answered 400\n`);
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end('{"type":"error","error":{"type":"invalid_request_error","message":"not a JSON message"}}');
+        return;
+      }
+      claudeHits.push(msg);
       if (claude429 && claudeHits.length <= claude429Count) { res.writeHead(429, { 'content-type': 'application/json', 'retry-after': claudeRetryAfter, ...(claudeBurst ? { 'anthropic-ratelimit-requests-remaining': '0' } : { 'anthropic-ratelimit-unified-status': 'rejected' }) }); res.end('{"type":"error","error":{"type":"rate_limit_error","message":"out"}}'); return; }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ id: 'c1', type: 'message', role: 'assistant', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'claude' }], usage: { input_tokens: 1, output_tokens: 1 } }));
@@ -121,7 +134,7 @@ async function setup({ failover = {}, exhausted = true, localStatus = 200, claud
   const proxy = createProxyServer(am, config, typeof hooks === 'function' ? hooks(am) : hooks);
   const port = await listen(proxy);
   return {
-    am, localSeen, claudeHits, logs,
+    am, localSeen, claudeHits, logs, strays, claudePort: cp,
     post: (body, session = null, key = 'k', headers = {}) => fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': key, ...(session ? { 'x-claude-code-session-id': session } : {}), ...headers }, body: JSON.stringify(body) }),
     state: () => proxy,
     status: () => fetch(`http://127.0.0.1:${port}/teamclaude/status`, { headers: { 'x-api-key': 'k' } }).then((r) => r.json()),
@@ -138,6 +151,18 @@ const SSE_EVENTS = [
   ['message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 } }],
   ['message_stop', { type: 'message_stop' }],
 ];
+
+test('harness: a body-less or non-JSON request at the fake Claude server is recorded and answered 400, never thrown', async () => {
+  const t = await setup();
+  try {
+    const empty = await fetch(`http://127.0.0.1:${t.claudePort}/api/oauth/usage`);
+    assert.equal(empty.status, 400);
+    const text = await fetch(`http://127.0.0.1:${t.claudePort}/v1/messages`, { method: 'POST', body: 'not json' });
+    assert.equal(text.status, 400);
+    assert.deepEqual(t.strays, ['GET /api/oauth/usage', 'POST /v1/messages']);
+    assert.equal(t.claudeHits.length, 0, 'a stray is never counted as a Claude hit');
+  } finally { t.close(); }
+});
 
 test('every account out of quota: served by the local model at once, tagged and counted', async () => {
   const t = await setup({ failover: { apiKey: 'lk' } });

@@ -1143,6 +1143,9 @@ test('forge-models: the collection boundary reads disabled_reason from the raw r
   assert.equal(registryRows(1, raw), null, 'a failed command is unreadable');
   assert.equal(registryRows(0, { ...raw, ok: false }), null);
   assert.equal(registryRows(0, { ok: true }), null);
+  // a malformed row makes the whole registry unreadable, before any property is read (xreview #102 round 2)
+  for (const bad of [[null], [{}], [{ name: 7 }], ['nebius/x'], [[]], [...raw.models, null]])
+    assert.equal(registryRows(0, { ok: true, models: bad }), null, JSON.stringify(bad).slice(0, 60));
   // and through judge(): the raw field decides the verdict
   const v = judge(FM_CFG, fmIn({ nebius: ['zai-org/GLM-5.3', 'deepseek-ai/DeepSeek-V4.1-Flash-1017-fast', 'x/odd'], registry: rows }), FM_NOW);
   assert.equal(v.state, 'fail', 'x/odd has no usable reason: still unlisted');
@@ -1152,7 +1155,7 @@ test('forge-models: the collection boundary reads disabled_reason from the raw r
 
 test('forge-models: a reason passes only as a plain sentence; URLs and key shapes print "reason not shown"', async () => {
   const { safeReason } = await import(join(C, 'forge-models.mjs'));
-  for (const ok of ['no price for the -fast tier', 'no-price-for-the-fast-tier-yet', 'preview, no SLA (until 2026-12)', 'deepseek-ai/DeepSeek-V4.1-Flash-1017-fast is too costly'])
+  for (const ok of ['no price for the -fast tier', 'no-price-for-the-fast-tier-yet', 'preview, no SLA (until 2026-12)', 'DeepSeek V4.1 Flash is too costly', 'rotate the key'])
     assert.equal(safeReason(ok), ok, ok);
   for (const bad of [
     'see https://example.com/pricing',              // a URL
@@ -1162,7 +1165,20 @@ test('forge-models: a reason passes only as a plain sentence; URLs and key shape
     'old key sk-abcdef123456 revoked',               // sk- prefix
     'aws AKIAIOSFODNN7EXAMPLE',                       // AKIA
     'x'.repeat(121),                                  // over the 120 cap
+    // safeName's shapes, kept (security review of 4bd7ce7)
+    'browser key AIzaSyA1b2c3d4e5f6',                 // AIza prefix
+    'word abcd1234efgh5678 here',                     // a 16+ word mixing letters and digits
+    'run abcdefghijklmnopqrstuvwxyz',                 // a 24+ alphanumeric run, letters only
     'quote "this"', 'semi;colon', 'new\nline', '',     // outside the charset, or empty
+    // round 2's bypasses of the denylist (comment 7148792741), refused by the allowlist
+    'see example.com/path',                           // a host path with no scheme
+    'priced at api.nebius.ai/pricing soon',           // a scheme-less host with a dot and a slash
+    'old sk-abc12 revoked',                           // a key prefix with only five characters after it
+    'password hunter2',                               // a secret word followed by another token
+    'jwt eyJhbGciOi.eyJzdWIi.c2ln',                    // a JWT whose parts sit under every length threshold
+    'mail ops@example.com', 'q a=1', 'why? no',        // @ = ? are not reason characters
+    'id ab12-cd34-ef56-gh78-ij90',                     // a 24-char token mixing letters and digits whose pieces are all short:
+                                                       // only the over-20 token rule sees it
   ]) assert.equal(safeReason(bad), 'reason not shown', JSON.stringify(bad));
 });
 

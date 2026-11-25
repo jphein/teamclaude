@@ -50,23 +50,27 @@ export function safeId(s) {
   return /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$/.test(v) && !/[A-Za-z0-9+]{20,}/.test(v) && !/(bearer|sk-|key|token|secret|password)/i.test(v) ? v : '(unrecognized id)';
 }
 
-// A registry row's disabled_reason for the line (xreview #102 round 1: its own rule, not safeName's).
-// Written by people, so only a plain sentence passes: the vault-name charset, at most 120 characters,
-// no URL ("://"), and no key shape: a known key prefix (sk-, pk-, AKIA, ghp_ ...), a run of 32+ hex
-// digits, or a base64-like run of 24+ characters. Anything else prints "reason not shown".
-const REASON_CHARS = /^[A-Za-z0-9 ._:()\/@,'-]{1,120}$/;
-const REASON_KEY_SHAPES = [
-  /:\/\//,
-  /(^|[^A-Za-z0-9])(sk|pk|rk|nvapi|gsk|hf|r8|fal|xai|ghp|gho|ghs|glpat|xox[abpr])[-_][A-Za-z0-9]{6,}/i,
-  /AKIA[0-9A-Z]{12,}/,
-  /[0-9a-fA-F]{32,}/,
-];
-// base64 / base64url: a 24+ run of its alphabet holding both letters and digits (a plain hyphenated
-// phrase such as "no-price-for-the-fast-tier" has no digits and is not a blob)
-const base64Run = (v) => (v.match(/[A-Za-z0-9+\/=_-]{24,}/g) || []).some((r) => /[0-9]/.test(r) && /[A-Za-z]/.test(r));
+// A registry row's disabled_reason for the line. An ALLOWLIST of what a reason looks like (xreview
+// #102 round 2, comment 7148792741: a denylist of secret shapes always has a next bypass). Anything
+// that does not look like a plain sentence prints "reason not shown":
+//   * letters, digits, spaces and , . ( ) - _ only, 1 to 120 characters (so no / : ? = @: no URL, no
+//     host path, no query, no email, no base64 padding);
+//   * no whitespace-separated token over 20 characters that mixes letters and digits;
+//   * no key prefix (sk- pk- ghp_ xoxb- AKIA eyJ), whatever follows it;
+//   * none of password, passwd, secret, token, key, bearer followed by another token.
+// Stricter still, kept from safeName (security review of 4bd7ce7): no 16+ word between separators
+// that mixes letters and digits, no 24+ alphanumeric run (which covers a 32+ hex run).
+const REASON_CHARS = /^[A-Za-z0-9 ,.()_-]{1,120}$/;
+const REASON_PREFIX = /(^|[^A-Za-z0-9])(sk-|pk-|ghp_|xoxb-|AKIA|eyJ)/i;
+const REASON_SECRET_WORD = /(^|[^A-Za-z0-9])(password|passwd|secret|token|key|bearer)\s+\S/i;
+const mixesLettersDigits = (/** @type {string} */ w) => /[0-9]/.test(w) && /[A-Za-z]/.test(w);
 export function safeReason(s) {
   const v = String(s ?? '').trim();
-  return REASON_CHARS.test(v) && !REASON_KEY_SHAPES.some((rx) => rx.test(v)) && !base64Run(v) ? v : 'reason not shown';
+  const plain = REASON_CHARS.test(v) && !REASON_PREFIX.test(v) && !REASON_SECRET_WORD.test(v)
+    && !v.split(/\s+/).some((t) => t.length > 20 && mixesLettersDigits(t))
+    && !v.split(/[ ,.()_-]+/).some((w) => w.length >= 16 && mixesLettersDigits(w))
+    && !/[A-Za-z0-9]{24,}/.test(v);   // (a 32+ hex run is one of these, so it needs no rule of its own)
+  return plain ? v : 'reason not shown';
 }
 
 // a vault item name for the line and the page: names are written by people, so only plain ones pass
@@ -221,6 +225,9 @@ function seatCount() {   // forge-check's request counter at the proxy (null whe
  */
 export function registryRows(status, reg) {
   if (status !== 0 || !reg?.ok || !Array.isArray(reg.models)) return null;
+  // Every row an object with a string name before any property is read; one malformed row makes the
+  // whole registry unreadable (null), never a partial list (xreview #102 round 2).
+  if (!reg.models.every((/** @type {any} */ m) => m !== null && typeof m === 'object' && !Array.isArray(m) && typeof m.name === 'string')) return null;
   return reg.models.map((/** @type {any} */ m) => ({ name: String(m.name), provider: String(m.provider), enabled: !!m.enabled, mode: m.mode || 'chat',
     upstream: String(m.upstream || ''), disabledReason: typeof m.disabled_reason === 'string' ? m.disabled_reason.trim() : '' }));
 }

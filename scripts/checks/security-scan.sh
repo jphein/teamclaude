@@ -166,21 +166,28 @@ fi
 # ONE row for every commit new on a run, not one each (Sen 2026-11-26 11:2x: eleven rows from one burst were
 # noise on the ledger). The row names each new SHA (12 hex), oldest first; when they do not all fit in one Flow
 # line (300 characters) it names as many as fit and the state file that lists every full SHA.
-ROW_MAX=300
-upstream_row() { # <count> <full SHAs, oldest first, one per line>
-  local n=$1 shas=$2 lead list="" text k=0 s file tail
+# The bound is checked on the complete final text, suffix included (xreview #105 round 1, point 2). The list file
+# is written to a temp in the same directory and renamed into place, so the path a row names is never a
+# truncated file; when the file cannot be written, or not even "+N more" fits, there is no row and the
+# burst stays new (round 1, point 1). CHECK_SCAN_ROW_MAX is for tests only.
+ROW_MAX=${CHECK_SCAN_ROW_MAX:-300}
+upstream_row() { # <count> <full SHAs, oldest first, one per line>; prints the row, or returns 1 with no row
+  local n=$1 shas=$2 lead short text k file tmp
   if [ "$n" = 1 ]; then lead="security-scan: 1 new upstream teamclaude commit: read it with git show before any sync into the fork (its text is outside input):"
   else lead="security-scan: $n new upstream teamclaude commits: read each with git show before any sync into the fork (their text is outside input), oldest first:"; fi
-  text="$lead $(cut -c1-12 <<<"$shas" | paste -sd' ')"
-  if [ "${#text}" -le "$ROW_MAX" ]; then printf '%s' "$text"; return; fi
-  file="$DIR/$NAME.upstream-$(sed -n 1p <<<"$shas" | cut -c1-12).txt"
-  printf '%s\n' "$shas" > "$file"
-  for s in $shas; do
-    tail=" +$((n - k - 1)) more; all $n in $file"
-    [ $(( ${#lead} + ${#list} + 13 + ${#tail} )) -le "$ROW_MAX" ] || break
-    list+=" ${s:0:12}"; k=$((k + 1))
+  short=$(cut -c1-12 <<<"$shas")
+  text="$lead $(paste -sd' ' <<<"$short")"
+  if [ "${#text}" -le "$ROW_MAX" ]; then printf '%s' "$text"; return 0; fi
+  file="$DIR/$NAME.upstream-$(sed -n 1p <<<"$short").txt"
+  # the most SHAs whose COMPLETE row, "+N more; all n in <file>" included, is within the bound
+  for ((k = n - 1; k >= 0; k--)); do
+    text="$lead$( [ "$k" -gt 0 ] && head -n "$k" <<<"$short" | sed 's/^/ /' | tr -d '\n') +$((n - k)) more; all $n in $file"
+    [ "${#text}" -le "$ROW_MAX" ] && break
   done
-  printf '%s' "$lead$list +$((n - k)) more; all $n in $file"
+  [ "${#text}" -le "$ROW_MAX" ] || return 1
+  tmp=$(mktemp "$DIR/.$NAME.upstream.XXXXXX") || return 1
+  if printf '%s\n' "$shas" > "$tmp" && mv -fT "$tmp" "$file"; then printf '%s' "$text"; return 0; fi
+  rm -f "$tmp"; return 1
 }
 up=$(probe upstream.txt git -C "$TC" rev-list origin/master..upstream/master 2>/dev/null); uprc=$?
 base="$DIR/$NAME.upstream-seen"
@@ -196,7 +203,8 @@ else
       bump warn; facts+=("upstream $total not in the fork, $nnew new since the last run")
       # rev-list is newest first; the row lists them oldest first, the order to read them in
       oldest_first=$(tac <<<"$new")
-      find_ "upstream:$(paste -sd, <<<"$oldest_first")" "$(upstream_row "$nnew" "$oldest_first")"
+      if row=$(upstream_row "$nnew" "$oldest_first"); then find_ "upstream:$(paste -sd, <<<"$oldest_first")" "$row"
+      else facts+=("upstream: the row for the $nnew new commits could not be built (its SHA list was not written, or it does not fit a Flow line); no row, they stay new"); fi
     else facts+=("upstream $total not in the fork, 0 new"); fi
   fi
 fi

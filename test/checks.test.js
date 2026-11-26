@@ -4,7 +4,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync, execFile, spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, chmodSync, mkdirSync, rmSync, utimesSync, copyFileSync, existsSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, chmodSync, mkdirSync, rmSync, utimesSync, copyFileSync, existsSync, symlinkSync, readdirSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join, dirname } from 'node:path';
 import { tmpdir, hostname, userInfo } from 'node:os';
@@ -2017,6 +2017,62 @@ test('security-scan: a burst too long for one Flow line names what fits and the 
   assert.equal(m[3], file);
   assert.deepEqual(readFileSync(file, 'utf8').trim().split('\n'), oldestFirst, 'the file lists all thirty, full SHAs');
   assert.match(scan(scanFixtures({ 'upstream.txt': `${burst.join('\n')}\n${SHA('1')}\n${SHA('2')}\n` }), { repo, state }).line, /upstream 32 not in the fork, 0 new/);
+});
+
+// xreview #105 round 1 (comment 7201447616), point 3: the bound at its edge. A list that fits exactly is the
+// plain row; one character less takes the overflow path, and that row is within the bound with its suffix.
+const BURST_LEAD = (n) => `security-scan: ${n} new upstream teamclaude commits: read each with git show before any sync into the fork (their text is outside input), oldest first:`;
+const burstOf = () => ['a', 'b', 'c'].map(SHA);   // newest first, as rev-list prints them
+const burstFx = () => scanFixtures({ 'upstream.txt': `${burstOf().join('\n')}\n${SHA('1')}\n${SHA('2')}\n` });
+const upRows = (r) => r.rows.filter((x) => x.includes('upstream teamclaude'));
+function baselined() { const repo = scanRepo(); const state = fresh(); scan(scanFixtures(), { repo, state }); return { repo, state }; }
+const exact = `${BURST_LEAD(3)} ${SHA('c').slice(0, 12)} ${SHA('b').slice(0, 12)} ${SHA('a').slice(0, 12)}`;
+
+test('security-scan: a burst row that fits the bound exactly lists every SHA and writes no file', () => {
+  const { repo, state } = baselined();
+  const r = scan(burstFx(), { repo, state, env: { CHECK_SCAN_ROW_MAX: String(exact.length) } });
+  assert.deepEqual(upRows(r), [exact]);
+  assert.ok(!readdirSync(state).some((f) => f.startsWith('security-scan.upstream-')), readdirSync(state).join(' '));
+});
+
+test('security-scan: one character over takes the overflow path: the COMPLETE row, suffix included, is within the bound, and the file holds every SHA', () => {
+  const { repo, state } = baselined();
+  const max = exact.length - 1;
+  const r = scan(burstFx(), { repo, state, env: { CHECK_SCAN_ROW_MAX: String(max) } });
+  const [row] = upRows(r);
+  const file = join(state, `security-scan.upstream-${SHA('c').slice(0, 12)}.txt`);
+  assert.ok(row && row.length <= max, `${row?.length} > ${max}: ${row}`);
+  assert.match(row, new RegExp(`^${BURST_LEAD(3).replace(/[()]/g, '\\$&')}(?: [0-9a-f]{12})* \\+[1-3] more; all 3 in ${file.replace(/[.]/g, '\\.')}$`));
+  assert.deepEqual(readFileSync(file, 'utf8').trim().split('\n'), [SHA('c'), SHA('b'), SHA('a')]);
+  assert.ok(!readdirSync(state).some((f) => f.startsWith('.security-scan.upstream.')), 'no temp file left behind');
+});
+
+test('security-scan: an overflow burst whose order fails stays new, and the next run files its one row', () => {
+  const { repo, state } = baselined();
+  const env = { CHECK_SCAN_ROW_MAX: String(exact.length - 1) };
+  let r = scan(burstFx(), { repo, state, env, flowFails: true });
+  assert.match(r.line, /upstream 5 not in the fork, 3 new since the last run; .*1 rows could not be filed/, r.line);
+  r = scan(burstFx(), { repo, state, env });
+  assert.match(r.line, /3 new since the last run; .*rows filed 1,/, r.line);
+  assert.equal(upRows(r).length, 1);
+  assert.match(scan(burstFx(), { repo, state, env }).line, /upstream 5 not in the fork, 0 new/);
+});
+
+test('security-scan: when the SHA list cannot be written (or not even "+N more" fits) there is no row and the burst stays new', () => {
+  const { repo, state } = baselined();
+  const env = { CHECK_SCAN_ROW_MAX: String(exact.length - 1) };
+  const file = join(state, `security-scan.upstream-${SHA('c').slice(0, 12)}.txt`);
+  mkdirSync(file);   // the rename onto the list's path fails
+  let r = scan(burstFx(), { repo, state, env });
+  assert.match(r.line, /^CHECK security-scan warn · .*3 new since the last run; upstream: the row for the 3 new commits could not be built .*no row, they stay new/, r.line);
+  assert.deepEqual(upRows(r), []);
+  assert.ok(!readdirSync(state).some((f) => f.startsWith('.security-scan.upstream.')), 'the temp file is removed');
+  r = scan(burstFx(), { repo, state, env: { CHECK_SCAN_ROW_MAX: '100' } });   // shorter than the lead itself
+  assert.match(r.line, /could not be built/, r.line);
+  assert.deepEqual(upRows(r), []);
+  rmSync(file, { recursive: true });
+  r = scan(burstFx(), { repo, state, env });
+  assert.equal(upRows(r).length, 1, 'the burst was never lost');
 });
 
 test('security-scan: open PRs that change dependencies, are truncated, bring upstream in, or cannot be read warn, each with a row', () => {

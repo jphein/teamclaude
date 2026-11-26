@@ -175,7 +175,7 @@ Each night it reads what is listed and what is reachable, and probes every liste
 
 **warn:**
 - a moderate npm advisory;
-- an upstream commit that is new since the baseline. The first baseline is written at the end of a run, and only if every probe saw and every row was filed (123 commits on 2026-11-24). A commit joins the baseline only after its row is filed. The row gives the SHA only, never the commit's own text;
+- an upstream commit that is new since the baseline. The first baseline is written at the end of a run, and only if every probe saw and every row was filed (123 commits on 2026-11-24). All the commits new on one run share ONE row, which lists their SHAs (12 hex, oldest first) and never a commit's own text. When they don't all fit in one Flow line (300 characters), the row names as many as fit and the state file `security-scan.upstream-<first sha>.txt`, which lists every full SHA. The commits join the baseline only after that row is filed;
 - an open PR that:
   - changes `package*.json`, `deploy/compose.yaml`, `go.mod` or `go.sum`;
   - has more files or commits than the API lists;

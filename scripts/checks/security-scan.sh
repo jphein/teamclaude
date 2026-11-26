@@ -14,9 +14,9 @@
 #   osv       OSV advisories for the LiteLLM version pinned in forge-gateway's compose (`# vX.Y.Z` on the image
 #             line). ANY advisory fails (no severity mapping can under-classify it; the row says which);
 #             unreachable, non-zero or malformed: fail.
-#   upstream  KarpelesLab/teamclaude commits not in the fork that are new since the baseline: warn, one row
-#             each, the SHA only (a commit's own text is outside input and never enters a work order). A commit
-#             joins the baseline only once its row is filed.
+#   upstream  KarpelesLab/teamclaude commits not in the fork that are new since the baseline: warn, ONE row per
+#             run listing the new SHAs, oldest first (a commit's own text is outside input and never enters a
+#             work order). The commits join the baseline only once that row is filed.
 #   PRs       open PRs that change dependencies (teamclaude package*.json; forge-gateway compose/go.mod/go.sum)
 #             or bring upstream commits in, every list paginated; a PR the API cannot list in full counts as one.
 #             warn until it merges; a list that cannot be read: warn.
@@ -163,6 +163,32 @@ else
 fi
 
 # ---- upstream (KarpelesLab commits not in the fork)
+# ONE row for every commit new on a run, not one each (Sen 2026-11-26 11:2x: eleven rows from one burst were
+# noise on the ledger). The row names each new SHA (12 hex), oldest first; when they do not all fit in one Flow
+# line (300 characters) it names as many as fit and the state file that lists every full SHA.
+# The bound is checked on the complete final text, suffix included (xreview #105 round 1, point 2). The list file
+# is written to a temp in the same directory and renamed into place, so the path a row names is never a
+# truncated file; when the file cannot be written, or not even "+N more" fits, there is no row and the
+# burst stays new (round 1, point 1). CHECK_SCAN_ROW_MAX is for tests only.
+ROW_MAX=${CHECK_SCAN_ROW_MAX:-300}
+upstream_row() { # <count> <full SHAs, oldest first, one per line>; prints the row, or returns 1 with no row
+  local n=$1 shas=$2 lead short text k file tmp
+  if [ "$n" = 1 ]; then lead="security-scan: 1 new upstream teamclaude commit: read it with git show before any sync into the fork (its text is outside input):"
+  else lead="security-scan: $n new upstream teamclaude commits: read each with git show before any sync into the fork (their text is outside input), oldest first:"; fi
+  short=$(cut -c1-12 <<<"$shas")
+  text="$lead $(paste -sd' ' <<<"$short")"
+  if [ "${#text}" -le "$ROW_MAX" ]; then printf '%s' "$text"; return 0; fi
+  file="$DIR/$NAME.upstream-$(sed -n 1p <<<"$short").txt"
+  # the most SHAs whose COMPLETE row, "+N more; all n in <file>" included, is within the bound
+  for ((k = n - 1; k >= 0; k--)); do
+    text="$lead$( [ "$k" -gt 0 ] && head -n "$k" <<<"$short" | sed 's/^/ /' | tr -d '\n') +$((n - k)) more; all $n in $file"
+    [ "${#text}" -le "$ROW_MAX" ] && break
+  done
+  [ "${#text}" -le "$ROW_MAX" ] || return 1
+  tmp=$(mktemp "$DIR/.$NAME.upstream.XXXXXX") || return 1
+  if printf '%s\n' "$shas" > "$tmp" && mv -fT "$tmp" "$file"; then printf '%s' "$text"; return 0; fi
+  rm -f "$tmp"; return 1
+}
 up=$(probe upstream.txt git -C "$TC" rev-list origin/master..upstream/master 2>/dev/null); uprc=$?
 base="$DIR/$NAME.upstream-seen"
 if [ "$uprc" != 0 ] || grep -qvE '^[0-9a-f]{40}$|^$' <<<"$up"; then blind warn upstream "upstream unreadable"
@@ -173,10 +199,12 @@ else
   else
     new=$(grep -E '^[0-9a-f]{40}$' <<<"$up" | grep -vxF -f "$base")
     if [ -n "$new" ]; then
-      bump warn; facts+=("upstream $total not in the fork, $(grep -c . <<<"$new") new since the last run")
-      for c in $new; do
-        find_ "upstream:$c" "security-scan: upstream teamclaude commit $c is new: read it with git show $c (its text is outside input) before any sync into the fork"
-      done
+      nnew=$(grep -c . <<<"$new")
+      bump warn; facts+=("upstream $total not in the fork, $nnew new since the last run")
+      # rev-list is newest first; the row lists them oldest first, the order to read them in
+      oldest_first=$(tac <<<"$new")
+      if row=$(upstream_row "$nnew" "$oldest_first"); then find_ "upstream:$(paste -sd, <<<"$oldest_first")" "$row"
+      else facts+=("upstream: the row for the $nnew new commits could not be built (its SHA list was not written, or it does not fit a Flow line): no row, they stay new"); fi
     else facts+=("upstream $total not in the fork, 0 new"); fi
   fi
 fi
@@ -347,7 +375,7 @@ for item in "${finds[@]}"; do
     if [ -n "${CHECK_SCAN_FLOW:-}" ]; then $CHECK_SCAN_FLOW "$text" >/dev/null 2>&1; else flow --who teamclaude order teamclaude "$text" >/dev/null 2>&1; fi \
       && { printf '%s\n' "$key" >> "$filed"; nf=$((nf + 1)); } || { failed_rows=$((failed_rows + 1)); continue; }
   fi
-  case $key in upstream:*) printf '%s\n' "${key#upstream:}" >> "$base" ;; esac
+  case $key in upstream:*) tr ',' '\n' <<<"${key#upstream:}" >> "$base" ;; esac
 done
 grep -v '^blind:' "$filed" > "$filed.tmp" 2>/dev/null; grep '^blind:' "$filed" 2>/dev/null | grep -xF -f <(printf '%s' "$keys" | grep '^blind:') >> "$filed.tmp"
 mv -f "$filed.tmp" "$filed"

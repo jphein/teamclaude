@@ -204,7 +204,7 @@ else
       # rev-list is newest first; the row lists them oldest first, the order to read them in
       oldest_first=$(tac <<<"$new")
       if row=$(upstream_row "$nnew" "$oldest_first"); then find_ "upstream:$(paste -sd, <<<"$oldest_first")" "$row"
-      else facts+=("upstream: the row for the $nnew new commits could not be built (its SHA list was not written, or it does not fit a Flow line); no row, they stay new"); fi
+      else facts+=("upstream: the row for the $nnew new commits could not be built (its SHA list was not written, or it does not fit a Flow line): no row, they stay new"); fi
     else facts+=("upstream $total not in the fork, 0 new"); fi
   fi
 fi

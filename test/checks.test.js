@@ -2079,10 +2079,12 @@ test('security-scan: when the SHA list cannot be written (or not even "+N more" 
   assert.match(r.line, /^CHECK security-scan warn · .*10 new since the last run; upstream: the row for the 10 new commits could not be built \(.*\): no row, they stay new/, r.line);
   assert.deepEqual(upRows(r), []);
   assert.ok(!readdirSync(state).some(isTemp), 'the temp file is removed');
-  r = scan(burstFx(), { repo, state, env: { CHECK_SCAN_ROW_MAX: '100' } });   // shorter than the lead itself
+  rmSync(file, { recursive: true });
+  // with the list's path free again, a bound shorter than the lead itself: the bound alone refuses the row
+  r = scan(burstFx(), { repo, state, env: { CHECK_SCAN_ROW_MAX: '100' } });
   assert.match(r.line, /could not be built/, r.line);
   assert.deepEqual(upRows(r), []);
-  rmSync(file, { recursive: true });
+  assert.ok(!readdirSync(state).some(isList), 'no list written for a row that is not filed');
   r = scan(burstFx(), { repo, state, env });
   assert.equal(upRows(r).length, 1, 'the burst was never lost');
 });

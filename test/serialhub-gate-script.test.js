@@ -66,7 +66,8 @@ test('serialhub-gate: a branch name is the fork\'s branch; a later run moves the
   assert.equal(r.status, 0, r.err);
   assert.match(r.out, new RegExp(`at ${s.two} `));
   assert.match(r.out, /^two$/m);
-  assert.match(r.out, /leftover: No such file/);
+  assert.match(r.out, /\bleftover'?: No such file/);
+  assert.match(r.out, /\bscratch'?: No such file/);
   assert.ok(existsSync(join(s.clone, '.git')), 'one clone, reused');
 });
 

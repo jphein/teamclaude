@@ -2062,8 +2062,12 @@ test('security-scan: one character over takes the overflow path: the COMPLETE ro
 test('security-scan: an overflow burst whose order fails stays new, and the next run files its one row', () => {
   const { repo, state } = baselined();
   const env = { CHECK_SCAN_ROW_MAX: String(exact.length - 1) };
+  // the lead's ruling on #105 (comment 7201633846): a failed order leaves the baseline byte for byte as it was
+  const seen = join(state, 'security-scan.upstream-seen');
+  const before = readFileSync(seen);
   let r = scan(burstFx(), { repo, state, env, flowFails: true });
   assert.match(r.line, /upstream 12 not in the fork, 10 new since the last run; .*1 rows could not be filed/, r.line);
+  assert.ok(readFileSync(seen).equals(before), `the baseline changed on a failed order:\n${readFileSync(seen, 'utf8')}`);
   r = scan(burstFx(), { repo, state, env });
   assert.match(r.line, /10 new since the last run; .*rows filed 1,/, r.line);
   assert.equal(upRows(r).length, 1);

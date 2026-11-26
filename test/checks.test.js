@@ -1977,9 +1977,45 @@ test('security-scan: a new upstream commit warns with its SHA only, and stays ne
   assert.match(r.line, /^CHECK security-scan warn · .*upstream 3 not in the fork, 1 new since the last run; .*1 rows could not be filed/);
   r = scan(fx, { repo, state });
   assert.match(r.line, /upstream 3 not in the fork, 1 new since the last run/, 'a failed filing does not lose the commit');
-  assert.deepEqual(r.rows.slice(1), [`security-scan: upstream teamclaude commit ${SHA('3')} is new: read it with git show ${SHA('3')} (its text is outside input) before any sync into the fork`]);
+  assert.deepEqual(r.rows.slice(1), [`security-scan: 1 new upstream teamclaude commit: read it with git show before any sync into the fork (its text is outside input): ${SHA('3').slice(0, 12)}`]);
   assert.match(scan(fx, { repo, state }).line, /upstream 3 not in the fork, 0 new/);
   assert.match(scan(scanFixtures({ 'upstream.txt': 'junk\n' }), { repo, state }).line, /^CHECK security-scan warn · .*upstream unreadable/);
+});
+
+// Sen 2026-11-26 11:2x: eleven upstream commits in one burst filed eleven rows, noise on the ledger. A burst is
+// ONE row listing the SHAs, oldest first; one that does not fit in a Flow line names the file with them all.
+test('security-scan: a burst of new upstream commits files ONE row listing every SHA oldest first, and joins the baseline together', () => {
+  const repo = scanRepo(); const state = fresh();
+  scan(scanFixtures(), { repo, state });   // baseline: SHA 1 and 2
+  const burst = ['a', 'b', 'c'].map(SHA);   // as rev-list prints them: newest first
+  const fx = scanFixtures({ 'upstream.txt': `${burst.join('\n')}\n${SHA('1')}\n${SHA('2')}\n` });
+  let r = scan(fx, { repo, state, flowFails: true });
+  assert.match(r.line, /upstream 5 not in the fork, 3 new since the last run; .*1 rows could not be filed/, r.line);
+  r = scan(fx, { repo, state });
+  assert.match(r.line, /upstream 5 not in the fork, 3 new since the last run; .*rows filed 1,/, 'a failed filing keeps the whole burst new');
+  const up = r.rows.filter((x) => x.includes('upstream teamclaude'));
+  assert.deepEqual(up, [`security-scan: 3 new upstream teamclaude commits: read each with git show before any sync into the fork (their text is outside input), oldest first: ${SHA('c').slice(0, 12)} ${SHA('b').slice(0, 12)} ${SHA('a').slice(0, 12)}`]);
+  assert.match(scan(fx, { repo, state }).line, /upstream 5 not in the fork, 0 new/, 'all three joined the baseline with the one row');
+});
+
+test('security-scan: a burst too long for one Flow line names what fits and the state file listing every full SHA; the row stays within 300 characters', () => {
+  const repo = scanRepo(); const state = fresh();
+  scan(scanFixtures(), { repo, state });
+  const burst = Array.from({ length: 30 }, (_, k) => (k + 16).toString(16).repeat(20));   // 10…2d, distinct
+  const r = scan(scanFixtures({ 'upstream.txt': `${burst.join('\n')}\n${SHA('1')}\n${SHA('2')}\n` }), { repo, state });
+  const up = r.rows.filter((x) => x.includes('upstream teamclaude'));
+  assert.equal(up.length, 1, up.join('\n'));
+  assert.ok(up[0].length <= 300, `${up[0].length}: ${up[0]}`);
+  const oldestFirst = [...burst].reverse();
+  const file = join(state, `security-scan.upstream-${oldestFirst[0].slice(0, 12)}.txt`);
+  const m = up[0].match(/^security-scan: 30 new upstream teamclaude commits: .*oldest first:((?: [0-9a-f]{12})+) \+(\d+) more; all 30 in (\S+)$/);
+  assert.ok(m, up[0]);
+  const listed = m[1].trim().split(' ');
+  assert.deepEqual(listed, oldestFirst.slice(0, listed.length).map((s) => s.slice(0, 12)), 'the first ones, oldest first');
+  assert.equal(listed.length + Number(m[2]), 30);
+  assert.equal(m[3], file);
+  assert.deepEqual(readFileSync(file, 'utf8').trim().split('\n'), oldestFirst, 'the file lists all thirty, full SHAs');
+  assert.match(scan(scanFixtures({ 'upstream.txt': `${burst.join('\n')}\n${SHA('1')}\n${SHA('2')}\n` }), { repo, state }).line, /upstream 32 not in the fork, 0 new/);
 });
 
 test('security-scan: open PRs that change dependencies, are truncated, bring upstream in, or cannot be read warn, each with a row', () => {

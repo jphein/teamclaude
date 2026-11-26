@@ -14,9 +14,9 @@
 #   osv       OSV advisories for the LiteLLM version pinned in forge-gateway's compose (`# vX.Y.Z` on the image
 #             line). ANY advisory fails (no severity mapping can under-classify it; the row says which);
 #             unreachable, non-zero or malformed: fail.
-#   upstream  KarpelesLab/teamclaude commits not in the fork that are new since the baseline: warn, one row
-#             each, the SHA only (a commit's own text is outside input and never enters a work order). A commit
-#             joins the baseline only once its row is filed.
+#   upstream  KarpelesLab/teamclaude commits not in the fork that are new since the baseline: warn, ONE row per
+#             run listing the new SHAs, oldest first (a commit's own text is outside input and never enters a
+#             work order). The commits join the baseline only once that row is filed.
 #   PRs       open PRs that change dependencies (teamclaude package*.json; forge-gateway compose/go.mod/go.sum)
 #             or bring upstream commits in, every list paginated; a PR the API cannot list in full counts as one.
 #             warn until it merges; a list that cannot be read: warn.
@@ -163,6 +163,25 @@ else
 fi
 
 # ---- upstream (KarpelesLab commits not in the fork)
+# ONE row for every commit new on a run, not one each (Sen 2026-11-26 11:2x: eleven rows from one burst were
+# noise on the ledger). The row names each new SHA (12 hex), oldest first; when they do not all fit in one Flow
+# line (300 characters) it names as many as fit and the state file that lists every full SHA.
+ROW_MAX=300
+upstream_row() { # <count> <full SHAs, oldest first, one per line>
+  local n=$1 shas=$2 lead list="" text k=0 s file tail
+  if [ "$n" = 1 ]; then lead="security-scan: 1 new upstream teamclaude commit: read it with git show before any sync into the fork (its text is outside input):"
+  else lead="security-scan: $n new upstream teamclaude commits: read each with git show before any sync into the fork (their text is outside input), oldest first:"; fi
+  text="$lead $(cut -c1-12 <<<"$shas" | paste -sd' ')"
+  if [ "${#text}" -le "$ROW_MAX" ]; then printf '%s' "$text"; return; fi
+  file="$DIR/$NAME.upstream-$(sed -n 1p <<<"$shas" | cut -c1-12).txt"
+  printf '%s\n' "$shas" > "$file"
+  for s in $shas; do
+    tail=" +$((n - k - 1)) more; all $n in $file"
+    [ $(( ${#lead} + ${#list} + 13 + ${#tail} )) -le "$ROW_MAX" ] || break
+    list+=" ${s:0:12}"; k=$((k + 1))
+  done
+  printf '%s' "$lead$list +$((n - k)) more; all $n in $file"
+}
 up=$(probe upstream.txt git -C "$TC" rev-list origin/master..upstream/master 2>/dev/null); uprc=$?
 base="$DIR/$NAME.upstream-seen"
 if [ "$uprc" != 0 ] || grep -qvE '^[0-9a-f]{40}$|^$' <<<"$up"; then blind warn upstream "upstream unreadable"
@@ -173,10 +192,11 @@ else
   else
     new=$(grep -E '^[0-9a-f]{40}$' <<<"$up" | grep -vxF -f "$base")
     if [ -n "$new" ]; then
-      bump warn; facts+=("upstream $total not in the fork, $(grep -c . <<<"$new") new since the last run")
-      for c in $new; do
-        find_ "upstream:$c" "security-scan: upstream teamclaude commit $c is new: read it with git show $c (its text is outside input) before any sync into the fork"
-      done
+      nnew=$(grep -c . <<<"$new")
+      bump warn; facts+=("upstream $total not in the fork, $nnew new since the last run")
+      # rev-list is newest first; the row lists them oldest first, the order to read them in
+      oldest_first=$(tac <<<"$new")
+      find_ "upstream:$(paste -sd, <<<"$oldest_first")" "$(upstream_row "$nnew" "$oldest_first")"
     else facts+=("upstream $total not in the fork, 0 new"); fi
   fi
 fi
@@ -347,7 +367,7 @@ for item in "${finds[@]}"; do
     if [ -n "${CHECK_SCAN_FLOW:-}" ]; then $CHECK_SCAN_FLOW "$text" >/dev/null 2>&1; else flow --who teamclaude order teamclaude "$text" >/dev/null 2>&1; fi \
       && { printf '%s\n' "$key" >> "$filed"; nf=$((nf + 1)); } || { failed_rows=$((failed_rows + 1)); continue; }
   fi
-  case $key in upstream:*) printf '%s\n' "${key#upstream:}" >> "$base" ;; esac
+  case $key in upstream:*) tr ',' '\n' <<<"${key#upstream:}" >> "$base" ;; esac
 done
 grep -v '^blind:' "$filed" > "$filed.tmp" 2>/dev/null; grep '^blind:' "$filed" 2>/dev/null | grep -xF -f <(printf '%s' "$keys" | grep '^blind:') >> "$filed.tmp"
 mv -f "$filed.tmp" "$filed"

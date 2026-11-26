@@ -2001,7 +2001,8 @@ test('security-scan: a burst of new upstream commits files ONE row listing every
 test('security-scan: a burst too long for one Flow line names what fits and the state file listing every full SHA; the row stays within 300 characters', () => {
   const repo = scanRepo(); const state = fresh();
   scan(scanFixtures(), { repo, state });
-  const burst = Array.from({ length: 30 }, (_, k) => (k + 16).toString(16).repeat(20));   // 10…2d, distinct
+  // 30…4d: distinct, and none is SHA('1') or SHA('2') of the baseline ('11'.repeat(20) would be)
+  const burst = Array.from({ length: 30 }, (_, k) => (k + 0x30).toString(16).repeat(20));
   const r = scan(scanFixtures({ 'upstream.txt': `${burst.join('\n')}\n${SHA('1')}\n${SHA('2')}\n` }), { repo, state });
   const up = r.rows.filter((x) => x.includes('upstream teamclaude'));
   assert.equal(up.length, 1, up.join('\n'));

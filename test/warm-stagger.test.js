@@ -421,7 +421,7 @@ test('follow: a cold seat whose window a request starts is armed by that request
   assert.deepEqual(h.touched.map(t => t.at), [at('14:00') + TOUCH_OFFSET_MS]);
 });
 
-test('follow: never a double start: a window traffic started right after the reset is left, and said so', async () => {
+test('follow: never a double start: a window traffic started right after the reset is that reset\'s touch, recorded as one', async () => {
   const h = harness(['a'], { now: at('09:00') });
   const a = h.am.accounts[0];
   Object.assign(a.quota, { unified5h: 0.3, unified5hReset: at('13:10') });
@@ -432,8 +432,27 @@ test('follow: never a double start: a window traffic started right after the res
   assert.deepEqual(h.touched, []);
   const s = h.st.status().seats[0];
   assert.equal(s.lastResetAt, new Date(at('13:10')).toISOString());
+  // round 1, finding 3: a substitute is a success said explicitly, never a missing touch excused by a note
+  assert.equal(s.touchedAt, new Date(at('13:10') + TOUCH_OFFSET_MS).toISOString());
+  assert.equal(s.touchedBy, 'request');
+  assert.equal(s.touchLagSeconds, TOUCH_OFFSET_MS / 1000);
+  assert.match(s.followNote, /window started by a request/);
+});
+
+test('follow: a touch that fails leaves the reset untouched, with the failure named (the CHECK still warns on it)', async () => {
+  const h = harness(['a'], { now: at('09:00') });
+  Object.assign(h.am.accounts[0].quota, { unified5h: 0.3, unified5hReset: at('13:10') });
+  h.warmer._warmTargets = async (/** @type {any[]} */ targets, /** @type {any} */ opts = {}) => {
+    for (const t of targets) opts.outcomes?.push({ account: t, outcome: 'error: 529 overloaded' });
+    return true;
+  };
+  h.st.configure(cfg);
+  await h.advance(at('13:12'));
+  const s = h.st.status().seats[0];
+  assert.equal(s.lastResetAt, new Date(at('13:10')).toISOString());
   assert.equal(s.touchedAt, null);
-  assert.match(s.followNote, /window started meanwhile/);
+  assert.equal(s.touchedBy, null);
+  assert.equal(s.followNote, 'touch failed: 529 overloaded');
 });
 
 test('follow: status names each seat\'s last reset, its touch stamp and the lag; a skip is named, not touched', async () => {
@@ -447,6 +466,7 @@ test('follow: status names each seat\'s last reset, its touch stamp and the lag;
   assert.equal(sa.lastResetAt, new Date(at('13:10')).toISOString());
   assert.equal(sa.touchedAt, new Date(at('13:10') + TOUCH_OFFSET_MS).toISOString());
   assert.equal(sa.touchLagSeconds, TOUCH_OFFSET_MS / 1000);
+  assert.equal(sa.touchedBy, 'stagger');
   assert.equal(sa.nextFollowAt, new Date(at('13:10') + TOUCH_OFFSET_MS + 5 * H).toISOString());
   assert.equal(ss.lastResetAt, new Date(at('13:00')).toISOString());
   assert.equal(ss.touchedAt, null);

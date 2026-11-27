@@ -122,38 +122,51 @@ test('pool-quota: no aggregate, bad JSON or no endpoint is a fail line (exit 0: 
 
 // JP 2026-11-27 13:0x: a seat's touch follows its reset within a minute. The line shows each seat's last reset
 // and its touch, and warns when a touch came more than 60 s after the reset, or has not come and nothing says why.
-const hms = (/** @type {number} */ t) => new Date(t).toISOString().slice(11, 19);
-const follow = (name, resetAgoMs, lagS, note = null) => ({
+// The lead's ruling on PR 108 round 1: per seat, "reset HH:MM, touch HH:MM, lag Ns", or "reset unknown, slot HH:MM
+// starts it", or "reset unknown, no touch planned (<why>)". Every seat is listed.
+const hm = (/** @type {number} */ t) => new Date(t).toISOString().slice(11, 16);
+const follow = (name, resetAgoMs, lagS, note = null, by = 'stagger') => ({
   name, slot: null, nextTouchAt: null, last: null,
   lastResetAt: iso(NOW - resetAgoMs), touchedAt: lagS == null ? null : iso(NOW - resetAgoMs + lagS * 1000),
-  touchLagSeconds: lagS, followNote: note, nextFollowAt: null,
+  touchLagSeconds: lagS, touchedBy: lagS == null ? null : by, followNote: note, nextFollowAt: null,
+});
+const unknown = (name, slot, last = null) => ({
+  name, slot, nextTouchAt: null, last, lastResetAt: null, touchedAt: null, touchLagSeconds: null, touchedBy: null, followNote: null, nextFollowAt: null,
 });
 
-test('pool-quota: the line shows each seat\'s last reset and its touch; on time is ok', () => {
+test('pool-quota: the line lists every seat: its reset and touch, or what starts it when its reset is unknown; on time is ok', () => {
   const body = quota(0.8, 0.6, [seat('a@x.org', 0.1, 0.2)]);
   body.stagger = { enabled: true, seats: [
     follow('claude2@x.org', 600_000, 10),
-    follow('claude3@x.org', 300_000, null, 'left (weekly limit reached)'),
+    follow('claude8@x.org', 900_000, 5, 'window started by a request', 'request'),
     follow('claude5@x.org', 30_000, null),           // reset 30 s ago: the touch is still due, not late
-    { name: 'claude6', slot: '04:30', lastResetAt: null, touchedAt: null, touchLagSeconds: null, followNote: null },
+    { ...unknown('claude7@x.org', null), nextFollowAt: iso(NOW + 3_600_000) }, // a known reset ahead
+    unknown('claude6', '04:30'),
+    unknown('claude3@x.org', null, 'no slot today (weekly limit reached)'),
   ] };
   const r = pq(body, { TZ: 'UTC' });
   assert.match(r.line, LINE);
-  assert.match(r.line, new RegExp(`^CHECK pool-quota ok · .*, touches: claude2 reset ${hms(NOW - 600_000)} touch \\+10s; `
-    + `claude3 reset ${hms(NOW - 300_000)} left \\(weekly limit reached\\); claude5 reset ${hms(NOW - 30_000)} touch due, at `), r.line);
-  assert.doesNotMatch(r.line, /claude6|@/);
+  const t = (/** @type {number} */ ms) => hm(NOW - ms);
+  assert.ok(r.line.startsWith('CHECK pool-quota ok · '), r.line);
+  assert.ok(r.line.includes(`, touches: claude2 reset ${t(600_000)}, touch ${hm(NOW - 600_000 + 10_000)}, lag 10s; `
+    + `claude8 reset ${t(900_000)}, touch ${hm(NOW - 900_000 + 5_000)}, lag 5s (window started by a request); `
+    + `claude5 reset ${t(30_000)}, touch due; claude7 reset ${hm(NOW + 3_600_000)}, touch due; `
+    + 'claude6 reset unknown, slot 04:30 starts it; claude3 reset unknown, no touch planned (weekly limit reached), at '), r.line);
+  assert.doesNotMatch(r.line, /@/);
 });
 
-test('pool-quota: a touch more than 60 s after its reset, or missing with no reason, warns and names the seat', () => {
+test('pool-quota: a touch more than 60 s after its reset, or missing past 60 s whatever its note, warns and names the seat', () => {
   const body = quota(0.8, 0.6, [seat('a@x.org', 0.1, 0.2)]);
   body.stagger = { enabled: true, seats: [
     follow('claude2@x.org', 600_000, 60),           // exactly 60 s: on time
     follow('claude6', 1_800_000, 75),
     follow('claude4@x.org', 180_000, null),
+    follow('claude9@x.org', 240_000, null, 'touch failed: 529 overloaded'),
+    follow('claude3@x.org', 300_000, null, 'left (weekly limit reached)'),
   ] };
   const r = pq(body, { TZ: 'UTC' });
-  assert.match(r.line, /^CHECK pool-quota warn · 5h 80% left, week 60% left \(touch late: claude6 \+75s; touch missing: claude4\), /, r.line);
-  assert.match(r.line, /touches: claude2 reset \S+ touch \+60s; claude6 reset \S+ touch \+75s; claude4 reset \S+ no touch, at /);
+  assert.match(r.line, /^CHECK pool-quota warn · 5h 80% left, week 60% left \(touch late: claude6 \+75s; touch missing: claude4 claude9 claude3\), /, r.line);
+  assert.match(r.line, /touches: claude2 reset \d\d:\d\d, touch \d\d:\d\d, lag 60s; claude6 reset \d\d:\d\d, touch \d\d:\d\d, lag 75s; claude4 reset \d\d:\d\d, no touch; claude9 reset \d\d:\d\d, no touch \(touch failed: 529 overloaded\); claude3 reset \d\d:\d\d, no touch \(left \(weekly limit reached\)\), at /, r.line);
   body.stagger = { enabled: false };
   assert.match(pq(body).line, /^CHECK pool-quota ok · .*, touches: stagger off, at /);
 });

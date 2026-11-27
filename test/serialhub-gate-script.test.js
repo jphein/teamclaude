@@ -4,7 +4,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, chmodSync, existsSync, rmSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, existsSync, rmSync, readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -117,17 +117,34 @@ test('serialhub-gate: installs only with npm ci from the commit\'s package-lock.
   assert.equal(r.status, 65, r.err);
   assert.match(r.err, /no package-lock\.json/);
   assert.doesNotMatch(r.out, /ran/);
+  // With a lockfile, the one npm command the host runs is `npm ci`, never `npm install` (the lead's ruling on PR
+  // 106, round 2). A stub npm records what it is asked. TC_GATE_NODE names a major mise does not hold, so the host
+  // keeps this PATH (stub first) and this node.
+  const ok = setup();
+  const bin = join(ok.d, 'bin'); mkdirSync(bin);
+  const seen = join(ok.d, 'npm-seen');
+  writeFileSync(join(bin, 'npm'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${seen}'\n`); chmodSync(join(bin, 'npm'), 0o755);
+  const g = gate(ok, [ok.two, '--', 'echo', 'ran'], { env: { PATH: `${bin}:${process.env.PATH}`, TC_GATE_NODE: '99' } });
+  assert.equal(g.status, 0, g.err);
+  assert.match(g.out, /^ran$/m);
+  assert.deepEqual(readFileSync(seen, 'utf8').trim().split('\n'), ['ci --no-audit --no-fund --ignore-scripts']);
 });
 
 test('serialhub-gate: npm keeps its cache and logs out of the host home, and removes them after the run', () => {
   const s = setup();
   const home = fresh();
-  const r = gate(s, [s.two, '--', 'sh', '-c', 'echo "cache=$npm_config_cache"'], { env: { HOME: home } });
+  const r = gate(s, [s.two, '--', 'sh', '-c', 'echo "cache=$npm_config_cache"; echo "logs=$npm_config_logs_dir"'], { env: { HOME: home } });
   assert.equal(r.status, 0, r.err);
   assert.ok(!existsSync(join(home, '.npm')), `npm wrote under the host home: ${readdirSync(home).join(' ')}`);
   const cache = r.out.match(/^cache=(\S+)$/m)?.[1];
+  const logs = r.out.match(/^logs=(\S+)$/m)?.[1];
   assert.ok(cache && !cache.startsWith(home), `cache: ${cache}`);
-  assert.ok(!existsSync(cache), 'the per-run npm dir is removed after the run');
+  assert.ok(logs && dirname(logs) === dirname(cache), `logs: ${logs}, cache: ${cache}`);
+  // the per-run directory both live in, beside the clone, and each of them, are gone after the run
+  const perRun = dirname(cache);
+  assert.match(perRun, /gate-clone\.npm\.[A-Za-z0-9]{6}$/);
+  for (const p of [cache, logs, perRun]) assert.ok(!existsSync(p), `${p} is left after the run`);
+  assert.deepEqual(readdirSync(dirname(perRun)).filter((n) => n.includes('.npm.')), [], 'no per-run npm dir is left beside the clone');
 });
 
 test('serialhub-gate: a ref that is not a plain ref, or unknown, is refused before the host is reached (22)', () => {

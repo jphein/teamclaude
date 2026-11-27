@@ -258,8 +258,10 @@ test('a suspend of days steps over the missed slots instead of walking them', as
   await h.advance(at('02:05'));
   const before = h.touched.length;
   const fired = await h.jump(at('09:00', 3));
-  assert.ok(fired <= 2, `the seat's overdue timer and the plan's fire once each, with no chain of past slots (fired ${fired})`);
+  // the seat's slot timer, its follower (armed for the 07:00 reset) and the plan's: once each, no chain
+  assert.ok(fired <= 3, `the seat's overdue timers and the plan's fire once each, with no chain of past slots (fired ${fired})`);
   assert.equal(h.touched.length, before);
+  assert.match(h.st.status().seats[0].followNote, /^missed \(woke \d+m late\)$/, 'a reset slept through is named, not touched late');
   assert.equal(h.st.status().seats[0].nextTouchAt, new Date(at('12:00', 3)).toISOString());
 });
 

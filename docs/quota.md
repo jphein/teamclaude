@@ -23,7 +23,7 @@ curl -H "x-api-key: $TEAMCLAUDE_API_KEY" https://proxy.example.com/teamclaude/qu
 Fork additions:
 - The top level carries `live_seats`, `next_reset` (when the next barred seat returns), `next_refresh` (`{at, seat, in_minutes}`: the soonest 5h reset on a seat whose week has room) and `stagger` (slots, next touch and last outcome per seat; see `warmupStagger` in [configuration](configuration.md)). Each seat there also carries its follower:
   - `lastResetAt`: the last reset the seat had;
-  - `touchedAt`, `touchLagSeconds` and `touchedBy`: the touch that followed it. `touchedBy` is `stagger`, or `request` when a request started the window first;
+  - `touchedAt`, `touchLagSeconds`, `touchedBy` and `touchRequestId`: the touch that followed it. `touchedBy` is `stagger`, or `request` when the response to a request started the window first; `touchRequestId` names that request;
   - `followNote`: what else happened (a skip, a failure, a missed reset, a request);
   - `nextFollowAt`: the reset it waits for.
 

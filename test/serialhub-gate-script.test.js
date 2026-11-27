@@ -1,10 +1,10 @@
 // scripts/serialhub-gate.sh (row 8aa26057): the gate runs on a lane host in a dedicated clone, detached at the
-// commit asked for. Here the "host" is this machine: TC_GATE_SSH is a stub that runs the remote script with
-// bash, TC_GATE_REPO a local bare repo, TC_GATE_DIR a temp clone dir.
+// commit asked for. Here the "host" is this machine: TC_GATE_SSH is a stub that runs the remote command line
+// with sh (as a login shell would), TC_GATE_REPO a local bare repo, TC_GATE_DIR a temp clone dir.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, chmodSync, existsSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, chmodSync, existsSync, rmSync, readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -21,13 +21,16 @@ const git = (cwd, ...a) => {
   assert.equal(r.status, 0, `git ${a.join(' ')}: ${r.stderr}`);
   return r.stdout.trim();
 };
+const LOCK = '{"name":"t","lockfileVersion":3,"requires":true,"packages":{"":{"name":"t"}}}\n';
 
-/** A bare "fork" with master at two commits and a branch, and a stub ssh that runs the remote script here. */
-function setup() {
+/** A bare "fork" with master at two commits and a branch, and a stub ssh that runs the remote command here.
+ *  STUB_BEFORE, when set, runs between the caller's resolve and the host's fetch (a push landing meanwhile). */
+function setup({ lock = true } = {}) {
   const d = fresh();
   const work = join(d, 'work'); const bare = join(d, 'fork.git');
   git(d, 'init', '-q', '-b', 'master', work);
   writeFileSync(join(work, 'package.json'), '{"name":"t","private":true}\n');
+  if (lock) writeFileSync(join(work, 'package-lock.json'), LOCK);
   writeFileSync(join(work, 'marker'), 'one\n');
   git(work, 'add', '.'); git(work, 'commit', '-qm', 'one');
   const one = git(work, 'rev-parse', 'HEAD');
@@ -37,12 +40,13 @@ function setup() {
   git(work, 'checkout', '-qb', 'feat/x');
   writeFileSync(join(work, 'marker'), 'branch\n');
   git(work, 'commit', '-qam', 'branch');
+  const branch = git(work, 'rev-parse', 'HEAD');
   git(d, 'clone', '-q', '--bare', work, bare);
   const ssh = join(d, 'ssh');
   const hosts = join(d, 'hosts');
-  writeFileSync(ssh, `#!/bin/sh\nprintf '%s\\n' "$1" >> '${hosts}'\nshift\nexec bash -c "$1"\n`);
+  writeFileSync(ssh, `#!/bin/sh\nprintf '%s\\n' "$1" >> '${hosts}'\nshift\n[ -z "\${STUB_BEFORE:-}" ] || sh -c "$STUB_BEFORE"\nexec sh -c "$1"\n`);
   chmodSync(ssh, 0o755);
-  return { d, bare, one, two, ssh, hosts, clone: join(d, 'gate-clone') };
+  return { d, work, bare, one, two, branch, ssh, hosts, clone: join(d, 'gate-clone') };
 }
 function gate(s, args, { env = {}, input } = {}) {
   const r = spawnSync('bash', [SCRIPT, ...args], { encoding: 'utf8', input, timeout: 60000,
@@ -52,7 +56,7 @@ function gate(s, args, { env = {}, input } = {}) {
 
 test('serialhub-gate: runs the command in a clean clone detached at the commit asked for, on the host named, and exits with its status', () => {
   const s = setup();
-  const r = gate(s, [s.one, '--', 'cat marker; git rev-parse HEAD; exit 3']);
+  const r = gate(s, [s.one, '--', 'sh', '-c', 'cat marker; git rev-parse HEAD; exit 3']);
   assert.equal(r.status, 3, r.err);
   assert.match(r.out, new RegExp(`^gate on \\S+ at ${s.one} · node v\\d+`, 'm'));
   assert.match(r.out, new RegExp(`^one\\n${s.one}$`, 'm'));
@@ -61,8 +65,8 @@ test('serialhub-gate: runs the command in a clean clone detached at the commit a
 
 test('serialhub-gate: a branch name is the fork\'s branch; a later run moves the same clone and removes what the last one left', () => {
   const s = setup();
-  assert.equal(gate(s, ['feat/x', '--', 'touch leftover; mkdir -p scratch && touch scratch/x']).status, 0);
-  const r = gate(s, ['master', '--', 'cat marker; ls leftover scratch 2>&1; true']);
+  assert.equal(gate(s, ['feat/x', '--', 'sh', '-c', 'touch leftover; mkdir -p scratch && touch scratch/x']).status, 0);
+  const r = gate(s, ['master', '--', 'sh', '-c', 'cat marker; ls leftover scratch 2>&1; true']);
   assert.equal(r.status, 0, r.err);
   assert.match(r.out, new RegExp(`at ${s.two} `));
   assert.match(r.out, /^two$/m);
@@ -71,38 +75,77 @@ test('serialhub-gate: a branch name is the fork\'s branch; a later run moves the
   assert.ok(existsSync(join(s.clone, '.git')), 'one clone, reused');
 });
 
+test('serialhub-gate: a branch is resolved to its commit before the host is reached, and that commit is what runs', () => {
+  const s = setup();
+  // a push to feat/x lands between the caller's resolve and the host's fetch
+  const moved = `git -C '${s.work}' commit -q --allow-empty -m moved && git -C '${s.work}' push -q '${s.bare}' HEAD:feat/x`;
+  const r = gate(s, ['feat/x', '--', 'git', 'rev-parse', 'HEAD'], { env: { STUB_BEFORE: moved } });
+  assert.equal(r.status, 0, r.err);
+  assert.notEqual(git(s.bare, 'rev-parse', 'feat/x'), s.branch, 'the branch did move');
+  assert.match(r.err, new RegExp(`^serialhub-gate: feat/x is ${s.branch}$`, 'm'));
+  assert.match(r.out, new RegExp(`at ${s.branch} `));
+  assert.match(r.out, new RegExp(`^${s.branch}$`, 'm'));
+});
+
 test('serialhub-gate: stdin reaches the command, so a local perturbation script runs in the clone', () => {
   const s = setup();
-  const r = gate(s, [s.two, '--', 'sh -s'], { input: 'cat marker\necho from-stdin\n' });
+  const r = gate(s, [s.two, '--', 'sh', '-s'], { input: 'cat marker\necho from-stdin\n' });
   assert.equal(r.status, 0, r.err);
   assert.match(r.out, /^two\nfrom-stdin$/m);
 });
 
-test('serialhub-gate: the command keeps its own quoting and never meets the remote shell unquoted', () => {
+test('serialhub-gate: the command is an argv that reaches the host word for word, never re-read by a shell', () => {
   const s = setup();
-  const r = gate(s, [s.two, '--', `printf '%s|' "a b" 'c;d' "$(echo e)"; echo`]);
+  const args = ['a b', 'c;d', '$(echo e)', '', "it's", '*', 'x\ny'];
+  const r = gate(s, [s.two, '--', 'printf', '<%s>', ...args]);
   assert.equal(r.status, 0, r.err);
-  assert.match(r.out, /^a b\|c;d\|e\|$/m);
+  assert.ok(r.out.endsWith(args.map((a) => `<${a}>`).join('')), JSON.stringify(r.out));
 });
 
-test('serialhub-gate: a ref that is not a plain ref is refused before anything runs (22); an unknown one fails on the host (22)', () => {
+test('serialhub-gate: a second gate on the same clone while one runs is refused (75), and the first is untouched', () => {
   const s = setup();
-  for (const bad of ['-x', 'a;touch pwned', '$(id)', 'a b', 'a..b', '']) {
+  const nested = `bash '${SCRIPT}' "$1" -- true; echo "nested=$?"; cat marker`;
+  const r = gate(s, [s.two, '--', 'sh', '-c', nested, 'sh', s.one]);
+  assert.equal(r.status, 0, r.err);
+  assert.match(r.out, /^nested=75\ntwo$/m);
+  assert.match(r.err, /another gate holds .*gate-clone/);
+});
+
+test('serialhub-gate: installs only with npm ci from the commit\'s package-lock.json; none is a refusal (65)', () => {
+  const s = setup({ lock: false });
+  const r = gate(s, [s.two, '--', 'echo', 'ran']);
+  assert.equal(r.status, 65, r.err);
+  assert.match(r.err, /no package-lock\.json/);
+  assert.doesNotMatch(r.out, /ran/);
+});
+
+test('serialhub-gate: npm keeps its cache and logs out of the host home, and removes them after the run', () => {
+  const s = setup();
+  const home = fresh();
+  const r = gate(s, [s.two, '--', 'sh', '-c', 'echo "cache=$npm_config_cache"'], { env: { HOME: home } });
+  assert.equal(r.status, 0, r.err);
+  assert.ok(!existsSync(join(home, '.npm')), `npm wrote under the host home: ${readdirSync(home).join(' ')}`);
+  const cache = r.out.match(/^cache=(\S+)$/m)?.[1];
+  assert.ok(cache && !cache.startsWith(home), `cache: ${cache}`);
+  assert.ok(!existsSync(cache), 'the per-run npm dir is removed after the run');
+});
+
+test('serialhub-gate: a ref that is not a plain ref, or unknown, is refused before the host is reached (22)', () => {
+  const s = setup();
+  for (const bad of ['-x', 'a;touch pwned', '$(id)', 'a b', 'a..b', '', 'no-such-branch']) {
     const r = gate(s, [bad, '--', 'true']);
     assert.equal(r.status, 22, `${JSON.stringify(bad)}: ${r.err}`);
     assert.ok(!existsSync(s.hosts), `${JSON.stringify(bad)} reached the host`);
   }
-  const r = gate(s, ['no-such-branch', '--', 'echo ran']);
-  assert.equal(r.status, 22, r.err);
-  assert.match(r.err, /no-such-branch is not a commit or branch/);
-  assert.doesNotMatch(r.out, /ran/);
+  assert.match(gate(s, ['no-such-branch', '--', 'true']).err, /no-such-branch is not a branch of .* or a commit/);
   assert.equal(gate(s, []).status, 22, 'no ref: usage');
   assert.equal(gate(s, [s.two, 'echo', 'x']).status, 22, 'a command without -- : usage');
+  assert.equal(gate(s, [s.two, '--']).status, 22, '-- with no command: usage');
 });
 
 test('serialhub-gate: the default command is the full local gate, scripts/gate.sh against origin/master', () => {
   const s = setup();
-  const r = gate(s, [s.two], { env: { PATH: `${s.d}:${process.env.PATH}` } });
+  const r = gate(s, [s.two]);
   // the fixture repo has no scripts/gate.sh: the default command is what fails, by name
   assert.notEqual(r.status, 0);
   assert.match(r.err, /scripts\/gate\.sh/);

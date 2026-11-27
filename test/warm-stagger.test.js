@@ -110,7 +110,9 @@ function harness(accounts, { now = at('01:00'), thresholds = { default: 0.93, un
     },
   };
   const lines = /** @type {string[]} */ ([]);
-  const st = new StaggerAnchors(am, warmer, { nowFn: () => clock, setTimeoutFn, clearTimeoutFn, log: l => lines.push(l), statePath });
+  // skew: what the wall clock reads, off from the timer queue's time (a clock stepped back, NTP, a VM resume)
+  let skew = 0;
+  const st = new StaggerAnchors(am, warmer, { nowFn: () => clock + skew, setTimeoutFn, clearTimeoutFn, log: l => lines.push(l), statePath });
   async function advance(/** @type {number} */ to) {
     for (;;) {
       timers.sort((a, b) => a.at - b.at || a.id - b.id);
@@ -138,7 +140,7 @@ function harness(accounts, { now = at('01:00'), thresholds = { default: 0.93, un
     }
     return fired;
   }
-  return { am, st, warmer, jump, touched, lines, advance, get clock() { return clock; } };
+  return { am, st, warmer, jump, touched, lines, advance, get clock() { return clock; }, setSkew(/** @type {number} */ ms) { skew = ms; } };
 }
 
 test('a cold seat is touched at its slot, and its windows then roll on the 5 h grid', async () => {
@@ -492,20 +494,93 @@ test('follow: a known reset is the follower\'s: a slot just after it leaves the 
   assert.equal(s.touchLagSeconds, TOUCH_OFFSET_MS / 1000);
 });
 
-test('follow: a touch that fails leaves the reset untouched, with the failure named (the CHECK still warns on it)', async () => {
+test('follow: a touch that keeps failing is tried 3 times with backoff, each failure logged, then given up and named (the CHECK warns)', async () => {
   const h = harness(['a'], { now: at('09:00') });
   Object.assign(h.am.accounts[0].quota, { unified5h: 0.3, unified5hReset: at('13:10') });
+  let calls = 0;
   h.warmer._warmTargets = async (/** @type {any[]} */ targets, /** @type {any} */ opts = {}) => {
+    calls++;
     for (const t of targets) opts.outcomes?.push({ account: t, outcome: 'error: 529 overloaded' });
     return true;
   };
   h.st.configure(cfg);
-  await h.advance(at('13:12'));
+  await h.advance(at('13:20'));
+  assert.equal(calls, 3, 'tried at the reset + 10 s, then 60 s and 120 s later; no more');
+  const fails = h.lines.filter(l => /touch of "a" at its reset .* failed: 529 overloaded/.test(l));
+  assert.equal(fails.length, 3, fails.join('\n'));
+  assert.match(fails[0], /\(try 1\/3, next in 60 s\)/);
+  assert.match(fails[2], /\(gave up after 3 tries\)/);
   const s = h.st.status().seats[0];
-  assert.equal(s.lastResetAt, new Date(at('13:10')).toISOString());
+  // round 3 ruling: lastResetAt is the last reset a touch succeeded for; a reset still without one is pending
+  assert.equal(s.lastResetAt, null);
+  assert.equal(s.pendingResetAt, new Date(at('13:10')).toISOString());
   assert.equal(s.touchedAt, null);
-  assert.equal(s.touchedBy, null);
-  assert.equal(s.followNote, 'touch failed: 529 overloaded');
+  assert.equal(s.followNote, 'touch failed: 529 overloaded (gave up after 3 tries)');
+});
+
+test('follow: a failed touch, or one that throws, is retried, and the retry that succeeds is the reset\'s touch', async () => {
+  for (const how of ['error', 'throw']) {
+    const h = harness(['a'], { now: at('09:00') });
+    Object.assign(h.am.accounts[0].quota, { unified5h: 0.3, unified5hReset: at('13:10') });
+    const real = h.warmer._warmTargets.bind(h.warmer);
+    let calls = 0;
+    h.warmer._warmTargets = async (/** @type {any[]} */ targets, /** @type {any} */ opts = {}) => {
+      if (++calls > 1) return real(targets, opts);
+      if (how === 'throw') throw new Error('boom');
+      for (const t of targets) opts.outcomes?.push({ account: t, outcome: 'error: 529 overloaded' });
+      return true;
+    };
+    h.st.configure(cfg);
+    await h.advance(at('13:15'));
+    assert.deepEqual(h.touched.map(t => t.at), [at('13:10') + TOUCH_OFFSET_MS + M], how);
+    assert.ok(h.lines.some(l => new RegExp(`touch of "a" at its reset .* failed: ${how === 'throw' ? 'exception: boom' : '529 overloaded'} \\(try 1/3, next in 60 s\\)`).test(l)), h.lines.join('\n'));
+    const s = h.st.status().seats[0];
+    assert.equal(s.lastResetAt, new Date(at('13:10')).toISOString());
+    assert.equal(s.touchLagSeconds, (TOUCH_OFFSET_MS + M) / 1000);
+    assert.equal(s.pendingResetAt, null);
+  }
+});
+
+test('follow: a timer and a poll or a slot on the same reset in one tick send exactly one touch', async () => {
+  const h = harness(['a']);
+  h.warmer.blind = true; // the warmer's own cold re-check is off: only the stagger's guards stand between them
+  /** @type {() => void} */
+  let release = () => {};
+  h.warmer.gate = new Promise(r => { release = () => r(); });
+  // the window ends at the 02:00 slot: the slot timer and the follower both fire at 02:00:10
+  Object.assign(h.am.accounts[0].quota, { unified5h: 0.4, unified5hReset: at('02:00') });
+  h.st.configure(cfg);
+  await h.advance(at('02:00') + TOUCH_OFFSET_MS);
+  // the touch is in flight (held at the gate); a poll and a seat request land on the same reset meanwhile
+  h.am.updateQuota(0, { 'anthropic-ratelimit-unified-5h-utilization': '0.4' }, null, { requestId: 'req-7' });
+  h.st._follow(h.am.accounts[0]);
+  await h.advance(at('02:00') + TOUCH_OFFSET_MS + 1);
+  release();
+  await h.advance(at('02:05'));
+  assert.equal(h.touched.length, 1, JSON.stringify(h.touched));
+});
+
+test('follow: a captured reset that is stale is never touched: changed means the timer is void, not yet happened means re-scheduled', async () => {
+  // changed: the seat's reset moved (no response said so) before the timer fired
+  let h = harness(['a'], { now: at('09:00') });
+  Object.assign(h.am.accounts[0].quota, { unified5h: 0.3, unified5hReset: at('13:10') });
+  h.st.configure(cfg);
+  await h.advance(at('13:05'));
+  h.am.accounts[0].quota.unified5hReset = at('14:00');
+  await h.advance(at('13:59'));
+  assert.deepEqual(h.touched, []);
+  assert.ok(h.lines.some(l => /"a": reset .*13:10.* is no longer the seat's .*: timer void/.test(l) || /"a": reset .* is no longer the seat's/.test(l)), h.lines.join('\n'));
+  // not yet happened: the wall clock reads before the reset when the timer fires (stepped back)
+  h = harness(['a'], { now: at('09:10') });
+  /** @type {any} */ (h.am.accounts[0])._5hWindowSeen = at('09:00'); // the last window ended at 09:00
+  h.setSkew(-20 * M); // the clock reads 08:50
+  h.st.configure(cfg);
+  await h.advance(at('09:10') + 1_000);
+  assert.deepEqual(h.touched, [], 'never before the reset');
+  assert.ok(h.lines.some(l => /"a": reset .* has not happened yet .*: re-scheduled/.test(l)), h.lines.join('\n'));
+  h.setSkew(0);
+  await h.advance(at('09:35'));
+  assert.equal(h.touched.length, 1, 'touched once, once the reset has happened');
 });
 
 test('follow: status names each seat\'s last reset, its touch stamp and the lag; a skip is named, not touched', async () => {
@@ -521,7 +596,8 @@ test('follow: status names each seat\'s last reset, its touch stamp and the lag;
   assert.equal(sa.touchLagSeconds, TOUCH_OFFSET_MS / 1000);
   assert.equal(sa.touchedBy, 'stagger');
   assert.equal(sa.nextFollowAt, new Date(at('13:10') + 5 * H).toISOString());
-  assert.equal(ss.lastResetAt, new Date(at('13:00')).toISOString());
+  assert.equal(ss.lastResetAt, null); // round 3 ruling: only a successful touch sets it
+  assert.equal(ss.pendingResetAt, new Date(at('13:00')).toISOString());
   assert.equal(ss.touchedAt, null);
   assert.match(ss.followNote, /weekly limit reached/);
   assert.ok(!h.touched.some(t => t.name === 'spent'));

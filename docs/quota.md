@@ -23,11 +23,11 @@ curl -H "x-api-key: $TEAMCLAUDE_API_KEY" https://proxy.example.com/teamclaude/qu
 Fork additions:
 - The top level carries `live_seats`, `next_reset` (when the next barred seat returns), `next_refresh` (`{at, seat, in_minutes}`: the soonest 5h reset on a seat whose week has room) and `stagger` (slots, next touch and last outcome per seat; see `warmupStagger` in [configuration](configuration.md)). Each seat there also carries its follower:
   - `lastResetAt`: the last reset the seat had;
-  - `touchedAt` and `touchLagSeconds`: the touch that followed it;
-  - `followNote`: why there was none (a skip, a request that started the window, a missed reset);
+  - `touchedAt`, `touchLagSeconds` and `touchedBy`: the touch that followed it. `touchedBy` is `stagger`, or `request` when a request started the window first;
+  - `followNote`: what else happened (a skip, a failure, a missed reset, a request);
   - `nextFollowAt`: the reset it waits for.
 
-  CHECK pool-quota prints these per seat. It warns on a touch more than 60 s after its reset, and on a reset over 60 s past with no touch and no reason given.
+  CHECK pool-quota prints every seat. It warns on a touch more than 60 s after its reset, and on a reset over 60 s past with no touch, whatever the note says.
 - Each `fiveHour` bucket gains `windowStart` (reset − 5 h).
 
 `GET /teamclaude/events` (fork) lists the last 300 routing decisions as JSON, newest last: `{ts, kind, text}`. Kinds are `switch`, `rebalance`, `refresh-routing`, `window-start`, `window-spent`, `session-reset`, `near-limit`, `stagger`, `keep-warm`, `threshold`, `account`, `reauth`, `quota-429` and `exhausted`. Filter with `?since=<ISO>&kind=<kind>&limit=<n>`. It takes the same key as `/teamclaude/status` and is kept in memory, so a restart empties it.

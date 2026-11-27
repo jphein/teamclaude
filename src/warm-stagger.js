@@ -168,11 +168,15 @@ export class StaggerAnchors {
     // Each seat's follower (JP 2026-11-27 13:0x: "touch it right away after it resets, not wait"): a timer at
     // that seat's next reset, and what happened at the last one. Kept across the daily re-plan; the timers
     // are dropped by stop(). Bumped by stop() only, so a re-plan never cancels a touch in flight.
-    /** @type {Map<string, {timer: any, resetAt: number|null, lastResetAt: number|null, touchedAt: number|null, touchedBy: string|null, note: string|null}>} */
+    /** @type {Map<string, {timer: any, resetAt: number|null, lastResetAt: number|null, touchedAt: number|null, touchedBy: string|null, requestId: string|null, note: string|null}>} */
     this.follow = new Map();
     this.followGeneration = 0;
     /** @type {(() => void)|null} */
     this.unsubscribe = null;
+    // When this process first configured the stagger: a reset older than that, touched right after, was missed
+    // while the proxy was down ("touched on boot").
+    /** @type {number|null} */
+    this.firstConfiguredAt = null;
   }
 
   get enabled() { return !!this.settings; }
@@ -203,36 +207,48 @@ export class StaggerAnchors {
       ? saved.slots : null;
     this._applyPlan(reuse, last ?? now, reuse ? 'kept' : 'made');
     this._armPlan();
-    // Every response a seat gets carries its reset: a window a request starts is followed from that moment.
-    this.unsubscribe = this.am.onSeatRequest?.((/** @type {{account: any}} */ { account }) => this._follow(account)) ?? null;
+    // Every response a seat gets carries its reset: a window a request starts is followed from that moment, and
+    // a request that started it after the reset is recorded, by its id, as that reset's touch.
+    this.unsubscribe = this.am.onSeatRequest?.((/** @type {{account: any, requestId?: string|null}} */ { account, requestId }) =>
+      this._follow(account, { requestId: requestId ?? null })) ?? null;
+    if (this.firstConfiguredAt == null) this.firstConfiguredAt = now;
     for (const a of this._roster()) this._follow(a);
   }
 
-  /** The reset a seat's next touch follows: its weekly reset while the week is spent, else its 5 h reset.
-   *  One that passed within the grace still counts (it is touched at once). @param {any} account */
+  /** The reset a seat's next touch follows: its weekly reset while the week is spent, else its 5 h reset, else
+   *  (the manager clears a passed reset) the last 5 h window it saw end. One already past is overdue and touched
+   *  at once, however long ago it passed (PR 108 round 2: a reset missed while the proxy was down is touched on
+   *  boot). @param {any} account */
   _resetToFollow(account) {
     const q = account.quota || {};
-    const now = this.nowFn();
-    const reset = Number(this.am.weekBarred?.(account) ? q.unified7dReset : q.unified5hReset);
-    return Number.isFinite(reset) && reset > now - GRACE_MS ? reset : null;
+    if (this.am.weekBarred?.(account)) {
+      const week = Number(q.unified7dReset);
+      return Number.isFinite(week) ? week : null;
+    }
+    const five = Number(q.unified5hReset);
+    if (Number.isFinite(five)) return five;
+    const seen = Number(account._5hWindowSeen);
+    return Number.isFinite(seen) && seen <= this.nowFn() ? seen : null;
   }
 
   /** Arm (or re-arm) the seat's touch for its next reset. Cheap when nothing changed: every seat request calls
-   *  it. @param {any} account */
-  _follow(account) {
+   *  it. @param {any} account @param {{requestId?: string|null}} [from] the response that called it, if one did */
+  _follow(account, { requestId = null } = {}) {
     if (!this.settings || !warmApplicable(account) || account.disabled) return;
     let f = this.follow.get(account.name);
     if (!f) {
-      f = { timer: null, resetAt: null, lastResetAt: null, touchedAt: null, touchedBy: null, note: null };
+      f = { timer: null, resetAt: null, lastResetAt: null, touchedAt: null, touchedBy: null, requestId: null, note: null };
       this.follow.set(account.name, f);
     }
     const target = this._resetToFollow(account);
     if (f.timer && target === f.resetAt) return;
     const now = this.nowFn();
-    // The reset armed for passed, and a request started the next window before the touch: the request is that
-    // reset's touch, recorded as one (when it was seen), never as a missing touch excused by a note.
+    // The reset armed for passed and a new window is running before the touch. Recorded as that reset's touch only
+    // when a response said so, with its request id; a window seen without one is not counted as a touch.
     if (f.resetAt != null && f.resetAt <= now && target !== f.resetAt) {
-      Object.assign(f, { lastResetAt: f.resetAt, touchedAt: now, touchedBy: 'request', note: 'window started by a request' });
+      Object.assign(f, requestId != null
+        ? { lastResetAt: f.resetAt, touchedAt: now, touchedBy: 'request', requestId, note: `window started by request ${requestId}` }
+        : { lastResetAt: f.resetAt, touchedAt: null, touchedBy: null, requestId: null, note: 'window running, no response seen' });
     }
     if (f.timer) { this.clearTimeoutFn(f.timer); f.timer = null; }
     f.resetAt = null;
@@ -251,22 +267,16 @@ export class StaggerAnchors {
     f.timer = timer;
   }
 
-  /** The reset a touch about to be sent serves, claimed so the follower does not report it again; null when
-   *  no reset has passed for it. @param {any} account */
-  _claimReset(account) {
-    const f = this.follow.get(account.name);
-    if (!f || f.resetAt == null || f.resetAt > this.nowFn()) return null;
-    if (f.timer) { this.clearTimeoutFn(f.timer); f.timer = null; }
-    Object.assign(f, { lastResetAt: f.resetAt, resetAt: null, touchedAt: null, touchedBy: null, note: null });
-    return f;
-  }
-
   /** @param {any} account @param {any} f @param {number} resetAt */
   async _followFire(account, f, resetAt) {
-    Object.assign(f, { lastResetAt: resetAt, resetAt: null, touchedAt: null, touchedBy: null, note: null });
+    Object.assign(f, { lastResetAt: resetAt, resetAt: null, touchedAt: null, touchedBy: null, requestId: null, note: null });
     const now = this.nowFn();
     const at = new Date(resetAt).toISOString();
-    if (now - resetAt > GRACE_MS) { f.note = `missed (woke ${Math.round((now - resetAt) / 60000)}m late)`; return; }
+    // Overdue (the proxy was down, or the host slept): touched now all the same, and the record says how late.
+    const lateMs = now - resetAt - TOUCH_OFFSET_MS;
+    const onBoot = this.firstConfiguredAt != null && resetAt < this.firstConfiguredAt && now - this.firstConfiguredAt <= GRACE_MS;
+    const late = lateMs > GRACE_MS || onBoot
+      ? `missed by ${Math.round((now - resetAt) / 60000)} min, touched ${onBoot ? 'on boot' : 'late'}` : null;
     const why = this.skipReason(account);
     if (why) {
       f.note = `left (${why})`;
@@ -275,26 +285,26 @@ export class StaggerAnchors {
     }
     const running = Number(account.quota?.unified5hReset);
     if (Number.isFinite(running) && running > now) {
-      // Something else started the window after the reset (a request, another sweep): that is the reset's
-      // touch, seen now. Every other way of ending here without a touch is a missing touch, whatever the note.
-      Object.assign(f, { touchedAt: now, touchedBy: 'request', note: 'window started by a request' });
+      // A new window, and no response recorded it as this reset's touch (that is _follow's, by request id): not
+      // counted as a touch, so the CHECK warns on it.
+      f.note = 'window running, no response seen';
       return;
     }
     const generation = this.followGeneration;
-    this.log(`[TeamClaude] Keep-warm stagger: touching "${account.name}" at its reset ${at}`);
+    this.log(`[TeamClaude] Keep-warm stagger: touching "${account.name}" at its reset ${at}${late ? ` (${late})` : ''}`);
     /** @type {{account: any, outcome: string}[]} */
     const outcomes = [];
     await this.warmer._warmTargets([account], {
       outcomes,
       waitForRunning: true,
       allowWhileSuspended: true,
-      deadline: resetAt + GRACE_MS,
+      deadline: Math.max(resetAt, now) + GRACE_MS,
       shouldContinue: () => generation === this.followGeneration
         && this.follow.get(account.name) === f
         && this.skipReason(account) == null,
     });
     const outcome = outcomes.find(o => o.account === account)?.outcome ?? 'skipped';
-    if (outcome === 'ok') Object.assign(f, { touchedAt: this.nowFn(), touchedBy: 'stagger' });
+    if (outcome === 'ok') Object.assign(f, { touchedAt: this.nowFn(), touchedBy: 'stagger', note: late });
     else f.note = outcome === 'skipped' ? 'cancelled before sending' : `touch failed: ${outcome.replace(/^error: /, '')}`;
   }
 
@@ -526,9 +536,13 @@ export class StaggerAnchors {
       seat.last = `left at ${new Date(at).toISOString()} (window started meanwhile, until ${new Date(running).toISOString()})`;
       return;
     }
+    // A known reset is its follower's (reset + 10 s); the slot starts only a seat whose reset is unknown (the
+    // lead's rule on PR 108: the follower wins when a reset is known).
+    if (this.follow.get(account.name)?.resetAt != null) {
+      seat.last = `left at ${new Date(at).toISOString()} (reset known: its follower touches it)`;
+      return;
+    }
     const generation = this.generation;
-    // A slot touch that lands right after a reset is that reset's touch too.
-    const claimed = this._claimReset(account);
     this.log(`[TeamClaude] Keep-warm stagger: touching "${account.name}" for its ${slot} slot at ${new Date(this.nowFn()).toISOString()}`);
     // The warmer re-checks that the seat is still cold right before it sends,
     // so a request that started the window meanwhile is not doubled.
@@ -554,10 +568,6 @@ export class StaggerAnchors {
     if (outcome === 'skipped') seat.last = `cancelled ${new Date(this.nowFn()).toISOString()} before sending`;
     else if (outcome === 'ok') seat.last = `touched ${new Date(this.nowFn()).toISOString()}${resets}`;
     else seat.last = `touch failed ${new Date(this.nowFn()).toISOString()}: ${outcome.replace(/^error: /, '')}`;
-    if (claimed) {
-      if (outcome === 'ok') Object.assign(claimed, { touchedAt: this.nowFn(), touchedBy: 'stagger' });
-      else claimed.note = outcome === 'skipped' ? 'cancelled before sending' : `touch failed: ${outcome.replace(/^error: /, '')}`;
-    }
     this._follow(account);
   }
 
@@ -586,6 +596,7 @@ export class StaggerAnchors {
           touchedAt: iso(f?.touchedAt),
           touchLagSeconds: f?.touchedAt != null && f.lastResetAt != null ? Math.round((f.touchedAt - f.lastResetAt) / 1000) : null,
           touchedBy: f?.touchedBy ?? null,
+          touchRequestId: f?.requestId ?? null,
           followNote: f?.note ?? null,
           nextFollowAt: iso(f?.resetAt),
         };

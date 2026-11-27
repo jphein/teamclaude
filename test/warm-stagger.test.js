@@ -288,7 +288,8 @@ test('a completed touch is reported with the reset it produced', async () => {
   const h = harness(['a']);
   h.st.configure(cfg);
   await h.advance(at('02:05'));
-  const want = new Date(at('07:00') + TOUCH_OFFSET_MS).toISOString().replace(/\./g, '\\.');
+  // the window starts at the 10-minute mark at or before the touch, so the 02:00:10 touch resets at 07:00 sharp
+  const want = new Date(at('07:00')).toISOString().replace(/\./g, '\\.');
   assert.match(h.st.status().seats[0].last, new RegExp(`^touched .*, resets ${want}$`));
 });
 

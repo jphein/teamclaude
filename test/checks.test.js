@@ -27,84 +27,149 @@ function run(script, env = {}, args = []) {
 const LINE = /^CHECK [a-z-]+ (ok|warn|fail) · .+ · .+$/;
 
 // ---------- pool-quota
-const NOW = 1_794_680_000_000;
+const NOW = 1_794_680_000_000; // a fixed instant; the line's clock times are read in TZ=UTC
+const PQH = 3_600_000;
+const hm = (ms) => new Date(ms).toLocaleString('en-US', { weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23', timeZone: 'UTC' }).replace(',', '');
 const seat = (name, fiveUtil, weekUtil, extra = {}) => ({
   name, type: 'oauth', disabled: false, status: 'active',
   buckets: {
-    fiveHour: fiveUtil == null ? null : { utilization: fiveUtil, remaining: 1 - fiveUtil, resetAt: NOW + 3_600_000 },
-    weeklyShared: { utilization: weekUtil, remaining: 1 - weekUtil, resetAt: NOW + 86_400_000 },
+    fiveHour: fiveUtil == null ? null : { utilization: fiveUtil, remaining: 1 - fiveUtil, resetAt: NOW + PQH },
+    weeklyShared: { utilization: weekUtil, remaining: 1 - weekUtil, resetAt: NOW + 24 * PQH },
   },
   ...extra,
 });
-const quota = (five, week, accounts) => ({ aggregate: { fiveHour: { remaining: five }, weeklyShared: { remaining: week } }, accounts });
+const at = (s, bucket, ms) => { s.buckets[bucket].resetAt = ms; return s; };
+const quota = (five, week, accounts, extra = {}) => ({ aggregate: { fiveHour: { remaining: five }, weeklyShared: { remaining: week } }, accounts, ...extra });
 function pq(body, extraEnv = {}) {
   const f = join(fresh(), 'q.json');
   writeFileSync(f, typeof body === 'string' ? body : JSON.stringify(body));
-  return run('pool-quota.sh', { CHECK_QUOTA_FILE: f, CHECK_NOW_MS: String(NOW), ...extraEnv });
+  return run('pool-quota.sh', { CHECK_QUOTA_FILE: f, CHECK_NOW_MS: String(NOW), TZ: 'UTC', ...extraEnv });
 }
 
-test('pool-quota: healthy pool is ok, names no seat by email', () => {
+test('pool-quota: two seats serving is ok; each serving seat shows its 5h and week; no email in the line', () => {
   const r = pq(quota(0.8, 0.6, [seat('a@x.org', 0.1, 0.2), seat('b@x.org', null, 0.5)]));
   assert.equal(r.status, 0);
   assert.match(r.line, LINE);
-  assert.match(r.line, /^CHECK pool-quota ok · 5h 80% left, week 60% left, seats ≥90% used: none, at \d\d:\d\d · /);
+  assert.match(r.line, /^CHECK pool-quota ok · serving 2 of 2 seats: a \(5h 10%, week 20% used\), b \(5h \?, week 50% used\); 5h 80% left, week 60% left, at \d\d:\d\d · a seat notice is not a wall while a seat serves · /);
   assert.doesNotMatch(r.line, /@/);
   assert.equal(readFileSync(join(r.state, 'pool-quota.line'), 'utf8').trim(), r.line);
 });
 
-test('pool-quota: weekly at or under 15% warns, at or under 5% fails; 5h under 15% warns; seats ≥90% named', () => {
-  let r = pq(quota(0.8, 0.15, [seat('claude3@x.org', null, 0.9), seat('b@x.org', 0.95, 0.1), seat('c@x.org', 0.2, 0.89)]));
-  assert.equal(r.status, 0);
-  assert.match(r.line, /^CHECK pool-quota warn · 5h 80% left, week 15% left \(week at or under 15%\), seats ≥90% used: claude3 b, /);
-  r = pq(quota(0.8, 0.05, [seat('a@x.org', 0.2, 0.95)]));
-  assert.equal(r.status, 0, 'a check never gates, even on fail');
-  assert.match(r.line, /^CHECK pool-quota fail · 5h 80% left, week 5% left \(week at or under 5%\)/);
-  r = pq(quota(0.14, 0.5, [seat('a@x.org', 0.86, 0.5)]));
-  assert.match(r.line, /^CHECK pool-quota warn · 5h 14% left, week 50% left \(5h under 15%\)/);
-  r = pq(quota(0.15, 0.151, [seat('a@x.org', 0.85, 0.7)]));
-  assert.match(r.line, /^CHECK pool-quota ok /, '5h exactly 15% and week just over 15% are ok');
-  r = pq(quota(0.8, 0.29, [seat('a@x.org', 0.2, 0.7)]));
-  assert.match(r.line, /^CHECK pool-quota ok · 5h 80% left, week 29% left, /, 'the old 30% weekly floor no longer warns (7-day cap 100%)');
+test('pool-quota: one seat serving warns and names when each week-spent seat comes back, soonest first, grouped by minute', () => {
+  const t1 = NOW + 10 * PQH, t2 = NOW + 30 * PQH;
+  const r = pq(quota(0.86, 0.13, [
+    at(seat('claude3@x.org', 0.3, 1), 'weeklyShared', t2 + 1000), // 1 s from jp's reset: same group (2026-11-19 it vanished)
+    at(seat('jp@x.org', 0, 1), 'weeklyShared', t2),
+    at(seat('claude2@x.org', 0, 0.99), 'weeklyShared', t1),
+    seat('claude6', 0.66, 0.11),
+  ], { live_seats: 1 }));
+  assert.match(r.line, new RegExp(`^CHECK pool-quota warn · serving 1 of 4 seats: claude6 \\(5h 66%, week 11% used\\); week-spent, back: claude2 ${hm(t1)}, claude3 jp ${hm(t2)}; 5h 86% left, week 13% left \\(one seat serves; week at or under 15%\\)`), r.line);
 });
 
-test('pool-quota: the line names the weekly reset when the proxy reports it, and only a sane one', () => {
-  const at = NOW + 2 * 86_400_000;
-  const want = new Date(at).toLocaleString('en-US', { weekday: 'short', timeZone: 'UTC' });
-  const body = quota(0.8, 0.12, [seat('a@x.org', 0.2, 0.9)]);
-  body.aggregate.weeklyShared.nextResetAt = at;
-  let r = pq(body, { TZ: 'UTC' });
-  const d = new Date(at);
-  const hhmm = `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
-  const mmdd = `${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-  assert.ok(r.line.includes(`week 12% left (week at or under 15%), week resets ${want} ${mmdd} ${hhmm}, seats`), r.line);
-  for (const bad of ['soon', -1, 0, 1e20]) {
-    body.aggregate.weeklyShared.nextResetAt = bad;
-    r = pq(body);
-    assert.match(r.line, /^CHECK pool-quota warn · /);
-    assert.doesNotMatch(r.line, /resets/, `nextResetAt ${bad} is not printed`);
+test('pool-quota: no seat serving is a fail that names the first seat back, 5h-full seats included', () => {
+  const r = pq(quota(0.5, 0.2, [
+    at(seat('six', 0.98, 0.2), 'fiveHour', NOW + 2 * PQH),
+    at(seat('two@x.org', 0.1, 0.98), 'weeklyShared', NOW + 5 * PQH),
+  ], { live_seats: 0 }));
+  assert.equal(r.status, 0, 'a check never gates, even on fail');
+  assert.match(r.line, new RegExp(`^CHECK pool-quota fail · serving 0 of 2 seats, first back ${hm(NOW + 2 * PQH)}; 5h-full, back: six ${hm(NOW + 2 * PQH)}; week-spent, back: two ${hm(NOW + 5 * PQH)}; .*\\(no seat serves: a wall\\)`), r.line);
+});
+
+test('pool-quota: the servable 5h figure decides the 5h warning when the proxy reports it; the raw one otherwise', () => {
+  const body = quota(0.86, 0.6, [seat('a', 0.2, 0.5), seat('b', 0.1, 0.4)]);
+  body.aggregate.fiveHour.servableRemaining = 0.05;
+  let r = pq(body);
+  assert.match(r.line, /^CHECK pool-quota warn · .*; 5h servable 5% \(raw 86%\), week 60% left \(5h servable under 15%\)/, r.line);
+  r = pq(quota(0.14, 0.5, [seat('a', 0.86, 0.5), seat('b', 0.1, 0.5)]));
+  assert.match(r.line, /^CHECK pool-quota warn · .*; 5h 14% left, week 50% left \(5h servable under 15%\)/);
+  r = pq(quota(0.15, 0.151, [seat('a', 0.85, 0.7), seat('b', 0.1, 0.5)]));
+  assert.match(r.line, /^CHECK pool-quota ok /, '5h exactly 15% and week just over 15% are ok');
+  r = pq(quota(0.8, 0.29, [seat('a', 0.2, 0.7), seat('b', 0.2, 0.7)]));
+  assert.match(r.line, /^CHECK pool-quota ok · .*week 29% left, /, 'the old 30% weekly floor no longer warns (7-day cap 100%)');
+});
+
+test('pool-quota: the proxy\'s live_seats is the count; without it the seats are counted here', () => {
+  let r = pq(quota(0.8, 0.6, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2)], { live_seats: 1 }));
+  assert.match(r.line, /^CHECK pool-quota warn · serving 1 of 2 seats: a .*, b .* \(the proxy's count; the seat data calls 2 servable\).*\(one seat serves\)/, r.line);
+  r = pq(quota(0.8, 0.6, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2)], { live_seats: 'many' }));
+  assert.match(r.line, /^CHECK pool-quota ok · serving 2 of 2 seats/);
+  assert.doesNotMatch(r.line, /the proxy's count/, 'no disagreement note when the counts agree');
+});
+
+test('pool-quota: the proxy serving none while the seat data calls seats servable fails and says the cause is unknown', () => {
+  const r = pq(quota(0.8, 0.6, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2), at(seat('c', 0.1, 1), 'weeklyShared', NOW + 3 * PQH)], { live_seats: 0 }));
+  assert.match(r.line, new RegExp(`^CHECK pool-quota fail · serving 0 of 3 seats, first back ${hm(NOW + 3 * PQH)}; the seat data calls 2 servable \\(a \\(5h 10%, week 20% used\\), b .*\\): why the proxy serves none is unknown here; .*\\(no seat serves: a wall`), r.line);
+  assert.doesNotMatch(r.line, /serving 0 of 3 seats: /, 'never lists seats as serving under a count of zero');
+});
+
+test('pool-quota: a week-spent seat whose 5 hours are also full comes back at the later reset; unknown if either is unknown', () => {
+  const wk1 = NOW + 1 * PQH, f2 = NOW + 2 * PQH;
+  let r = pq(quota(0.5, 0.5, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2), at(at(seat('both', 0.99, 0.99), 'weeklyShared', wk1), 'fiveHour', f2)]));
+  assert.match(r.line, new RegExp(`week-spent, back: both ${hm(f2)}; `), r.line);
+  r = pq(quota(0.5, 0.5, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2), at(at(seat('both', 0.99, 0.99), 'weeklyShared', f2), 'fiveHour', wk1)]));
+  assert.match(r.line, new RegExp(`week-spent, back: both ${hm(f2)}; `), 'the week resetting later wins too');
+  r = pq(quota(0.5, 0.5, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2), at(at(seat('both', 0.99, 0.99), 'weeklyShared', wk1), 'fiveHour', null)]));
+  assert.match(r.line, /week-spent, back: both \?; /, r.line);
+  r = pq(quota(0.5, 0.5, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2), at(at(seat('wkonly', 0.5, 0.99), 'weeklyShared', wk1), 'fiveHour', f2)]));
+  assert.match(r.line, new RegExp(`week-spent, back: wkonly ${hm(wk1)}; `), 'a 5h bucket with room does not delay the return');
+  r = pq(quota(0.5, 0.5, [at(at(seat('both', 0.99, 0.99), 'weeklyShared', wk1), 'fiveHour', f2)], { live_seats: 0 }));
+  assert.match(r.line, new RegExp(`serving 0 of 1 seats, first back ${hm(f2)}; `), 'first back uses the same later reset');
+});
+
+test('pool-quota: an empty or domain-only name prints as ? and never shifts the serving entry', () => {
+  const r = pq(quota(0.8, 0.6, [seat('', 0.1, 0.2), seat('@x.org', 0.3, 0.4)]));
+  assert.match(r.line, /serving 2 of 2 seats: \? \(5h 10%, week 20% used\), \? \(5h 30%, week 40% used\); /, r.line);
+});
+
+test('pool-quota: hostile names in the 5h-full and week-spent groups are reduced; unknown times group last', () => {
+  const r = pq(quota(0.5, 0.5, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2),
+    at(seat('\u001b]0;x\u0007f5@x.org', 0.98, 0.2), 'fiveHour', NOW + PQH),
+    at(seat('w\nk@x.org', 0.1, 0.99), 'weeklyShared', null),
+    at(seat('zz', 0.1, 0.99), 'weeklyShared', 'soon'),
+    at(seat('early', 0.1, 0.99), 'weeklyShared', NOW + 2 * PQH)]));
+  assert.doesNotMatch(r.stdout, /[\x00-\x09\x0b-\x1f\x7f]/);
+  assert.equal(r.stdout.trim().split('\n').length, 1);
+  assert.match(r.line, new RegExp(`5h-full, back: \\?\\?0\\?x\\?f5 ${hm(NOW + PQH)}; week-spent, back: early ${hm(NOW + 2 * PQH)}, w\\?k zz \\?; `), r.line);
+});
+
+test('pool-quota: 5 hours at exactly 97 % is full; just under serves', () => {
+  let r = pq(quota(0.5, 0.5, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2), at(seat('edge', 0.97, 0.2), 'fiveHour', NOW + PQH)]));
+  assert.match(r.line, new RegExp(`serving 2 of 3 seats: a .*; 5h-full, back: edge ${hm(NOW + PQH)}; `), r.line);
+  r = pq(quota(0.5, 0.5, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2), seat('edge', 0.969, 0.2)]));
+  assert.match(r.line, /serving 3 of 3 seats: .*edge \(5h 97%, week 20% used\)/, r.line);
+});
+
+test('pool-quota: a low weekly pool with seats serving warns and never fails (the weekly fail is gone)', () => {
+  const r = pq(quota(0.8, 0.04, [seat('a', 0.1, 0.9), seat('b', 0.1, 0.95)]));
+  assert.match(r.line, /^CHECK pool-quota warn · serving 2 of 2 seats: .*week 4% left \(week at or under 15%\)/, r.line);
+});
+
+test('pool-quota: a reset time that is missing or insane prints as ?', () => {
+  for (const bad of ['soon', -1, 0, 1e20, null]) {
+    const r = pq(quota(0.5, 0.5, [seat('a', 0.1, 0.2), seat('b', 0.1, 0.2), at(seat('c', 0.1, 1), 'weeklyShared', bad)]));
+    assert.match(r.line, /week-spent, back: c \?; /, `resetAt ${bad}: ${r.line}`);
   }
 });
 
 test('pool-quota: a bucket reset more than 15 min ago that still shows usage is stale and warns', () => {
-  const stale = seat('old@x.org', 0.4, 0.2);
-  stale.buckets.fiveHour.resetAt = NOW - 16 * 60_000;
-  const recent = seat('new@x.org', 0.4, 0.2);
-  recent.buckets.fiveHour.resetAt = NOW - 10 * 60_000;
+  const stale = at(seat('old@x.org', 0.4, 0.2), 'fiveHour', NOW - 16 * 60_000);
+  const recent = at(seat('new@x.org', 0.4, 0.2), 'fiveHour', NOW - 10 * 60_000);
   const r = pq(quota(0.8, 0.6, [stale, recent]));
   assert.match(r.line, /^CHECK pool-quota warn · .*\(stale buckets: old\)/);
 });
 
 test('pool-quota: seat names cannot carry control characters into the line', () => {
-  const r = pq(quota(0.5, 0.5, [seat('\u001b[2J\u001b[Hspoof@x.org', 0.95, 0.1), seat('re\nx@x.org', 0.1, 0.1, { status: 'bad\u0007' })]));
+  const r = pq(quota(0.5, 0.5, [seat('\u001b[2J\u001b[Hspoof@x.org', 0.1, 0.1), seat('ok', 0.1, 0.1), seat('re\nx@x.org', 0.1, 0.1, { status: 'bad\u0007' })]));
   assert.equal(r.status, 0);
   assert.doesNotMatch(r.stdout, /[\x00-\x09\x0b-\x1f\x7f]/);
   assert.equal(r.stdout.trim().split('\n').length, 1);
-  assert.match(r.line, /seats ≥90% used: \?\?2J\?\?Hspoof, not active: re\?x=bad\?, /);
+  assert.match(r.line, /serving 2 of 3 seats: \?\?2J\?\?Hspoof \(5h 10%, week 10% used\), ok .*, not active: re\?x=bad\?, /);
 });
 
-test('pool-quota: disabled seats are ignored; a seat not active is named', () => {
-  const r = pq(quota(0.8, 0.6, [seat('off@x.org', 0.99, 0.99, { disabled: true }), seat('re@x.org', 0.1, 0.1, { status: 'needs-reauth' })]));
-  assert.match(r.line, /seats ≥90% used: none, not active: re=needs-reauth, /);
+test('pool-quota: disabled seats are ignored; a seat not active is named and does not count as serving', () => {
+  const r = pq(quota(0.8, 0.6, [seat('off@x.org', 0.1, 0.1, { disabled: true }), seat('a', 0.1, 0.1), seat('b', 0.1, 0.1), seat('re@x.org', 0.1, 0.1, { status: 'needs-reauth' })]));
+  assert.match(r.line, /^CHECK pool-quota ok · serving 2 of 3 seats: a .*, b .*, not active: re=needs-reauth, /);
+  assert.doesNotMatch(r.line, /off/);
 });
 
 test('pool-quota: no aggregate, bad JSON or no endpoint is a fail line (exit 0: a check never gates)', () => {

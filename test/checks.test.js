@@ -1947,17 +1947,20 @@ test('security-scan [stub npm]: npm audit high fails, moderate warns, counts wit
   assert.match(r.rows[0], /could not see: npm audit could not be read/);
   assert.match(scan(scanFixtures({ 'audit.json': AUDIT({ low: 0, total: 0 }, 1) })).line, /npm audit could not be read \(exit 1\)/, 'exit 1 with no advisory disagrees');
   r = scan(scanFixtures({ 'audit.json': null }), { env: { PATH: stubs(fresh(), { npm: '[ "$1" = install ] && exit 0; echo "npm ERR! network"; exit 7' }) } });
-  assert.match(r.line, /^CHECK security-scan fail · .*npm audit could not be read \(exit 7\)/, r.line);
+  // a blind audit's line names the thresholds too: the same shape on every path (the lead's ruling on PR 107)
+  assert.match(r.line, /^CHECK security-scan fail · .*npm audit could not be read \(exit 7\) \(fail at high\+, warn at moderate\+\)/, r.line);
   r = scan(scanFixtures({ 'audit.json': null }), { repo: scanRepo({ lock: false }), env: { PATH: stubs(fresh(), { npm: 'exit 1' }) } });
-  assert.match(r.line, /npm audit could not be read \(exit no-lockfile\)/, r.line);
+  assert.match(r.line, /npm audit could not be read \(exit no-lockfile\) \(fail at high\+, warn at moderate\+\)/, r.line);
 });
 
 test('security-scan [stub npm]: npm audit reads master\'s committed package-lock.json, not the working tree\'s, and resolves nothing', () => {
   // the working tree's lockfile differs from the committed one; the stub refuses any npm verb but audit, and
-  // answers only when the lockfile it is handed is master's
+  // answers only when the lockfile it is handed is master's and the audit runs with --package-lock-only and
+  // --ignore-scripts (the lead's ruling on PR 107: belt and braces)
   const repo = scanRepo();
   writeFileSync(join(repo.tc, 'package-lock.json'), '{"name":"t","lockfileVersion":3,"packages":{},"marker":"worktree-lock"}\n');
   const npm = '[ "$1" = audit ] || { echo "npm $1: resolved"; exit 9; }; grep -q master-lock package-lock.json || exit 8; '
+    + 'case " $* " in *" --package-lock-only "*) ;; *) exit 6 ;; esac; case " $* " in *" --ignore-scripts "*) ;; *) exit 5 ;; esac; '
     + `printf '%s' '{"metadata":{"vulnerabilities":{"critical":0,"high":0,"moderate":0,"low":0,"total":0}}}'`;
   const r = scan(scanFixtures({ 'audit.json': null }), { repo, env: { PATH: stubs(fresh(), { npm }) } });
   assert.match(r.line, /^CHECK security-scan ok · .*npm audit 0 critical 0 high 0 moderate 0 low \(fail at high\+, warn at moderate\+\);/, r.line);

@@ -165,6 +165,14 @@ export class StaggerAnchors {
     this.served = new Map();
     // Bumped by configure/stop; a touch from an older generation never sends.
     this.generation = 0;
+    // Each seat's follower (JP 2026-11-27 13:0x: "touch it right away after it resets, not wait"): a timer at
+    // that seat's next reset, and what happened at the last one. Kept across the daily re-plan; the timers
+    // are dropped by stop(). Bumped by stop() only, so a re-plan never cancels a touch in flight.
+    /** @type {Map<string, {timer: any, resetAt: number|null, lastResetAt: number|null, touchedAt: number|null, note: string|null}>} */
+    this.follow = new Map();
+    this.followGeneration = 0;
+    /** @type {(() => void)|null} */
+    this.unsubscribe = null;
   }
 
   get enabled() { return !!this.settings; }
@@ -195,6 +203,97 @@ export class StaggerAnchors {
       ? saved.slots : null;
     this._applyPlan(reuse, last ?? now, reuse ? 'kept' : 'made');
     this._armPlan();
+    // Every response a seat gets carries its reset: a window a request starts is followed from that moment.
+    this.unsubscribe = this.am.onSeatRequest?.((/** @type {{account: any}} */ { account }) => this._follow(account)) ?? null;
+    for (const a of this._roster()) this._follow(a);
+  }
+
+  /** The reset a seat's next touch follows: its weekly reset while the week is spent, else its 5 h reset.
+   *  One that passed within the grace still counts (it is touched at once). @param {any} account */
+  _resetToFollow(account) {
+    const q = account.quota || {};
+    const now = this.nowFn();
+    const reset = Number(this.am.weekBarred?.(account) ? q.unified7dReset : q.unified5hReset);
+    return Number.isFinite(reset) && reset > now - GRACE_MS ? reset : null;
+  }
+
+  /** Arm (or re-arm) the seat's touch for its next reset. Cheap when nothing changed: every seat request calls
+   *  it. @param {any} account */
+  _follow(account) {
+    if (!this.settings || !warmApplicable(account) || account.disabled) return;
+    let f = this.follow.get(account.name);
+    if (!f) {
+      f = { timer: null, resetAt: null, lastResetAt: null, touchedAt: null, note: null };
+      this.follow.set(account.name, f);
+    }
+    const target = this._resetToFollow(account);
+    if (f.timer && target === f.resetAt) return;
+    const now = this.nowFn();
+    // The reset armed for passed, and a request started the next window before the touch: that reset needed
+    // no touch, and the record says so.
+    if (f.resetAt != null && f.resetAt <= now && target !== f.resetAt) {
+      Object.assign(f, { lastResetAt: f.resetAt, touchedAt: null, note: 'window started meanwhile (a request)' });
+    }
+    if (f.timer) { this.clearTimeoutFn(f.timer); f.timer = null; }
+    f.resetAt = null;
+    if (target == null || target === f.lastResetAt) return;
+    f.resetAt = target;
+    const settings = this.settings;
+    const record = f;
+    const timer = this.setTimeoutFn(() => {
+      if (this.settings !== settings || this.follow.get(account.name) !== record) return;
+      record.timer = null;
+      this._followFire(account, record, target).catch(() => {}).finally(() => {
+        if (this.settings === settings) this._follow(account);
+      });
+    }, Math.max(0, target + TOUCH_OFFSET_MS - now));
+    timer?.unref?.();
+    f.timer = timer;
+  }
+
+  /** The reset a touch about to be sent serves, claimed so the follower does not report it again; null when
+   *  no reset has passed for it. @param {any} account */
+  _claimReset(account) {
+    const f = this.follow.get(account.name);
+    if (!f || f.resetAt == null || f.resetAt > this.nowFn()) return null;
+    if (f.timer) { this.clearTimeoutFn(f.timer); f.timer = null; }
+    Object.assign(f, { lastResetAt: f.resetAt, resetAt: null, touchedAt: null, note: null });
+    return f;
+  }
+
+  /** @param {any} account @param {any} f @param {number} resetAt */
+  async _followFire(account, f, resetAt) {
+    Object.assign(f, { lastResetAt: resetAt, resetAt: null, touchedAt: null, note: null });
+    const now = this.nowFn();
+    const at = new Date(resetAt).toISOString();
+    if (now - resetAt > GRACE_MS) { f.note = `missed (woke ${Math.round((now - resetAt) / 60000)}m late)`; return; }
+    const why = this.skipReason(account);
+    if (why) {
+      f.note = `left (${why})`;
+      this.log(`[TeamClaude] Keep-warm stagger: leaving "${account.name}" at its reset ${at} (${why})`);
+      return;
+    }
+    const running = Number(account.quota?.unified5hReset);
+    if (Number.isFinite(running) && running > now) {
+      f.note = `window started meanwhile, until ${new Date(running).toISOString()}`;
+      return;
+    }
+    const generation = this.followGeneration;
+    this.log(`[TeamClaude] Keep-warm stagger: touching "${account.name}" at its reset ${at}`);
+    /** @type {{account: any, outcome: string}[]} */
+    const outcomes = [];
+    await this.warmer._warmTargets([account], {
+      outcomes,
+      waitForRunning: true,
+      allowWhileSuspended: true,
+      deadline: resetAt + GRACE_MS,
+      shouldContinue: () => generation === this.followGeneration
+        && this.follow.get(account.name) === f
+        && this.skipReason(account) == null,
+    });
+    const outcome = outcomes.find(o => o.account === account)?.outcome ?? 'skipped';
+    if (outcome === 'ok') f.touchedAt = this.nowFn();
+    else f.note = outcome === 'skipped' ? 'cancelled before sending' : `touch failed: ${outcome.replace(/^error: /, '')}`;
   }
 
   /** What a saved plan must match to be reused. */
@@ -309,6 +408,14 @@ export class StaggerAnchors {
 
   stop() {
     this.generation += 1;
+    this.followGeneration += 1;
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+    for (const f of this.follow.values()) {
+      if (f.timer) this.clearTimeoutFn(f.timer);
+      f.timer = null;
+      f.resetAt = null;
+    }
     if (this.planTimer) { this.clearTimeoutFn(this.planTimer); this.planTimer = null; }
     for (const seat of this.seats.values()) if (seat.timer) this.clearTimeoutFn(seat.timer);
     this.seats = new Map();
@@ -418,6 +525,8 @@ export class StaggerAnchors {
       return;
     }
     const generation = this.generation;
+    // A slot touch that lands right after a reset is that reset's touch too.
+    const claimed = this._claimReset(account);
     this.log(`[TeamClaude] Keep-warm stagger: touching "${account.name}" for its ${slot} slot at ${new Date(this.nowFn()).toISOString()}`);
     // The warmer re-checks that the seat is still cold right before it sends,
     // so a request that started the window meanwhile is not doubled.
@@ -443,6 +552,11 @@ export class StaggerAnchors {
     if (outcome === 'skipped') seat.last = `cancelled ${new Date(this.nowFn()).toISOString()} before sending`;
     else if (outcome === 'ok') seat.last = `touched ${new Date(this.nowFn()).toISOString()}${resets}`;
     else seat.last = `touch failed ${new Date(this.nowFn()).toISOString()}: ${outcome.replace(/^error: /, '')}`;
+    if (claimed) {
+      if (outcome === 'ok') claimed.touchedAt = this.nowFn();
+      else claimed.note = outcome === 'skipped' ? 'cancelled before sending' : `touch failed: ${outcome.replace(/^error: /, '')}`;
+    }
+    this._follow(account);
   }
 
   /** For /teamclaude/quota and /status. */
@@ -456,12 +570,23 @@ export class StaggerAnchors {
       minWeeklyRemaining: this.settings.minWeeklyRemaining,
       planAt: this.planAt != null ? new Date(this.planAt).toISOString() : null,
       nextPlanAt: this.nextPlanAt != null ? new Date(this.nextPlanAt).toISOString() : null,
-      seats: [...this.seats.entries()].map(([name, s]) => ({
-        name,
-        slot: s.minutes == null ? null : formatSlot(s.minutes),
-        nextTouchAt: s.nextAt != null ? new Date(s.nextAt).toISOString() : null,
-        last: s.last,
-      })),
+      seats: [...this.seats.entries()].map(([name, s]) => {
+        const f = this.follow.get(name);
+        const iso = (/** @type {number|null|undefined} */ t) => (t != null ? new Date(t).toISOString() : null);
+        return {
+          name,
+          slot: s.minutes == null ? null : formatSlot(s.minutes),
+          nextTouchAt: s.nextAt != null ? new Date(s.nextAt).toISOString() : null,
+          last: s.last,
+          // The follower: the seat's last reset, the touch that followed it (or why none), and the next reset
+          // it waits for. The quota CHECK warns on a touch more than 60 s after its reset.
+          lastResetAt: iso(f?.lastResetAt),
+          touchedAt: iso(f?.touchedAt),
+          touchLagSeconds: f?.touchedAt != null && f.lastResetAt != null ? Math.round((f.touchedAt - f.lastResetAt) / 1000) : null,
+          followNote: f?.note ?? null,
+          nextFollowAt: iso(f?.resetAt),
+        };
+      }),
     };
   }
 }

@@ -662,7 +662,7 @@ export class AccountManager {
     this._on5hWindowStarted = [];
     // A Claude seat's quota was read off a response (onSeatRequest): the banked-reset rules decide
     // there, with how long the seat had been idle before this request (null = never used before).
-    /** @type {Array<(ev: { account: any, idleMs: number|null }) => void>} */
+    /** @type {Array<(ev: { account: any, idleMs: number|null, requestId: string|null }) => void>} */
     this._onSeatRequest = [];
     // Skip-reason log throttle (per account) and the session a skip is
     // attributed to — diagnostics only, see _logSkipReason.

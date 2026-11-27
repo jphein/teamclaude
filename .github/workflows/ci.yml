@@ -27,11 +27,11 @@ jobs:
       # `--ignore-scripts`: the devDependencies (eslint, typescript, @types/node)
       # are needed for lint and typecheck only, and neither they nor their
       # transitive packages need lifecycle scripts to work. Not running them denies a compromised package arbitrary code
-      # execution at install time. Still `npm install` rather than `npm ci`:
-      # package-lock.json is deliberately gitignored for this zero-dependency
-      # package, so there is no lockfile for `npm ci` to consume.
+      # execution at install time. `npm ci` installs exactly the committed
+      # package-lock.json (and fails if package.json disagrees with it), so the
+      # graph tested here is the graph CHECK security-scan audits (row 5bb792b5).
       - name: Install dependencies
-        run: npm install --ignore-scripts
+        run: npm ci --ignore-scripts
 
       - name: Run tests
         run: npm test

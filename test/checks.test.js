@@ -1827,11 +1827,12 @@ const git = (cwd, ...a) => {
   assert.equal(r.status, 0, `git ${a.join(' ')}: ${r.stderr}`);
   return r.stdout.trim();
 };
-function scanRepo() { // a fork with origin/master and upstream/master refs, and a VM clone of it
+function scanRepo({ lock = true } = {}) { // a fork with origin/master and upstream/master refs, and a VM clone of it
   const d = fresh();
   const tc = join(d, 'tc');
   mkdirSync(join(tc, 'src'), { recursive: true }); mkdirSync(join(tc, 'bin'));
   writeFileSync(join(tc, 'package.json'), '{"name":"t","devDependencies":{"eslint":"^9.0.0"}}\n');
+  if (lock) writeFileSync(join(tc, 'package-lock.json'), '{"name":"t","lockfileVersion":3,"packages":{},"marker":"master-lock"}\n');
   writeFileSync(join(tc, 'src', 'index.js'), 'console.log(1)\n');
   writeFileSync(join(tc, 'bin', 'tc'), '#!/bin/sh\n'); chmodSync(join(tc, 'bin', 'tc'), 0o755);
   writeFileSync(join(tc, '.gitignore'), 'scratch/\n');
@@ -1887,7 +1888,7 @@ test('security-scan [live VM]: a clean day is ok, every tracked file (dotfiles t
   const r = scan(scanFixtures());
   assert.equal(r.status, 0);
   assert.match(r.line, LINE);
-  assert.match(r.line, /^CHECK security-scan ok · teamclaude gitleaks 0; forge-gateway gitleaks 0; npm audit 0 critical 0 high 0 moderate; litellm 1\.106\.9 OSV 0; upstream 2 commits not in the fork; VM [0-9a-f]{7}( \S+)? proxy running, files = merged tree \(5 files\); forge services \(db litellm\): each running its pin; upstream baseline recorded; rows filed 0, at \d\d:\d\d · /, r.line);
+  assert.match(r.line, /^CHECK security-scan ok · teamclaude gitleaks 0; forge-gateway gitleaks 0; npm audit 0 critical 0 high 0 moderate; litellm 1\.106\.9 OSV 0; upstream 2 commits not in the fork; VM [0-9a-f]{7}( \S+)? proxy running, files = merged tree \(6 files\); forge services \(db litellm\): each running its pin; upstream baseline recorded; rows filed 0, at \d\d:\d\d · /, r.line);
   assert.deepEqual(r.rows, []);
 });
 
@@ -1947,8 +1948,16 @@ test('security-scan [stub npm]: npm audit high fails, moderate warns, counts wit
   assert.match(scan(scanFixtures({ 'audit.json': AUDIT({ low: 0, total: 0 }, 1) })).line, /npm audit could not be read \(exit 1\)/, 'exit 1 with no advisory disagrees');
   r = scan(scanFixtures({ 'audit.json': null }), { env: { PATH: stubs(fresh(), { npm: '[ "$1" = install ] && exit 0; echo "npm ERR! network"; exit 7' }) } });
   assert.match(r.line, /^CHECK security-scan fail · .*npm audit could not be read \(exit 7\)/, r.line);
-  r = scan(scanFixtures({ 'audit.json': null }), { env: { PATH: stubs(fresh(), { npm: 'exit 1' }) } });
-  assert.match(r.line, /npm audit could not be read \(exit install-1\)/, r.line);
+  r = scan(scanFixtures({ 'audit.json': null }), { repo: scanRepo({ lock: false }), env: { PATH: stubs(fresh(), { npm: 'exit 1' }) } });
+  assert.match(r.line, /npm audit could not be read \(exit no-lockfile\)/, r.line);
+});
+
+test('security-scan [stub npm]: npm audit reads master\'s committed package-lock.json and resolves nothing', () => {
+  // the stub refuses any npm verb but audit, and answers only when the lockfile it is given is master's
+  const npm = '[ "$1" = audit ] || { echo "npm $1: resolved"; exit 9; }; grep -q master-lock package-lock.json || exit 8; '
+    + `printf '%s' '{"metadata":{"vulnerabilities":{"critical":0,"high":0,"moderate":0,"low":0,"total":0}}}'`;
+  const r = scan(scanFixtures({ 'audit.json': null }), { env: { PATH: stubs(fresh(), { npm }) } });
+  assert.match(r.line, /^CHECK security-scan ok · .*npm audit 0 critical 0 high 0 moderate;/, r.line);
 });
 
 test('security-scan [stub curl]: any OSV advisory fails with its severity; {} (OSV\'s no-advisory answer) is zero; null, malformed or unreachable fails with a row', () => {

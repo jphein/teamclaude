@@ -146,7 +146,7 @@ Each night it reads what is listed and what is reachable, and probes every liste
 
 **What runs** (read-only apart from `git fetch`):
 - `gitleaks git --redact` over each main history. It honours the `.gitleaksignore` committed on that main, which holds fingerprints only, never values.
-- `npm install --package-lock-only --ignore-scripts`, then `npm audit --package-lock-only`, on teamclaude's master `package.json` in a temp dir. Nothing is installed and no scripts run. Master keeps no lockfile on purpose: CI runs `npm install --ignore-scripts` with none (`.github/workflows/ci.yml`). So what is audited is **this run's resolved graph: CI's in practice, not provably** (a registry can resolve differently between the two runs). A committed lockfile with `npm ci` would close that gap; it has its own row.
+- `npm audit --package-lock-only` on teamclaude's master `package.json` and committed `package-lock.json`, in a temp dir. Nothing is resolved or installed and no scripts run. CI installs exactly that lockfile with `npm ci --ignore-scripts` (`.github/workflows/ci.yml`), so what is audited **is the graph CI tests** (row 5bb792b5). A master without a lockfile is a blind audit: fail.
 - An OSV query for the LiteLLM version written on the compose image line (`# vX.Y.Z`).
 - `gh api --paginate` for open PRs, with their files and commits.
 - On the VM, a script that prints the git mode and blob id (`git hash-object --no-filters`, a hash of the bytes) of every file in the checkout except `.git`, dotfiles included, and the node's start time (from `/proc/<pid>/stat`). This side lists the same for the merged commit the VM names, with `git ls-tree -r`. The VM's index and HEAD are never trusted for the comparison.

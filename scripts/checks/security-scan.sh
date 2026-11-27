@@ -105,15 +105,13 @@ for pair in "teamclaude:$TC:origin/master" "forge-gateway:$FG:origin/main"; do
 done
 
 # ---- audit (teamclaude dev tools)
-audit() { # -> npm audit JSON, then "#RC n" ("#RC install-n" when the lockfile could not be resolved)
-  # master keeps no lockfile on purpose: CI runs `npm install --ignore-scripts` with none (.github/workflows/ci.yml,
-  # "there is no lockfile for npm ci to consume"), so the graph CI tests is a fresh resolution of package.json,
-  # and that is the graph audited here, resolved the same way.
+audit() { # -> npm audit JSON, then "#RC n" ("#RC show-1" / "#RC no-lockfile" when master's files cannot be read)
+  # master commits package-lock.json and CI installs exactly it with `npm ci` (.github/workflows/ci.yml, row
+  # 5bb792b5), so the graph audited is master's lockfile as committed: nothing is resolved here.
   local rc
   mkdir -p "$tmp/audit"
   git -C "$TC" show origin/master:package.json > "$tmp/audit/package.json" 2>/dev/null || { echo "#RC show-1"; return; }
-  (cd "$tmp/audit" && noproxy timeout 180 npm install --package-lock-only --ignore-scripts --no-audit --no-fund >/dev/null 2>&1) \
-    || { echo "#RC install-$?"; return; }
+  git -C "$TC" show origin/master:package-lock.json > "$tmp/audit/package-lock.json" 2>/dev/null || { echo "#RC no-lockfile"; return; }
   (cd "$tmp/audit" && noproxy timeout 120 npm audit --package-lock-only --json 2>/dev/null); rc=$?
   echo; echo "#RC $rc"
 }

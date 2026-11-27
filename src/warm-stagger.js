@@ -221,14 +221,16 @@ export class StaggerAnchors {
    *  boot). @param {any} account */
   _resetToFollow(account) {
     const q = account.quota || {};
+    // null is no reset, never 0 (Number(null) is 0: a seat with no reading would read as overdue since 1970)
+    const ms = (/** @type {any} */ v) => (v == null || v === '' ? NaN : Number(v));
     if (this.am.weekBarred?.(account)) {
-      const week = Number(q.unified7dReset);
-      return Number.isFinite(week) ? week : null;
+      const week = ms(q.unified7dReset);
+      return Number.isFinite(week) && week > 0 ? week : null;
     }
-    const five = Number(q.unified5hReset);
-    if (Number.isFinite(five)) return five;
-    const seen = Number(account._5hWindowSeen);
-    return Number.isFinite(seen) && seen <= this.nowFn() ? seen : null;
+    const five = ms(q.unified5hReset);
+    if (Number.isFinite(five) && five > 0) return five;
+    const seen = ms(account._5hWindowSeen);
+    return Number.isFinite(seen) && seen > 0 && seen <= this.nowFn() ? seen : null;
   }
 
   /** Arm (or re-arm) the seat's touch for its next reset. Cheap when nothing changed: every seat request calls

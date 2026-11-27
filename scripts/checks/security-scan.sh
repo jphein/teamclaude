@@ -120,7 +120,7 @@ audit() { # -> npm audit JSON, then "#RC n" ("#RC show-1" / "#RC no-lockfile" wh
   mkdir -p "$tmp/audit"
   git -C "$TC" show origin/master:package.json > "$tmp/audit/package.json" 2>/dev/null || { echo "#RC show-1"; return; }
   git -C "$TC" show origin/master:package-lock.json > "$tmp/audit/package-lock.json" 2>/dev/null || { echo "#RC no-lockfile"; return; }
-  (cd "$tmp/audit" && noproxy timeout 120 npm audit --package-lock-only --json 2>/dev/null); rc=$?
+  (cd "$tmp/audit" && noproxy timeout 120 npm audit --package-lock-only --ignore-scripts --json 2>/dev/null); rc=$?
   echo; echo "#RC $rc"
 }
 out=$(probe audit.json audit); rc=$(rc_of <<<"$out"); body=$(body_of <<<"$out")
@@ -136,7 +136,7 @@ fr=$(sev_rank "$AUDIT_FAIL"); wr=$(sev_rank "$AUDIT_WARN")
 if [ "$fr" = 0 ] || [ "$wr" = 0 ] || [ "$wr" -gt "$fr" ]; then
   blind fail audit "npm audit thresholds unreadable (CHECK_SCAN_AUDIT_FAIL=$(clean <<<"$AUDIT_FAIL") CHECK_SCAN_AUDIT_WARN=$(clean <<<"$AUDIT_WARN"): each one of low moderate high critical, warn at or below fail)"
 elif [ -z "$v" ] || { [ "$rc" != 0 ] && [ "$rc" != 1 ]; } || { [ "$rc" = 0 ] && [ "$total" != 0 ]; } || { [ "$rc" = 1 ] && [ "$total" = 0 ]; }; then
-  blind fail audit "npm audit could not be read (exit ${rc:-?})"
+  blind fail audit "npm audit could not be read (exit ${rc:-?}) (fail at $AUDIT_FAIL+, warn at $AUDIT_WARN+)"
 else
   names=$(jq -r --argjson w "$wr" '[.vulnerabilities // {} | to_entries[] | select(({"low": 1, "moderate": 2, "high": 3, "critical": 4}[.value.severity] // 0) >= $w) | "\(.key)(\(.value.severity))"] | join(" ")' <<<"$body" | clean)
   nfail=$(at_or_above "$fr"); nwarn=$(at_or_above "$wr")

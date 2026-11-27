@@ -120,6 +120,44 @@ test('pool-quota: no aggregate, bad JSON or no endpoint is a fail line (exit 0: 
   assert.match(r.line, /^CHECK pool-quota fail · quota endpoint http:\/\/127\.0\.0\.1:1\/teamclaude\/quota did not answer/);
 });
 
+// JP 2026-11-27 13:0x: a seat's touch follows its reset within a minute. The line shows each seat's last reset
+// and its touch, and warns when a touch came more than 60 s after the reset, or has not come and nothing says why.
+const hms = (/** @type {number} */ t) => new Date(t).toISOString().slice(11, 19);
+const follow = (name, resetAgoMs, lagS, note = null) => ({
+  name, slot: null, nextTouchAt: null, last: null,
+  lastResetAt: iso(NOW - resetAgoMs), touchedAt: lagS == null ? null : iso(NOW - resetAgoMs + lagS * 1000),
+  touchLagSeconds: lagS, followNote: note, nextFollowAt: null,
+});
+
+test('pool-quota: the line shows each seat\'s last reset and its touch; on time is ok', () => {
+  const body = quota(0.8, 0.6, [seat('a@x.org', 0.1, 0.2)]);
+  body.stagger = { enabled: true, seats: [
+    follow('claude2@x.org', 600_000, 10),
+    follow('claude3@x.org', 300_000, null, 'left (weekly limit reached)'),
+    follow('claude5@x.org', 30_000, null),           // reset 30 s ago: the touch is still due, not late
+    { name: 'claude6', slot: '04:30', lastResetAt: null, touchedAt: null, touchLagSeconds: null, followNote: null },
+  ] };
+  const r = pq(body, { TZ: 'UTC' });
+  assert.match(r.line, LINE);
+  assert.match(r.line, new RegExp(`^CHECK pool-quota ok · .*, touches: claude2 reset ${hms(NOW - 600_000)} touch \\+10s; `
+    + `claude3 reset ${hms(NOW - 300_000)} left \\(weekly limit reached\\); claude5 reset ${hms(NOW - 30_000)} touch due, at `), r.line);
+  assert.doesNotMatch(r.line, /claude6|@/);
+});
+
+test('pool-quota: a touch more than 60 s after its reset, or missing with no reason, warns and names the seat', () => {
+  const body = quota(0.8, 0.6, [seat('a@x.org', 0.1, 0.2)]);
+  body.stagger = { enabled: true, seats: [
+    follow('claude2@x.org', 600_000, 60),           // exactly 60 s: on time
+    follow('claude6', 1_800_000, 75),
+    follow('claude4@x.org', 180_000, null),
+  ] };
+  const r = pq(body, { TZ: 'UTC' });
+  assert.match(r.line, /^CHECK pool-quota warn · 5h 80% left, week 60% left \(touch late: claude6 \+75s; touch missing: claude4\), /, r.line);
+  assert.match(r.line, /touches: claude2 reset \S+ touch \+60s; claude6 reset \S+ touch \+75s; claude4 reset \S+ no touch, at /);
+  body.stagger = { enabled: false };
+  assert.match(pq(body).line, /^CHECK pool-quota ok · .*, touches: stagger off, at /);
+});
+
 // ---------- proxy-wrapper (assessment, with a canned probe)
 const SELF = spawnSync('hostname', ['-s'], { encoding: 'utf8' }).stdout.trim() || hostname();
 function pw(results) { // host -> probe line ('' = unreachable)

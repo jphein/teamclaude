@@ -374,3 +374,80 @@ test('the plan is made 10 minutes before the rounded first slot, and on a spring
   const w = planWindow(ny, Date.parse('2027-03-14T06:00:00Z'));
   assert.equal(w.next, slot - 10 * M);
 });
+
+// JP 2026-11-27 13:0x: "the lane quota touches that are used to get the 5 hour limit restarted right away need
+// to touch it right away after it resets, not wait." Each seat follows its own reset: a timer at that seat's
+// resetAt touches it within a minute, wherever the reset falls; the slots only start a cold seat.
+
+test('follow: a window that ends off-slot (traffic started it) is touched at its reset, not at the next slot', async () => {
+  const h = harness(['a'], { now: at('09:00') });
+  Object.assign(h.am.accounts[0].quota, { unified5h: 0.3, unified5hReset: at('13:10') });
+  h.st.configure(cfg);
+  await h.advance(at('13:15'));
+  assert.deepEqual(h.touched.map(t => t.at), [at('13:10') + TOUCH_OFFSET_MS]);
+});
+
+test('follow: no overnight rest: the day\'s last window is followed by a touch at its reset', async () => {
+  const h = harness(['a']);
+  h.st.configure(cfg);
+  await h.advance(at('22:30'));
+  const last = h.touched.filter(t => t.name === 'a').at(-1)?.at ?? 0;
+  assert.ok(last >= at('22:00') && last <= at('22:00') + M, `last touch ${new Date(last).toISOString()}`);
+});
+
+test('follow: a seat whose week resets mid-day is touched right after the weekly reset, not at tomorrow\'s plan', async () => {
+  const h = harness(['spent'], { now: at('09:00') });
+  const spent = h.am.accounts[0];
+  Object.assign(spent.quota, { unified7d: 0.98, unified7dReset: at('13:00') });
+  h.st.configure(cfg);
+  await h.advance(at('12:59'));
+  assert.deepEqual(h.touched, []);
+  // what the manager does at the reset (it clears against the real clock, which this fake one is ahead of)
+  Object.assign(spent.quota, { unified7d: 0, unified7dReset: at('13:00', 7) });
+  await h.advance(at('13:05'));
+  assert.deepEqual(h.touched.map(t => t.at), [at('13:00') + TOUCH_OFFSET_MS]);
+});
+
+test('follow: a cold seat whose window a request starts is armed by that request, and touched at its reset', async () => {
+  const h = harness(['a'], { now: at('09:00') });
+  h.st.configure(cfg);
+  h.am.updateQuota(0, {
+    'anthropic-ratelimit-unified-5h-utilization': '0.2',
+    'anthropic-ratelimit-unified-5h-reset': String(at('14:00') / 1000),
+  });
+  await h.advance(at('14:05'));
+  assert.deepEqual(h.touched.map(t => t.at), [at('14:00') + TOUCH_OFFSET_MS]);
+});
+
+test('follow: never a double start: a window traffic started right after the reset is left, and said so', async () => {
+  const h = harness(['a'], { now: at('09:00') });
+  const a = h.am.accounts[0];
+  Object.assign(a.quota, { unified5h: 0.3, unified5hReset: at('13:10') });
+  h.st.configure(cfg);
+  await h.advance(at('13:10') + 5_000);
+  Object.assign(a.quota, { unified5h: 0.05, unified5hReset: at('18:10') }); // traffic, 5 s after the reset
+  await h.advance(at('13:12'));
+  assert.deepEqual(h.touched, []);
+  const s = h.st.status().seats[0];
+  assert.equal(s.lastResetAt, new Date(at('13:10')).toISOString());
+  assert.equal(s.touchedAt, null);
+  assert.match(s.followNote, /window started meanwhile/);
+});
+
+test('follow: status names each seat\'s last reset, its touch stamp and the lag; a skip is named, not touched', async () => {
+  const h = harness(['a', 'spent'], { now: at('09:00'), thresholds: { default: 0.93, unified5h: 0.95, unified7d: 0.97 } });
+  const [a, spent] = h.am.accounts;
+  Object.assign(a.quota, { unified5h: 0.3, unified5hReset: at('13:10') });
+  Object.assign(spent.quota, { unified7d: 0.98, unified7dReset: at('13:00') }); // still spent at the reset: skipped
+  h.st.configure(cfg);
+  await h.advance(at('13:15'));
+  const [sa, ss] = h.st.status().seats;
+  assert.equal(sa.lastResetAt, new Date(at('13:10')).toISOString());
+  assert.equal(sa.touchedAt, new Date(at('13:10') + TOUCH_OFFSET_MS).toISOString());
+  assert.equal(sa.touchLagSeconds, TOUCH_OFFSET_MS / 1000);
+  assert.equal(sa.nextFollowAt, new Date(at('13:10') + TOUCH_OFFSET_MS + 5 * H).toISOString());
+  assert.equal(ss.lastResetAt, new Date(at('13:00')).toISOString());
+  assert.equal(ss.touchedAt, null);
+  assert.match(ss.followNote, /weekly limit reached/);
+  assert.ok(!h.touched.some(t => t.name === 'spent'));
+});

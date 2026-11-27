@@ -146,7 +146,7 @@ Each night it reads what is listed and what is reachable, and probes every liste
 
 **What runs** (read-only apart from `git fetch`):
 - `gitleaks git --redact` over each main history. It honours the `.gitleaksignore` committed on that main, which holds fingerprints only, never values.
-- `npm install --package-lock-only --ignore-scripts`, then `npm audit --package-lock-only`, on teamclaude's master `package.json` in a temp dir. Nothing is installed and no scripts run. Master keeps no lockfile on purpose: CI runs `npm install --ignore-scripts` with none (`.github/workflows/ci.yml`). So what is audited is **this run's resolved graph: CI's in practice, not provably** (a registry can resolve differently between the two runs). A committed lockfile with `npm ci` would close that gap; it has its own row.
+- `npm audit --package-lock-only` on teamclaude's master `package.json` and committed `package-lock.json`, in a temp dir. Nothing is resolved or installed and no scripts run. CI installs exactly that lockfile with `npm ci --ignore-scripts` (`.github/workflows/ci.yml`), so what is audited **is the graph CI tests** (row 5bb792b5). A master without a lockfile is a blind audit: fail.
 - An OSV query for the LiteLLM version written on the compose image line (`# vX.Y.Z`).
 - `gh api --paginate` for open PRs, with their files and commits.
 - On the VM, a script that prints the git mode and blob id (`git hash-object --no-filters`, a hash of the bytes) of every file in the checkout except `.git`, dotfiles included, and the node's start time (from `/proc/<pid>/stat`). This side lists the same for the merged commit the VM names, with `git ls-tree -r`. The VM's index and HEAD are never trusted for the comparison.
@@ -157,8 +157,9 @@ Each night it reads what is listed and what is reachable, and probes every liste
   - a finding (rule and file only, never the value);
   - an exit other than 0 or 1, a report that is not a JSON array, or an exit that disagrees with the report.
 - **npm audit:**
-  - a high or critical advisory;
-  - an error exit, a lockfile that can't be resolved, missing counts, or an exit that disagrees with the counts (0 means no advisories, 1 means some).
+  - an advisory at or above `CHECK_SCAN_AUDIT_FAIL` (default `high`: high or critical);
+  - an error exit, no lockfile on master, missing counts, or an exit that disagrees with the counts (0 means no advisories, 1 means some);
+  - a threshold outside `low moderate high critical`, or a warn threshold above the fail one.
 - **OSV:**
   - **any** advisory on the pinned LiteLLM, so no severity mapping can under-classify one. The line and the row name each advisory's severity or CVSS vector;
   - a non-zero exit; an answer that is not an object; a `vulns` key that is present but not an array (`null` included); an advisory that is not an object with a non-empty string `id`. OSV answers a version with no advisory as `{}`, without the key; that was measured on 2026-11-24 (litellm 1.106.9 → `{}`, 1.40.0 → 60 advisories), so an absent key is zero;
@@ -174,7 +175,7 @@ Each night it reads what is listed and what is reachable, and probes every liste
   - a service with no running container.
 
 **warn:**
-- a moderate npm advisory;
+- an npm advisory at or above `CHECK_SCAN_AUDIT_WARN` (default `moderate`) and below the fail threshold. The line counts every severity and names both thresholds: `npm audit 0 critical 0 high 0 moderate 0 low (fail at high+, warn at moderate+)`;
 - an upstream commit that is new since the baseline. The first baseline is written at the end of a run, and only if every probe saw and every row was filed (123 commits on 2026-11-24). All the commits new on one run share ONE row, which lists their SHAs (12 hex, oldest first) and never a commit's own text. When they don't all fit in one Flow line (300 characters), the row names as many as fit and the state file `security-scan.upstream-<first sha>.txt`, which lists every full SHA. The commits join the baseline only after that row is filed;
 - an open PR that:
   - changes `package*.json`, `deploy/compose.yaml`, `go.mod` or `go.sum`;
@@ -191,7 +192,7 @@ Each night it reads what is listed and what is reachable, and probes every liste
 
 **Not covered yet:** the weekly Claude Security scan. It needs a Claude session, so it waits for a seat (row f3fb83d4).
 
-**Example:** `CHECK security-scan ok · teamclaude gitleaks 0; forge-gateway gitleaks 0; npm audit 0 critical 0 high 0 moderate; litellm 1.106.9 OSV 0; upstream 123 not in the fork, 0 new; VM 1a1d8e9 v24.22.1 proxy running, files = merged tree (491 files); forge services (db litellm redis): each running its pin; rows filed 0, at 06:42 · findings are Flow rows · next run tomorrow 06:40 · owner teamclaude lane`
+**Example:** `CHECK security-scan ok · teamclaude gitleaks 0; forge-gateway gitleaks 0; npm audit 0 critical 0 high 0 moderate 0 low (fail at high+, warn at moderate+); litellm 1.106.9 OSV 0; upstream 123 not in the fork, 0 new; VM 1a1d8e9 v24.22.1 proxy running, files = merged tree (491 files); forge services (db litellm redis): each running its pin; rows filed 0, at 06:42 · findings are Flow rows · next run tomorrow 06:40 · owner teamclaude lane`
 
 ## Install, update and rollback
 

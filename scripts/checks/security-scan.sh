@@ -8,9 +8,11 @@
 #             the last fetched refs, and the line says so).
 #   leaks     gitleaks over teamclaude origin/master and forge-gateway origin/main history, minus each repo's
 #             committed .gitleaksignore (fingerprints, no values). Any finding: fail; gitleaks errored: fail.
-#   audit     npm audit of teamclaude's dev tools (no runtime deps), lockfile resolved in a temp dir with no
-#             scripts run. Its exit status and its JSON must agree (0 = no advisories, 1 = some); critical/high:
-#             fail; moderate: warn; an error, a disagreement or malformed JSON: fail.
+#   audit     npm audit of teamclaude's dev tools (no runtime deps): master's committed package-lock.json, read
+#             as committed in a temp dir, nothing resolved and no scripts run. Its exit status and its JSON must
+#             agree (0 = no advisories, 1 = some); at or above CHECK_SCAN_AUDIT_FAIL (default high): fail; at or
+#             above CHECK_SCAN_AUDIT_WARN (default moderate): warn; the line names both; an error, a
+#             disagreement, malformed JSON, no lockfile or an unreadable threshold: fail.
 #   osv       OSV advisories for the LiteLLM version pinned in forge-gateway's compose (`# vX.Y.Z` on the image
 #             line). ANY advisory fails (no severity mapping can under-classify it; the row says which);
 #             unreachable, non-zero or malformed: fail.
@@ -29,6 +31,7 @@
 # Inputs (tests): CHECK_SCAN_FIXTURES (a dir; a probe whose file is there is read from it, any other runs live),
 #   CHECK_SCAN_FLOW (files a row), CHECK_SCAN_TC_REPO, CHECK_SCAN_FG_REPO, CHECK_SCAN_VM_RUN and
 #   CHECK_SCAN_DOCKER_RUN (commands that run a script read on stdin; default ssh), CHECK_SCAN_VM_DIR.
+# Settings: CHECK_SCAN_AUDIT_FAIL, CHECK_SCAN_AUDIT_WARN (npm audit severities; see audit above).
 set -uo pipefail
 . "$(dirname "$0")/lib.sh"
 NAME=security-scan
@@ -42,6 +45,11 @@ VM_DIR=${CHECK_SCAN_VM_DIR:-teamclaude}
 # carries the same "... src/index.js server" after its options (tests: a unique stand-in)
 VM_PROC=${CHECK_SCAN_VM_PROC:-^[^ ]*node [^ ]*src/index[.]js server}
 DOCKER_RUN=${CHECK_SCAN_DOCKER_RUN:-timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=8 ubox0 sh -s --}
+# npm audit severity mapping (an operator setting; the CHECK line names it): an advisory at or above AUDIT_FAIL fails,
+# one at or above AUDIT_WARN warns, lower ones are counted only. Order: low < moderate < high < critical. A value
+# outside that list, or a warn above the fail, is a blind audit (fail), never a silent default.
+AUDIT_FAIL=${CHECK_SCAN_AUDIT_FAIL:-high}
+AUDIT_WARN=${CHECK_SCAN_AUDIT_WARN:-moderate}
 DIR=${CHECK_STATE_DIR:-$HOME/.local/state/checks}
 mkdir -p "$DIR" 2>/dev/null
 tmp=$(mktemp -d) || check_emit "$NAME" fail "cannot make a temp dir at $(check_now)" "$NEXT"
@@ -105,30 +113,38 @@ for pair in "teamclaude:$TC:origin/master" "forge-gateway:$FG:origin/main"; do
 done
 
 # ---- audit (teamclaude dev tools)
-audit() { # -> npm audit JSON, then "#RC n" ("#RC install-n" when the lockfile could not be resolved)
-  # master keeps no lockfile on purpose: CI runs `npm install --ignore-scripts` with none (.github/workflows/ci.yml,
-  # "there is no lockfile for npm ci to consume"), so the graph CI tests is a fresh resolution of package.json,
-  # and that is the graph audited here, resolved the same way.
+audit() { # -> npm audit JSON, then "#RC n" ("#RC show-1" / "#RC no-lockfile" when master's files cannot be read)
+  # master commits package-lock.json and CI installs exactly it with `npm ci` (.github/workflows/ci.yml, row
+  # 5bb792b5), so the graph audited is master's lockfile as committed: nothing is resolved here.
   local rc
   mkdir -p "$tmp/audit"
   git -C "$TC" show origin/master:package.json > "$tmp/audit/package.json" 2>/dev/null || { echo "#RC show-1"; return; }
-  (cd "$tmp/audit" && noproxy timeout 180 npm install --package-lock-only --ignore-scripts --no-audit --no-fund >/dev/null 2>&1) \
-    || { echo "#RC install-$?"; return; }
-  (cd "$tmp/audit" && noproxy timeout 120 npm audit --package-lock-only --json 2>/dev/null); rc=$?
+  git -C "$TC" show origin/master:package-lock.json > "$tmp/audit/package-lock.json" 2>/dev/null || { echo "#RC no-lockfile"; return; }
+  (cd "$tmp/audit" && noproxy timeout 120 npm audit --package-lock-only --ignore-scripts --json 2>/dev/null); rc=$?
   echo; echo "#RC $rc"
 }
 out=$(probe audit.json audit); rc=$(rc_of <<<"$out"); body=$(body_of <<<"$out")
-v=$(jq -er '.metadata.vulnerabilities | [.critical, .high, .moderate, .total] | if all(type == "number") then map(tostring) | join(" ") else error end' <<<"$body" 2>/dev/null)
-read -r crit high mod total <<<"${v:-x x x x}"
-if [ -z "$v" ] || { [ "$rc" != 0 ] && [ "$rc" != 1 ]; } || { [ "$rc" = 0 ] && [ "$total" != 0 ]; } || { [ "$rc" = 1 ] && [ "$total" = 0 ]; }; then
-  blind fail audit "npm audit could not be read (exit ${rc:-?})"
+v=$(jq -er '.metadata.vulnerabilities | [.critical, .high, .moderate, .low, .total] | if all(type == "number") then map(tostring) | join(" ") else error end' <<<"$body" 2>/dev/null)
+read -r crit high mod low total <<<"${v:-x x x x x}"
+sev_rank() { case $1 in low) echo 1 ;; moderate) echo 2 ;; high) echo 3 ;; critical) echo 4 ;; *) echo 0 ;; esac; }
+at_or_above() { # rank -> how many advisories are at that severity or above
+  local r=$1 n=0
+  [ "$r" -le 4 ] && n=$((n + crit)); [ "$r" -le 3 ] && n=$((n + high)); [ "$r" -le 2 ] && n=$((n + mod)); [ "$r" -le 1 ] && n=$((n + low))
+  echo "$n"
+}
+fr=$(sev_rank "$AUDIT_FAIL"); wr=$(sev_rank "$AUDIT_WARN")
+if [ "$fr" = 0 ] || [ "$wr" = 0 ] || [ "$wr" -gt "$fr" ]; then
+  blind fail audit "npm audit thresholds unreadable (CHECK_SCAN_AUDIT_FAIL=$(clean <<<"$AUDIT_FAIL") CHECK_SCAN_AUDIT_WARN=$(clean <<<"$AUDIT_WARN"): each one of low moderate high critical, warn at or below fail)"
+elif [ -z "$v" ] || { [ "$rc" != 0 ] && [ "$rc" != 1 ]; } || { [ "$rc" = 0 ] && [ "$total" != 0 ]; } || { [ "$rc" = 1 ] && [ "$total" = 0 ]; }; then
+  blind fail audit "npm audit could not be read (exit ${rc:-?}) (fail at $AUDIT_FAIL+, warn at $AUDIT_WARN+)"
 else
-  names=$(jq -r '[.vulnerabilities // {} | to_entries[] | select(.value.severity == "critical" or .value.severity == "high" or .value.severity == "moderate") | "\(.key)(\(.value.severity))"] | join(" ")' <<<"$body" | clean)
-  if [ $((crit + high)) -gt 0 ]; then bump fail; elif [ "$mod" -gt 0 ]; then bump warn; fi
-  facts+=("npm audit $crit critical $high high $mod moderate${names:+ ($names)}")
+  names=$(jq -r --argjson w "$wr" '[.vulnerabilities // {} | to_entries[] | select(({"low": 1, "moderate": 2, "high": 3, "critical": 4}[.value.severity] // 0) >= $w) | "\(.key)(\(.value.severity))"] | join(" ")' <<<"$body" | clean)
+  nfail=$(at_or_above "$fr"); nwarn=$(at_or_above "$wr")
+  if [ "$nfail" -gt 0 ]; then bump fail; elif [ "$nwarn" -gt 0 ]; then bump warn; fi
+  facts+=("npm audit $crit critical $high high $mod moderate $low low${names:+ ($names)} (fail at $AUDIT_FAIL+, warn at $AUDIT_WARN+)")
   for p in $names; do find_ "audit:$p" "security-scan: npm audit flags $p in teamclaude's dev tools on master: bump or pin it"; done
   # counts with no named package still file a row: no warn or fail goes without one
-  [ -z "$names" ] && [ $((crit + high + mod)) -gt 0 ] && find_ "audit:counts:$crit-$high-$mod" "security-scan: npm audit counts $crit critical $high high $mod moderate in teamclaude's dev tools, packages unnamed: run npm audit by hand"
+  [ -z "$names" ] && [ "$nwarn" -gt 0 ] && find_ "audit:counts:$crit-$high-$mod$([ "$wr" = 1 ] && echo "-$low")" "security-scan: npm audit counts $crit critical $high high $mod moderate $low low in teamclaude's dev tools, packages unnamed: run npm audit by hand"
 fi
 
 # ---- osv (the LiteLLM version the compose pins)

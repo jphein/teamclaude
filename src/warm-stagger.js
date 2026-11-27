@@ -168,7 +168,7 @@ export class StaggerAnchors {
     // Each seat's follower (JP 2026-11-27 13:0x: "touch it right away after it resets, not wait"): a timer at
     // that seat's next reset, and what happened at the last one. Kept across the daily re-plan; the timers
     // are dropped by stop(). Bumped by stop() only, so a re-plan never cancels a touch in flight.
-    /** @type {Map<string, {timer: any, resetAt: number|null, lastResetAt: number|null, touchedAt: number|null, note: string|null}>} */
+    /** @type {Map<string, {timer: any, resetAt: number|null, lastResetAt: number|null, touchedAt: number|null, touchedBy: string|null, note: string|null}>} */
     this.follow = new Map();
     this.followGeneration = 0;
     /** @type {(() => void)|null} */
@@ -223,16 +223,16 @@ export class StaggerAnchors {
     if (!this.settings || !warmApplicable(account) || account.disabled) return;
     let f = this.follow.get(account.name);
     if (!f) {
-      f = { timer: null, resetAt: null, lastResetAt: null, touchedAt: null, note: null };
+      f = { timer: null, resetAt: null, lastResetAt: null, touchedAt: null, touchedBy: null, note: null };
       this.follow.set(account.name, f);
     }
     const target = this._resetToFollow(account);
     if (f.timer && target === f.resetAt) return;
     const now = this.nowFn();
-    // The reset armed for passed, and a request started the next window before the touch: that reset needed
-    // no touch, and the record says so.
+    // The reset armed for passed, and a request started the next window before the touch: the request is that
+    // reset's touch, recorded as one (when it was seen), never as a missing touch excused by a note.
     if (f.resetAt != null && f.resetAt <= now && target !== f.resetAt) {
-      Object.assign(f, { lastResetAt: f.resetAt, touchedAt: null, note: 'window started meanwhile (a request)' });
+      Object.assign(f, { lastResetAt: f.resetAt, touchedAt: now, touchedBy: 'request', note: 'window started by a request' });
     }
     if (f.timer) { this.clearTimeoutFn(f.timer); f.timer = null; }
     f.resetAt = null;
@@ -257,13 +257,13 @@ export class StaggerAnchors {
     const f = this.follow.get(account.name);
     if (!f || f.resetAt == null || f.resetAt > this.nowFn()) return null;
     if (f.timer) { this.clearTimeoutFn(f.timer); f.timer = null; }
-    Object.assign(f, { lastResetAt: f.resetAt, resetAt: null, touchedAt: null, note: null });
+    Object.assign(f, { lastResetAt: f.resetAt, resetAt: null, touchedAt: null, touchedBy: null, note: null });
     return f;
   }
 
   /** @param {any} account @param {any} f @param {number} resetAt */
   async _followFire(account, f, resetAt) {
-    Object.assign(f, { lastResetAt: resetAt, resetAt: null, touchedAt: null, note: null });
+    Object.assign(f, { lastResetAt: resetAt, resetAt: null, touchedAt: null, touchedBy: null, note: null });
     const now = this.nowFn();
     const at = new Date(resetAt).toISOString();
     if (now - resetAt > GRACE_MS) { f.note = `missed (woke ${Math.round((now - resetAt) / 60000)}m late)`; return; }
@@ -275,7 +275,9 @@ export class StaggerAnchors {
     }
     const running = Number(account.quota?.unified5hReset);
     if (Number.isFinite(running) && running > now) {
-      f.note = `window started meanwhile, until ${new Date(running).toISOString()}`;
+      // Something else started the window after the reset (a request, another sweep): that is the reset's
+      // touch, seen now. Every other way of ending here without a touch is a missing touch, whatever the note.
+      Object.assign(f, { touchedAt: now, touchedBy: 'request', note: 'window started by a request' });
       return;
     }
     const generation = this.followGeneration;
@@ -292,7 +294,7 @@ export class StaggerAnchors {
         && this.skipReason(account) == null,
     });
     const outcome = outcomes.find(o => o.account === account)?.outcome ?? 'skipped';
-    if (outcome === 'ok') f.touchedAt = this.nowFn();
+    if (outcome === 'ok') Object.assign(f, { touchedAt: this.nowFn(), touchedBy: 'stagger' });
     else f.note = outcome === 'skipped' ? 'cancelled before sending' : `touch failed: ${outcome.replace(/^error: /, '')}`;
   }
 
@@ -553,7 +555,7 @@ export class StaggerAnchors {
     else if (outcome === 'ok') seat.last = `touched ${new Date(this.nowFn()).toISOString()}${resets}`;
     else seat.last = `touch failed ${new Date(this.nowFn()).toISOString()}: ${outcome.replace(/^error: /, '')}`;
     if (claimed) {
-      if (outcome === 'ok') claimed.touchedAt = this.nowFn();
+      if (outcome === 'ok') Object.assign(claimed, { touchedAt: this.nowFn(), touchedBy: 'stagger' });
       else claimed.note = outcome === 'skipped' ? 'cancelled before sending' : `touch failed: ${outcome.replace(/^error: /, '')}`;
     }
     this._follow(account);
@@ -583,6 +585,7 @@ export class StaggerAnchors {
           lastResetAt: iso(f?.lastResetAt),
           touchedAt: iso(f?.touchedAt),
           touchLagSeconds: f?.touchedAt != null && f.lastResetAt != null ? Math.round((f.touchedAt - f.lastResetAt) / 1000) : null,
+          touchedBy: f?.touchedBy ?? null,
           followNote: f?.note ?? null,
           nextFollowAt: iso(f?.resetAt),
         };

@@ -602,3 +602,19 @@ test('follow: status names each seat\'s last reset, its touch stamp and the lag;
   assert.match(ss.followNote, /weekly limit reached/);
   assert.ok(!h.touched.some(t => t.name === 'spent'));
 });
+
+test('follow: a weekly reset the manager cleared, on a seat a request has meanwhile started, is never a second start', async () => {
+  const h = harness(['spent'], { now: at('09:00') });
+  h.warmer.blind = true; // only the stagger's own checks
+  const spent = h.am.accounts[0];
+  Object.assign(spent.quota, { unified7d: 0.98, unified7dReset: at('13:00') });
+  h.st.configure(cfg);
+  await h.advance(at('12:59'));
+  // the week clears, and traffic has already started a 5 h window, with no response the stagger saw
+  Object.assign(spent.quota, { unified7d: 0, unified7dReset: at('13:00', 7), unified5h: 0.05, unified5hReset: at('17:59') });
+  await h.advance(at('13:05'));
+  assert.deepEqual(h.touched, []);
+  const s = h.st.status().seats[0];
+  assert.equal(s.pendingResetAt, new Date(at('13:00')).toISOString());
+  assert.equal(s.followNote, 'window running, no response seen');
+});

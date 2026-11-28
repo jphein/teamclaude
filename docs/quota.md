@@ -22,12 +22,13 @@ curl -H "x-api-key: $TEAMCLAUDE_API_KEY" https://proxy.example.com/teamclaude/qu
 
 Fork additions:
 - The top level carries `live_seats`, `next_reset` (when the next barred seat returns), `next_refresh` (`{at, seat, in_minutes}`: the soonest 5h reset on a seat whose week has room) and `stagger` (slots, next touch and last outcome per seat; see `warmupStagger` in [configuration](configuration.md)). Each seat there also carries its follower:
-  - `lastResetAt`: the last reset the seat had;
-  - `touchedAt`, `touchLagSeconds`, `touchedBy` and `touchRequestId`: the touch that followed it. `touchedBy` is `stagger`, or `request` when the response to a request started the window first; `touchRequestId` names that request;
-  - `followNote`: what else happened (a skip, a failure, a missed reset, a request);
+  - `lastResetAt`: the last reset a touch succeeded for;
+  - `touchedAt`, `touchLagSeconds`, `touchedBy` and `touchRequestId`: that touch. `touchedBy` is `stagger`, or `request` when the response to a request started the window first; `touchRequestId` names that request;
+  - `pendingResetAt`: a later reset with no successful touch yet: being retried (3 tries in all, 60 s then 120 s apart), given up, or skipped;
+  - `followNote`: what happened to it (a skip, a failure and its try, a missed reset, a request);
   - `nextFollowAt`: the reset it waits for.
 
-  CHECK pool-quota prints every seat. It warns on a touch more than 60 s after its reset, and on a reset over 60 s past with no touch, whatever the note says.
+  CHECK pool-quota prints every seat, reporting a pending reset newer than the last success as that seat's reset. It warns on a touch more than 60 s after its reset, and on a reset over 60 s past with no touch, whatever the note says.
 - Each `fiveHour` bucket gains `windowStart` (reset − 5 h).
 
 `GET /teamclaude/events` (fork) lists the last 300 routing decisions as JSON, newest last: `{ts, kind, text}`. Kinds are `switch`, `rebalance`, `refresh-routing`, `window-start`, `window-spent`, `session-reset`, `near-limit`, `stagger`, `keep-warm`, `threshold`, `account`, `reauth`, `quota-429` and `exhausted`. Filter with `?since=<ISO>&kind=<kind>&limit=<n>`. It takes the same key as `/teamclaude/status` and is kept in memory, so a restart empties it.

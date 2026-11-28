@@ -80,7 +80,14 @@ Each night it reads what is listed and what is reachable, and probes every liste
 - **warn:**
   - five-hour remaining is under 0.15;
   - weekly-shared remaining is at or under 0.15;
-  - a seat bucket's `resetAt` is more than 15 minutes in the past and it still shows usage. The numbers have stopped updating; that is the stale data JP named.
+  - a seat bucket's `resetAt` is more than 15 minutes in the past and it still shows usage. The numbers have stopped updating; that is the stale data JP named;
+  - a seat's keep-warm touch came more than 60 s after its reset (`touch late: <seat> +Ns`), or its reset is more than 60 s past with no touch, whatever its note says (`touch missing: <seat>`; the note, such as a failure or a skip, is appended). This is row f8f91adf, from JP on 2026-11-27. The stagger's follower touches each seat 10 s after its reset, and a window a request started right after the reset counts as that reset's touch.
+- **Touches:** every seat is listed in one of three forms, set by the lead's ruling on PR 108:
+  - `reset HH:MM, touch HH:MM, lag Ns`, for a known reset;
+  - `reset unknown, slot HH:MM starts it`, for a cold seat its morning slot starts;
+  - `reset unknown, no touch planned (<why>)`, for a seat with no slot.
+
+  For example: `touches: claude2 reset 12:00, touch 12:00, lag 10s; claude6 reset unknown, slot 04:30 starts it; claude3 reset unknown, no touch planned (weekly limit reached)`. When the stagger is off, it says `stagger off`.
 - **fail:**
   - weekly-shared remaining is at or under 0.05;
   - the endpoint does not answer, or it answers with anything other than exactly one JSON document holding the aggregate numbers.

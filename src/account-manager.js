@@ -662,7 +662,7 @@ export class AccountManager {
     this._on5hWindowStarted = [];
     // A Claude seat's quota was read off a response (onSeatRequest): the banked-reset rules decide
     // there, with how long the seat had been idle before this request (null = never used before).
-    /** @type {Array<(ev: { account: any, idleMs: number|null }) => void>} */
+    /** @type {Array<(ev: { account: any, idleMs: number|null, requestId: string|null }) => void>} */
     this._onSeatRequest = [];
     // Skip-reason log throttle (per account) and the session a skip is
     // attributed to — diagnostics only, see _logSkipReason.
@@ -4754,7 +4754,7 @@ export class AccountManager {
     }
   }
 
-  updateQuota(accountIndex, headers, model = null) {
+  updateQuota(accountIndex, headers, model = null, { requestId = null } = {}) {
     const account = this.accounts[accountIndex];
     if (!account) return;
 
@@ -4887,13 +4887,15 @@ export class AccountManager {
       console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" ${trip.bucket} at ${(trip.used * 100).toFixed(1)}% usage — will switch on next request`);
     }
     const idleMs = Number.isFinite(prevUsed) ? Math.max(0, Date.now() - prevUsed) : null;
+    // requestId: the proxy request whose response carried these headers (the keep-warm stagger records a
+    // window a request started after a reset as that reset's touch, by this id).
     for (const fn of this._onSeatRequest) {
-      try { fn({ account, idleMs }); }
+      try { fn({ account, idleMs, requestId }); }
       catch (err) { console.error(`[TeamClaude] seat-request listener failed: ${/** @type {any} */ (err)?.message || err}`); }
     }
   }
 
-  /** @param {(ev: { account: any, idleMs: number|null }) => void} fn @returns {() => void} unsubscribe */
+  /** @param {(ev: { account: any, idleMs: number|null, requestId: string|null }) => void} fn @returns {() => void} unsubscribe */
   onSeatRequest(fn) {
     this._onSeatRequest.push(fn);
     return () => { this._onSeatRequest = this._onSeatRequest.filter(f => f !== fn); };

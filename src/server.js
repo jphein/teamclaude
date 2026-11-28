@@ -4849,7 +4849,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       && upstreamRes.headers.get('x-should-retry')?.trim().toLowerCase() === 'false';
     // This refusal is about the request, even if it carries incidental quota
     // headers. Do not store those headers as an account-wide quota verdict.
-    if (!nonRetryable429) accountManager.updateQuota(account.index, rateLimitHeaders, ctx.model);
+    if (!nonRetryable429) accountManager.updateQuota(account.index, rateLimitHeaders, ctx.model, { requestId: reqId });
 
     // Any response at all came back through the account's routing proxy.
     accountManager.clearRoutingFailed(account.index);

@@ -103,13 +103,16 @@ function harness(accounts, { now = at('01:00'), thresholds = { default: 0.93, un
         touched.push({ name: a.name, at: clock });
         opts.outcomes?.push({ account: a, outcome: 'ok' });
         a.quota.unified5h = 0.01;
-        a.quota.unified5hReset = clock + 5 * H;
+        // Anthropic starts the window at the 10-minute mark at or before the request (measured 2026-11-10)
+        a.quota.unified5hReset = Math.floor(clock / (10 * M)) * 10 * M + 5 * H;
       }
       return true;
     },
   };
   const lines = /** @type {string[]} */ ([]);
-  const st = new StaggerAnchors(am, warmer, { nowFn: () => clock, setTimeoutFn, clearTimeoutFn, log: l => lines.push(l), statePath });
+  // skew: what the wall clock reads, off from the timer queue's time (a clock stepped back, NTP, a VM resume)
+  let skew = 0;
+  const st = new StaggerAnchors(am, warmer, { nowFn: () => clock + skew, setTimeoutFn, clearTimeoutFn, log: l => lines.push(l), statePath });
   async function advance(/** @type {number} */ to) {
     for (;;) {
       timers.sort((a, b) => a.at - b.at || a.id - b.id);
@@ -137,7 +140,7 @@ function harness(accounts, { now = at('01:00'), thresholds = { default: 0.93, un
     }
     return fired;
   }
-  return { am, st, warmer, jump, touched, lines, advance, get clock() { return clock; } };
+  return { am, st, warmer, jump, touched, lines, advance, get clock() { return clock; }, setSkew(/** @type {number} */ ms) { skew = ms; } };
 }
 
 test('a cold seat is touched at its slot, and its windows then roll on the 5 h grid', async () => {
@@ -258,9 +261,14 @@ test('a suspend of days steps over the missed slots instead of walking them', as
   await h.advance(at('02:05'));
   const before = h.touched.length;
   const fired = await h.jump(at('09:00', 3));
-  assert.ok(fired <= 2, `the seat's overdue timer and the plan's fire once each, with no chain of past slots (fired ${fired})`);
-  assert.equal(h.touched.length, before);
-  assert.equal(h.st.status().seats[0].nextTouchAt, new Date(at('12:00', 3)).toISOString());
+  // the seat's slot timer, its follower (armed for the 07:00 reset) and the plan's: once each, no chain
+  assert.ok(fired <= 3, `the seat's overdue timers and the plan's fire once each, with no chain of past slots (fired ${fired})`);
+  // No slot is replayed; the reset slept through is overdue, so the follower touches the seat once, on waking
+  // (PR 108 round 2: an overdue reset is touched at once), and names how late.
+  assert.deepEqual(h.touched.slice(before).map(t => t.at), [at('09:00', 3)]);
+  const s = h.st.status().seats[0];
+  assert.equal(s.followNote, `missed by ${(at('09:00', 3) - at('07:00')) / M} min, touched late`);
+  assert.equal(s.nextTouchAt, new Date(at('12:00', 3)).toISOString());
 });
 
 test('the reserve is asked again at send time, and a cancelled touch is reported as one', async () => {
@@ -282,7 +290,8 @@ test('a completed touch is reported with the reset it produced', async () => {
   const h = harness(['a']);
   h.st.configure(cfg);
   await h.advance(at('02:05'));
-  const want = new Date(at('07:00') + TOUCH_OFFSET_MS).toISOString().replace(/\./g, '\\.');
+  // the window starts at the 10-minute mark at or before the touch, so the 02:00:10 touch resets at 07:00 sharp
+  const want = new Date(at('07:00')).toISOString().replace(/\./g, '\\.');
   assert.match(h.st.status().seats[0].last, new RegExp(`^touched .*, resets ${want}$`));
 });
 
@@ -373,4 +382,239 @@ test('the plan is made 10 minutes before the rounded first slot, and on a spring
   const slot = Date.parse('2027-03-14T07:00:00Z'); // 03:00 EDT
   const w = planWindow(ny, Date.parse('2027-03-14T06:00:00Z'));
   assert.equal(w.next, slot - 10 * M);
+});
+
+// JP 2026-11-27 13:0x: "the lane quota touches that are used to get the 5 hour limit restarted right away need
+// to touch it right away after it resets, not wait." Each seat follows its own reset: a timer at that seat's
+// resetAt touches it within a minute, wherever the reset falls; the slots only start a cold seat.
+
+test('follow: a window that ends off-slot (traffic started it) is touched at its reset, not at the next slot', async () => {
+  const h = harness(['a'], { now: at('09:00') });
+  Object.assign(h.am.accounts[0].quota, { unified5h: 0.3, unified5hReset: at('13:10') });
+  h.st.configure(cfg);
+  await h.advance(at('13:15'));
+  assert.deepEqual(h.touched.map(t => t.at), [at('13:10') + TOUCH_OFFSET_MS]);
+});
+
+test('follow: no overnight rest: the day\'s last window is followed by a touch at its reset', async () => {
+  const h = harness(['a']);
+  h.st.configure(cfg);
+  await h.advance(at('22:30'));
+  const last = h.touched.filter(t => t.name === 'a').at(-1)?.at ?? 0;
+  assert.ok(last >= at('22:00') && last <= at('22:00') + M, `last touch ${new Date(last).toISOString()}`);
+});
+
+test('follow: a seat whose week resets mid-day is touched right after the weekly reset, not at tomorrow\'s plan', async () => {
+  const h = harness(['spent'], { now: at('09:00') });
+  const spent = h.am.accounts[0];
+  Object.assign(spent.quota, { unified7d: 0.98, unified7dReset: at('13:00') });
+  h.st.configure(cfg);
+  await h.advance(at('12:59'));
+  assert.deepEqual(h.touched, []);
+  // what the manager does at the reset (it clears against the real clock, which this fake one is ahead of)
+  Object.assign(spent.quota, { unified7d: 0, unified7dReset: at('13:00', 7) });
+  await h.advance(at('13:05'));
+  assert.deepEqual(h.touched.map(t => t.at), [at('13:00') + TOUCH_OFFSET_MS]);
+});
+
+test('follow: a cold seat whose window a request starts is armed by that request, and touched at its reset', async () => {
+  const h = harness(['a'], { now: at('09:00') });
+  h.st.configure(cfg);
+  h.am.updateQuota(0, {
+    'anthropic-ratelimit-unified-5h-utilization': '0.2',
+    'anthropic-ratelimit-unified-5h-reset': String(at('14:00') / 1000),
+  });
+  await h.advance(at('14:05'));
+  assert.deepEqual(h.touched.map(t => t.at), [at('14:00') + TOUCH_OFFSET_MS]);
+});
+
+test('follow: never a double start: the response that started the window after the reset is that reset\'s touch, recorded with its request id', async () => {
+  const h = harness(['a'], { now: at('09:00') });
+  Object.assign(h.am.accounts[0].quota, { unified5h: 0.3, unified5hReset: at('13:10') });
+  h.st.configure(cfg);
+  await h.advance(at('13:10') + 5_000);
+  // traffic, 5 s after the reset: its response carries the new window (PR 108 round 2: recorded there, and only there)
+  h.am.updateQuota(0, {
+    'anthropic-ratelimit-unified-5h-utilization': '0.05',
+    'anthropic-ratelimit-unified-5h-reset': String(at('18:10') / 1000),
+  }, null, { requestId: 'req-42' });
+  await h.advance(at('13:12'));
+  assert.deepEqual(h.touched, []);
+  const s = h.st.status().seats[0];
+  assert.equal(s.lastResetAt, new Date(at('13:10')).toISOString());
+  assert.equal(s.touchedAt, new Date(at('13:10') + 5_000).toISOString());
+  assert.equal(s.touchedBy, 'request');
+  assert.equal(s.touchRequestId, 'req-42');
+  assert.equal(s.touchLagSeconds, 5);
+  assert.equal(s.followNote, 'window started by request req-42');
+});
+
+test('follow: a window found running with no response seen is not counted as a touch', async () => {
+  const h = harness(['a'], { now: at('09:00') });
+  const a = h.am.accounts[0];
+  Object.assign(a.quota, { unified5h: 0.3, unified5hReset: at('13:10') });
+  h.st.configure(cfg);
+  await h.advance(at('13:10') + 5_000);
+  Object.assign(a.quota, { unified5h: 0.05, unified5hReset: at('18:10') }); // a new window, but no response said so
+  await h.advance(at('13:12'));
+  assert.deepEqual(h.touched, []);
+  const s = h.st.status().seats[0];
+  assert.equal(s.touchedAt, null);
+  assert.equal(s.touchedBy, null);
+  assert.match(s.followNote, /window running, no response seen/);
+});
+
+test('follow: a reset that passed while the proxy was down is touched at once on boot, and says by how much it was missed', async () => {
+  for (const known of [true, false]) {
+    const h = harness(['a'], { now: at('09:00') });
+    const a = h.am.accounts[0];
+    // the restored reading: still on the quota, or already cleared by the manager (its last window kept)
+    if (known) Object.assign(a.quota, { unified5h: 0.4, unified5hReset: at('08:00') });
+    else /** @type {any} */ (a)._5hWindowSeen = at('08:00');
+    h.st.configure(cfg);
+    await h.advance(at('09:00') + 1_000);
+    assert.deepEqual(h.touched.map(t => t.at), [at('09:00')], `reset ${known ? 'on the quota' : 'cleared'}`);
+    const s = h.st.status().seats[0];
+    assert.equal(s.lastResetAt, new Date(at('08:00')).toISOString());
+    assert.equal(s.touchLagSeconds, 3600);
+    assert.equal(s.followNote, 'missed by 60 min, touched on boot');
+  }
+});
+
+test('follow: a known reset is the follower\'s: a slot just after it leaves the seat to the reset-plus-10-s touch', async () => {
+  const h = harness(['a']);
+  // the window ends 5 s after the 02:00 slot: the slot timer (02:00:10) comes before the follower (02:00:15)
+  Object.assign(h.am.accounts[0].quota, { unified5h: 0.4, unified5hReset: at('02:00') + 5_000 });
+  h.st.configure(cfg);
+  await h.advance(at('02:05'));
+  assert.deepEqual(h.touched.map(t => t.at), [at('02:00') + 5_000 + TOUCH_OFFSET_MS]);
+  const s = h.st.status().seats[0];
+  assert.match(s.last, /left at .*\(reset known: its follower touches it\)/);
+  assert.equal(s.touchedBy, 'stagger');
+  assert.equal(s.touchLagSeconds, TOUCH_OFFSET_MS / 1000);
+});
+
+test('follow: a touch that keeps failing is tried 3 times with backoff, each failure logged, then given up and named (the CHECK warns)', async () => {
+  const h = harness(['a'], { now: at('09:00') });
+  Object.assign(h.am.accounts[0].quota, { unified5h: 0.3, unified5hReset: at('13:10') });
+  let calls = 0;
+  h.warmer._warmTargets = async (/** @type {any[]} */ targets, /** @type {any} */ opts = {}) => {
+    calls++;
+    for (const t of targets) opts.outcomes?.push({ account: t, outcome: 'error: 529 overloaded' });
+    return true;
+  };
+  h.st.configure(cfg);
+  await h.advance(at('13:20'));
+  assert.equal(calls, 3, 'tried at the reset + 10 s, then 60 s and 120 s later; no more');
+  const fails = h.lines.filter(l => /touch of "a" at its reset .* failed: 529 overloaded/.test(l));
+  assert.equal(fails.length, 3, fails.join('\n'));
+  assert.match(fails[0], /\(try 1\/3, next in 60 s\)/);
+  assert.match(fails[2], /\(gave up after 3 tries\)/);
+  const s = h.st.status().seats[0];
+  // round 3 ruling: lastResetAt is the last reset a touch succeeded for; a reset still without one is pending
+  assert.equal(s.lastResetAt, null);
+  assert.equal(s.pendingResetAt, new Date(at('13:10')).toISOString());
+  assert.equal(s.touchedAt, null);
+  assert.equal(s.followNote, 'touch failed: 529 overloaded (gave up after 3 tries)');
+});
+
+test('follow: a failed touch, or one that throws, is retried, and the retry that succeeds is the reset\'s touch', async () => {
+  for (const how of ['error', 'throw']) {
+    const h = harness(['a'], { now: at('09:00') });
+    Object.assign(h.am.accounts[0].quota, { unified5h: 0.3, unified5hReset: at('13:10') });
+    const real = h.warmer._warmTargets.bind(h.warmer);
+    let calls = 0;
+    h.warmer._warmTargets = async (/** @type {any[]} */ targets, /** @type {any} */ opts = {}) => {
+      if (++calls > 1) return real(targets, opts);
+      if (how === 'throw') throw new Error('boom');
+      for (const t of targets) opts.outcomes?.push({ account: t, outcome: 'error: 529 overloaded' });
+      return true;
+    };
+    h.st.configure(cfg);
+    await h.advance(at('13:15'));
+    assert.deepEqual(h.touched.map(t => t.at), [at('13:10') + TOUCH_OFFSET_MS + M], how);
+    assert.ok(h.lines.some(l => new RegExp(`touch of "a" at its reset .* failed: ${how === 'throw' ? 'exception: boom' : '529 overloaded'} \\(try 1/3, next in 60 s\\)`).test(l)), h.lines.join('\n'));
+    const s = h.st.status().seats[0];
+    assert.equal(s.lastResetAt, new Date(at('13:10')).toISOString());
+    assert.equal(s.touchLagSeconds, (TOUCH_OFFSET_MS + M) / 1000);
+    assert.equal(s.pendingResetAt, null);
+  }
+});
+
+test('follow: a timer and a poll or a slot on the same reset in one tick send exactly one touch', async () => {
+  const h = harness(['a']);
+  h.warmer.blind = true; // the warmer's own cold re-check is off: only the stagger's guards stand between them
+  /** @type {() => void} */
+  let release = () => {};
+  h.warmer.gate = new Promise(r => { release = () => r(); });
+  // the window ends at the 02:00 slot: the slot timer and the follower both fire at 02:00:10
+  Object.assign(h.am.accounts[0].quota, { unified5h: 0.4, unified5hReset: at('02:00') });
+  h.st.configure(cfg);
+  await h.advance(at('02:00') + TOUCH_OFFSET_MS);
+  // the touch is in flight (held at the gate); a poll and a seat request land on the same reset meanwhile
+  h.am.updateQuota(0, { 'anthropic-ratelimit-unified-5h-utilization': '0.4' }, null, { requestId: 'req-7' });
+  h.st._follow(h.am.accounts[0]);
+  await h.advance(at('02:00') + TOUCH_OFFSET_MS + 1);
+  release();
+  await h.advance(at('02:05'));
+  assert.equal(h.touched.length, 1, JSON.stringify(h.touched));
+});
+
+test('follow: a captured reset that is stale is never touched: changed means the timer is void, not yet happened means re-scheduled', async () => {
+  // changed: the seat's reset moved (no response said so) before the timer fired
+  let h = harness(['a'], { now: at('09:00') });
+  Object.assign(h.am.accounts[0].quota, { unified5h: 0.3, unified5hReset: at('13:10') });
+  h.st.configure(cfg);
+  await h.advance(at('13:05'));
+  h.am.accounts[0].quota.unified5hReset = at('14:00');
+  await h.advance(at('13:59'));
+  assert.deepEqual(h.touched, []);
+  assert.ok(h.lines.some(l => /"a": reset .*13:10.* is no longer the seat's .*: timer void/.test(l) || /"a": reset .* is no longer the seat's/.test(l)), h.lines.join('\n'));
+  // not yet happened: the wall clock reads before the reset when the timer fires (stepped back)
+  h = harness(['a'], { now: at('09:10') });
+  /** @type {any} */ (h.am.accounts[0])._5hWindowSeen = at('09:00'); // the last window ended at 09:00
+  h.st.configure(cfg); // armed against a right clock: the 09:00 reset is overdue, the timer due at once
+  h.setSkew(-20 * M); // then the clock is stepped back: it reads 08:50 when the timer fires
+  await h.advance(at('09:10') + 1_000);
+  assert.deepEqual(h.touched, [], 'never before the reset');
+  assert.ok(h.lines.some(l => /"a": reset .* has not happened yet .*: re-scheduled/.test(l)), h.lines.join('\n'));
+  h.setSkew(0);
+  await h.advance(at('09:35'));
+  assert.equal(h.touched.length, 1, 'touched once, once the reset has happened');
+});
+
+test('follow: status names each seat\'s last reset, its touch stamp and the lag; a skip is named, not touched', async () => {
+  const h = harness(['a', 'spent'], { now: at('09:00'), thresholds: { default: 0.93, unified5h: 0.95, unified7d: 0.97 } });
+  const [a, spent] = h.am.accounts;
+  Object.assign(a.quota, { unified5h: 0.3, unified5hReset: at('13:10') });
+  Object.assign(spent.quota, { unified7d: 0.98, unified7dReset: at('13:00') }); // still spent at the reset: skipped
+  h.st.configure(cfg);
+  await h.advance(at('13:15'));
+  const [sa, ss] = h.st.status().seats;
+  assert.equal(sa.lastResetAt, new Date(at('13:10')).toISOString());
+  assert.equal(sa.touchedAt, new Date(at('13:10') + TOUCH_OFFSET_MS).toISOString());
+  assert.equal(sa.touchLagSeconds, TOUCH_OFFSET_MS / 1000);
+  assert.equal(sa.touchedBy, 'stagger');
+  assert.equal(sa.nextFollowAt, new Date(at('13:10') + 5 * H).toISOString());
+  assert.equal(ss.lastResetAt, null); // round 3 ruling: only a successful touch sets it
+  assert.equal(ss.pendingResetAt, new Date(at('13:00')).toISOString());
+  assert.equal(ss.touchedAt, null);
+  assert.match(ss.followNote, /weekly limit reached/);
+  assert.ok(!h.touched.some(t => t.name === 'spent'));
+});
+
+test('follow: a weekly reset the manager cleared, on a seat a request has meanwhile started, is never a second start', async () => {
+  const h = harness(['spent'], { now: at('09:00') });
+  h.warmer.blind = true; // only the stagger's own checks
+  const spent = h.am.accounts[0];
+  Object.assign(spent.quota, { unified7d: 0.98, unified7dReset: at('13:00') });
+  h.st.configure(cfg);
+  await h.advance(at('12:59'));
+  // the week clears, and traffic has already started a 5 h window, with no response the stagger saw
+  Object.assign(spent.quota, { unified7d: 0, unified7dReset: at('13:00', 7), unified5h: 0.05, unified5hReset: at('17:59') });
+  await h.advance(at('13:05'));
+  assert.deepEqual(h.touched, []);
+  const s = h.st.status().seats[0];
+  assert.equal(s.pendingResetAt, new Date(at('13:00')).toISOString());
+  assert.equal(s.followNote, 'window running, no response seen');
 });

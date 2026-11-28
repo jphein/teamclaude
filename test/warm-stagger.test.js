@@ -573,8 +573,8 @@ test('follow: a captured reset that is stale is never touched: changed means the
   // not yet happened: the wall clock reads before the reset when the timer fires (stepped back)
   h = harness(['a'], { now: at('09:10') });
   /** @type {any} */ (h.am.accounts[0])._5hWindowSeen = at('09:00'); // the last window ended at 09:00
-  h.setSkew(-20 * M); // the clock reads 08:50
-  h.st.configure(cfg);
+  h.st.configure(cfg); // armed against a right clock: the 09:00 reset is overdue, the timer due at once
+  h.setSkew(-20 * M); // then the clock is stepped back: it reads 08:50 when the timer fires
   await h.advance(at('09:10') + 1_000);
   assert.deepEqual(h.touched, [], 'never before the reset');
   assert.ok(h.lines.some(l => /"a": reset .* has not happened yet .*: re-scheduled/.test(l)), h.lines.join('\n'));

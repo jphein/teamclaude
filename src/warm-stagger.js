@@ -174,7 +174,7 @@ export class StaggerAnchors {
     // lastResetAt/touchedAt/touchedBy/requestId: the last reset a touch SUCCEEDED for (the lead's ruling after
     // round 3 on PR 108); pendingResetAt: a reset still without one (retrying, given up, skipped); settledResetAt:
     // the reset nothing more is done for (success or a final decision); inFlight: a touch is being sent.
-    /** @type {Map<string, {timer: any, resetAt: number|null, inFlight: boolean, attempts: number, settledResetAt: number|null, lastResetAt: number|null, touchedAt: number|null, touchedBy: string|null, requestId: string|null, pendingResetAt: number|null, note: string|null}>} */
+    /** @type {Map<string, {timer: any, resetAt: number|null, weekly?: boolean, inFlight: boolean, attempts: number, settledResetAt: number|null, lastResetAt: number|null, touchedAt: number|null, touchedBy: string|null, requestId: string|null, pendingResetAt: number|null, note: string|null}>} */
     this.follow = new Map();
     this.followGeneration = 0;
     /** @type {(() => void)|null} */
@@ -254,6 +254,8 @@ export class StaggerAnchors {
   _armFollow(account, f, target, delayMs) {
     if (f.timer) this.clearTimeoutFn(f.timer);
     f.resetAt = target;
+    // which reset it is: the week's (the seat's week is spent) or the 5 h window's
+    f.weekly = !!this.am.weekBarred?.(account);
     const settings = this.settings;
     const timer = this.setTimeoutFn(() => {
       if (this.settings !== settings || this.follow.get(account.name) !== f) return;
@@ -303,9 +305,11 @@ export class StaggerAnchors {
     const name = account.name;
     const at = new Date(resetAt).toISOString();
     const now = this.nowFn();
-    // The captured reset must still be the seat's, and must have happened (the lead's ruling after round 3).
+    // The captured reset must still be the seat's, and must have happened (the lead's ruling after round 3). A
+    // weekly reset the manager has cleared (the seat is no longer week-barred, the clock past it) did happen.
     const current = this._resetToFollow(account);
-    if (current !== resetAt) {
+    const weekCleared = f.weekly && !this.am.weekBarred?.(account) && now >= resetAt;
+    if (current !== resetAt && !weekCleared) {
       // Void: _follow (run when this returns) records what replaced it and arms the current reset.
       this.log(`[TeamClaude] Keep-warm stagger: "${name}": reset ${at} is no longer the seat's (now ${current != null ? new Date(current).toISOString() : 'unknown'}): timer void`);
       return;

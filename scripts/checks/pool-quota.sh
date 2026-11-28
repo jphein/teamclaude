@@ -81,7 +81,9 @@ case $tl in
   OFF) touches="stagger off" ;;
   *)
     parts=(); late=(); missing=()
-    hm() { date -d "@$1" '+%H:%M'; }
+    # HH:MM for a time today, "Sat 14:00" for any other day (a weekly reset days away must not read as today)
+    today=$(date -d "@$(( now_ms / 1000 ))" '+%F')
+    hm() { if [ "$(date -d "@$1" '+%F')" = "$today" ]; then date -d "@$1" '+%H:%M'; else date -d "@$1" '+%a %H:%M'; fi; }
     okt() { [[ $1 =~ ^[0-9]{9,11}$ ]]; }
     while IFS=$'\x1f' read -r w r tch lag note nxt slot nwhy; do
       [ -n "$w" ] || continue

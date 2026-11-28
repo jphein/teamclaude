@@ -177,6 +177,19 @@ test('pool-quota: a touch more than 60 s after its reset, or missing past 60 s w
   assert.match(pq(body).line, /^CHECK pool-quota ok · .*, touches: stagger off, at /);
 });
 
+test('pool-quota: a reset that is not today carries its weekday, so a weekly reset days away does not read as today', () => {
+  // the lead, 2026-11-27 17:3x: "Sat 14:00" style for any reset not today. NOW is Sat 18:13 UTC.
+  const body = quota(0.8, 0.6, [seat('a@x.org', 0.1, 0.2)]);
+  body.stagger = { enabled: true, seats: [
+    { ...unknown('claude3@x.org', null), nextFollowAt: iso(Date.UTC(2026, 10, 16, 22, 59)) }, // Mon 22:59
+    { ...unknown('claude2@x.org', null), nextFollowAt: iso(NOW + 3_600_000) },              // today 19:13
+    follow('claude@x.org', 30 * 3_600_000, 11),                                             // Fri 12:13
+  ] };
+  const r = pq(body, { TZ: 'UTC' });
+  assert.ok(r.line.includes('touches: claude3 reset Mon 22:59, touch due; claude2 reset 19:13, touch due; '
+    + 'claude reset Fri 12:13, touch Fri 12:13, lag 11s, at '), r.line);
+});
+
 // ---------- proxy-wrapper (assessment, with a canned probe)
 const SELF = spawnSync('hostname', ['-s'], { encoding: 'utf8' }).stdout.trim() || hostname();
 function pw(results) { // host -> probe line ('' = unreachable)

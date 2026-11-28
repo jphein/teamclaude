@@ -65,8 +65,12 @@ tl=$(jq -r '
   if (.stagger | type) != "object" then "NONE"
   elif .stagger.enabled != true then "OFF"
   else (.stagger.seats // [])[] | select(type == "object")
-    | [who, (.lastResetAt | secs), (.touchedAt | secs),
-       (if (.touchLagSeconds | type) == "number" then .touchLagSeconds else "" end),
+    # the reset reported: a pending one (no successful touch yet: retrying, given up, skipped) when it is newer
+    # than the last reset a touch succeeded for, and then with no touch
+    | (.lastResetAt | secs) as $l | (.pendingResetAt | secs) as $p
+    | (if ($p | type) == "number" and (($l | type) != "number" or $p > $l) then [$p, "", ""]
+       else [$l, (.touchedAt | secs), (if (.touchLagSeconds | type) == "number" then .touchLagSeconds else "" end)] end) as $rt
+    | [who, $rt[0], $rt[1], $rt[2],
        ((.followNote // "") | clean), (.nextFollowAt | secs),
        (if (.slot | type) == "string" and (.slot | test("^[0-2][0-9]:[0-5][0-9]$")) then .slot else "" end),
        ((.last // "") | tostring | (try capture("^no slot today \\((?<w>[^)]*)\\)").w catch "") | clean)]

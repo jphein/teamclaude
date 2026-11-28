@@ -125,10 +125,16 @@ test('pool-quota: no aggregate, bad JSON or no endpoint is a fail line (exit 0: 
 // The lead's ruling on PR 108 round 1: per seat, "reset HH:MM, touch HH:MM, lag Ns", or "reset unknown, slot HH:MM
 // starts it", or "reset unknown, no touch planned (<why>)". Every seat is listed.
 const hm = (/** @type {number} */ t) => new Date(t).toISOString().slice(11, 16);
-const follow = (name, resetAgoMs, lagS, note = null, by = 'stagger') => ({
+// A touched reset is lastResetAt with its touch; a reset with no touch (yet) is pendingResetAt, newer than the
+// seat's last successful one (5 h before, touched +10 s), which the line then does not show (round 3 ruling).
+const follow = (name, resetAgoMs, lagS, note = null, by = 'stagger') => (lagS == null ? {
   name, slot: null, nextTouchAt: null, last: null,
-  lastResetAt: iso(NOW - resetAgoMs), touchedAt: lagS == null ? null : iso(NOW - resetAgoMs + lagS * 1000),
-  touchLagSeconds: lagS, touchedBy: lagS == null ? null : by, followNote: note, nextFollowAt: null,
+  lastResetAt: iso(NOW - resetAgoMs - 5 * 3_600_000), touchedAt: iso(NOW - resetAgoMs - 5 * 3_600_000 + 10_000),
+  touchLagSeconds: 10, touchedBy: 'stagger', pendingResetAt: iso(NOW - resetAgoMs), followNote: note, nextFollowAt: null,
+} : {
+  name, slot: null, nextTouchAt: null, last: null,
+  lastResetAt: iso(NOW - resetAgoMs), touchedAt: iso(NOW - resetAgoMs + lagS * 1000), pendingResetAt: null,
+  touchLagSeconds: lagS, touchedBy: by, followNote: note, nextFollowAt: null,
 });
 const unknown = (name, slot, last = null) => ({
   name, slot, nextTouchAt: null, last, lastResetAt: null, touchedAt: null, touchLagSeconds: null, touchedBy: null, followNote: null, nextFollowAt: null,
